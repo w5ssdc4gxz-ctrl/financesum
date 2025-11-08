@@ -1,6 +1,7 @@
 """Filings API endpoints."""
 import json
 import logging
+import math
 import re
 from datetime import datetime, timedelta, timezone
 from html import unescape
@@ -46,7 +47,8 @@ logger = logging.getLogger(__name__)
 
 # Gemini 2.0 Flash Lite supports up to ~1M tokens. We limit to keep requests manageable.
 MAX_GEMINI_CONTEXT_CHARS = 600_000
-MAX_SUMMARY_ATTEMPTS = 3
+MAX_SUMMARY_ATTEMPTS = 8
+MAX_REWRITE_ATTEMPTS = 3
 
 DETAIL_LEVEL_PROMPTS: Dict[str, str] = {
     "snapshot": "Keep analysis concise (1–2 short paragraphs) and only cite headline metrics that prove the main point.",
@@ -72,15 +74,186 @@ def _count_words(text: str) -> int:
     return len(tokens)
 
 
-def _needs_length_retry(text: str, target_length: int) -> Tuple[bool, int, int]:
+def _truncate_text_to_word_limit(text: str, max_words: int) -> str:
+    """Trim text so it contains at most `max_words` tokens while preserving original formatting."""
+    if max_words <= 0:
+        return ""
+
+    matches = list(re.finditer(r"\b\w+\b", text))
+    if len(matches) <= max_words:
+        return text.rstrip()
+
+    cutoff_index = matches[max_words - 1].end()
+    truncated = text[:cutoff_index].rstrip()
+    if cutoff_index >= len(text):
+        return truncated
+
+    # Try to backtrack to the nearest natural boundary (sentence end or paragraph break)
+    boundary_index = None
+    sentence_pattern = re.compile(r"[.!?](?:['\"\)\]]+)?")
+    for match in sentence_pattern.finditer(truncated):
+        boundary_index = match.end()
+    if boundary_index is not None and boundary_index > max(0.6 * len(truncated), 0):
+        truncated = truncated[:boundary_index].rstrip()
+        if truncated:
+            return truncated
+
+    paragraph_break = truncated.rfind("\n\n")
+    if paragraph_break != -1 and paragraph_break > len(truncated) * 0.4:
+        return truncated[:paragraph_break].rstrip()
+
+    return truncated
+
+
+def _needs_length_retry(text: str, target_length: int, cached_count: Optional[int] = None) -> Tuple[bool, int, int]:
     """Return tuple indicating if retry needed, actual count, tolerance band size."""
-    words = _count_words(text)
-    tolerance = max(5, int(target_length * 0.05))
+    words = cached_count if cached_count is not None else _count_words(text)
+    tolerance = max(3, int(math.ceil(target_length * 0.02)))
     lower = target_length - tolerance
     upper = target_length + tolerance
     if lower <= words <= upper:
         return False, words, tolerance
     return True, words, tolerance
+
+
+def _rewrite_summary_to_length(
+    gemini_client,
+    summary_text: str,
+    target_length: int,
+    quality_validators: Optional[List[Callable[[str], Optional[str]]]],
+    current_words: Optional[int] = None,
+) -> Tuple[str, Tuple[int, int]]:
+    """
+    Ask the model to rewrite an existing draft so it fits within the required length band
+    while keeping every section intact. Returns the new draft and its (word_count, tolerance).
+    """
+    tolerance = max(3, int(math.ceil(target_length * 0.02)))
+    lower = target_length - tolerance
+    upper = target_length + tolerance
+    corrections: List[str] = []
+    working_draft = summary_text
+    latest_words = current_words if current_words is not None else _count_words(working_draft)
+
+    def _build_prompt() -> str:
+        length_state = "exceeded" if latest_words > upper else "fell short of"
+        prompt = (
+            f"You previously drafted an equity research memo containing {latest_words} words, which {length_state} the "
+            f"required range of {lower}–{upper} words (target {target_length}). "
+            "Rewrite the entire memo so it stays inside that range while preserving every section and investor-specific instruction."
+            "\n\nMANDATORY REQUIREMENTS:\n"
+            "- Keep all existing section headings (Investor Lens, Executive Summary, Financial Performance, Management Discussion & Analysis, Risk Factors, "
+            "Strategic Initiatives & Capital Allocation, Key Metrics/Others) unless they were absent in the draft. Do NOT drop sections to save space.\n"
+            "- Retain the key figures, personas, and conclusions; reduce length by merging redundant sentences and tightening language.\n"
+            "- Ensure each paragraph ends on a complete sentence; do not stop mid-thought.\n"
+            "- After rewriting, append a final line formatted exactly as `WORD COUNT: ###` (replace ### with the true count)."
+        )
+        if corrections:
+            prompt += "\n\nADDITIONAL CORRECTIONS:\n" + "\n".join(corrections)
+        prompt += "\n\nPREVIOUS DRAFT:\n" + working_draft
+        return prompt
+
+    for attempt in range(1, MAX_REWRITE_ATTEMPTS + 1):
+        prompt = _build_prompt()
+        response = gemini_client.model.generate_content(prompt)
+        new_text, reported_count = _extract_word_count_control(response.text)
+        if not new_text.strip():
+            corrections.append("OUTPUT ISSUE: Draft was empty. Provide the full memo with all sections.")
+            continue
+
+        working_draft = new_text
+        latest_words = _count_words(working_draft)
+        within_band = lower <= latest_words <= upper
+
+        if reported_count is None:
+            corrections.append(
+                "QUALITY CORRECTION: Append the control line `WORD COUNT: ###` exactly once at the end after recounting."
+            )
+            continue
+        if latest_words != reported_count:
+            corrections.append(
+                f"QUALITY CORRECTION: Control line reported {reported_count} words but the memo contains {latest_words}. "
+                "Recount accurately and update the memo."
+            )
+            continue
+
+        issue_message = None
+        if quality_validators:
+            for validator in quality_validators:
+                issue_message = validator(working_draft)
+                if issue_message:
+                    break
+
+        if within_band and not issue_message:
+            return working_draft, (latest_words, tolerance)
+
+        if not within_band:
+            corrections.append(
+                f"LENGTH CORRECTION #{attempt}: Draft contains {latest_words} words but must land between {lower} and {upper}. "
+                "Condense prose without deleting mandated sections or metrics."
+            )
+        if issue_message:
+            corrections.append(
+                f"QUALITY CORRECTION #{attempt}: {issue_message} Rewrite the memo while keeping every prior requirement."
+            )
+
+    return working_draft, (latest_words, tolerance)
+
+
+def _enforce_length_constraints(
+    summary_text: str,
+    target_length: int,
+    gemini_client,
+    quality_validators: Optional[List[Callable[[str], Optional[str]]]],
+    last_word_stats: Optional[Tuple[int, int]],
+) -> str:
+    """
+    Ensure the final memo fits inside the required length band using rewrite attempts before trimming.
+    """
+    if not summary_text:
+        return summary_text
+
+    if last_word_stats:
+        actual_words, tolerance = last_word_stats
+    else:
+        _, actual_words, tolerance = _needs_length_retry(summary_text, target_length)
+    lower = target_length - tolerance
+    upper = target_length + tolerance
+
+    if lower <= actual_words <= upper:
+        return summary_text
+
+    rewritten_text, rewrite_stats = _rewrite_summary_to_length(
+        gemini_client,
+        summary_text,
+        target_length,
+        quality_validators,
+        current_words=actual_words,
+    )
+    summary_text = rewritten_text
+    actual_words, tolerance = rewrite_stats
+    lower = target_length - tolerance
+    upper = target_length + tolerance
+
+    if lower <= actual_words <= upper:
+        return summary_text
+
+    if actual_words > upper:
+        trimmed_summary = _truncate_text_to_word_limit(summary_text, upper)
+        trimmed_count = _count_words(trimmed_summary)
+        logger.warning(
+            "Summary remained above target range after rewrite fallback; trimmed from %s to %s words.",
+            actual_words,
+            trimmed_count,
+        )
+        return trimmed_summary
+
+    logger.warning(
+        "Summary remained below target range after rewrite fallback (got %s words; target %s±%s).",
+        actual_words,
+        target_length,
+        tolerance,
+    )
+    return summary_text
 
 
 def _generate_summary_with_length_control(
@@ -102,17 +275,54 @@ def _generate_summary_with_quality_control(
     """
     corrections: List[str] = []
     prompt = base_prompt
+    previous_draft: Optional[str] = None
+    summary_text: str = ""
+    last_word_stats: Optional[Tuple[int, int]] = None  # (actual_words, tolerance)
 
     def _rebuild_prompt() -> str:
-        return base_prompt + ("\n\n" + "\n\n".join(corrections) if corrections else "")
+        correction_block = ("\n\n".join(corrections)) if corrections else ""
+        previous_block = (
+            f"\n\nPrevious draft (for reference, do not copy verbatim):\n{previous_draft}\n"
+            if previous_draft
+            else ""
+        )
+        combined = base_prompt
+        if correction_block:
+            combined += "\n\n" + correction_block
+        combined += previous_block
+        combined += "\n\nRewrite the entire memo applying every instruction above."
+        return combined
 
     for attempt in range(1, MAX_SUMMARY_ATTEMPTS + 1):
         response = gemini_client.model.generate_content(prompt)
-        summary_text = response.text
+        raw_text = response.text
+        summary_text, reported_count = _extract_word_count_control(raw_text)
+        previous_draft = summary_text
 
         needs_length_retry = False
+        actual_words = None
         if target_length:
-            needs_length_retry, actual_words, tolerance = _needs_length_retry(summary_text, target_length)
+            actual_words = _count_words(summary_text)
+            needs_length_retry, actual_words, tolerance = _needs_length_retry(
+                summary_text, target_length, cached_count=actual_words
+            )
+            last_word_stats = (actual_words, tolerance)
+
+        if target_length:
+            if reported_count is None:
+                corrections.append(
+                    "QUALITY CORRECTION: You must append a final line formatted exactly as 'WORD COUNT: ###' (with the "
+                    "actual number of words in the memo). Add this control line after recounting."
+                )
+                prompt = _rebuild_prompt()
+                continue
+            if actual_words is not None and reported_count != actual_words:
+                corrections.append(
+                    f"QUALITY CORRECTION: Your control line reported {reported_count} words but the memo contains "
+                    f"{actual_words}. Recount accurately, adjust the memo to the required length, and update the control line."
+                )
+                prompt = _rebuild_prompt()
+                continue
 
         if not needs_length_retry:
             issue_message = None
@@ -130,58 +340,25 @@ def _generate_summary_with_quality_control(
             prompt = _rebuild_prompt()
             continue
 
+        prior_count = reported_count if reported_count is not None else actual_words
         corrections.append(
-            f"LENGTH CORRECTION #{attempt}: The previous draft contained {actual_words} words but the target is "
-            f"{target_length} words (tolerance ±{tolerance}). Rewrite the entire memo so the total word count falls "
-            f"within this band while preserving all original sections and requirements. Do not mention the counting process."
+            f"LENGTH CORRECTION #{attempt}: Your last draft contained {prior_count} words, but the required range is "
+            f"{target_length - tolerance}–{target_length + tolerance} words (target {target_length}). "
+            f"Recount while drafting and stop writing the moment you reach that window. If the next draft is outside the range, "
+            "it will be rejected. Update the 'WORD COUNT: ###' control line to reflect the exact total."
         )
         prompt = _rebuild_prompt()
 
+    if target_length and summary_text:
+        summary_text = _enforce_length_constraints(
+            summary_text,
+            target_length,
+            gemini_client,
+            quality_validators,
+            last_word_stats,
+        )
+
     return summary_text
-
-
-def _trim_text_to_word_limit(text: str, limit: int) -> str:
-    if limit <= 0:
-        return ""
-    words = 0
-    pieces: List[str] = []
-    for match in re.finditer(r"\S+|\s+", text):
-        part = match.group(0)
-        if part.isspace():
-            pieces.append(part)
-            continue
-        if words >= limit:
-            break
-        pieces.append(part)
-        words += 1
-    trimmed = "".join(pieces).rstrip()
-    return trimmed if trimmed else text
-
-
-def _finalize_summary_length(text: str, target_length: Optional[int]) -> str:
-    if not target_length:
-        return text
-    needs_retry, actual_words, tolerance = _needs_length_retry(text, target_length)
-    if not needs_retry:
-        return text
-    upper_limit = target_length + tolerance
-    lower_limit = max(1, target_length - tolerance)
-    if actual_words > upper_limit:
-        return _trim_text_to_word_limit(text, upper_limit)
-    # Too short: add a short clarifying line without exceeding tolerance too much
-    padding_sentence = (
-        "\n\nAdditional disclosure beyond this scope is not provided in the filing, so this memo covers every available detail."
-    )
-    candidate = text.rstrip() + padding_sentence
-    # If padding overshoots, trim back down to upper limit
-    _, new_words, _ = _needs_length_retry(candidate, target_length)
-    if new_words > upper_limit:
-        return _trim_text_to_word_limit(candidate, upper_limit)
-    if new_words < lower_limit:
-        # As a final measure, target the midpoint
-        midpoint = (lower_limit + upper_limit) // 2
-        return _trim_text_to_word_limit(candidate, midpoint)
-    return candidate
 
 
 MDNA_BANNED_PHRASES = [
@@ -247,6 +424,10 @@ def _build_preference_instructions(
         )
         instructions.append(
             "- In every major section, include at least one sentence explaining why the content matters to this investor profile before citing generic takeaways."
+        )
+    else:
+        instructions.append(
+            "- No persona name was provided, but treat the investor brief text as the governing viewpoint and reference it explicitly in the Investor Lens and Executive Summary."
         )
 
     if preferences.focus_areas:
@@ -1285,6 +1466,7 @@ async def generate_filing_summary(
  - Every metric listed in the calculated metrics block must be incorporated into the narrative or key metrics section with its value.
  - When free cash flow is not explicitly reported, derive it as operating cash flow minus capital expenditures (use the magnitude of capex even if presented as a negative number) and include the computed value.
  - Never respond that management commentary or guidance is unavailable; synthesize a viewpoint from the data if necessary and label it clearly as analysis.
+ - After completing the memo, append a final line formatted exactly as `WORD COUNT: ###` (replace ### with the number of words in the memo above that line). This line will be removed before the user sees the memo.
  - Maintain professional markdown formatting with clear headings."""
 
         summary_text = _generate_summary_with_quality_control(
@@ -1293,7 +1475,6 @@ async def generate_filing_summary(
             target_length,
             quality_validators=[_validate_mdna_section],
         )
-        summary_text = _finalize_summary_length(summary_text, target_length)
         
         # Cache only for default runs so user-specific prompts aren't reused globally
         if use_default_cache:
@@ -1357,3 +1538,20 @@ async def parse_filing(filing_id: str):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error starting parse task: {str(e)}")
+
+WORD_COUNT_PATTERN = re.compile(r"WORD\s+COUNT:\s*(\d+)\s*$", re.IGNORECASE)
+
+
+def _extract_word_count_control(text: str) -> Tuple[str, Optional[int]]:
+    """Remove control line 'WORD COUNT: ###' if present and return cleaned text with reported value."""
+    stripped = text.rstrip()
+    lines = stripped.splitlines()
+    if not lines:
+        return stripped, None
+    last_line = lines[-1].strip()
+    match = WORD_COUNT_PATTERN.match(last_line)
+    if not match:
+        return stripped, None
+    reported = int(match.group(1))
+    cleaned = "\n".join(lines[:-1]).rstrip()
+    return cleaned, reported
