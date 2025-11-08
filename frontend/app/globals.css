@@ -1,0 +1,249 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --foreground-rgb: 15, 23, 42;
+  --background-start-rgb: 248, 250, 252;
+  --background-end-rgb: 255, 255, 255;
+}
+
+* {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color: rgb(var(--foreground-rgb));
+  background: rgb(var(--background-start-rgb));
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Premium Glassmorphism Effect */
+.glass {
+  background: rgba(255, 255, 255, 0.8);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+}
+
+.glass-dark {
+  background: rgba(15, 23, 42, 0.8);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* Premium Button Styles */
+.btn-premium {
+  @apply relative overflow-hidden px-8 py-3 rounded-lg font-semibold text-white;
+  @apply bg-gradient-to-r from-primary-600 to-accent-600;
+  @apply hover:from-primary-700 hover:to-accent-700;
+  @apply transform transition-all duration-300 hover:scale-105;
+  @apply shadow-premium hover:shadow-premium-lg;
+}
+
+.btn-premium::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
+  transition: left 0.5s;
+}
+
+.btn-premium:hover::before {
+  left: 100%;
+}
+
+/* Premium Card Styles */
+.card-premium {
+  @apply bg-white rounded-2xl p-8 shadow-lg;
+  @apply border border-gray-100;
+  @apply transition-all duration-300;
+  @apply hover:shadow-premium hover:scale-105;
+  @apply hover:border-primary-200;
+}
+
+/* Gradient Text */
+.gradient-text {
+  @apply bg-gradient-to-r from-primary-600 to-accent-600;
+  @apply bg-clip-text text-transparent;
+}
+
+/* Premium Input Styles */
+.input-premium {
+  @apply w-full px-6 py-4 rounded-lg border-2 border-gray-200;
+  @apply focus:border-primary-500 focus:ring-4 focus:ring-primary-100;
+  @apply transition-all duration-300;
+  @apply bg-white placeholder-gray-400;
+}
+
+.input-premium:focus {
+  @apply outline-none;
+}
+
+/* Loading Spinner */
+.spinner {
+  border: 3px solid rgba(168, 85, 247, 0.1);
+  border-radius: 50%;
+  border-top: 3px solid #a855f7;
+  width: 40px;
+  height: 40px;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+/* Premium Score Badge */
+.score-badge {
+  @apply relative inline-flex items-center justify-center;
+  @apply rounded-full bg-gradient-to-br from-primary-500 to-accent-500;
+  @apply text-white font-bold shadow-premium;
+}
+
+/* Smooth Transitions */
+.transition-premium {
+  @apply transition-all duration-500 ease-out;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, #a855f7, #d946ef);
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, #9333ea, #c026d3);
+}
+
+/* Premium Metrics Cards */
+.metrics-grid {
+  @apply grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4;
+}
+
+.metric-card {
+  @apply bg-gradient-to-br from-primary-500/10 to-accent-500/10;
+  @apply border border-primary-500/20 rounded-xl p-4;
+  @apply backdrop-blur-sm transition-all hover:border-primary-500/40;
+}
+
+.metric-label {
+  @apply text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1;
+}
+
+.metric-value {
+  @apply text-2xl font-bold text-white;
+}
+
+/* Enhanced Prose Styling for Analysis */
+.prose-premium {
+  @apply prose prose-invert prose-lg max-w-none;
+}
+
+.prose-premium h2 {
+  @apply text-3xl font-bold text-white mt-8 mb-4;
+  @apply border-b border-primary-500/30 pb-3;
+}
+
+.prose-premium h3 {
+  @apply text-xl font-bold text-white mt-6 mb-3;
+}
+
+.prose-premium h4 {
+  @apply text-lg font-bold text-primary-300 mt-4 mb-2;
+}
+
+.prose-premium p {
+  @apply text-gray-300 leading-relaxed mb-4;
+}
+
+.prose-premium strong {
+  @apply text-white font-bold;
+}
+
+.prose-premium ul,
+.prose-premium ol {
+  @apply space-y-2 my-4;
+}
+
+.prose-premium li {
+  @apply text-gray-300;
+}
+
+.prose-premium li strong {
+  @apply text-primary-300 font-bold;
+}
+
+.prose-premium code {
+  @apply bg-primary-500/20 text-primary-300 px-2 py-1 rounded;
+}
+
+.prose-premium pre {
+  @apply bg-dark-800 border border-primary-500/20 rounded-xl p-4;
+}
+
+.prose-premium blockquote {
+  @apply border-l-4 border-primary-500 bg-primary-500/10;
+  @apply pl-4 py-2 my-4 italic text-gray-300;
+}
+
+.prose-premium a {
+  @apply text-primary-400 hover:text-primary-300 underline;
+}
+
+.prose-premium table {
+  @apply w-full border-collapse my-6;
+}
+
+.prose-premium th {
+  @apply bg-primary-500/20 text-white font-bold p-3 text-left;
+  @apply border border-primary-500/30;
+}
+
+.prose-premium td {
+  @apply p-3 border border-primary-500/20 text-gray-300;
+}
+
+.prose-premium tr:hover td {
+  @apply bg-primary-500/5;
+}
+
+/* Highlight Box for Key Metrics */
+.highlight-box {
+  @apply bg-gradient-to-r from-primary-600/20 to-accent-600/20;
+  @apply border-l-4 border-primary-500;
+  @apply p-4 rounded-r-xl my-4;
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,210 @@
+"""Companies API endpoints."""
+from datetime import datetime
+from uuid import uuid4
+from fastapi import APIRouter, HTTPException
+from typing import List
+
+from app.models.database import get_supabase_client
+from app.models.schemas import (
+    Company,
+    CompanyLookupRequest,
+    CompanyLookupResponse,
+)
+from app.services.edgar_fetcher import search_company_by_ticker_or_cik
+from app.services.local_cache import fallback_companies
+from app.config import get_settings
+
+
+def _supabase_configured(settings) -> bool:
+    """Return True when Supabase keys are present and not placeholders."""
+    key = (settings.supabase_service_role_key or "").strip()
+    url = (settings.supabase_url or "").strip()
+    if not key or not url:
+        return False
+    if key.lower().startswith("your_"):
+        return False
+    return True
+
+router = APIRouter()
+
+
+@router.post("/lookup", response_model=CompanyLookupResponse)
+async def lookup_company(request: CompanyLookupRequest):
+    """
+    Search for companies by ticker, CIK, or name.
+    First checks local database, then queries EODHD/SEC EDGAR if not found.
+    """
+    settings = get_settings()
+    query = request.query.strip().upper()
+    
+    # Search local database first (only if Supabase is configured)
+    if _supabase_configured(settings):
+        try:
+            supabase = get_supabase_client()
+            # Try ticker match
+            response = supabase.table("companies").select("*").eq("ticker", query).execute()
+            
+            if not response.data:
+                # Try CIK match
+                response = supabase.table("companies").select("*").eq("cik", query).execute()
+            
+            if not response.data:
+                # Try name match (case-insensitive partial match)
+                response = supabase.table("companies").select("*").ilike("name", f"%{query}%").execute()
+            
+            companies = [Company(**company) for company in response.data]
+            
+            if companies:
+                return CompanyLookupResponse(companies=companies)
+        
+        except Exception as e:
+            print(f"Database search error (skipping): {e}")
+    else:
+        print("Supabase not configured, skipping database search")
+    
+    # If not found in database, search EDGAR
+    try:
+        edgar_companies = await search_company_by_ticker_or_cik(query)
+        
+        if not edgar_companies:
+            raise HTTPException(status_code=404, detail="Company not found")
+        
+        # Save found companies to database (if Supabase is configured)
+        saved_companies = []
+        for company_data in edgar_companies:
+            try:
+                if _supabase_configured(settings):
+                    supabase = get_supabase_client()
+                    # Check if already exists
+                    existing = supabase.table("companies").select("*").eq("ticker", company_data["ticker"]).execute()
+                    
+                    if existing.data:
+                        saved_companies.append(Company(**existing.data[0]))
+                    else:
+                        # Insert new company
+                        result = supabase.table("companies").insert(company_data).execute()
+                        if result.data:
+                            saved_companies.append(Company(**result.data[0]))
+                else:
+                    # No database configured, return the company data with stub metadata
+                    ticker = company_data.get("ticker", query)
+                    existing_match = next(
+                        (Company(**data) for data in fallback_companies.values() if data.get("ticker") == ticker),
+                        None,
+                    )
+                    if existing_match:
+                        saved_companies.append(existing_match)
+                        continue
+
+                    now = datetime.utcnow()
+                    company_id = uuid4()
+                    fallback_company = Company(
+                        id=company_id,
+                        ticker=ticker,
+                        name=company_data.get("name", query),
+                        cik=company_data.get("cik"),
+                        exchange=company_data.get("exchange"),
+                        industry=company_data.get("industry"),
+                        sector=company_data.get("sector"),
+                        country=company_data.get("country", "US"),
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    fallback_companies[str(company_id)] = fallback_company.model_dump()
+                    saved_companies.append(fallback_company)
+            except Exception as e:
+                print(f"Error saving company: {e}")
+                ticker = company_data.get("ticker", query)
+                existing_match = next(
+                    (Company(**data) for data in fallback_companies.values() if data.get("ticker") == ticker),
+                    None,
+                )
+                if existing_match:
+                    saved_companies.append(existing_match)
+                    continue
+
+                now = datetime.utcnow()
+                company_id = uuid4()
+                fallback_company = Company(
+                    id=company_id,
+                    ticker=ticker,
+                    name=company_data.get("name", query),
+                    cik=company_data.get("cik"),
+                    exchange=company_data.get("exchange"),
+                    industry=company_data.get("industry"),
+                    sector=company_data.get("sector"),
+                    country=company_data.get("country", "US"),
+                    created_at=now,
+                    updated_at=now,
+                )
+                fallback_companies[str(company_id)] = fallback_company.model_dump()
+                saved_companies.append(fallback_company)
+                continue
+        
+        return CompanyLookupResponse(companies=saved_companies)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error searching for company: {str(e)}")
+
+
+@router.get("/{company_id}", response_model=Company)
+async def get_company(company_id: str):
+    """Get company details by ID."""
+    settings = get_settings()
+
+    if not _supabase_configured(settings):
+        cached = fallback_companies.get(str(company_id))
+        if cached:
+            return Company(**cached)
+        raise HTTPException(status_code=404, detail="Company not available without Supabase configuration")
+
+    supabase = get_supabase_client()
+
+    try:
+        response = supabase.table("companies").select("*").eq("id", company_id).execute()
+
+        if not response.data:
+            raise HTTPException(status_code=404, detail="Company not found")
+
+        return Company(**response.data[0])
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving company: {str(e)}")
+
+
+@router.get("/", response_model=List[Company])
+async def list_companies(
+    limit: int = 100,
+    offset: int = 0,
+    sector: str = None,
+    industry: str = None
+):
+    """List companies with optional filters."""
+    settings = get_settings()
+
+    if not _supabase_configured(settings):
+        return [Company(**data) for data in fallback_companies.values()]
+
+    supabase = get_supabase_client()
+
+    try:
+        query = supabase.table("companies").select("*")
+
+        if sector:
+            query = query.eq("sector", sector)
+        if industry:
+            query = query.eq("industry", industry)
+
+        response = query.range(offset, offset + limit - 1).execute()
+
+        return [Company(**company) for company in response.data]
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing companies: {str(e)}")
+
+
+
