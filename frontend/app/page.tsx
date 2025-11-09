@@ -2,13 +2,15 @@
 
 import Link from 'next/link'
 import { motion } from 'framer-motion'
-import { FaChartLine, FaRobot, FaUsers, FaFileAlt, FaBalanceScale, FaDownload } from 'react-icons/fa'
+import { FaUsers, FaChartLine, FaRobot } from 'react-icons/fa'
 import Navbar from '@/components/Navbar'
 import AnimatedBackground from '@/components/AnimatedBackground'
 import LogoLoop from '@/components/LogoLoop'
 import ResearchMemoShowcase from '@/components/ResearchMemoShowcase'
+import JourneySection from '@/components/JourneySection'
+import ColourfulText from '@/components/ui/colourful-text'
 import { useAuth } from '@/contexts/AuthContext'
-import { fadeInUp, zoomIn, staggerContainer, scaleIn } from '@/lib/animations'
+import { fadeInUp, zoomIn, staggerContainer } from '@/lib/animations'
 
 export default function Home() {
   const { user } = useAuth()
@@ -36,16 +38,8 @@ export default function Home() {
             className="hero-title text-6xl md:text-8xl font-black mb-8"
             variants={fadeInUp}
           >
-            <span className="text-white">Analyze Like</span>
-            <br />
-            <motion.span 
-              className="gradient-text hero-highlight mt-2 text-shadow-glow"
-              initial={{ opacity: 0, scale: 0.8 }}
-              animate={{ opacity: 1, scale: 1 }}
-              transition={{ delay: 0.3, duration: 0.8, type: 'spring' }}
-            >
-              The Legends
-            </motion.span>
+            <span className="text-white block">Analyze Like</span>
+            <ColourfulText text="The Legends" className="hero-highlight mt-2 block text-shadow-glow" />
           </motion.h1>
 
           <motion.p 
@@ -69,7 +63,7 @@ export default function Home() {
             </motion.div>
             <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
               <Link
-                href="#features"
+                href="#journey"
                 className="px-12 py-5 rounded-xl font-semibold text-white border-2 border-white/30 hover:border-primary-400 transition-all duration-300 hover:bg-white/5 backdrop-blur-sm text-xl"
               >
                 See How It Works
@@ -177,7 +171,7 @@ export default function Home() {
                   Launch the Memo Experience →
                 </Link>
                 <Link
-                  href="#features"
+                  href="#journey"
                   className="px-10 py-4 rounded-xl font-semibold text-white border-2 border-white/30 hover:border-primary-400 transition-all duration-300 hover:bg-white/5 backdrop-blur-sm text-lg"
                 >
                   Explore all features
@@ -189,119 +183,9 @@ export default function Home() {
           </div>
         </section>
 
-        {/* Features Section - Now with icons */}
-        <div id="features" className="py-24 bg-gradient-to-b from-transparent to-dark-800/50">
-          <motion.div 
-            className="text-center mb-20"
-            initial={{ opacity: 0, y: 40 }}
-            whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true, margin: "-100px" }}
-            transition={{ duration: 0.6 }}
-          >
-            <h2 className="text-5xl md:text-6xl font-black text-white mb-6">
-              Everything You Need to <span className="gradient-text">Invest Smarter</span>
-            </h2>
-            <p className="text-gray-300 text-xl max-w-3xl mx-auto">Powerful AI-driven tools designed for serious investors who demand comprehensive analysis</p>
-          </motion.div>
-          
-          <motion.div 
-            className="grid grid-cols-1 gap-8 sm:grid-cols-2 lg:grid-cols-3"
-            initial="initial"
-            whileInView="animate"
-            viewport={{ once: true, margin: "-100px" }}
-            variants={staggerContainer}
-          >
-            <motion.div 
-              className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20 hover:border-primary-500/50 group backdrop-blur-sm"
-              variants={scaleIn}
-              whileHover={{ y: -8, scale: 1.02 }}
-              transition={{ duration: 0.2 }}
-            >
-              <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-primary-500 to-accent-500 flex items-center justify-center mb-6 group-hover:scale-110 transition-transform shadow-glow">
-                <FaChartLine className="text-3xl text-white" />
-              </div>
-              <h3 className="text-2xl font-bold mb-4 text-white">Automated Analysis</h3>
-              <p className="text-gray-300 leading-relaxed text-lg">
-                Calculate comprehensive financial ratios, health scores, and key metrics automatically from SEC filings with enterprise-grade accuracy
-              </p>
-            </motion.div>
-            
-            <motion.div 
-              className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20 hover:border-primary-500/50 group backdrop-blur-sm"
-              variants={scaleIn}
-              whileHover={{ y: -8, scale: 1.02 }}
-              transition={{ duration: 0.2 }}
-            >
-              <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-primary-500 to-accent-500 flex items-center justify-center mb-6 group-hover:scale-110 transition-transform shadow-glow">
-                <FaRobot className="text-3xl text-white" />
-              </div>
-              <h3 className="text-2xl font-bold mb-4 text-white">AI-Powered Insights</h3>
-              <p className="text-gray-300 leading-relaxed text-lg">
-                Generate institutional-grade investment memos with risks, catalysts, and strategic insights using advanced AI models
-              </p>
-            </motion.div>
-            
-            <motion.div 
-              className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20 hover:border-primary-500/50 group backdrop-blur-sm"
-              variants={scaleIn}
-              whileHover={{ y: -8, scale: 1.02 }}
-              transition={{ duration: 0.2 }}
-            >
-              <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-primary-500 to-accent-500 flex items-center justify-center mb-6 group-hover:scale-110 transition-transform shadow-glow">
-                <FaUsers className="text-3xl text-white" />
-              </div>
-              <h3 className="text-2xl font-bold mb-4 text-white">10 Investor Personas</h3>
-              <p className="text-gray-300 leading-relaxed text-lg">
-                See how Warren Buffett, Cathie Wood, Ray Dalio, and 7 other legendary investors would analyze each company
-              </p>
-            </motion.div>
-            
-            <motion.div 
-              className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20 hover:border-primary-500/50 group backdrop-blur-sm"
-              variants={scaleIn}
-              whileHover={{ y: -8, scale: 1.02 }}
-              transition={{ duration: 0.2 }}
-            >
-              <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-primary-500 to-accent-500 flex items-center justify-center mb-6 group-hover:scale-110 transition-transform shadow-glow">
-                <FaFileAlt className="text-3xl text-white" />
-              </div>
-              <h3 className="text-2xl font-bold mb-4 text-white">Visual Charts & Reports</h3>
-              <p className="text-gray-300 leading-relaxed text-lg">
-                Interactive charts showing financial trends, ratio comparisons, and historical performance with beautiful visualizations
-              </p>
-            </motion.div>
-            
-            <motion.div 
-              className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20 hover:border-primary-500/50 group backdrop-blur-sm"
-              variants={scaleIn}
-              whileHover={{ y: -8, scale: 1.02 }}
-              transition={{ duration: 0.2 }}
-            >
-              <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-primary-500 to-accent-500 flex items-center justify-center mb-6 group-hover:scale-110 transition-transform shadow-glow">
-                <FaBalanceScale className="text-3xl text-white" />
-              </div>
-              <h3 className="text-2xl font-bold mb-4 text-white">Compare Companies</h3>
-              <p className="text-gray-300 leading-relaxed text-lg">
-                Side-by-side comparison of multiple companies with their key metrics, ratios, and performance indicators
-              </p>
-            </motion.div>
-            
-            <motion.div 
-              className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20 hover:border-primary-500/50 group backdrop-blur-sm"
-              variants={scaleIn}
-              whileHover={{ y: -8, scale: 1.02 }}
-              transition={{ duration: 0.2 }}
-            >
-              <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-primary-500 to-accent-500 flex items-center justify-center mb-6 group-hover:scale-110 transition-transform shadow-glow">
-                <FaDownload className="text-3xl text-white" />
-              </div>
-              <h3 className="text-2xl font-bold mb-4 text-white">Export & Share</h3>
-              <p className="text-gray-300 leading-relaxed text-lg">
-                Download comprehensive analysis as PDF, Word, or Markdown for your investment records and team collaboration
-              </p>
-            </motion.div>
-          </motion.div>
-        </div>
+        <section id="journey" className="py-28 bg-gradient-to-b from-transparent via-dark-900/40 to-dark-800/60">
+          <JourneySection />
+        </section>
 
         {/* How It Works Section */}
         <div className="py-24 bg-dark-900">
