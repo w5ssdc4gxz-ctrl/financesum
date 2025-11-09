@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import { Button } from '@/components/base/buttons/button'
 
 const PERSONAS = [
   { id: 'buffett', name: 'Warren Buffett', description: 'Value, moat, FCF focus' },
@@ -42,18 +43,22 @@ export default function PersonaSelector({ selectedPersonas, onSelectionChange }:
       <div className="flex justify-between items-center mb-4">
         <h3 className="text-lg font-semibold">Select Investor Personas</h3>
         <div className="space-x-2">
-          <button
+          <Button
             onClick={selectAll}
-            className="text-sm text-primary-600 hover:text-primary-700"
+            color="ghost"
+            size="sm"
+            className="text-primary-600 hover:text-primary-700"
           >
             Select All
-          </button>
-          <button
+          </Button>
+          <Button
             onClick={clearAll}
-            className="text-sm text-gray-600 hover:text-gray-700"
+            color="ghost"
+            size="sm"
+            className="text-gray-600 hover:text-gray-700"
           >
             Clear
-          </button>
+          </Button>
         </div>
       </div>
       

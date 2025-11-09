@@ -3,6 +3,7 @@
 import { useState } from 'react'
 import Navbar from '@/components/Navbar'
 import CompanySearch from '@/components/CompanySearch'
+import { Button } from '@/components/base/buttons/button'
 
 interface Company {
   id: string
@@ -49,12 +50,14 @@ export default function ComparePage() {
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
               {selectedCompanies.map(company => (
                 <div key={company.id} className="border rounded-lg p-4 relative">
-                  <button
+                  <Button
                     onClick={() => removeCompany(company.id)}
-                    className="absolute top-2 right-2 text-gray-400 hover:text-red-600"
+                    color="ghost"
+                    size="sm"
+                    className="absolute top-2 right-2 text-gray-400 hover:text-red-600 p-1"
                   >
                     ✕
-                  </button>
+                  </Button>
                   <div className="font-semibold text-gray-900">{company.ticker}</div>
                   <div className="text-sm text-gray-600 mt-1">{company.name}</div>
                 </div>
@@ -63,11 +66,12 @@ export default function ComparePage() {
 
             {selectedCompanies.length >= 2 && (
               <div className="mt-6">
-                <button
-                  className="px-6 py-3 bg-primary-600 text-white rounded-md hover:bg-primary-700"
+                <Button
+                  color="primary"
+                  size="md"
                 >
                   Generate Comparison
-                </button>
+                </Button>
               </div>
             )}
           </div>

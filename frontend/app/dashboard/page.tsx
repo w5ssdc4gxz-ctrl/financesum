@@ -2,9 +2,12 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
+import { motion } from 'framer-motion'
 import Navbar from '@/components/Navbar'
 import CompanySearch from '@/components/CompanySearch'
+import AnimatedBackground from '@/components/AnimatedBackground'
 import { useAuth } from '@/contexts/AuthContext'
+import { fadeInUp, scaleIn, staggerContainer } from '@/lib/animations'
 
 interface Company {
   id: string
@@ -36,29 +39,55 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-dark-900 via-primary-900 to-dark-900">
+      <AnimatedBackground />
       <Navbar />
       
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
         {/* Hero Section */}
-        <div className="mb-12 text-center animate-fade-in">
-          <h1 className="text-4xl md:text-5xl font-bold mb-4">
+        <motion.div 
+          className="mb-12 text-center"
+          initial="initial"
+          animate="animate"
+          variants={staggerContainer}
+        >
+          <motion.h1 
+            className="text-4xl md:text-5xl font-bold mb-4"
+            variants={fadeInUp}
+          >
             <span className="text-white">Welcome to Your</span>
             <span className="gradient-text"> Investment Hub</span>
-          </h1>
-          <p className="text-gray-300 text-lg">
+          </motion.h1>
+          <motion.p 
+            className="text-gray-300 text-lg"
+            variants={fadeInUp}
+          >
             Search for any company to unlock AI-powered financial insights
-          </p>
-        </div>
+          </motion.p>
+        </motion.div>
 
         {/* Search Section */}
-        <div className="mb-16 flex justify-center animate-slide-up">
+        <motion.div 
+          className="mb-16 flex justify-center"
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.4, duration: 0.6 }}
+        >
           <CompanySearch onSelectCompany={handleSelectCompany} />
-        </div>
+        </motion.div>
 
         {/* Dashboard Cards */}
         {user ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 animate-scale-in">
-            <div className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20 hover:border-primary-500/50">
+          <motion.div 
+            className="grid grid-cols-1 md:grid-cols-2 gap-6"
+            initial="initial"
+            animate="animate"
+            variants={staggerContainer}
+          >
+            <motion.div 
+              className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20 hover:border-primary-500/50 backdrop-blur-sm"
+              variants={scaleIn}
+              whileHover={{ y: -8, boxShadow: '0 20px 40px rgba(168, 85, 247, 0.3)' }}
+            >
               <div className="flex items-center justify-between mb-6">
                 <h2 className="text-2xl font-bold text-white">Recent Analyses</h2>
                 <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-primary-500 to-accent-500 flex items-center justify-center">
@@ -77,9 +106,13 @@ export default function Dashboard() {
                   Your recent company analyses will appear here
                 </p>
               </div>
-            </div>
+            </motion.div>
             
-            <div className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20 hover:border-primary-500/50">
+            <motion.div 
+              className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20 hover:border-primary-500/50 backdrop-blur-sm"
+              variants={scaleIn}
+              whileHover={{ y: -8, boxShadow: '0 20px 40px rgba(168, 85, 247, 0.3)' }}
+            >
               <div className="flex items-center justify-between mb-6">
                 <h2 className="text-2xl font-bold text-white">Watchlist</h2>
                 <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-primary-500 to-accent-500 flex items-center justify-center">
@@ -98,11 +131,19 @@ export default function Dashboard() {
                   Add companies to your watchlist to track them
                 </p>
               </div>
-            </div>
-          </div>
+            </motion.div>
+          </motion.div>
         ) : (
-          <div className="max-w-2xl mx-auto">
-            <div className="card-premium bg-gradient-to-br from-primary-900/30 to-accent-900/30 border-primary-500/40 text-center">
+          <motion.div 
+            className="max-w-2xl mx-auto"
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ delay: 0.6, duration: 0.6 }}
+          >
+            <motion.div 
+              className="card-premium bg-gradient-to-br from-primary-900/30 to-accent-900/30 border-primary-500/40 text-center backdrop-blur-sm"
+              whileHover={{ scale: 1.02, boxShadow: '0 20px 40px rgba(168, 85, 247, 0.2)' }}
+            >
               <div className="w-16 h-16 rounded-full bg-primary-500/20 border border-primary-500/40 flex items-center justify-center mx-auto mb-6">
                 <svg className="w-8 h-8 text-primary-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
@@ -122,8 +163,8 @@ export default function Dashboard() {
                   <span className="font-medium">Free to get started</span>
                 </span>
               </div>
-            </div>
-          </div>
+            </motion.div>
+          </motion.div>
         )}
       </main>
     </div>

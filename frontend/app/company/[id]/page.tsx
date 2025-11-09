@@ -8,8 +8,10 @@ import HealthScoreBadge from '@/components/HealthScoreBadge'
 import FinancialCharts from '@/components/FinancialCharts'
 import PersonaSelector from '@/components/PersonaSelector'
 import EnhancedSummary from '@/components/EnhancedSummary'
+import AnimatedList, { AnimatedListItem } from '@/components/AnimatedList'
 import { companyApi, filingsApi, analysisApi, API_BASE_URL, FilingSummaryPreferencesPayload } from '@/lib/api-client'
 import ReactMarkdown from 'react-markdown'
+import { Button } from '@/components/base/buttons/button'
 
 type SummaryMode = 'default' | 'custom'
 type SummaryTone = 'objective' | 'cautiously optimistic' | 'bullish' | 'bearish'
@@ -219,6 +221,25 @@ export default function CompanyPage() {
     () => filings?.find((f: any) => f.id === selectedFilingForSummary),
     [filings, selectedFilingForSummary],
   )
+  const filingListItems = useMemo<AnimatedListItem[]>(() => {
+    if (!filings) return []
+    return filings.map((filing: any) => {
+      const formattedDate = filing.filing_date
+        ? new Date(filing.filing_date).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+        : 'Date unavailable'
+
+      const period = filing.period || filing.period_end || filing.fiscal_period
+      const description = period ? `${formattedDate} • ${period}` : formattedDate
+      const status = filing.status || filing.filing_status
+
+      return {
+        id: filing.id,
+        title: filing.filing_type || 'Filing',
+        description,
+        meta: status,
+      }
+    })
+  }, [filings])
 
   // Fetch analyses
   const { data: analyses, refetch: refetchAnalyses, error: analysesError } = useQuery({
@@ -374,17 +395,20 @@ export default function CompanyPage() {
                 { id: 'analysis', label: 'Analysis' },
                 { id: 'personas', label: 'Investor Personas' },
               ].map(tab => (
-                <button
+                <Button
                   key={tab.id}
                   onClick={() => setSelectedTab(tab.id as any)}
-                  className={`px-6 py-4 text-sm font-semibold whitespace-nowrap transition-all ${
+                  color="ghost"
+                  size="sm"
+                  asMotion={false}
+                  className={`px-6 py-4 text-sm font-semibold whitespace-nowrap transition-all rounded-none ${
                     selectedTab === tab.id
                       ? 'border-b-2 border-primary-500 text-white bg-white/5'
                       : 'text-gray-400 hover:text-white hover:bg-white/5'
                   }`}
                 >
                   {tab.label}
-                </button>
+                </Button>
               ))}
             </nav>
           </div>
@@ -401,44 +425,37 @@ export default function CompanyPage() {
                     Quick Actions
                   </h2>
                   <div className="flex flex-wrap gap-4 mb-6">
-                    <button
+                    <Button
                       onClick={() => fetchFilingsMutation.mutate()}
-                      disabled={fetchFilingsMutation.isPending}
-                      className="btn-premium flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
-                      {fetchFilingsMutation.isPending ? (
-                        <>
-                          <div className="spinner w-5 h-5 border-2"></div>
-                          <span>Fetching Filings...</span>
-                        </>
-                      ) : (
-                        <>
+                      color="primary"
+                      size="md"
+                      isLoading={fetchFilingsMutation.isPending}
+                      leftIcon={
+                        !fetchFilingsMutation.isPending ? (
                           <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
                           </svg>
-                          <span>Fetch Latest Filings</span>
-                        </>
-                      )}
-                    </button>
-                    <button
-                      onClick={() => runAnalysisMutation.mutate()}
-                      disabled={runAnalysisMutation.isPending || !filings || filings.length === 0}
-                      className="px-8 py-3 rounded-lg font-semibold text-white bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 disabled:from-gray-600 disabled:to-gray-700 disabled:cursor-not-allowed transition-all hover:scale-105 disabled:hover:scale-100 shadow-premium flex items-center gap-2"
+                        ) : undefined
+                      }
                     >
-                      {runAnalysisMutation.isPending ? (
-                        <>
-                          <div className="spinner w-5 h-5 border-2"></div>
-                          <span>Running Analysis...</span>
-                        </>
-                      ) : (
-                        <>
+                      {fetchFilingsMutation.isPending ? 'Fetching Filings...' : 'Fetch Latest Filings'}
+                    </Button>
+                    <Button
+                      onClick={() => runAnalysisMutation.mutate()}
+                      disabled={!filings || filings.length === 0}
+                      color="success"
+                      size="md"
+                      isLoading={runAnalysisMutation.isPending}
+                      leftIcon={
+                        !runAnalysisMutation.isPending ? (
                           <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
                           </svg>
-                          <span>Run Analysis</span>
-                        </>
-                      )}
-                    </button>
+                        ) : undefined
+                      }
+                    >
+                      {runAnalysisMutation.isPending ? 'Running Analysis...' : 'Run Analysis'}
+                    </Button>
                   </div>
                   
                   {filings && filings.length > 0 && (
@@ -470,19 +487,20 @@ export default function CompanyPage() {
 
                       <div className="space-y-6">
                         <div>
-                          <label className="text-sm font-semibold text-gray-300 mb-2 block">Select filing</label>
-                          <select
-                            value={selectedFilingForSummary}
-                            onChange={(e) => setSelectedFilingForSummary(e.target.value)}
-                            className="w-full px-4 py-3 bg-dark-900 border-2 border-white/10 rounded-lg text-white focus:outline-none focus:border-primary-500 focus:ring-4 focus:ring-primary-100/20 transition-all"
-                          >
-                            <option value="">Select a filing...</option>
-                            {filings.map((f: any) => (
-                              <option key={f.id} value={f.id}>
-                                {f.filing_type} - {new Date(f.filing_date).toLocaleDateString()}
-                              </option>
-                            ))}
-                          </select>
+                          <div className="flex items-center justify-between mb-2">
+                            <label className="text-sm font-semibold text-gray-300">Select filing</label>
+                            <span className="text-xs text-gray-400">
+                              {selectedFilingForSummary ? 'Press Enter to confirm' : 'Use ↑ ↓ + Enter'}
+                            </span>
+                          </div>
+                          <AnimatedList
+                            items={filingListItems}
+                            selectedId={selectedFilingForSummary}
+                            onItemSelect={(item) => setSelectedFilingForSummary(item.id)}
+                            showGradients
+                            enableArrowNavigation
+                            displayScrollbar={false}
+                          />
                         </div>
 
                         <div>
@@ -491,10 +509,13 @@ export default function CompanyPage() {
                             {['default', 'custom'].map((mode) => {
                               const isSelected = summaryPreferences.mode === mode
                               return (
-                                <button
+                                <Button
                                   key={mode}
                                   type="button"
                                   onClick={() => setSummaryPreferences(prev => ({ ...prev, mode: mode as SummaryMode }))}
+                                  color="ghost"
+                                  size="md"
+                                  asMotion={false}
                                   className={`text-left p-4 rounded-xl border transition-all ${
                                     isSelected
                                       ? 'border-primary-500/60 bg-primary-500/15 text-white shadow-premium'
@@ -512,7 +533,7 @@ export default function CompanyPage() {
                                       ? 'Use the Financesum house style with balanced coverage.'
                                       : 'Answer a few prompts so the AI focuses on what you care about.'}
                                   </p>
-                                </button>
+                                </Button>
                               )
                             })}
                           </div>
@@ -539,10 +560,13 @@ export default function CompanyPage() {
                                 {focusAreaOptions.map(area => {
                                   const active = summaryPreferences.focusAreas.includes(area)
                                   return (
-                                    <button
+                                    <Button
                                       key={area}
                                       type="button"
                                       onClick={() => toggleFocusArea(area)}
+                                      color="ghost"
+                                      size="sm"
+                                      asMotion={false}
                                       className={`px-4 py-2 rounded-full text-sm border transition-all ${
                                         active
                                           ? 'border-primary-500 text-primary-200 bg-primary-500/15'
@@ -550,7 +574,7 @@ export default function CompanyPage() {
                                       }`}
                                     >
                                       {area}
-                                    </button>
+                                    </Button>
                                   )
                                 })}
                               </div>
@@ -563,17 +587,20 @@ export default function CompanyPage() {
                                   {toneOptions.map(option => {
                                     const active = summaryPreferences.tone === option.value
                                     return (
-                                      <button
+                                      <Button
                                         key={option.value}
                                         type="button"
                                         onClick={() => setSummaryPreferences(prev => ({ ...prev, tone: option.value }))}
+                                        color="ghost"
+                                        size="sm"
+                                        asMotion={false}
                                         className={`w-full text-left px-3 py-2 rounded-lg text-sm transition ${
                                           active ? 'bg-primary-500/20 text-white border border-primary-500/60' : 'bg-dark-900 border border-white/10 text-gray-300 hover:border-primary-500/40'
                                         }`}
                                       >
                                         <p className="font-semibold">{option.label}</p>
                                         <p className="text-xs text-gray-400">{option.description}</p>
-                                      </button>
+                                      </Button>
                                     )
                                   })}
                                 </div>
@@ -584,17 +611,20 @@ export default function CompanyPage() {
                                   {detailOptions.map(option => {
                                     const active = summaryPreferences.detailLevel === option.value
                                     return (
-                                      <button
+                                      <Button
                                         key={option.value}
                                         type="button"
                                         onClick={() => setSummaryPreferences(prev => ({ ...prev, detailLevel: option.value }))}
+                                        color="ghost"
+                                        size="sm"
+                                        asMotion={false}
                                         className={`w-full text-left px-3 py-2 rounded-lg text-sm transition ${
                                           active ? 'bg-primary-500/20 text-white border border-primary-500/60' : 'bg-dark-900 border border-white/10 text-gray-300 hover:border-primary-500/40'
                                         }`}
                                       >
                                         <p className="font-semibold">{option.label}</p>
                                         <p className="text-xs text-gray-400">{option.description}</p>
-                                      </button>
+                                      </Button>
                                     )
                                   })}
                                 </div>
@@ -605,17 +635,20 @@ export default function CompanyPage() {
                                   {outputStyleOptions.map(option => {
                                     const active = summaryPreferences.outputStyle === option.value
                                     return (
-                                      <button
+                                      <Button
                                         key={option.value}
                                         type="button"
                                         onClick={() => setSummaryPreferences(prev => ({ ...prev, outputStyle: option.value }))}
+                                        color="ghost"
+                                        size="sm"
+                                        asMotion={false}
                                         className={`w-full text-left px-3 py-2 rounded-lg text-sm transition ${
                                           active ? 'bg-primary-500/20 text-white border border-primary-500/60' : 'bg-dark-900 border border-white/10 text-gray-300 hover:border-primary-500/40'
                                         }`}
                                       >
                                         <p className="font-semibold">{option.label}</p>
                                         <p className="text-xs text-gray-400">{option.description}</p>
-                                      </button>
+                                      </Button>
                                     )
                                   })}
                                 </div>
@@ -629,13 +662,16 @@ export default function CompanyPage() {
                                   <span className="text-sm text-primary-200 font-semibold">
                                     {summaryPreferences.targetLength} words
                                   </span>
-                                  <button
+                                  <Button
                                     type="button"
                                     onClick={() => setShowCustomLengthInput(prev => !prev)}
+                                    color="ghost"
+                                    size="sm"
+                                    asMotion={false}
                                     className="px-3 py-1 rounded-lg border border-white/10 text-xs text-gray-300 hover:border-primary-500/40 hover:text-white transition"
                                   >
                                     {showCustomLengthInput ? 'Hide custom' : 'Custom'}
-                                  </button>
+                                  </Button>
                                 </div>
                               </div>
                               <input
@@ -661,13 +697,14 @@ export default function CompanyPage() {
                                     className="flex-1 px-4 py-2 rounded-lg bg-dark-900 border-2 border-white/10 text-white focus:outline-none focus:border-primary-500 focus:ring-4 focus:ring-primary-100/20"
                                     placeholder="Enter custom word count"
                                   />
-                                  <button
+                                  <Button
                                     type="button"
                                     onClick={handleCustomLengthApply}
-                                    className="px-4 py-2 rounded-lg bg-primary-600 text-white font-semibold hover:bg-primary-500 transition"
+                                    color="primary"
+                                    size="sm"
                                   >
                                     Apply
-                                  </button>
+                                  </Button>
                                 </div>
                               )}
                             </div>
@@ -683,26 +720,24 @@ export default function CompanyPage() {
                         )}
 
                         <div className="flex flex-wrap gap-3">
-                          <button
+                          <Button
                             onClick={requestSummaryWithPreferences}
-                            disabled={!selectedFilingForSummary || isSummaryGenerating}
-                            className="px-6 py-3 bg-gradient-to-r from-purple-600 to-pink-600 text-white rounded-lg font-semibold hover:from-purple-700 hover:to-pink-700 disabled:from-gray-600 disabled:to-gray-700 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2 shadow-premium"
-                          >
-                            {isSummaryGenerating ? (
-                              <>
-                                <div className="spinner w-5 h-5 border-2"></div>
-                                <span>Generating...</span>
-                              </>
-                            ) : (
-                              <>
+                            disabled={!selectedFilingForSummary}
+                            isLoading={isSummaryGenerating}
+                            color="primary"
+                            size="md"
+                            className="bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700"
+                            leftIcon={
+                              !isSummaryGenerating ? (
                                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 4a2 2 0 114 0v1a1 1 0 001 1h3a1 1 0 011 1v3a1 1 0 01-1 1h-1a2 2 0 100 4h1a1 1 0 011 1v3a1 1 0 01-1 1h-3a1 1 0 01-1-1v-1a2 2 0 10-4 0v1a1 1 0 01-1 1H7a1 1 0 01-1-1v-3a1 1 0 00-1-1H4a2 2 0 110-4h1a1 1 0 001-1V7a1 1 0 011-1h3a1 1 0 001-1V4z" />
                                 </svg>
-                                <span>{summaryPreferences.mode === 'custom' ? 'Generate custom summary' : 'Generate default summary'}</span>
-                              </>
-                            )}
-                          </button>
-                          <button
+                              ) : undefined
+                            }
+                          >
+                            {isSummaryGenerating ? 'Generating...' : (summaryPreferences.mode === 'custom' ? 'Generate custom summary' : 'Generate default summary')}
+                          </Button>
+                          <Button
                             type="button"
                             onClick={() => {
                               const defaults = createDefaultSummaryPreferences()
@@ -710,10 +745,12 @@ export default function CompanyPage() {
                               setShowCustomLengthInput(false)
                               setCustomLengthInput(String(defaults.targetLength))
                             }}
+                            color="ghost"
+                            size="md"
                             className="px-5 py-3 rounded-lg border border-white/10 text-sm text-gray-300 hover:border-primary-500/40 hover:text-white transition"
                           >
                             Reset questionnaire
-                          </button>
+                          </Button>
                         </div>
                       </div>
                     </div>
@@ -757,18 +794,20 @@ export default function CompanyPage() {
                               </div>
                             </div>
                           </div>
-                          <button
+                          <Button
                             onClick={() => {
                               const newSummaries = { ...filingSummaries }
                               delete newSummaries[filingId]
                               setFilingSummaries(newSummaries)
                             }}
+                            color="ghost"
+                            size="sm"
                             className="text-gray-400 hover:text-red-400 transition-colors p-2"
                           >
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                             </svg>
-                          </button>
+                          </Button>
                         </div>
                         {meta?.investorFocus && (
                           <div className="mb-4 px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-sm text-gray-200">
@@ -830,23 +869,18 @@ export default function CompanyPage() {
                             </div>
                           </div>
                           <div className="flex gap-2">
-                            <button
+                            <Button
                               onClick={() => {
                                 setSelectedFilingForSummary(filing.id)
                                 scrollToSummaryCard()
                               }}
-                              disabled={loadingSummaries[filing.id]}
-                              className="px-4 py-2 bg-gradient-to-r from-purple-600 to-pink-600 text-white text-sm rounded-lg hover:from-purple-700 hover:to-pink-700 disabled:from-gray-600 disabled:to-gray-700 font-semibold transition-all flex items-center gap-2"
+                              isLoading={loadingSummaries[filing.id]}
+                              color="primary"
+                              size="sm"
+                              className="px-4 py-2 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-sm"
                             >
-                              {loadingSummaries[filing.id] ? (
-                                <>
-                                  <div className="spinner w-4 h-4 border-2"></div>
-                                  <span>Generating...</span>
-                                </>
-                              ) : (
-                                <span>AI Summary Options</span>
-                              )}
-                            </button>
+                              {loadingSummaries[filing.id] ? 'Generating...' : 'AI Summary Options'}
+                            </Button>
                             {filing.url && (
                               <a
                                 href={resolveFilingUrl(filing.url)}

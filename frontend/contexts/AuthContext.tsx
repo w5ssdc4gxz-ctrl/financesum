@@ -54,8 +54,8 @@ const createDemoUser = (): User => {
     identities: [],
     created_at: timestamp,
     updated_at: timestamp,
-    factors: null,
-    phone_confirmed_at: null,
+    factors: undefined,
+    phone_confirmed_at: timestamp,
     raw_user_meta_data: {},
   } as User
 }
