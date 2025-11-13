@@ -1,8 +1,9 @@
 """Main FastAPI application."""
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
-from app.config import get_settings
-from app.api import companies, filings, analysis
+
+from app.api import analysis, companies, filings
+from app.config import DEFAULT_CORS_ORIGINS, get_settings
 
 settings = get_settings()
 
@@ -10,17 +11,30 @@ app = FastAPI(
     title="FinanceSum API",
     description="Financial analysis platform API",
     version="1.0.0",
-    debug=settings.debug
+    debug=settings.debug,
 )
 
-# CORS middleware
+allowed_origins = settings.cors_origins or DEFAULT_CORS_ORIGINS.copy()
+cors_allow_all = settings.cors_allow_all or "*" in allowed_origins
+
+if cors_allow_all:
+    cors_kwargs = {
+        "allow_origins": ["*"],
+        "allow_origin_regex": None,
+        "allow_credentials": False,
+    }
+else:
+    cors_kwargs = {
+        "allow_origins": allowed_origins,
+        "allow_origin_regex": settings.cors_origin_regex,
+        "allow_credentials": True,
+    }
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_origin_regex=settings.cors_origin_regex,
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    **cors_kwargs,
 )
 
 
@@ -64,6 +78,5 @@ app.include_router(
     prefix=f"/api/{settings.api_version}/analysis",
     tags=["analysis"]
 )
-
 
 

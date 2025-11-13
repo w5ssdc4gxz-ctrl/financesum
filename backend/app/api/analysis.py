@@ -18,6 +18,7 @@ from app.services.analysis_fallback import (
     list_company_analyses as fallback_list_company_analyses,
     run_analysis as fallback_run_analysis,
 )
+from app.utils.supabase_errors import is_supabase_table_missing_error
 
 router = APIRouter()
 
@@ -43,6 +44,8 @@ async def run_analysis(request: AnalysisRunRequest):
     except HTTPException:
         raise
     except Exception as e:
+        if is_supabase_table_missing_error(e):
+            return fallback_run_analysis(request)
         raise HTTPException(status_code=500, detail=f"Error verifying company: {str(e)}")
     
     # Get filing IDs if not provided
@@ -66,6 +69,8 @@ async def run_analysis(request: AnalysisRunRequest):
         except HTTPException:
             raise
         except Exception as e:
+            if is_supabase_table_missing_error(e):
+                return fallback_run_analysis(request)
             raise HTTPException(status_code=500, detail=f"Error finding filings: {str(e)}")
     
     # Create analysis record
@@ -87,6 +92,8 @@ async def run_analysis(request: AnalysisRunRequest):
     except HTTPException:
         raise
     except Exception as e:
+        if is_supabase_table_missing_error(e):
+            return fallback_run_analysis(request)
         raise HTTPException(status_code=500, detail=f"Error creating analysis: {str(e)}")
     
     # Start analysis task
@@ -118,6 +125,8 @@ async def run_analysis(request: AnalysisRunRequest):
         )
     
     except Exception as e:
+        if is_supabase_table_missing_error(e):
+            return fallback_run_analysis(request)
         raise HTTPException(status_code=500, detail=f"Error starting analysis task: {str(e)}")
 
 
@@ -142,6 +151,8 @@ async def get_analysis(analysis_id: str):
     except HTTPException:
         raise
     except Exception as e:
+        if is_supabase_table_missing_error(e):
+            return fallback_get_analysis(analysis_id)
         raise HTTPException(status_code=500, detail=f"Error retrieving analysis: {str(e)}")
 
 
@@ -166,6 +177,8 @@ async def get_analysis_status(analysis_id: str):
     except HTTPException:
         raise
     except Exception as e:
+        if is_supabase_table_missing_error(e):
+            return fallback_get_analysis_status(analysis_id)
         raise HTTPException(status_code=500, detail=f"Error retrieving analysis status: {str(e)}")
 
 
@@ -194,6 +207,8 @@ async def list_company_analyses(
         return [Analysis(**analysis) for analysis in response.data]
     
     except Exception as e:
+        if is_supabase_table_missing_error(e):
+            return fallback_list_company_analyses(company_id, limit=limit, offset=offset)
         raise HTTPException(status_code=500, detail=f"Error listing analyses: {str(e)}")
 
 
@@ -218,7 +233,8 @@ async def get_task_status(task_id: str):
     except HTTPException:
         raise
     except Exception as e:
+        if is_supabase_table_missing_error(e):
+            return fallback_get_task_status(task_id)
         raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
-
 
 

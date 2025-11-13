@@ -214,9 +214,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       throw new Error('Supabase Google sign-in is disabled. Enable the provider in Supabase Auth.')
     }
 
-    const redirectBase =
-      process.env.NEXT_PUBLIC_SITE_URL ||
-      (typeof window !== 'undefined' ? window.location.origin : '')
+    const envSiteUrl = (process.env.NEXT_PUBLIC_SITE_URL ?? '').replace(/\/$/, '')
+    const runtimeOrigin =
+      typeof window !== 'undefined' ? window.location.origin.replace(/\/$/, '') : ''
+    const redirectBase = envSiteUrl || runtimeOrigin
 
     if (!redirectBase) {
       throw new Error('Unable to determine redirect URL for authentication.')

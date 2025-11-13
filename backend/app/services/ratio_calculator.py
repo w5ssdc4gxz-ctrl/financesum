@@ -376,3 +376,5 @@ def calculate_ratios(financial_data: Dict[str, Any]) -> Dict[str, Optional[float
 
 
 
+
+

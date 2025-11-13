@@ -11,8 +11,9 @@ from app.models.schemas import (
     CompanyLookupResponse,
 )
 from app.services.edgar_fetcher import search_company_by_ticker_or_cik
-from app.services.local_cache import fallback_companies
+from app.services.local_cache import fallback_companies, save_fallback_companies
 from app.config import get_settings
+from app.utils.supabase_errors import is_supabase_table_missing_error
 
 
 def _supabase_configured(settings) -> bool:
@@ -24,6 +25,39 @@ def _supabase_configured(settings) -> bool:
     if key.lower().startswith("your_"):
         return False
     return True
+
+
+async def _hydrate_company_from_ticker(company_id: str, ticker: str) -> Company:
+    """Attempt to rebuild a company record when only the ticker is available."""
+    cleaned = (ticker or "").strip().upper()
+    if not cleaned:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    try:
+        matches = await search_company_by_ticker_or_cik(cleaned)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Unable to rebuild company from ticker: {exc}") from exc
+
+    if not matches:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    source = matches[0]
+    now = datetime.utcnow()
+    fallback_company = Company(
+        id=company_id,
+        ticker=source.get("ticker") or cleaned,
+        name=source.get("name") or cleaned,
+        cik=source.get("cik"),
+        exchange=source.get("exchange"),
+        industry=source.get("industry"),
+        sector=source.get("sector"),
+        country=source.get("country", "US"),
+        created_at=now,
+        updated_at=now,
+    )
+    fallback_companies[str(company_id)] = fallback_company.model_dump()
+    save_fallback_companies()
+    return fallback_company
 
 router = APIRouter()
 
@@ -111,6 +145,7 @@ async def lookup_company(request: CompanyLookupRequest):
                         updated_at=now,
                     )
                     fallback_companies[str(company_id)] = fallback_company.model_dump()
+                    save_fallback_companies()
                     saved_companies.append(fallback_company)
             except Exception as e:
                 print(f"Error saving company: {e}")
@@ -138,6 +173,7 @@ async def lookup_company(request: CompanyLookupRequest):
                     updated_at=now,
                 )
                 fallback_companies[str(company_id)] = fallback_company.model_dump()
+                save_fallback_companies()
                 saved_companies.append(fallback_company)
                 continue
         
@@ -150,7 +186,7 @@ async def lookup_company(request: CompanyLookupRequest):
 
 
 @router.get("/{company_id}", response_model=Company)
-async def get_company(company_id: str):
+async def get_company(company_id: str, ticker: str | None = None):
     """Get company details by ID."""
     settings = get_settings()
 
@@ -158,6 +194,8 @@ async def get_company(company_id: str):
         cached = fallback_companies.get(str(company_id))
         if cached:
             return Company(**cached)
+        if ticker:
+            return await _hydrate_company_from_ticker(str(company_id), ticker)
         raise HTTPException(status_code=404, detail="Company not available without Supabase configuration")
 
     supabase = get_supabase_client()
@@ -166,6 +204,11 @@ async def get_company(company_id: str):
         response = supabase.table("companies").select("*").eq("id", company_id).execute()
 
         if not response.data:
+            cached = fallback_companies.get(str(company_id))
+            if cached:
+                return Company(**cached)
+            if ticker:
+                return await _hydrate_company_from_ticker(str(company_id), ticker)
             raise HTTPException(status_code=404, detail="Company not found")
 
         return Company(**response.data[0])
@@ -173,6 +216,13 @@ async def get_company(company_id: str):
     except HTTPException:
         raise
     except Exception as e:
+        if is_supabase_table_missing_error(e):
+            cached = fallback_companies.get(str(company_id))
+            if cached:
+                return Company(**cached)
+            if ticker:
+                return await _hydrate_company_from_ticker(str(company_id), ticker)
+            raise HTTPException(status_code=404, detail="Company not found (Supabase tables missing and no cached data).")
         raise HTTPException(status_code=500, detail=f"Error retrieving company: {str(e)}")
 
 
@@ -204,7 +254,6 @@ async def list_companies(
         return [Company(**company) for company in response.data]
 
     except Exception as e:
+        if is_supabase_table_missing_error(e):
+            return [Company(**data) for data in fallback_companies.values()]
         raise HTTPException(status_code=500, detail=f"Error listing companies: {str(e)}")
-
-
-

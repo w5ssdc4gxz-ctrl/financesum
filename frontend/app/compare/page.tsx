@@ -1,9 +1,11 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { useRouter } from 'next/navigation'
 import Navbar from '@/components/Navbar'
 import CompanySearch from '@/components/CompanySearch'
 import { Button } from '@/components/base/buttons/button'
+import { useAuth } from '@/contexts/AuthContext'
 
 interface Company {
   id: string
@@ -13,7 +15,26 @@ interface Company {
 }
 
 export default function ComparePage() {
+  const { user, loading } = useAuth()
+  const router = useRouter()
   const [selectedCompanies, setSelectedCompanies] = useState<Company[]>([])
+
+  useEffect(() => {
+    if (!loading && !user) {
+      router.replace('/signup')
+    }
+  }, [loading, user, router])
+
+  if (loading || !user) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-dark-900 via-primary-900 to-dark-900 flex items-center justify-center">
+        <div className="text-center">
+          <div className="spinner mx-auto mb-4"></div>
+          <p className="text-gray-300 text-xl">Checking your session...</p>
+        </div>
+      </div>
+    )
+  }
 
   const handleSelectCompany = (company: Company) => {
     // Limit to 4 companies
@@ -96,6 +117,7 @@ export default function ComparePage() {
     </div>
   )
 }
+
 
 
 

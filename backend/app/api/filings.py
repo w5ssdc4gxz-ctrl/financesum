@@ -38,9 +38,11 @@ from app.services.local_cache import (
     fallback_filings_by_id,
     fallback_financial_statements,
     fallback_filing_summaries,
+    save_fallback_companies,
 )
 from app.services.gemini_client import get_gemini_client
 from app.services.sample_data import sample_filings_by_ticker
+from app.utils.supabase_errors import is_supabase_table_missing_error
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -702,7 +704,7 @@ def _prepare_filing_response(raw_filing: Dict[str, Any], settings) -> Filing:
 def _resolve_filing_context(filing_id: str, settings) -> Dict[str, Any]:
     filing_key = str(filing_id)
 
-    if not _supabase_configured(settings):
+    def _resolve_from_fallback() -> Dict[str, Any]:
         filing = fallback_filings_by_id.get(filing_key)
         if not filing:
             raise HTTPException(status_code=404, detail="Filing not found")
@@ -718,31 +720,41 @@ def _resolve_filing_context(filing_id: str, settings) -> Dict[str, Any]:
             "source": "fallback",
         }
 
+    if not _supabase_configured(settings):
+        return _resolve_from_fallback()
+
     supabase = get_supabase_client()
 
-    filing_response = supabase.table("filings").select("*").eq("id", filing_key).execute()
-    if not filing_response.data:
-        raise HTTPException(status_code=404, detail="Filing not found")
+    try:
+        filing_response = supabase.table("filings").select("*").eq("id", filing_key).execute()
+        if not filing_response.data:
+            raise HTTPException(status_code=404, detail="Filing not found")
 
-    filing = filing_response.data[0]
-    company_id = filing.get("company_id")
+        filing = filing_response.data[0]
+        company_id = filing.get("company_id")
 
-    company_response = (
-        supabase.table("companies")
-        .select("id, ticker, exchange, cik")
-        .eq("id", company_id)
-        .execute()
-    )
-    if not company_response.data:
-        raise HTTPException(status_code=404, detail="Company not found for filing")
+        company_response = (
+            supabase.table("companies")
+            .select("id, ticker, exchange, cik")
+            .eq("id", company_id)
+            .execute()
+        )
+        if not company_response.data:
+            raise HTTPException(status_code=404, detail="Company not found for filing")
 
-    company = company_response.data[0]
+        company = company_response.data[0]
 
-    return {
-        "filing": filing,
-        "company": company,
-        "source": "supabase",
-    }
+        return {
+            "filing": filing,
+            "company": company,
+            "source": "supabase",
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if is_supabase_table_missing_error(exc):
+            return _resolve_from_fallback()
+        raise HTTPException(status_code=500, detail=f"Error resolving filing context: {exc}")
 
 
 def _fetch_eodhd_document(ticker: str, exchange: Optional[str] = None, filter_param: Optional[str] = None) -> Dict[str, Any]:
@@ -822,6 +834,299 @@ def _ensure_local_document(context: Dict[str, Any], settings) -> Optional[Path]:
     return None
 
 
+async def _start_fetch_with_fallback_company(
+    company_key: str,
+    company_data: Any,
+    request: FilingsFetchRequest,
+    settings,
+) -> FilingsFetchResponse:
+    """
+    Populate filings from local/sample data when Supabase is unavailable.
+    Mirrors the legacy non-database flow so callers (including Supabase fallbacks)
+    can reuse the same logic.
+    """
+    if hasattr(company_data, "model_dump"):
+        company = company_data.model_dump()
+    else:
+        company = dict(company_data)
+
+    fallback_companies[company_key] = company
+    save_fallback_companies()
+
+    ticker = company.get("ticker")
+    if not ticker:
+        raise HTTPException(status_code=400, detail="Company is missing a ticker symbol")
+
+    entries_to_ingest: List[Dict[str, Any]] = []
+
+    try:
+        financial_data = get_eodhd_client().get_financial_statements(ticker, exchange="US")
+        eodhd_url = f"https://eodhd.com/api/fundamentals/{ticker}.US"
+
+        quarterly_income = financial_data.get("income_statement", {}).get("quarterly", {})
+        for date_str, statement in quarterly_income.items():
+            entries_to_ingest.append(
+                {
+                    "filing_type": "10-Q",
+                    "date_str": date_str,
+                    "income_statement": statement,
+                    "balance_sheet": financial_data.get("balance_sheet", {}).get("quarterly", {}).get(date_str, {}),
+                    "cash_flow": financial_data.get("cash_flow", {}).get("quarterly", {}).get(date_str, {}),
+                    "url": eodhd_url,
+                }
+            )
+
+        yearly_income = financial_data.get("income_statement", {}).get("yearly", {})
+        for date_str, statement in yearly_income.items():
+            entries_to_ingest.append(
+                {
+                    "filing_type": "10-K",
+                    "date_str": date_str,
+                    "income_statement": statement,
+                    "balance_sheet": financial_data.get("balance_sheet", {}).get("yearly", {}).get(date_str, {}),
+                    "cash_flow": financial_data.get("cash_flow", {}).get("yearly", {}).get(date_str, {}),
+                    "url": eodhd_url,
+                }
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except (EODHDAccessError, EODHDClientError) as exc:
+        logger.warning(
+            "EODHD data unavailable for %s: %s. Set EODHD_API_KEY to a paid token to enable live fundamentals.",
+            ticker,
+            exc,
+        )
+        entries_to_ingest = _sample_entries_for_ticker(ticker)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unexpected failure while fetching EODHD data for %s", ticker)
+        entries_to_ingest = _sample_entries_for_ticker(ticker)
+
+    if not entries_to_ingest:
+        logger.warning("No sample filings available for %s; continuing with empty dataset.", ticker)
+
+    cutoff_date = None
+    if request.max_history_years:
+        cutoff_date = datetime.now(timezone.utc).date() - timedelta(days=365 * request.max_history_years)
+
+    company_filings = fallback_filings.setdefault(company_key, [])
+    existing_pairs = {(filing["filing_type"], filing["filing_date"]) for filing in company_filings}
+    saved_count = 0
+
+    for existing in company_filings:
+        fallback_filings_by_id.setdefault(str(existing["id"]), existing)
+
+    storage_dir = _ensure_storage_dir(settings)
+    sec_filings_map: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+
+    cik_value = company.get("cik")
+    ticker_symbol = company.get("ticker")
+
+    if (not cik_value or not str(cik_value).isdigit()) and ticker_symbol:
+        try:
+            general_info = get_eodhd_client().get_company_info(ticker_symbol, exchange=company.get("exchange") or "US")
+            candidate_cik = general_info.get("CIK") or general_info.get("cik")
+            if candidate_cik:
+                cik_value = str(candidate_cik)
+                company["cik"] = cik_value
+                fallback_companies[company_key]["cik"] = cik_value
+                save_fallback_companies()
+        except Exception:
+            pass
+
+    if (not cik_value or not str(cik_value).isdigit()) and ticker_symbol:
+        try:
+            matches = await search_company_by_ticker_or_cik(ticker_symbol)
+            if matches:
+                candidate_cik = matches[0].get("cik")
+                if candidate_cik:
+                    cik_value = str(candidate_cik)
+                    company["cik"] = cik_value
+                    fallback_companies[company_key]["cik"] = cik_value
+                    save_fallback_companies()
+        except Exception as cik_exc:  # noqa: BLE001
+            logger.warning(
+                "Unable to resolve CIK for company %s: %s",
+                company_key,
+                cik_exc,
+            )
+
+    if cik_value:
+        cik_value = str(cik_value)
+        cik_digits = ''.join(ch for ch in cik_value if ch.isdigit())
+        cik_value = cik_digits.zfill(10) if cik_digits else None
+
+    if cik_value:
+        try:
+            sec_filings = get_company_filings(
+                cik=cik_value,
+                filing_types=request.filing_types or ["10-K", "10-Q"],
+                max_results=200,
+            )
+            for entry in sec_filings:
+                filing_type_value = entry.get("filing_type")
+                filing_date_value = entry.get("filing_date")
+                period_end_value = entry.get("period_end")
+
+                if filing_type_value and filing_date_value:
+                    sec_filings_map[(filing_type_value, filing_date_value, "filing_date")] = entry
+                if filing_type_value and period_end_value:
+                    sec_filings_map[(filing_type_value, period_end_value, "period_end")] = entry
+        except Exception as sec_exc:  # noqa: BLE001
+            logger.warning(
+                "Unable to retrieve SEC filings for CIK %s: %s",
+                cik_value,
+                sec_exc,
+            )
+    else:
+        logger.warning("CIK not available for company %s; SEC document download skipped", company_key)
+
+    if not entries_to_ingest and sec_filings_map:
+        unique_entries: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for entry in sec_filings_map.values():
+            filing_type_value = entry.get("filing_type")
+            reference_date = entry.get("filing_date") or entry.get("period_end")
+            if not filing_type_value or not reference_date:
+                continue
+            key = (filing_type_value, reference_date)
+            unique_entries.setdefault(key, entry)
+
+        sorted_entries = sorted(
+            unique_entries.values(),
+            key=lambda item: item.get("filing_date") or item.get("period_end") or "",
+            reverse=True,
+        )
+
+        max_entries = 8
+        if request.max_history_years:
+            max_entries = max(2, request.max_history_years * 2)
+
+        for entry in sorted_entries[:max_entries]:
+            entries_to_ingest.append(
+                {
+                    "filing_type": entry.get("filing_type"),
+                    "date_str": entry.get("filing_date") or entry.get("period_end"),
+                    "income_statement": {},
+                    "balance_sheet": {},
+                    "cash_flow": {},
+                    "url": entry.get("url"),
+                }
+            )
+
+    def _maybe_add_filing(
+        filing_type: str,
+        date_str: str,
+        income_statement: dict,
+        balance_sheet: dict,
+        cash_flow: dict,
+        source_url: str,
+    ) -> None:
+        nonlocal saved_count, existing_pairs, company_filings
+
+        if request.filing_types and filing_type not in request.filing_types:
+            return
+
+        try:
+            filing_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            return
+
+        if cutoff_date and filing_date < cutoff_date:
+            return
+
+        key = (filing_type, filing_date)
+        if key in existing_pairs:
+            return
+
+        filing_id = uuid4()
+        filing_id_str = str(filing_id)
+        now = datetime.now(timezone.utc)
+
+        filing_record = {
+            "id": filing_id,
+            "company_id": request.company_id,
+            "filing_type": filing_type,
+            "filing_date": filing_date,
+            "period_end": filing_date,
+            "url": source_url,
+            "pages": None,
+            "raw_file_path": f"eodhd_{ticker}_{filing_type.replace('-', '')}_{date_str}",
+            "parsed_json_path": None,
+            "status": "parsed",
+            "error_message": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        sec_match = None
+        if sec_filings_map:
+            sec_match = sec_filings_map.get((filing_type, date_str, "filing_date"))
+            if not sec_match:
+                sec_match = sec_filings_map.get((filing_type, date_str, "period_end"))
+        local_document_path = None
+        source_doc_url = None
+
+        if sec_match:
+            source_doc_url = sec_match.get("url")
+            if source_doc_url:
+                target_path = _build_local_document_path(storage_dir, filing_id_str)
+                try:
+                    if download_filing(source_doc_url, str(target_path)):
+                        local_document_path = str(target_path)
+                except Exception as download_exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to download SEC filing %s: %s",
+                        source_doc_url,
+                        download_exc,
+                    )
+
+        if source_doc_url:
+            filing_record["source_doc_url"] = source_doc_url
+        if local_document_path:
+            filing_record["local_document_path"] = local_document_path
+
+        company_filings.append(filing_record)
+        existing_pairs.add(key)
+        saved_count += 1
+
+        fallback_filings_by_id[str(filing_id)] = filing_record
+
+        fallback_financial_statements[str(filing_id)] = {
+            "filing_id": filing_id,
+            "period_start": filing_date,
+            "period_end": filing_date,
+            "currency": "USD",
+            "statements": {
+                "income_statement": income_statement,
+                "balance_sheet": balance_sheet,
+                "cash_flow": cash_flow,
+            },
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    for entry in entries_to_ingest:
+        _maybe_add_filing(
+            entry["filing_type"],
+            entry["date_str"],
+            entry.get("income_statement", {}),
+            entry.get("balance_sheet", {}),
+            entry.get("cash_flow", {}),
+            entry.get("url", "https://www.sec.gov"),
+        )
+
+    company_filings.sort(key=lambda filing: filing["filing_date"], reverse=True)
+
+    task_id = f"local-{uuid4()}"
+    return FilingsFetchResponse(
+        task_id=task_id,
+        message=(
+            f"Fetched {saved_count} filings for {company.get('name', ticker)}"
+            if saved_count
+            else "No new filings were fetched"
+        ),
+    )
+
+
 @router.post("/fetch", response_model=FilingsFetchResponse)
 async def fetch_filings(request: FilingsFetchRequest):
     """
@@ -835,277 +1140,7 @@ async def fetch_filings(request: FilingsFetchRequest):
         company = fallback_companies.get(company_key)
         if not company:
             raise HTTPException(status_code=404, detail="Company not found")
-
-        ticker = company.get("ticker")
-        if not ticker:
-            raise HTTPException(status_code=400, detail="Company is missing a ticker symbol")
-
-        entries_to_ingest: List[Dict[str, Any]] = []
-
-        try:
-            financial_data = get_eodhd_client().get_financial_statements(ticker, exchange="US")
-            eodhd_url = f"https://eodhd.com/api/fundamentals/{ticker}.US"
-
-            quarterly_income = financial_data.get("income_statement", {}).get("quarterly", {})
-            for date_str, statement in quarterly_income.items():
-                entries_to_ingest.append(
-                    {
-                        "filing_type": "10-Q",
-                        "date_str": date_str,
-                        "income_statement": statement,
-                        "balance_sheet": financial_data.get("balance_sheet", {}).get("quarterly", {}).get(date_str, {}),
-                        "cash_flow": financial_data.get("cash_flow", {}).get("quarterly", {}).get(date_str, {}),
-                        "url": eodhd_url,
-                    }
-                )
-
-            yearly_income = financial_data.get("income_statement", {}).get("yearly", {})
-            for date_str, statement in yearly_income.items():
-                entries_to_ingest.append(
-                    {
-                        "filing_type": "10-K",
-                        "date_str": date_str,
-                        "income_statement": statement,
-                        "balance_sheet": financial_data.get("balance_sheet", {}).get("yearly", {}).get(date_str, {}),
-                        "cash_flow": financial_data.get("cash_flow", {}).get("yearly", {}).get(date_str, {}),
-                        "url": eodhd_url,
-                    }
-                )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc))
-        except (EODHDAccessError, EODHDClientError) as exc:
-            logger.warning(
-                "EODHD data unavailable for %s: %s. Set EODHD_API_KEY to a paid token to enable live fundamentals.",
-                ticker,
-                exc,
-            )
-            entries_to_ingest = _sample_entries_for_ticker(ticker)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Unexpected failure while fetching EODHD data for %s", ticker)
-            entries_to_ingest = _sample_entries_for_ticker(ticker)
-
-        if not entries_to_ingest:
-            logger.warning("No sample filings available for %s; continuing with empty dataset.", ticker)
-
-        cutoff_date = None
-        if request.max_history_years:
-            cutoff_date = datetime.now(timezone.utc).date() - timedelta(days=365 * request.max_history_years)
-
-        company_filings = fallback_filings.setdefault(company_key, [])
-        existing_pairs = {(filing["filing_type"], filing["filing_date"]) for filing in company_filings}
-        saved_count = 0
-
-        for existing in company_filings:
-            fallback_filings_by_id.setdefault(str(existing["id"]), existing)
-
-        storage_dir = _ensure_storage_dir(settings)
-        sec_filings_map: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-
-        cik_value = company.get("cik")
-        ticker_symbol = company.get("ticker")
-
-        if (not cik_value or not str(cik_value).isdigit()) and ticker_symbol:
-            try:
-                general_info = get_eodhd_client().get_company_info(ticker_symbol, exchange=company.get("exchange") or "US")
-                candidate_cik = general_info.get("CIK") or general_info.get("cik")
-                if candidate_cik:
-                    cik_value = str(candidate_cik)
-                    company["cik"] = cik_value
-                    fallback_companies[company_key]["cik"] = cik_value
-            except Exception:
-                pass
-
-        if (not cik_value or not str(cik_value).isdigit()) and ticker_symbol:
-            try:
-                matches = await search_company_by_ticker_or_cik(ticker_symbol)
-                if matches:
-                    candidate_cik = matches[0].get("cik")
-                    if candidate_cik:
-                        cik_value = str(candidate_cik)
-                        company["cik"] = cik_value
-                        fallback_companies[company_key]["cik"] = cik_value
-            except Exception as cik_exc:  # noqa: BLE001
-                logger.warning(
-                    "Unable to resolve CIK for company %s: %s",
-                    company_key,
-                    cik_exc,
-                )
-
-        if cik_value:
-            cik_value = str(cik_value)
-            cik_digits = ''.join(ch for ch in cik_value if ch.isdigit())
-            cik_value = cik_digits.zfill(10) if cik_digits else None
-
-        if cik_value:
-            try:
-                sec_filings = get_company_filings(
-                    cik=cik_value,
-                    filing_types=request.filing_types or ["10-K", "10-Q"],
-                    max_results=200,
-                )
-                for entry in sec_filings:
-                    filing_type_value = entry.get("filing_type")
-                    filing_date_value = entry.get("filing_date")
-                    period_end_value = entry.get("period_end")
-
-                    if filing_type_value and filing_date_value:
-                        sec_filings_map[(filing_type_value, filing_date_value, "filing_date")] = entry
-                    if filing_type_value and period_end_value:
-                        sec_filings_map[(filing_type_value, period_end_value, "period_end")] = entry
-            except Exception as sec_exc:  # noqa: BLE001
-                logger.warning(
-                    "Unable to retrieve SEC filings for CIK %s: %s",
-                    cik_value,
-                    sec_exc,
-                )
-        else:
-            logger.warning("CIK not available for company %s; SEC document download skipped", company_key)
-
-        if not entries_to_ingest and sec_filings_map:
-            unique_entries: Dict[Tuple[str, str], Dict[str, Any]] = {}
-            for entry in sec_filings_map.values():
-                filing_type_value = entry.get("filing_type")
-                reference_date = entry.get("filing_date") or entry.get("period_end")
-                if not filing_type_value or not reference_date:
-                    continue
-                key = (filing_type_value, reference_date)
-                unique_entries.setdefault(key, entry)
-
-            sorted_entries = sorted(
-                unique_entries.values(),
-                key=lambda item: item.get("filing_date") or item.get("period_end") or "",
-                reverse=True,
-            )
-
-            max_entries = 8
-            if request.max_history_years:
-                max_entries = max(2, request.max_history_years * 2)
-
-            for entry in sorted_entries[:max_entries]:
-                entries_to_ingest.append(
-                    {
-                        "filing_type": entry.get("filing_type"),
-                        "date_str": entry.get("filing_date") or entry.get("period_end"),
-                        "income_statement": {},
-                        "balance_sheet": {},
-                        "cash_flow": {},
-                        "url": entry.get("url"),
-                    }
-                )
-
-        def _maybe_add_filing(
-            filing_type: str,
-            date_str: str,
-            income_statement: dict,
-            balance_sheet: dict,
-            cash_flow: dict,
-            source_url: str,
-        ) -> None:
-            nonlocal saved_count, existing_pairs, company_filings
-
-            if request.filing_types and filing_type not in request.filing_types:
-                return
-
-            try:
-                filing_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-            except ValueError:
-                return
-
-            if cutoff_date and filing_date < cutoff_date:
-                return
-
-            key = (filing_type, filing_date)
-            if key in existing_pairs:
-                return
-
-            filing_id = uuid4()
-            filing_id_str = str(filing_id)
-            now = datetime.now(timezone.utc)
-
-            filing_record = {
-                "id": filing_id,
-                "company_id": request.company_id,
-                "filing_type": filing_type,
-                "filing_date": filing_date,
-                "period_end": filing_date,
-                "url": source_url,
-                "pages": None,
-                "raw_file_path": f"eodhd_{ticker}_{filing_type.replace('-', '')}_{date_str}",
-                "parsed_json_path": None,
-                "status": "parsed",
-                "error_message": None,
-                "created_at": now,
-                "updated_at": now,
-            }
-
-            sec_match = None
-            if sec_filings_map:
-                sec_match = sec_filings_map.get((filing_type, date_str, "filing_date"))
-                if not sec_match:
-                    sec_match = sec_filings_map.get((filing_type, date_str, "period_end"))
-            local_document_path = None
-            source_doc_url = None
-
-            if sec_match:
-                source_doc_url = sec_match.get("url")
-                if source_doc_url:
-                    target_path = _build_local_document_path(storage_dir, filing_id_str)
-                    try:
-                        if download_filing(source_doc_url, str(target_path)):
-                            local_document_path = str(target_path)
-                    except Exception as download_exc:  # noqa: BLE001
-                        logger.warning(
-                            "Failed to download SEC filing %s: %s",
-                            source_doc_url,
-                            download_exc,
-                        )
-
-            if source_doc_url:
-                filing_record["source_doc_url"] = source_doc_url
-            if local_document_path:
-                filing_record["local_document_path"] = local_document_path
-
-            company_filings.append(filing_record)
-            existing_pairs.add(key)
-            saved_count += 1
-
-            fallback_filings_by_id[str(filing_id)] = filing_record
-
-            fallback_financial_statements[str(filing_id)] = {
-                "filing_id": filing_id,
-                "period_start": filing_date,
-                "period_end": filing_date,
-                "currency": "USD",
-                "statements": {
-                    "income_statement": income_statement,
-                    "balance_sheet": balance_sheet,
-                    "cash_flow": cash_flow,
-                },
-                "created_at": now,
-                "updated_at": now,
-            }
-
-        for entry in entries_to_ingest:
-            _maybe_add_filing(
-                entry["filing_type"],
-                entry["date_str"],
-                entry.get("income_statement", {}),
-                entry.get("balance_sheet", {}),
-                entry.get("cash_flow", {}),
-                entry.get("url", "https://www.sec.gov"),
-            )
-
-        company_filings.sort(key=lambda filing: filing["filing_date"], reverse=True)
-
-        task_id = f"local-{uuid4()}"
-        return FilingsFetchResponse(
-            task_id=task_id,
-            message=(
-                f"Fetched {saved_count} filings for {company.get('name', ticker)}"
-                if saved_count
-                else "No new filings were fetched"
-            ),
-        )
+        return await _start_fetch_with_fallback_company(company_key, company, request, settings)
 
     supabase = get_supabase_client()
     
@@ -1119,6 +1154,19 @@ async def fetch_filings(request: FilingsFetchRequest):
     except HTTPException:
         raise
     except Exception as e:
+        if is_supabase_table_missing_error(e):
+            fallback_company = fallback_companies.get(str(request.company_id))
+            if fallback_company:
+                return await _start_fetch_with_fallback_company(
+                    str(request.company_id),
+                    fallback_company,
+                    request,
+                    settings,
+                )
+            raise HTTPException(
+                status_code=404,
+                detail="Company not found (Supabase tables missing and no cached companies)",
+            )
         raise HTTPException(status_code=500, detail=f"Error verifying company: {str(e)}")
     
     # Create task
@@ -1281,6 +1329,11 @@ async def get_filing(filing_id: str):
     except HTTPException:
         raise
     except Exception as e:
+        if is_supabase_table_missing_error(e):
+            filing = fallback_filings_by_id.get(filing_id) or fallback_filings_by_id.get(str(filing_id))
+            if filing:
+                return _prepare_filing_response(filing, settings)
+            raise HTTPException(status_code=404, detail="Filing not found (Supabase tables missing and no cached filing).")
         raise HTTPException(status_code=500, detail=f"Error retrieving filing: {str(e)}")
 
 
@@ -1314,6 +1367,12 @@ async def list_company_filings(
         return [_prepare_filing_response(filing, settings) for filing in response.data]
     
     except Exception as e:
+        if is_supabase_table_missing_error(e):
+            filings = fallback_filings.get(company_id, [])
+            if filing_type:
+                filings = [filing for filing in filings if filing["filing_type"] == filing_type]
+            sliced = filings[offset:offset + limit]
+            return [_prepare_filing_response(filing, settings) for filing in sliced]
         raise HTTPException(status_code=500, detail=f"Error listing filings: {str(e)}")
 
 

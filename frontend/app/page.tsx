@@ -1,26 +1,39 @@
 'use client'
 
+import { useEffect } from 'react'
 import Link from 'next/link'
 import { motion } from 'framer-motion'
 import { FaUsers, FaChartLine, FaRobot } from 'react-icons/fa'
 import Navbar from '@/components/Navbar'
-import AnimatedBackground from '@/components/AnimatedBackground'
 import LogoLoop from '@/components/LogoLoop'
 import ResearchMemoShowcase from '@/components/ResearchMemoShowcase'
 import JourneySection from '@/components/JourneySection'
-import ColourfulText from '@/components/ui/colourful-text'
+import AnimatedHighlightWord from '@/components/ui/animated-highlight-word'
+import { LayoutTextFlip } from '@/components/ui/layout-text-flip'
+import LayeredScrollBackground from '@/components/LayeredScrollBackground'
+import MegaFooter from '@/components/MegaFooter'
 import { useAuth } from '@/contexts/AuthContext'
 import { fadeInUp, zoomIn, staggerContainer } from '@/lib/animations'
 
 export default function Home() {
   const { user } = useAuth()
+  const immersiveDescriptors = ['cinematic', 'electric', 'effortless']
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (window.location.hash) {
+      window.history.replaceState(null, '', window.location.pathname + window.location.search)
+    }
+    window.scrollTo({ top: 0, behavior: 'auto' })
+  }, [])
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-dark-900 via-primary-900 to-dark-900">
-      <AnimatedBackground />
-      <Navbar />
-      
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+    <div className="relative min-h-screen overflow-hidden bg-[#050015] text-white">
+      <LayeredScrollBackground />
+      <div className="relative z-10">
+        <Navbar />
+        
+        <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         {/* Hero Section */}
         <motion.div 
           className="text-center py-20 md:py-32"
@@ -30,70 +43,49 @@ export default function Home() {
         >
           <motion.div className="mb-8" variants={zoomIn}>
             <span className="inline-block px-6 py-3 rounded-full bg-primary-500/10 border border-primary-500/20 text-primary-300 text-sm font-semibold backdrop-blur-sm shadow-glow">
-              ✨ AI-Powered Financial Intelligence for Modern Investors
+              ⚡ SEC filing summaries in 60 seconds
             </span>
           </motion.div>
 
           <motion.h1 
-            className="hero-title text-6xl md:text-8xl font-black mb-8"
+            className="hero-title text-6xl md:text-8xl font-black leading-[1.05] mb-8"
             variants={fadeInUp}
           >
-            <span className="text-white block">Analyze Like</span>
-            <ColourfulText text="The Legends" className="hero-highlight mt-2 block text-shadow-glow" />
+            <span className="text-white block">Summarize SEC filings</span>
+            <AnimatedHighlightWord className="hero-highlight mt-4 inline-flex text-6xl md:text-8xl px-8 py-4">
+              In Seconds
+            </AnimatedHighlightWord>
           </motion.h1>
 
           <motion.p 
             className="text-2xl md:text-3xl text-gray-200 mb-16 max-w-4xl mx-auto leading-relaxed font-light"
             variants={fadeInUp}
           >
-            Transform SEC filings into actionable insights with <span className="font-bold text-primary-300">AI-powered analysis</span> through the lens of legendary investors like Warren Buffett and Cathie Wood.
+            FinanceSum is the SEC filing summary app that turns dense PDFs into investor-ready research memos. Upload a 10-K, choose a legendary investor lens, and get KPIs, narrative, and risks you can share in under a minute.
           </motion.p>
 
           <motion.div 
-            className="flex flex-col sm:flex-row justify-center gap-6 mb-12"
+            className="flex flex-col sm:flex-row items-center justify-center gap-6 mb-12"
             variants={fadeInUp}
           >
-            <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
-              <Link
-                href="/dashboard"
-                className="btn-premium text-xl px-12 py-5 shadow-glow-lg"
-              >
-                {user ? 'Go to Dashboard →' : 'Start Free Trial →'}
-              </Link>
+              <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+                <Link
+                  href={user ? '/dashboard' : '/signup'}
+                  className="btn-premium text-xl px-10 py-4 shadow-glow-lg min-w-[220px] text-center"
+                >
+                  {user ? 'Go to Dashboard →' : 'Start Free Trial →'}
+                </Link>
+              </motion.div>
+              <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+                <Link
+                  href="#journey"
+                  className="px-10 py-4 rounded-xl font-semibold text-white border-2 border-white/30 hover:border-primary-400 transition-all duration-300 hover:bg-white/5 backdrop-blur-sm text-xl min-w-[220px] text-center"
+                >
+                  See How It Works
+                </Link>
+              </motion.div>
             </motion.div>
-            <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
-              <Link
-                href="#journey"
-                className="px-12 py-5 rounded-xl font-semibold text-white border-2 border-white/30 hover:border-primary-400 transition-all duration-300 hover:bg-white/5 backdrop-blur-sm text-xl"
-              >
-                See How It Works
-              </Link>
-            </motion.div>
-          </motion.div>
 
-          <motion.div 
-            className="flex flex-wrap items-center justify-center gap-8 text-gray-300 text-base"
-            variants={fadeInUp}
-          >
-            <div className="flex items-center gap-3">
-              <svg className="w-6 h-6 text-green-400" fill="currentColor" viewBox="0 0 20 20">
-                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
-              </svg>
-              <span className="font-medium">No credit card required</span>
-            </div>
-            <div className="flex items-center gap-3">
-              <svg className="w-6 h-6 text-green-400" fill="currentColor" viewBox="0 0 20 20">
-                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
-              </svg>
-              <span className="font-medium">Instant access</span>
-            </div>
-            <div className="flex items-center gap-3">
-              <svg className="w-6 h-6 text-green-400" fill="currentColor" viewBox="0 0 20 20">
-                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
-              </svg>
-              <span className="font-medium">10+ investor personas</span>
-            </div>
-          </motion.div>
         </motion.div>
 
         {/* Trusted By Section */}
@@ -128,7 +120,7 @@ export default function Home() {
         </motion.div>
 
         {/* Immersive Demo Section */}
-        <section className="py-24">
+        <section id="app-demo" className="py-24">
           <div className="grid gap-12 lg:grid-cols-[0.95fr,1.15fr] items-center">
             <motion.div
               initial={{ opacity: 0, y: 30 }}
@@ -141,18 +133,21 @@ export default function Home() {
                 <span className="w-2 h-2 rounded-full bg-primary-300 animate-pulse" />
                 Live Product Preview
               </p>
-              <h2 className="text-4xl md:text-5xl font-black text-white leading-tight">
-                Research Memos that feel <span className="gradient-text">alive</span>.
-              </h2>
+              <LayoutTextFlip
+                text="Financial Analysis that feels"
+                words={immersiveDescriptors.map((word) => `${word}.`)}
+                className="justify-start text-left"
+                textClassName="text-4xl md:text-5xl"
+                pillClassName="text-4xl md:text-5xl px-8 py-4"
+              />
               <p className="text-lg text-gray-300 leading-relaxed">
-                Hover through our interactive memo card to see how FinanceSum blends AI narratives, investor-ready KPIs, and
-                risk callouts inside a cinematic 3D workspace.
+                Explore our interactive analysis card to see how FinanceSum transforms SEC filings into investor-ready insights with AI narratives, comprehensive KPIs, and risk analysis in a cinematic 3D workspace.
               </p>
               <ul className="space-y-4">
                 {[
-                  'Layered 3D surface keeps executive summary, metrics, and analyst bias in one view.',
-                  'Sections mirror real equity research structure—Executive Summary, KPIs, Risks, Initiatives.',
-                  'Designed for presentations: neon accents, glass morphism, and subtle depth cues.',
+                  'Layered 3D surface presents executive summary, financial metrics, and analysis in one unified view.',
+                  'Sections mirror real equity research structure—Executive Summary, Financial Performance, Management Discussion, Risk Factors.',
+                  'Designed for clarity and impact: modern aesthetics, glass morphism, and intuitive depth cues.',
                 ].map((item) => (
                   <li key={item} className="flex items-start gap-3 text-gray-200">
                     <svg className="w-6 h-6 text-primary-300 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
@@ -168,7 +163,7 @@ export default function Home() {
               </ul>
               <div className="flex flex-wrap gap-4 pt-2">
                 <Link href="/dashboard" className="btn-premium text-lg px-10 py-4 shadow-glow-lg">
-                  Launch the Memo Experience →
+                  Start Analyzing →
                 </Link>
                 <Link
                   href="#journey"
@@ -183,12 +178,12 @@ export default function Home() {
           </div>
         </section>
 
-        <section id="journey" className="py-28 bg-gradient-to-b from-transparent via-dark-900/40 to-dark-800/60">
+        <section id="journey" className="py-28 mt-20">
           <JourneySection />
         </section>
 
         {/* How It Works Section */}
-        <div className="py-24 bg-dark-900">
+        <div className="py-24 bg-dark-900 rounded-[40px] border border-white/10 shadow-[0_25px_120px_rgba(0,0,0,0.45)] mt-20">
           <motion.div 
             className="text-center mb-20"
             initial={{ opacity: 0, y: 40 }}
@@ -315,51 +310,13 @@ export default function Home() {
           </motion.div>
         </div>
         
-        {/* CTA Section */}
-        <div className="py-32 bg-gradient-to-br from-primary-900 via-accent-900 to-primary-900 rounded-3xl my-20">
-          <motion.div 
-            className="text-center max-w-5xl mx-auto px-8"
-            initial={{ opacity: 0, scale: 0.9 }}
-            whileInView={{ opacity: 1, scale: 1 }}
-            viewport={{ once: true }}
-            transition={{ duration: 0.8 }}
-          >
-            <motion.h2 
-              className="text-5xl md:text-7xl font-black text-white mb-8"
-              initial={{ opacity: 0, y: 20 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true }}
-              transition={{ delay: 0.2 }}
-            >
-              Ready to Invest Like a Legend?
-            </motion.h2>
-            <motion.p 
-              className="text-2xl text-gray-200 mb-12"
-              initial={{ opacity: 0, y: 20 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true }}
-              transition={{ delay: 0.3 }}
-            >
-              Join thousands of investors making smarter decisions with AI-powered financial analysis
-            </motion.p>
-            <motion.div
-              initial={{ opacity: 0, y: 20 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true }}
-              transition={{ delay: 0.4 }}
-              whileHover={{ scale: 1.05 }}
-              whileTap={{ scale: 0.95 }}
-            >
-              <Link
-                href="/dashboard"
-                className="btn-premium text-2xl inline-block px-16 py-6 shadow-glow-lg"
-              >
-                Start Analyzing Now →
-              </Link>
-            </motion.div>
-          </motion.div>
-        </div>
       </main>
+      <div className="px-4 sm:px-6 lg:px-8">
+        <MegaFooter />
+      </div>
+      </div>
     </div>
   )
 }
+
+

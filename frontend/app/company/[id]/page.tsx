@@ -1,7 +1,7 @@
 'use client'
 
-import { useMemo, useRef, useState } from 'react'
-import { useParams } from 'next/navigation'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useParams, useRouter, useSearchParams } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import Navbar from '@/components/Navbar'
 import HealthScoreBadge from '@/components/HealthScoreBadge'
@@ -10,8 +10,11 @@ import PersonaSelector from '@/components/PersonaSelector'
 import EnhancedSummary from '@/components/EnhancedSummary'
 import AnimatedList, { AnimatedListItem } from '@/components/AnimatedList'
 import { companyApi, filingsApi, analysisApi, API_BASE_URL, FilingSummaryPreferencesPayload } from '@/lib/api-client'
+import DashboardStorage, { StoredAnalysisSnapshot, StoredSummaryPreferences } from '@/lib/dashboard-storage'
+import { buildSummaryPreview, scoreToRating } from '@/lib/analysis-insights'
 import ReactMarkdown from 'react-markdown'
 import { Button } from '@/components/base/buttons/button'
+import { useAuth } from '@/contexts/AuthContext'
 
 type SummaryMode = 'default' | 'custom'
 type SummaryTone = 'objective' | 'cautiously optimistic' | 'bullish' | 'bearish'
@@ -113,23 +116,104 @@ const snapshotPreferences = (prefs: SummaryPreferenceFormState): SummaryPreferen
   }
 }
 
+const isSummaryToneValue = (value: string): value is SummaryTone => toneOptions.some(option => option.value === value)
+const isSummaryDetailValue = (value: string): value is SummaryDetailLevel =>
+  detailOptions.some(option => option.value === value)
+const isSummaryOutputStyleValue = (value: string): value is SummaryOutputStyle =>
+  outputStyleOptions.some(option => option.value === value)
+
+const sanitizeStoredPreferences = (stored: StoredSummaryPreferences): SummaryPreferenceFormState => ({
+  mode: stored.mode === 'custom' ? 'custom' : 'default',
+  investorFocus: stored.investorFocus ?? '',
+  focusAreas: Array.isArray(stored.focusAreas) ? stored.focusAreas : [],
+  tone: isSummaryToneValue(stored.tone) ? stored.tone : 'objective',
+  detailLevel: isSummaryDetailValue(stored.detailLevel) ? stored.detailLevel : 'balanced',
+  outputStyle: isSummaryOutputStyleValue(stored.outputStyle) ? stored.outputStyle : 'narrative',
+  targetLength: clampTargetLength(stored.targetLength),
+})
+
 export default function CompanyPage() {
   const params = useParams()
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const { user, loading } = useAuth()
   const companyId = params?.id as string
   const [feedback, setFeedback] = useState<string | null>(null)
-  const [selectedTab, setSelectedTab] = useState<'overview' | 'filings' | 'analysis' | 'personas'>('overview')
+  const analysisIdParam = searchParams?.get('analysis_id')
+  const [selectedTab, setSelectedTab] = useState<'overview' | 'filings' | 'analysis' | 'personas'>(
+    analysisIdParam ? 'analysis' : 'overview',
+  )
   const [selectedPersonas, setSelectedPersonas] = useState<string[]>([])
-  const [currentAnalysisId, setCurrentAnalysisId] = useState<string | null>(null)
+  const [currentAnalysisId, setCurrentAnalysisId] = useState<string | null>(analysisIdParam ?? null)
+  const [localAnalysisSnapshot, setLocalAnalysisSnapshot] = useState<StoredAnalysisSnapshot | null>(null)
   const [filingSummaries, setFilingSummaries] = useState<FilingSummaryMap>({})
   const [loadingSummaries, setLoadingSummaries] = useState<Record<string, boolean>>({})
   const [selectedFilingForSummary, setSelectedFilingForSummary] = useState<string>('')
   const [summaryPreferences, setSummaryPreferences] = useState<SummaryPreferenceFormState>(() => createDefaultSummaryPreferences())
   const [showCustomLengthInput, setShowCustomLengthInput] = useState(false)
   const [customLengthInput, setCustomLengthInput] = useState(() => String(createDefaultSummaryPreferences().targetLength))
+  const [dashboardSavedSummaries, setDashboardSavedSummaries] = useState<Record<string, boolean>>({})
   const summaryCardRef = useRef<HTMLDivElement | null>(null)
+  const preferencesHydratedRef = useRef(false)
   const isSummaryGenerating = selectedFilingForSummary ? !!loadingSummaries[selectedFilingForSummary] : false
   const queryClient = useQueryClient()
   const sliderLengthValue = Math.max(50, Math.min(5000, summaryPreferences.targetLength))
+  const authPending = loading || !user
+  const queriesEnabled = !!companyId && !authPending
+  const fallbackTicker = searchParams?.get('ticker') ?? undefined
+  const isLocalAnalysisId = currentAnalysisId?.startsWith('summary-') ?? false
+
+  useEffect(() => {
+    if (!loading && !user) {
+      router.replace('/signup')
+    }
+  }, [loading, user, router])
+
+  useEffect(() => {
+    const stored = DashboardStorage.loadSummaryPreferences()
+    if (stored) {
+      const sanitized = sanitizeStoredPreferences(stored)
+      setSummaryPreferences(sanitized)
+      setCustomLengthInput(String(sanitized.targetLength))
+    }
+    preferencesHydratedRef.current = true
+  }, [])
+
+  useEffect(() => {
+    if (!preferencesHydratedRef.current) return
+    DashboardStorage.saveSummaryPreferences(summaryPreferences)
+  }, [summaryPreferences])
+
+  useEffect(() => {
+    if (analysisIdParam && analysisIdParam !== currentAnalysisId) {
+      setCurrentAnalysisId(analysisIdParam)
+      setSelectedTab('analysis')
+    } else if (!analysisIdParam && currentAnalysisId) {
+      setCurrentAnalysisId(null)
+      setSelectedTab(prev => (prev === 'analysis' ? 'overview' : prev))
+    }
+  }, [analysisIdParam, currentAnalysisId])
+
+  useEffect(() => {
+    if (!currentAnalysisId || !isLocalAnalysisId) {
+      setLocalAnalysisSnapshot(null)
+      return
+    }
+    const history = DashboardStorage.loadAnalysisHistory()
+    const snapshot = history.find(item => item.analysisId === currentAnalysisId) ?? null
+    setLocalAnalysisSnapshot(snapshot)
+  }, [currentAnalysisId, isLocalAnalysisId])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const saved = DashboardStorage.loadAnalysisHistory().reduce<Record<string, boolean>>((acc, entry) => {
+      if (entry.analysisId?.startsWith('summary-')) {
+        acc[entry.analysisId.replace('summary-', '')] = true
+      }
+      return acc
+    }, {})
+    setDashboardSavedSummaries(saved)
+  }, [])
 
   const resolveFilingUrl = (path?: string | null) => {
     if (!path) return '#'
@@ -161,6 +245,31 @@ export default function CompanyPage() {
     } finally {
       setLoadingSummaries(prev => ({ ...prev, [filingId]: false }))
     }
+  }
+
+  const handleAddSummaryToDashboard = (filingId: string) => {
+    if (!company) return
+    const summary = filingSummaries[filingId]
+    if (!summary) return
+
+    const generatedAt = new Date().toISOString()
+    DashboardStorage.upsertAnalysisSnapshot({
+      analysisId: `summary-${filingId}`,
+      generatedAt,
+      id: company.id,
+      name: company.name,
+      ticker: company.ticker,
+      exchange: company.exchange,
+      sector: company.sector,
+      industry: company.industry,
+      country: company.country,
+      healthScore: null,
+      scoreBand: null,
+      ratingLabel: summary.metadata?.mode === 'custom' ? 'Custom brief' : 'Quick brief',
+      summaryMd: summary.content,
+      summaryPreview: buildSummaryPreview(summary.content),
+    })
+    setDashboardSavedSummaries(prev => ({ ...prev, [filingId]: true }))
   }
 
   const scrollToSummaryCard = () => {
@@ -200,12 +309,13 @@ export default function CompanyPage() {
 
   // Fetch company data
   const { data: company, isLoading: companyLoading, error: companyError } = useQuery({
-    queryKey: ['company', companyId],
+    queryKey: ['company', companyId, fallbackTicker],
     queryFn: async () => {
-      const response = await companyApi.getCompany(companyId)
+      const response = await companyApi.getCompany(companyId, { ticker: fallbackTicker })
       return response.data
     },
     retry: false,
+    enabled: queriesEnabled,
   })
 
   // Fetch filings
@@ -216,6 +326,7 @@ export default function CompanyPage() {
       return response.data
     },
     retry: false,
+    enabled: queriesEnabled,
   })
   const selectedFilingDetails = useMemo(
     () => filings?.find((f: any) => f.id === selectedFilingForSummary),
@@ -249,17 +360,18 @@ export default function CompanyPage() {
       return response.data
     },
     retry: false,
+    enabled: queriesEnabled,
   })
 
   // Fetch specific analysis
   const { data: currentAnalysis } = useQuery({
     queryKey: ['analysis', currentAnalysisId],
     queryFn: async () => {
-      if (!currentAnalysisId) return null
+      if (!currentAnalysisId || isLocalAnalysisId) return null
       const response = await analysisApi.getAnalysis(currentAnalysisId)
       return response.data
     },
-    enabled: !!currentAnalysisId,
+    enabled: !!currentAnalysisId && !authPending && !isLocalAnalysisId,
   })
 
   // Fetch filings mutation
@@ -304,6 +416,83 @@ export default function CompanyPage() {
 
   const infoMessage = feedback ?? computedError
 
+  const latestAnalysis = useMemo(() => {
+    if (!analyses || analyses.length === 0) return null
+    return analyses[0]
+  }, [analyses])
+
+  const analysisFromSnapshot = useMemo(() => {
+    if (!localAnalysisSnapshot) return null
+    return {
+      id: localAnalysisSnapshot.analysisId,
+      summary_md: localAnalysisSnapshot.summaryMd ?? localAnalysisSnapshot.summaryPreview ?? null,
+      investor_persona_summaries: null,
+    }
+  }, [localAnalysisSnapshot])
+
+  const analysisToDisplay = useMemo(() => {
+    if (currentAnalysis) return currentAnalysis
+    if (analysisFromSnapshot) return analysisFromSnapshot
+    return latestAnalysis
+  }, [currentAnalysis, analysisFromSnapshot, latestAnalysis])
+
+  useEffect(() => {
+    if (!company?.id) return
+    DashboardStorage.upsertRecentCompany({
+      id: company.id,
+      name: company.name,
+      ticker: company.ticker,
+      exchange: company.exchange,
+      sector: company.sector,
+      industry: company.industry,
+      country: company.country,
+    })
+  }, [company])
+
+  useEffect(() => {
+    if (!company?.id || !latestAnalysis?.id) return
+    const personaSignals = latestAnalysis.investor_persona_summaries
+      ? Object.entries(latestAnalysis.investor_persona_summaries).map(([personaId, data]: [string, any]) => ({
+          personaId,
+          personaName: data?.persona_name ?? personaId,
+          stance: data?.stance ?? 'Neutral',
+        }))
+      : undefined
+    const generatedAt =
+      latestAnalysis.analysis_date ||
+      latestAnalysis.created_at ||
+      (latestAnalysis.updated_at ? latestAnalysis.updated_at : new Date().toISOString())
+
+    DashboardStorage.upsertAnalysisSnapshot({
+      analysisId: latestAnalysis.id,
+      generatedAt,
+      id: company.id,
+      name: company.name,
+      ticker: company.ticker,
+      exchange: company.exchange,
+      sector: company.sector,
+      industry: company.industry,
+      country: company.country,
+      healthScore: latestAnalysis.health_score,
+      scoreBand: latestAnalysis.score_band,
+      ratingLabel: scoreToRating(latestAnalysis.health_score).label,
+      summaryMd: latestAnalysis.summary_md,
+      summaryPreview: buildSummaryPreview(latestAnalysis.summary_md),
+      personaSignals,
+    })
+  }, [company, latestAnalysis])
+
+  if (authPending) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-dark-900 via-primary-900 to-dark-900 flex items-center justify-center">
+        <div className="text-center">
+          <div className="spinner mx-auto mb-4"></div>
+          <p className="text-gray-300 text-xl">Checking your session...</p>
+        </div>
+      </div>
+    )
+  }
+
   if (companyLoading) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-dark-900 via-primary-900 to-dark-900">
@@ -336,8 +525,6 @@ export default function CompanyPage() {
       </div>
     )
   }
-
-  const latestAnalysis = analyses && analyses.length > 0 ? analyses[0] : null
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-dark-900 via-primary-900 to-dark-900">
@@ -768,7 +955,7 @@ export default function CompanyPage() {
 
                     return (
                       <div key={filingId} className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/30 animate-scale-in">
-                        <div className="flex justify-between items-start mb-6">
+                        <div className="flex justify-between items-start mb-6 gap-4 flex-wrap">
                           <div className="flex items-center gap-3">
                             <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-primary-500 to-accent-500 flex items-center justify-center">
                               <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -794,20 +981,42 @@ export default function CompanyPage() {
                               </div>
                             </div>
                           </div>
-                          <Button
-                            onClick={() => {
-                              const newSummaries = { ...filingSummaries }
-                              delete newSummaries[filingId]
-                              setFilingSummaries(newSummaries)
-                            }}
-                            color="ghost"
-                            size="sm"
-                            className="text-gray-400 hover:text-red-400 transition-colors p-2"
-                          >
-                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                            </svg>
-                          </Button>
+                          <div className="flex items-center gap-2">
+                            <Button
+                              onClick={() => handleAddSummaryToDashboard(filingId)}
+                              color={dashboardSavedSummaries[filingId] ? 'success' : 'secondary'}
+                              size="sm"
+                              disabled={!company || dashboardSavedSummaries[filingId]}
+                              className="whitespace-nowrap"
+                              leftIcon={
+                                dashboardSavedSummaries[filingId] ? (
+                                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                                  </svg>
+                                ) : (
+                                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                                  </svg>
+                                )
+                              }
+                            >
+                              {dashboardSavedSummaries[filingId] ? 'Added to dashboard' : 'Add to dashboard'}
+                            </Button>
+                            <Button
+                              onClick={() => {
+                                const newSummaries = { ...filingSummaries }
+                                delete newSummaries[filingId]
+                                setFilingSummaries(newSummaries)
+                              }}
+                              color="ghost"
+                              size="sm"
+                              className="text-gray-400 hover:text-red-400 transition-colors p-2"
+                            >
+                              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                              </svg>
+                            </Button>
+                          </div>
                         </div>
                         {meta?.investorFocus && (
                           <div className="mb-4 px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-sm text-gray-200">
@@ -946,9 +1155,9 @@ export default function CompanyPage() {
                   </svg>
                   Financial Analysis
                 </h2>
-                {latestAnalysis && latestAnalysis.summary_md ? (
+                {analysisToDisplay && analysisToDisplay.summary_md ? (
                   <div className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/30">
-                    <EnhancedSummary content={latestAnalysis.summary_md} />
+                    <EnhancedSummary content={analysisToDisplay.summary_md} />
                   </div>
                 ) : (
                   <div className="text-center py-12 card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20">

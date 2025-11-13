@@ -6,16 +6,7 @@ import { useAuth } from '@/contexts/AuthContext'
 import { Button } from '@/components/base/buttons/button'
 
 export default function Navbar() {
-  const { user, loading, signIn, signOut } = useAuth()
-
-  const handleSignIn = async () => {
-    try {
-      await signIn()
-    } catch (error: any) {
-      const message = error?.message ?? 'Unable to sign in'
-      alert(message)
-    }
-  }
+  const { user, loading, signOut } = useAuth()
 
   return (
     <motion.nav 
@@ -89,13 +80,12 @@ export default function Navbar() {
                 </Button>
               </>
             ) : (
-              <Button
-                onClick={handleSignIn}
-                color="primary"
-                size="sm"
+              <Link
+                href="/signup"
+                className="inline-flex items-center rounded-xl border border-white/30 px-5 py-2 text-sm font-semibold text-white transition-all duration-300 hover:border-primary-400 hover:bg-white/5"
               >
-                Sign In
-              </Button>
+                Join the beta
+              </Link>
             )}
           </motion.div>
         </div>
