@@ -46,3 +46,7 @@ export default function HealthScoreBadge({ score, band }: HealthScoreBadgeProps)
 
 
 
+
+
+
+

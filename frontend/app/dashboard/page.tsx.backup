@@ -1,0 +1,692 @@
+'use client'
+
+import { ReactNode, useEffect, useMemo, useState } from 'react'
+import { useRouter } from 'next/navigation'
+import { motion } from 'framer-motion'
+import {
+  IconBrandTabler,
+  IconChartHistogram,
+  IconCompass,
+  IconMap,
+  IconNotebook,
+  IconSparkles,
+  IconUserBolt,
+  IconTrendingUp,
+  IconBuilding,
+  IconFileAnalytics,
+  IconWorld,
+} from '@tabler/icons-react'
+import { Sidebar, SidebarBody, SidebarLink } from '@/components/ui/sidebar'
+import { useAuth } from '@/contexts/AuthContext'
+import CompanySearch from '@/components/CompanySearch'
+import GeoImpactMap from '@/components/dashboard/GeoImpactMap'
+import { ProgressBar } from '@/components/dashboard/ui/ProgressBar'
+import { ProgressCircle } from '@/components/dashboard/ui/ProgressCircle'
+import { StatCard } from '@/components/dashboard/ui/StatCard'
+import { BarList, type BarListItem } from '@/components/dashboard/ui/BarList'
+import { DonutChart, type DonutDataPoint } from '@/components/dashboard/ui/DonutChart'
+import AnalysisTrend from '@/components/dashboard/charts/AnalysisTrend'
+import SectorStack from '@/components/dashboard/charts/SectorStack'
+import useDashboardData from '@/hooks/useDashboardData'
+import { scoreToRating } from '@/lib/analysis-insights'
+import { Button } from '@/components/base/buttons/button'
+import DashboardContent from './DashboardContent'
+
+interface Company {
+  id: string
+  ticker: string
+  name: string
+  exchange?: string
+}
+
+type CompanyIdentifier = {
+  id?: string | null
+  company_id?: string | null
+  companyId?: string | null
+}
+
+const motionFade = {
+  hidden: { opacity: 0, y: 20 },
+  visible: { opacity: 1, y: 0 },
+}
+
+const navLinks = [
+  {
+    label: 'Home',
+    href: '/dashboard',
+    icon: <IconBrandTabler className="h-5 w-5 shrink-0 text-slate-600" />,
+  },
+  {
+    label: 'Market Pulse',
+    href: '#overview',
+    icon: <IconSparkles className="h-5 w-5 shrink-0 text-slate-600" />,
+  },
+  {
+    label: 'Workflow',
+    href: '#workflow',
+    icon: <IconCompass className="h-5 w-5 shrink-0 text-slate-600" />,
+  },
+  {
+    label: 'Coverage',
+    href: '#coverage',
+    icon: <IconMap className="h-5 w-5 shrink-0 text-slate-600" />,
+  },
+  {
+    label: 'Personas',
+    href: '#personas',
+    icon: <IconUserBolt className="h-5 w-5 shrink-0 text-slate-600" />,
+  },
+]
+
+const PIN_STORAGE_KEY = 'financesum.dashboardPins'
+
+const resolveCompanyId = (entry?: CompanyIdentifier | null) =>
+  entry?.id ?? entry?.company_id ?? entry?.companyId ?? null
+
+const relativeTime = (value?: string | null) => {
+  if (!value) return '—'
+  const timestamp = new Date(value).getTime()
+  if (Number.isNaN(timestamp)) return '—'
+  const delta = Date.now() - timestamp
+  const minutes = Math.floor(delta / 60000)
+  if (minutes < 60) return `${minutes || 1}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  if (days < 7) return `${days}d ago`
+  const weeks = Math.floor(days / 7)
+  return `${weeks}w ago`
+}
+
+const buildCompanyRoute = (companyId?: string | null, ticker?: string | null, analysisId?: string | null) => {
+  if (!companyId) return null
+  const params = new URLSearchParams()
+  if (ticker) params.set('ticker', ticker)
+  if (analysisId) params.set('analysis_id', analysisId)
+  const query = params.toString()
+  return query ? `/company/${companyId}?${query}` : `/company/${companyId}`
+}
+
+export default function DashboardPage() {
+  const router = useRouter()
+  const { user } = useAuth()
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [pinnedBriefs, setPinnedBriefs] = useState<Record<string, boolean>>({})
+  const { history, preferences, stats, primaryAnalysis, personaSignals, mapPoints, hasAnalyses } = useDashboardData()
+  const rating = scoreToRating(primaryAnalysis?.healthScore)
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    const loadPins = () => {
+      try {
+        const stored = window.localStorage.getItem(PIN_STORAGE_KEY)
+        if (stored) {
+          setPinnedBriefs(JSON.parse(stored))
+        } else {
+          setPinnedBriefs({})
+        }
+      } catch {
+        setPinnedBriefs({})
+      }
+    }
+    loadPins()
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === PIN_STORAGE_KEY) {
+        loadPins()
+      }
+    }
+    window.addEventListener('storage', handleStorage)
+    return () => window.removeEventListener('storage', handleStorage)
+  }, [])
+
+  const statsCards = useMemo(
+    () => [
+      {
+        label: 'Analyses completed',
+        value: stats.analysisCount,
+        meta: stats.analysisCount ? `${relativeTime(history[0]?.generatedAt)} latest` : 'Run your first analysis',
+        icon: IconSparkles,
+      },
+      {
+        label: 'Average health score',
+        value: typeof stats.avgScore === 'number' ? `${stats.avgScore}` : '—',
+        meta: stats.avgScore ? rating.label : 'No score yet',
+        icon: IconChartHistogram,
+      },
+      {
+        label: 'Top sectors',
+        value: stats.sectors.length ? stats.sectors[0].label : '—',
+        meta:
+          stats.sectors
+            .slice(0, 3)
+            .map((item) => item.label)
+            .join(', ') || 'Track a few industries',
+        icon: IconNotebook,
+      },
+      {
+        label: 'Global spread',
+        value: stats.countries.length ? `${stats.countries.length} regions` : '—',
+        meta:
+          stats.countries.slice(0, 2).map((item) => item.label).join(', ') || 'Add companies from other markets',
+        icon: IconMap,
+      },
+    ],
+    [stats, rating.label, history],
+  )
+
+  const pinnedCount = useMemo(() => Object.values(pinnedBriefs).filter(Boolean).length, [pinnedBriefs])
+  const averageScore = typeof stats.avgScore === 'number' ? stats.avgScore : 0
+  const completionTarget = 12
+  const topRegions = stats.countries.slice(0, 3)
+  const analysisTrendData = useMemo(() => {
+    const dailyCounts: Record<string, number> = {}
+    history.forEach((item) => {
+      if (!item.generatedAt) return
+      const date = new Date(item.generatedAt)
+      const key = `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`
+      dailyCounts[key] = (dailyCounts[key] ?? 0) + 1
+    })
+    const sorted = Object.entries(dailyCounts)
+      .map(([key, value]) => {
+        const [year, month, day] = key.split('-').map(Number)
+        const date = new Date(year, month - 1, day)
+        return {
+          date,
+          label: date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+          value,
+        }
+      })
+      .sort((a, b) => a.date.getTime() - b.date.getTime())
+      .slice(-8)
+    return sorted
+  }, [history])
+
+  const sectorStackData = useMemo(() => {
+    const total = stats.sectors.reduce((sum, item) => sum + item.value, 0) || 1
+    return stats.sectors.slice(0, 4).map((sector) => ({
+      label: sector.label,
+      value: sector.value,
+      percent: Math.round((sector.value / total) * 100),
+    }))
+  }, [stats.sectors])
+
+  const handleSelectCompany = (company: Company) => {
+    const target = buildCompanyRoute(company.id, company.ticker)
+    if (target) router.push(target)
+  }
+
+  const latestCompanyId = resolveCompanyId(primaryAnalysis)
+  const latestCompanyLink = buildCompanyRoute(latestCompanyId, primaryAnalysis?.ticker, primaryAnalysis?.analysisId)
+  const latestPreviewCopy =
+    primaryAnalysis?.summaryPreview ||
+    primaryAnalysis?.summaryMd ||
+    'Run your next analysis to receive an AI-authored executive brief that you can pin to this dashboard.'
+
+  const scrollToSearch = () => {
+    if (typeof window === 'undefined') return
+    document.getElementById('search')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
+  const handleReopenLatest = () => {
+    const target = buildCompanyRoute(latestCompanyId, primaryAnalysis?.ticker, primaryAnalysis?.analysisId)
+    if (target) router.push(target)
+  }
+
+  const handleOpenBrief = (snapshot: (typeof history)[number]) => {
+    const target = buildCompanyRoute(resolveCompanyId(snapshot), snapshot.ticker, snapshot.analysisId)
+    if (target) {
+      router.push(target)
+    } else {
+      alert('Company details are not available for this brief yet.')
+    }
+  }
+
+  const heroStats = [
+    {
+      label: 'Pinned briefs',
+      value: pinnedCount,
+      detail: 'Ready for investor updates',
+    },
+    {
+      label: 'Latest',
+      value: primaryAnalysis?.ticker ?? '—',
+      detail: relativeTime(primaryAnalysis?.generatedAt),
+    },
+    {
+      label: 'Coverage',
+      value: stats.countries.length || 0,
+      detail: stats.countries.length === 1 ? 'Region tracked' : 'Regions tracked',
+    },
+  ]
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-50">
+      <div className="mx-auto flex w-full max-w-[1600px] flex-col gap-6 px-4 py-8 md:flex-row lg:px-8">
+        <Sidebar open={sidebarOpen} setOpen={setSidebarOpen}>
+          <SidebarBody className="justify-between gap-8 rounded-xl border border-gray-200 bg-white p-4 text-gray-900 shadow-sm dark:border-gray-800 dark:bg-gray-950 dark:text-gray-50">
+            <div className="flex flex-1 flex-col overflow-hidden">
+              <SidebarLogo open={sidebarOpen} />
+              <div className="mt-8 flex flex-col gap-2">
+                {navLinks.map((link, idx) => (
+                  <SidebarLink
+                    key={link.label}
+                    link={{
+                      ...link,
+                      icon: (
+                        <motion.div
+                          initial={{ opacity: 0, x: -4 }}
+                          animate={{ opacity: 1, x: 0 }}
+                          transition={{ delay: 0.05 * idx }}
+                        >
+                          {link.icon}
+                        </motion.div>
+                      ),
+                    }}
+                    className="rounded-lg px-3 py-2 text-sm font-medium text-gray-600 transition hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-900 dark:hover:text-gray-50"
+                  />
+                ))}
+              </div>
+            </div>
+            <div className="rounded-lg border border-gray-200 bg-gray-50 p-3 dark:border-gray-800 dark:bg-gray-900">
+              <SidebarLink
+                link={{
+                  label: user?.user_metadata?.full_name ?? user?.email ?? 'Investor',
+                  href: latestCompanyLink ?? '#',
+                  icon: (
+                    <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-600 text-sm font-bold text-white">
+                      {(user?.user_metadata?.full_name ?? user?.email ?? 'FS').slice(0, 2).toUpperCase()}
+                    </div>
+                  ),
+                }}
+              />
+            </div>
+          </SidebarBody>
+        </Sidebar>
+
+        <main className="flex-1">
+          <motion.section
+            id="overview"
+            variants={motionFade}
+            initial="hidden"
+            animate="visible"
+            transition={{ duration: 0.5 }}
+            className="rounded-[32px] border border-slate-200 bg-white p-8 shadow-sm"
+          >
+            <div className="grid gap-8 lg:grid-cols-[1.2fr_0.8fr]">
+              <div className="flex flex-col gap-6">
+                <div>
+                  <p className="text-xs uppercase tracking-[0.35em] text-slate-400">FinanceSum Pulse</p>
+                  <h1 className="mt-3 text-3xl font-semibold text-slate-900">
+                    {hasAnalyses ? 'Your research cockpit is ready' : 'Start summarizing filings with AI'}
+                  </h1>
+                  <p className="mt-4 max-w-2xl text-slate-500">
+                    Track AI summaries, keep your investing preferences in sync, and see exactly where coverage gaps exist.
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-3">
+                  <Button color="primary" size="md" onClick={handleReopenLatest} disabled={!latestCompanyLink}>
+                    Re-open latest analysis
+                  </Button>
+                  <Button color="secondary" size="md" onClick={scrollToSearch} className="border border-slate-200 text-slate-900">
+                    Start new summary
+                  </Button>
+                </div>
+                <div className="grid gap-4 sm:grid-cols-3">
+                  {heroStats.map((stat) => (
+                    <div key={stat.label} className="rounded-2xl border border-slate-100 bg-slate-50 p-4">
+                      <p className="text-xs uppercase tracking-[0.3em] text-slate-500">{stat.label}</p>
+                      <p className="mt-2 text-3xl font-semibold text-slate-900">{stat.value}</p>
+                      <p className="text-sm text-slate-500">{stat.detail}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="rounded-3xl border border-slate-100 bg-slate-50 p-6">
+                <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Current rating</p>
+                <div className="mt-4 flex flex-col gap-6">
+                  <div className="flex items-end justify-between">
+                    <div>
+                      <p className="text-5xl font-bold text-slate-900">{rating.grade}</p>
+                      <p className="text-sm font-semibold text-slate-500">{rating.label}</p>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-base font-semibold text-slate-900">{primaryAnalysis?.name ?? 'Awaiting insights'}</p>
+                      <p className="text-sm text-slate-500">{primaryAnalysis?.ticker ?? 'Run your first summary'}</p>
+                    </div>
+                  </div>
+                  <p className="text-sm text-slate-600">{rating.description}</p>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="rounded-2xl border border-slate-100 bg-white/80 px-4 py-3">
+                      <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Status</p>
+                      <p className="mt-2 text-sm text-slate-800">
+                        {hasAnalyses ? 'AI brief refreshed with your latest filing.' : 'Generate a summary to populate this space.'}
+                      </p>
+                    </div>
+                    <div className="rounded-2xl border border-slate-100 bg-white/80 px-4 py-3">
+                      <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Last run</p>
+                      <p className="mt-2 text-sm text-slate-800">{relativeTime(primaryAnalysis?.generatedAt)}</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </motion.section>
+
+          <motion.section
+            id="workflow"
+            variants={motionFade}
+            initial="hidden"
+            animate="visible"
+            transition={{ delay: 0.05, duration: 0.5 }}
+            className="grid gap-6 xl:grid-cols-[1.1fr_0.9fr]"
+          >
+            <div id="search" className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+              <SectionHeader
+                eyebrow="Start a summary"
+                title="Company search"
+                description="Search any ticker, CIK, or company name to open a new filing summary."
+              />
+              <div className="mt-6 rounded-2xl border border-slate-200 bg-slate-50 p-3">
+                <CompanySearch onSelectCompany={handleSelectCompany} />
+              </div>
+            </div>
+            <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+              <SectionHeader
+                eyebrow="AI briefing preview"
+                title="Latest memo"
+                description="Highlights from your most recent filing summary."
+                action={
+                  <Button color="ghost" size="sm" onClick={handleReopenLatest} disabled={!latestCompanyLink}>
+                    View memo
+                  </Button>
+                }
+              />
+              <p className="mt-4 text-sm text-slate-600 line-clamp-6">{latestPreviewCopy}</p>
+              <div className="mt-6 flex flex-wrap gap-2 text-xs font-semibold text-slate-500">
+                <span className="rounded-full border border-slate-200 px-3 py-1">{primaryAnalysis?.ticker ?? 'No ticker yet'}</span>
+                <span className="rounded-full border border-slate-200 px-3 py-1">
+                  {rating.grade} · {rating.label}
+                </span>
+                <span className="rounded-full border border-slate-200 px-3 py-1">{relativeTime(primaryAnalysis?.generatedAt)}</span>
+              </div>
+            </div>
+          </motion.section>
+
+          <motion.section
+            variants={motionFade}
+            initial="hidden"
+            animate="visible"
+            transition={{ delay: 0.1, duration: 0.5 }}
+            className="grid gap-6 xl:grid-cols-[1.2fr_0.8fr]"
+          >
+            <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+              <SectionHeader
+                eyebrow="Portfolio stats"
+                title="Where you're spending research time"
+                description="Auto-updates after every analysis."
+              />
+              <div className="mt-6 grid gap-4 md:grid-cols-2">
+                {statsCards.map((card) => (
+                  <div key={card.label} className="rounded-2xl border border-slate-100 bg-slate-50/80 p-4">
+                    <div className="flex items-center gap-4">
+                      <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-white text-slate-700">
+                        <card.icon className="h-5 w-5" />
+                      </div>
+                      <div>
+                        <p className="text-xs uppercase tracking-[0.3em] text-slate-500">{card.label}</p>
+                        <p className="text-2xl font-semibold text-slate-900">{card.value}</p>
+                        <p className="text-sm text-slate-500">{card.meta}</p>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="space-y-6">
+              <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+                <SectionHeader eyebrow="Progress" title="Analysis cadence" description="Recent eight days of filing activity." />
+                <div className="mt-4 space-y-6">
+                  <AnalysisTrend data={analysisTrendData} />
+                  <div className="grid gap-4 md:grid-cols-2">
+                    <div>
+                      <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Pipeline progress</p>
+                      <ProgressBar value={stats.analysisCount} max={completionTarget} label={`${stats.analysisCount} / ${completionTarget} filings`} />
+                    </div>
+                    <div>
+                      <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Average score</p>
+                      <ProgressBar
+                        value={averageScore}
+                        max={100}
+                        variant={averageScore >= 60 ? 'success' : averageScore >= 40 ? 'neutral' : 'warning'}
+                        label={stats.avgScore ? `${averageScore} health score` : 'No score yet'}
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+                <SectionHeader eyebrow="Coverage mix" title="Top focus areas" description="Sector composition of your tracked summaries." />
+                <div className="mt-4 space-y-4 text-sm text-slate-600">
+                  {sectorStackData.length ? (
+                    <SectorStack sectors={sectorStackData} />
+                  ) : (
+                    <p className="rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-6 text-center text-xs text-slate-500">
+                      Track a company to unlock sector insights.
+                    </p>
+                  )}
+                  {topRegions.length ? (
+                    <div className="rounded-2xl border border-slate-100 bg-slate-50 px-4 py-3 text-xs text-slate-600">
+                      <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Regions in focus</p>
+                      <p className="mt-2 text-sm font-semibold text-slate-900">
+                        {topRegions.map((region) => region.label).join(' · ')}
+                      </p>
+                      <p className="text-xs text-slate-500">Expand to new markets to diversify coverage.</p>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-500">Add coverage from another market to light this up.</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          </motion.section>
+
+          <motion.section
+            id="personas"
+            variants={motionFade}
+            initial="hidden"
+            animate="visible"
+            transition={{ delay: 0.15, duration: 0.5 }}
+            className="grid gap-6 xl:grid-cols-2"
+          >
+            <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+              <SectionHeader
+                eyebrow="Persona pulse"
+                title="Investor stances"
+                action={<span className="text-xs uppercase tracking-[0.3em] text-slate-400">Live signals</span>}
+              />
+              {personaSignals.length ? (
+                <ul className="mt-4 space-y-3">
+                  {personaSignals.map((persona) => (
+                    <li
+                      key={persona.personaId}
+                      className="flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50 px-4 py-3"
+                    >
+                      <div>
+                        <p className="text-sm font-semibold text-slate-900">{persona.personaName}</p>
+                        <p className="text-xs uppercase tracking-widest text-slate-500">{persona.stance}</p>
+                      </div>
+                      <span
+                        className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                          persona.stance?.toLowerCase().includes('buy')
+                            ? 'bg-emerald-100 text-emerald-700'
+                            : persona.stance?.toLowerCase().includes('sell')
+                              ? 'bg-rose-100 text-rose-700'
+                              : 'bg-slate-200 text-slate-700'
+                        }`}
+                      >
+                        {persona.stance}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <div className="mt-6 rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-6 text-center text-slate-500">
+                  Run an analysis with personas enabled to see their buy/sell sentiment here.
+                </div>
+              )}
+            </div>
+            <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+              <SectionHeader
+                eyebrow="Summary settings"
+                title="Preferred memo style"
+                description="AI writers remember these preferences for every filing."
+              />
+              <dl className="mt-6 space-y-4 text-sm text-slate-600">
+                <div className="flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50 px-4 py-3">
+                  <dt className="text-slate-500">Tone</dt>
+                  <dd className="font-semibold text-slate-900">{preferences.tone}</dd>
+                </div>
+                <div className="flex items-center justify-between rounded-2xl border border-slate-100 bg-slate-50 px-4 py-3">
+                  <dt className="text-slate-500">Detail level</dt>
+                  <dd className="font-semibold text-slate-900">{preferences.detailLevel}</dd>
+                </div>
+                <div className="rounded-2xl border border-slate-100 bg-slate-50 px-4 py-3">
+                  <dt className="text-slate-500">Focus areas</dt>
+                  <dd className="mt-2 flex flex-wrap gap-2">
+                    {preferences.focusAreas.length ? (
+                      preferences.focusAreas.map((area) => (
+                        <span key={area} className="rounded-full border border-slate-200 bg-white px-3 py-1 text-xs text-slate-700">
+                          {area}
+                        </span>
+                      ))
+                    ) : (
+                      <span className="text-xs uppercase tracking-[0.4em] text-slate-400">None selected</span>
+                    )}
+                  </dd>
+                </div>
+              </dl>
+              <div className="mt-4 text-xs text-slate-500">
+                Target length:{' '}
+                <span className="font-semibold text-slate-900">{preferences.targetLength} words</span>
+              </div>
+            </div>
+          </motion.section>
+
+          <motion.section
+            id="coverage"
+            variants={motionFade}
+            initial="hidden"
+            animate="visible"
+            transition={{ delay: 0.2, duration: 0.5 }}
+            className="grid gap-6 xl:grid-cols-[1.1fr_0.9fr]"
+          >
+            <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+              <SectionHeader
+                eyebrow="Global coverage"
+                title="Where your filings live"
+                description="Pinpoint the regions and exchanges you've analyzed recently."
+              />
+              <div className="mt-6 rounded-3xl border border-slate-100 bg-slate-50 p-4">
+                {mapPoints.length ? (
+                  <GeoImpactMap points={mapPoints} />
+                ) : (
+                  <div className="flex h-full flex-col items-center justify-center gap-4 py-12 text-slate-500">
+                    <IconMap className="h-10 w-10" />
+                    <p className="max-w-sm text-center">Add coverage across multiple countries to light up this map.</p>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="rounded-[28px] border border-slate-200 bg-white p-6 shadow-sm">
+              <SectionHeader
+                eyebrow="Activity"
+                title="Recent briefs"
+                description="Pin briefs directly from the company summary; pinned items stay here."
+                action={<span className="text-xs uppercase tracking-[0.3em] text-slate-400">Live sync</span>}
+              />
+              {history.length ? (
+                <ul className="mt-6 space-y-4">
+                  {history.slice(0, 5).map((item) => {
+                    const itemRating = scoreToRating(item.healthScore)
+                    const isPinned = Boolean(pinnedBriefs[item.analysisId])
+                    return (
+                      <li key={item.analysisId} className="rounded-2xl border border-slate-100 bg-slate-50/80 p-4">
+                        <div className="flex flex-wrap items-start justify-between gap-4">
+                          <div className="space-y-1">
+                            <p className="text-base font-semibold text-slate-900">{item.name}</p>
+                            <p className="text-xs uppercase tracking-widest text-slate-500">{item.ticker}</p>
+                            <div className="flex flex-wrap gap-2 text-xs text-slate-500">
+                              <span className="rounded-full border border-slate-200 px-3 py-1">
+                                {itemRating.grade} · {itemRating.label}
+                              </span>
+                              <span className="rounded-full border border-slate-200 px-3 py-1">{relativeTime(item.generatedAt)}</span>
+                            </div>
+                          </div>
+                          <div
+                            className={`rounded-full px-4 py-1 text-xs font-semibold ${
+                              isPinned ? 'bg-indigo-50 text-indigo-600 border border-indigo-100' : 'bg-white text-slate-500 border border-slate-200'
+                            }`}
+                          >
+                            {isPinned ? 'Pinned' : 'Pin from summary view'}
+                          </div>
+                        </div>
+                        {item.summaryPreview && (
+                          <button
+                            type="button"
+                            onClick={() => handleOpenBrief(item)}
+                            className="mt-3 w-full text-left text-sm text-slate-600 hover:text-slate-900"
+                          >
+                            {item.summaryPreview}
+                          </button>
+                        )}
+                      </li>
+                    )
+                  })}
+                </ul>
+              ) : (
+                <div className="mt-6 rounded-2xl border border-dashed border-slate-200 bg-slate-50 p-6 text-center text-slate-500">
+                  Your most recent AI briefs will show up here once you run an analysis.
+                </div>
+              )}
+            </div>
+          </motion.section>
+        </main>
+      </div>
+    </div>
+  )
+}
+
+const SidebarLogo = ({ open }: { open: boolean }) => {
+  return (
+    <a href="#" className="flex items-center gap-3">
+      <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-indigo-600 text-white">
+        <IconBrandTabler className="h-6 w-6" />
+      </div>
+      {open && (
+        <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-lg font-semibold text-slate-900">
+          FinanceSum
+        </motion.span>
+      )}
+    </a>
+  )
+}
+
+interface SectionHeaderProps {
+  eyebrow?: string
+  title: string
+  description?: string
+  action?: ReactNode
+}
+
+const SectionHeader = ({ eyebrow, title, description, action }: SectionHeaderProps) => {
+  return (
+    <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+      <div>
+        {eyebrow && <p className="text-xs uppercase tracking-[0.3em] text-slate-400">{eyebrow}</p>}
+        <h3 className="text-xl font-semibold text-slate-900">{title}</h3>
+        {description && <p className="text-sm text-slate-500">{description}</p>}
+      </div>
+      {action && <div className="text-sm text-slate-500 md:text-right">{action}</div>}
+    </div>
+  )
+}

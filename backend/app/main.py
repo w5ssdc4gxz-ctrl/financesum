@@ -2,7 +2,7 @@
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import analysis, companies, filings
+from app.api import analysis, companies, filings, dashboard
 from app.config import DEFAULT_CORS_ORIGINS, get_settings
 
 settings = get_settings()
@@ -79,4 +79,9 @@ app.include_router(
     tags=["analysis"]
 )
 
+app.include_router(
+    dashboard.router,
+    prefix=f"/api/{settings.api_version}/dashboard",
+    tags=["dashboard"]
+)
 

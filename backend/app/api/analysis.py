@@ -18,6 +18,7 @@ from app.services.analysis_fallback import (
     list_company_analyses as fallback_list_company_analyses,
     run_analysis as fallback_run_analysis,
 )
+from app.services.local_cache import fallback_analysis_by_id, fallback_analyses
 from app.utils.supabase_errors import is_supabase_table_missing_error
 
 router = APIRouter()
@@ -236,5 +237,30 @@ async def get_task_status(task_id: str):
         if is_supabase_table_missing_error(e):
             return fallback_get_task_status(task_id)
         raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
+
+
+@router.delete("/{analysis_id}", status_code=204)
+async def delete_analysis(analysis_id: str):
+    """Delete an analysis."""
+    settings = get_settings()
+
+    if not _supabase_configured(settings):
+        if analysis_id in fallback_analysis_by_id:
+            analysis = fallback_analysis_by_id.pop(analysis_id)
+            company_id = analysis.get("company_id")
+            if company_id and company_id in fallback_analyses:
+                fallback_analyses[company_id] = [
+                    a for a in fallback_analyses[company_id] if a["id"] != analysis_id
+                ]
+        return None
+
+    supabase = get_supabase_client()
+
+    try:
+        supabase.table("analyses").delete().eq("id", analysis_id).execute()
+    except Exception as e:
+        if is_supabase_table_missing_error(e):
+            return None
+        raise HTTPException(status_code=500, detail=f"Error deleting analysis: {str(e)}")
 
 

@@ -1,9 +1,9 @@
 -- Enable UUID extension
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- Companies table
 CREATE TABLE companies (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     ticker TEXT NOT NULL,
     cik TEXT,
     name TEXT NOT NULL,
@@ -22,7 +22,7 @@ CREATE INDEX idx_companies_name ON companies(name);
 
 -- Filings table
 CREATE TABLE filings (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
     filing_type TEXT NOT NULL, -- 10-K, 10-Q, 8-K, etc.
     filing_date DATE NOT NULL,
@@ -44,7 +44,7 @@ CREATE INDEX idx_filings_status ON filings(status);
 
 -- Financial statements table
 CREATE TABLE financial_statements (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     filing_id UUID NOT NULL REFERENCES filings(id) ON DELETE CASCADE,
     period_start DATE NOT NULL,
     period_end DATE NOT NULL,
@@ -59,7 +59,7 @@ CREATE INDEX idx_financial_statements_period ON financial_statements(period_star
 
 -- Analyses table
 CREATE TABLE analyses (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
     filing_ids UUID[] NOT NULL,
     analysis_date TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -81,7 +81,7 @@ CREATE INDEX idx_analyses_status ON analyses(status);
 
 -- Watchlists table
 CREATE TABLE watchlists (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
     company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -103,7 +103,7 @@ CREATE TABLE user_profiles (
 
 -- Task status table (for Celery task tracking)
 CREATE TABLE task_status (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id TEXT UNIQUE NOT NULL,
     task_type TEXT NOT NULL,
     status TEXT NOT NULL, -- pending, running, completed, failed
@@ -209,6 +209,10 @@ CREATE TRIGGER update_task_status_updated_at BEFORE UPDATE ON task_status
 -- Storage buckets (to be created via Supabase UI or API)
 -- Bucket: filings (for raw PDFs/HTML and parsed JSON)
 -- Policies: authenticated users can upload, everyone can read
+
+
+
+
 
 
 

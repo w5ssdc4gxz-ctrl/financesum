@@ -1,4 +1,6 @@
 """Pydantic schemas for API models."""
+from __future__ import annotations
+
 from datetime import datetime, date
 from typing import Optional, List, Dict, Any, Literal
 from pydantic import BaseModel, Field
@@ -197,6 +199,15 @@ class AnalysisRunResponse(BaseModel):
     message: str
 
 
+class HealthRatingPreferences(BaseModel):
+    enabled: bool = False
+    framework: Optional[str] = Field(default=None, max_length=80)
+    primary_factor_weighting: Optional[str] = Field(default=None, max_length=80)
+    risk_tolerance: Optional[str] = Field(default=None, max_length=80)
+    analysis_depth: Optional[str] = Field(default=None, max_length=80)
+    display_style: Optional[str] = Field(default=None, max_length=80)
+
+
 class FilingSummaryPreferences(BaseModel):
     mode: Literal["default", "custom"] = "default"
     investor_focus: Optional[str] = Field(default=None, max_length=600)
@@ -205,6 +216,7 @@ class FilingSummaryPreferences(BaseModel):
     detail_level: Optional[str] = Field(default=None, max_length=50)
     output_style: Optional[str] = Field(default=None, max_length=50)
     target_length: Optional[int] = Field(default=None, ge=50, le=1200)
+    health_rating: Optional[HealthRatingPreferences] = None
 
 
 class HealthScoreBreakdown(BaseModel):
@@ -212,6 +224,7 @@ class HealthScoreBreakdown(BaseModel):
     score_band: str
     components: Dict[str, float]
     percentile_ranks: Dict[str, float]
+
 
 
 

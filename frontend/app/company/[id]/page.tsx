@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import Navbar from '@/components/Navbar'
@@ -14,12 +14,42 @@ import DashboardStorage, { StoredAnalysisSnapshot, StoredSummaryPreferences } fr
 import { buildSummaryPreview, scoreToRating } from '@/lib/analysis-insights'
 import ReactMarkdown from 'react-markdown'
 import { Button } from '@/components/base/buttons/button'
+import { Button as StatefulButton } from '@/components/ui/stateful-button'
 import { useAuth } from '@/contexts/AuthContext'
 
 type SummaryMode = 'default' | 'custom'
 type SummaryTone = 'objective' | 'cautiously optimistic' | 'bullish' | 'bearish'
 type SummaryDetailLevel = 'snapshot' | 'balanced' | 'deep dive'
 type SummaryOutputStyle = 'narrative' | 'bullets' | 'mixed'
+
+type HealthFramework =
+  | 'value_investor_default'
+  | 'quality_moat_focus'
+  | 'financial_resilience'
+  | 'growth_sustainability'
+  | 'user_defined_mix'
+
+type HealthWeighting =
+  | 'profitability_margins'
+  | 'cash_flow_conversion'
+  | 'balance_sheet_strength'
+  | 'liquidity_near_term_risk'
+  | 'execution_competitiveness'
+
+type HealthRiskTolerance = 'very_conservative' | 'moderately_conservative' | 'balanced' | 'moderately_lenient' | 'very_lenient'
+
+type HealthAnalysisDepth = 'headline_only' | 'key_financial_items' | 'full_footnote_review' | 'accounting_integrity' | 'forensic_deep_dive'
+
+type HealthDisplayStyle = 'score_only' | 'score_plus_grade' | 'score_plus_traffic_light' | 'score_plus_pillars' | 'score_with_narrative'
+
+type HealthRatingFormState = {
+  enabled: boolean
+  framework: HealthFramework
+  weighting: HealthWeighting
+  riskTolerance: HealthRiskTolerance
+  analysisDepth: HealthAnalysisDepth
+  displayStyle: HealthDisplayStyle
+}
 
 type SummaryPreferenceFormState = {
   mode: SummaryMode
@@ -29,6 +59,7 @@ type SummaryPreferenceFormState = {
   detailLevel: SummaryDetailLevel
   outputStyle: SummaryOutputStyle
   targetLength: number
+  healthRating: HealthRatingFormState
 }
 
 type SummaryPreferenceSnapshot = {
@@ -39,6 +70,7 @@ type SummaryPreferenceSnapshot = {
   detailLevel?: SummaryDetailLevel
   outputStyle?: SummaryOutputStyle
   targetLength?: number
+  healthRating?: Partial<HealthRatingFormState>
 }
 
 type FilingSummaryMap = Record<string, { content: string; metadata: SummaryPreferenceSnapshot }>
@@ -71,6 +103,55 @@ const outputStyleOptions: Array<{ value: SummaryOutputStyle; label: string; desc
   { value: 'mixed', label: 'Mixed', description: 'Narrative with supporting bullets' },
 ]
 
+const healthFrameworkOptions: Array<{ value: HealthFramework; label: string; description: string }> = [
+  { value: 'value_investor_default', label: 'Value Investor Default', description: 'Cash flow durability, balance sheet strength, downside protection' },
+  { value: 'quality_moat_focus', label: 'Quality & Moat Focus', description: 'ROIC consistency, competitive advantage, earnings stability' },
+  { value: 'financial_resilience', label: 'Financial Resilience', description: 'Liquidity coverage, leverage, refinancing risk' },
+  { value: 'growth_sustainability', label: 'Growth Sustainability', description: 'Margin expansion, reinvestment efficiency, growth durability' },
+  { value: 'user_defined_mix', label: 'User-Defined Mix', description: 'Equal weight: profitability, risk, liquidity, growth, efficiency' },
+]
+
+const healthWeightingOptions: Array<{ value: HealthWeighting; label: string; description: string }> = [
+  { value: 'profitability_margins', label: 'Profitability & Margins', description: 'Emphasize margin momentum and earnings power' },
+  { value: 'cash_flow_conversion', label: 'Cash Flow & Conversion', description: 'Prioritize free cash flow quality' },
+  { value: 'balance_sheet_strength', label: 'Balance Sheet Strength', description: 'Focus on leverage, debt mix, and coverage' },
+  { value: 'liquidity_near_term_risk', label: 'Liquidity & Near-Term Risk', description: 'Watch near-term debt maturities and cash runway' },
+  { value: 'execution_competitiveness', label: 'Execution & Competitiveness', description: 'Reward operational excellence and competitive position' },
+]
+
+const healthRiskOptions: Array<{ value: HealthRiskTolerance; label: string; description: string }> = [
+  { value: 'very_conservative', label: 'Very Conservative', description: 'Penalize even small weaknesses' },
+  { value: 'moderately_conservative', label: 'Moderately Conservative', description: 'Value-investor baseline' },
+  { value: 'balanced', label: 'Balanced', description: 'Neutral scoring posture' },
+  { value: 'moderately_lenient', label: 'Moderately Lenient', description: 'Highlight strengths unless risks are significant' },
+  { value: 'very_lenient', label: 'Very Lenient', description: 'Focus on upside even with risks' },
+]
+
+const healthAnalysisDepthOptions: Array<{ value: HealthAnalysisDepth; label: string; description: string }> = [
+  { value: 'headline_only', label: 'Headline Red Flags', description: 'Only obvious management-highlighted risks' },
+  { value: 'key_financial_items', label: 'Key Financial Items', description: 'Margins, cash flow drivers, debt' },
+  { value: 'full_footnote_review', label: 'Full Footnote Review', description: 'Leases, covenants, disclosure footnotes' },
+  { value: 'accounting_integrity', label: 'Accounting Integrity', description: 'Non-GAAP, adjustments, quality of earnings' },
+  { value: 'forensic_deep_dive', label: 'Forensic Deep Dive', description: 'Aggressive accounting, accrual spikes, anomalies' },
+]
+
+const healthDisplayOptions: Array<{ value: HealthDisplayStyle; label: string; description: string }> = [
+  { value: 'score_only', label: '0–100 Score Only', description: 'Single score headline' },
+  { value: 'score_plus_grade', label: 'Score + Letter Grade', description: 'Pair score with an A–F ranking' },
+  { value: 'score_plus_traffic_light', label: 'Score + Traffic Light', description: 'Color-coded risk signal' },
+  { value: 'score_plus_pillars', label: 'Score + 4 Pillars', description: 'Profitability | Risk | Liquidity | Growth' },
+  { value: 'score_with_narrative', label: 'Score + Narrative', description: 'Add a short justification paragraph' },
+]
+
+const healthRatingDefaults: HealthRatingFormState = {
+  enabled: false,
+  framework: 'value_investor_default',
+  weighting: 'profitability_margins',
+  riskTolerance: 'moderately_conservative',
+  analysisDepth: 'key_financial_items',
+  displayStyle: 'score_plus_grade',
+}
+
 const createDefaultSummaryPreferences = (): SummaryPreferenceFormState => ({
   mode: 'default',
   investorFocus: '',
@@ -79,6 +160,7 @@ const createDefaultSummaryPreferences = (): SummaryPreferenceFormState => ({
   detailLevel: 'balanced',
   outputStyle: 'narrative',
   targetLength: 300,
+  healthRating: { ...healthRatingDefaults },
 })
 
 const clampTargetLength = (value: number) => {
@@ -87,23 +169,47 @@ const clampTargetLength = (value: number) => {
 }
 
 const buildPreferencePayload = (prefs: SummaryPreferenceFormState): FilingSummaryPreferencesPayload | undefined => {
-  if (prefs.mode === 'default') {
-    return undefined
+  const buildHealthRating = () =>
+    prefs.healthRating.enabled
+      ? {
+          enabled: true,
+          framework: prefs.healthRating.framework,
+          primary_factor_weighting: prefs.healthRating.weighting,
+          risk_tolerance: prefs.healthRating.riskTolerance,
+          analysis_depth: prefs.healthRating.analysisDepth,
+          display_style: prefs.healthRating.displayStyle,
+        }
+      : undefined
+
+  if (prefs.mode === 'custom') {
+    return {
+      mode: 'custom',
+      investor_focus: prefs.investorFocus.trim() || undefined,
+      focus_areas: prefs.focusAreas.length ? prefs.focusAreas : undefined,
+      tone: prefs.tone,
+      detail_level: prefs.detailLevel,
+      output_style: prefs.outputStyle,
+      target_length: clampTargetLength(prefs.targetLength),
+      health_rating: buildHealthRating(),
+    }
   }
-  return {
-    mode: 'custom',
-    investor_focus: prefs.investorFocus.trim() || undefined,
-    focus_areas: prefs.focusAreas.length ? prefs.focusAreas : undefined,
-    tone: prefs.tone,
-    detail_level: prefs.detailLevel,
-    output_style: prefs.outputStyle,
-    target_length: clampTargetLength(prefs.targetLength),
+
+  if (prefs.healthRating.enabled) {
+    return {
+      mode: 'default',
+      health_rating: buildHealthRating(),
+    }
   }
+
+  return undefined
 }
 
 const snapshotPreferences = (prefs: SummaryPreferenceFormState): SummaryPreferenceSnapshot => {
   if (prefs.mode === 'default') {
-    return { mode: 'default' }
+    return {
+      mode: 'default',
+      healthRating: prefs.healthRating.enabled ? { ...prefs.healthRating } : undefined,
+    }
   }
   return {
     mode: 'custom',
@@ -113,6 +219,11 @@ const snapshotPreferences = (prefs: SummaryPreferenceFormState): SummaryPreferen
     detailLevel: prefs.detailLevel,
     outputStyle: prefs.outputStyle,
     targetLength: clampTargetLength(prefs.targetLength),
+    healthRating: prefs.healthRating.enabled
+      ? {
+          ...prefs.healthRating,
+        }
+      : undefined,
   }
 }
 
@@ -122,6 +233,17 @@ const isSummaryDetailValue = (value: string): value is SummaryDetailLevel =>
 const isSummaryOutputStyleValue = (value: string): value is SummaryOutputStyle =>
   outputStyleOptions.some(option => option.value === value)
 
+const isHealthFrameworkValue = (value: string | undefined): value is HealthFramework =>
+  typeof value === 'string' && healthFrameworkOptions.some(option => option.value === value)
+const isHealthWeightingValue = (value: string | undefined): value is HealthWeighting =>
+  typeof value === 'string' && healthWeightingOptions.some(option => option.value === value)
+const isHealthRiskValue = (value: string | undefined): value is HealthRiskTolerance =>
+  typeof value === 'string' && healthRiskOptions.some(option => option.value === value)
+const isHealthAnalysisDepthValue = (value: string | undefined): value is HealthAnalysisDepth =>
+  typeof value === 'string' && healthAnalysisDepthOptions.some(option => option.value === value)
+const isHealthDisplayValue = (value: string | undefined): value is HealthDisplayStyle =>
+  typeof value === 'string' && healthDisplayOptions.some(option => option.value === value)
+
 const sanitizeStoredPreferences = (stored: StoredSummaryPreferences): SummaryPreferenceFormState => ({
   mode: stored.mode === 'custom' ? 'custom' : 'default',
   investorFocus: stored.investorFocus ?? '',
@@ -130,7 +252,71 @@ const sanitizeStoredPreferences = (stored: StoredSummaryPreferences): SummaryPre
   detailLevel: isSummaryDetailValue(stored.detailLevel) ? stored.detailLevel : 'balanced',
   outputStyle: isSummaryOutputStyleValue(stored.outputStyle) ? stored.outputStyle : 'narrative',
   targetLength: clampTargetLength(stored.targetLength),
+  healthRating: {
+    enabled: stored.healthRating?.enabled ?? false,
+    framework: isHealthFrameworkValue(stored.healthRating?.framework) ? stored.healthRating!.framework : healthRatingDefaults.framework,
+    weighting: isHealthWeightingValue(stored.healthRating?.weighting)
+      ? stored.healthRating!.weighting
+      : healthRatingDefaults.weighting,
+    riskTolerance: isHealthRiskValue(stored.healthRating?.riskTolerance)
+      ? stored.healthRating!.riskTolerance
+      : healthRatingDefaults.riskTolerance,
+    analysisDepth: isHealthAnalysisDepthValue(stored.healthRating?.analysisDepth)
+      ? stored.healthRating!.analysisDepth
+      : healthRatingDefaults.analysisDepth,
+    displayStyle: isHealthDisplayValue(stored.healthRating?.displayStyle)
+      ? stored.healthRating!.displayStyle
+      : healthRatingDefaults.displayStyle,
+  },
 })
+
+const extractHealthRating = (summaryText: string) => {
+  if (!summaryText) {
+    return { score: null as number | null }
+  }
+  const normalized = summaryText.replace(/\*/g, '')
+  const ratingRegex = /financial health rating[^0-9]{0,80}(\d{1,3})(?:\s*\/\s*100)?(?:\s*\(([A-F][+-]?)\))?/i
+  const match = normalized.match(ratingRegex)
+  if (match) {
+    const score = Number(match[1])
+    const letter = match[2] ?? null
+    if (Number.isFinite(score)) {
+      return { score, letter }
+    }
+  }
+  const fallback = normalized.match(/(\d{1,2}|100)\s*(?:\/\s*100)?\s*(?:points|score|rating)/i)
+  if (fallback) {
+    const score = Number(fallback[1])
+    if (Number.isFinite(score)) {
+      return { score, letter: null }
+    }
+  }
+  return { score: null as number | null }
+}
+
+const emitDashboardSync = () => {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('financesum-dashboard-sync'))
+  }
+}
+
+const mapPersonaSignals = (input?: Record<string, any> | null) => {
+  if (!input || typeof input !== 'object') return undefined
+  return Object.entries(input).map(([personaId, data]: [string, any]) => ({
+    personaId,
+    personaName: data?.persona_name ?? personaId,
+    stance: data?.stance ?? 'Neutral',
+  }))
+}
+
+const parseNumericScore = (value: unknown): number | null => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
 
 export default function CompanyPage() {
   const params = useParams()
@@ -206,13 +392,22 @@ export default function CompanyPage() {
 
   useEffect(() => {
     if (typeof window === 'undefined') return
-    const saved = DashboardStorage.loadAnalysisHistory().reduce<Record<string, boolean>>((acc, entry) => {
-      if (entry.analysisId?.startsWith('summary-')) {
-        acc[entry.analysisId.replace('summary-', '')] = true
-      }
-      return acc
-    }, {})
-    setDashboardSavedSummaries(saved)
+    const syncSavedSummaries = () => {
+      const saved = DashboardStorage.loadAnalysisHistory().reduce<Record<string, boolean>>((acc, entry) => {
+        if (entry.analysisId?.startsWith('summary-')) {
+          acc[entry.analysisId.replace('summary-', '')] = true
+        }
+        return acc
+      }, {})
+      setDashboardSavedSummaries(saved)
+    }
+    syncSavedSummaries()
+    window.addEventListener('storage', syncSavedSummaries)
+    window.addEventListener('focus', syncSavedSummaries)
+    return () => {
+      window.removeEventListener('storage', syncSavedSummaries)
+      window.removeEventListener('focus', syncSavedSummaries)
+    }
   }, [])
 
   const resolveFilingUrl = (path?: string | null) => {
@@ -251,8 +446,12 @@ export default function CompanyPage() {
     if (!company) return
     const summary = filingSummaries[filingId]
     if (!summary) return
+    const filing = filings?.find((item: any) => item.id === filingId)
 
     const generatedAt = new Date().toISOString()
+    const { score: extractedScore } = extractHealthRating(summary.content)
+    const ratingInfo = typeof extractedScore === 'number' ? scoreToRating(extractedScore) : null
+
     DashboardStorage.upsertAnalysisSnapshot({
       analysisId: `summary-${filingId}`,
       generatedAt,
@@ -263,13 +462,19 @@ export default function CompanyPage() {
       sector: company.sector,
       industry: company.industry,
       country: company.country,
-      healthScore: null,
-      scoreBand: null,
-      ratingLabel: summary.metadata?.mode === 'custom' ? 'Custom brief' : 'Quick brief',
+      healthScore: extractedScore ?? null,
+      scoreBand: ratingInfo?.grade ?? null,
+      ratingLabel:
+        ratingInfo?.label ?? (summary.metadata?.mode === 'custom' ? 'Custom brief' : 'Quick brief'),
       summaryMd: summary.content,
       summaryPreview: buildSummaryPreview(summary.content),
+      filingId: filing?.id ?? filingId,
+      filingType: filing?.filing_type ?? null,
+      filingDate: filing?.filing_date ?? null,
+      source: 'summary',
     })
     setDashboardSavedSummaries(prev => ({ ...prev, [filingId]: true }))
+    emitDashboardSync()
   }
 
   const scrollToSummaryCard = () => {
@@ -290,6 +495,64 @@ export default function CompanyPage() {
       return { ...prev, focusAreas: updatedFocus }
     })
   }
+
+  const handleHealthToggle = () =>
+    new Promise<void>((resolve) => {
+      setSummaryPreferences(prev => ({
+        ...prev,
+        healthRating: {
+          ...prev.healthRating,
+          enabled: !prev.healthRating.enabled,
+        },
+      }))
+      setTimeout(resolve, 250)
+    })
+
+  const updateHealthRatingField = <K extends keyof HealthRatingFormState>(field: K, value: HealthRatingFormState[K]) => {
+    setSummaryPreferences(prev => ({
+      ...prev,
+      healthRating: {
+        ...prev.healthRating,
+        [field]: value,
+      },
+    }))
+  }
+
+  const renderHealthGroup = (
+    title: string,
+    subtitle: string,
+    options: Array<{ value: string; label: string; description: string }>,
+    selectedValue: string,
+    onSelect: (value: string) => void,
+  ) => (
+    <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+      <p className="text-sm font-semibold text-gray-200">{title}</p>
+      <p className="text-xs text-gray-400 mb-3">{subtitle}</p>
+      <div className="flex flex-wrap gap-2">
+        {options.map(option => {
+          const active = option.value === selectedValue
+          return (
+            <Button
+              key={option.value}
+              type="button"
+              onClick={() => onSelect(option.value)}
+              color="ghost"
+              size="sm"
+              asMotion={false}
+              className={`min-w-[200px] flex-1 text-left px-4 py-3 rounded-xl border ${
+                active
+                  ? 'bg-primary-500/15 border-primary-500/60 text-white shadow-premium'
+                  : 'bg-white/5 border-white/10 text-gray-300 hover:border-primary-500/40'
+              }`}
+            >
+              <p className="font-semibold">{option.label}</p>
+              <p className="text-xs text-gray-400">{option.description}</p>
+            </Button>
+          )
+        })}
+      </div>
+    </div>
+  )
 
   const updateTargetLength = (value: number) => {
     const clamped = clampTargetLength(value)
@@ -374,6 +637,52 @@ export default function CompanyPage() {
     enabled: !!currentAnalysisId && !authPending && !isLocalAnalysisId,
   })
 
+  const persistAnalysisSnapshot = useCallback(
+    (analysis: any | null, overrideId?: string | null) => {
+      if (!analysis || !company?.id) return
+      const identifier = overrideId ?? analysis.id ?? analysis.analysisId
+      if (!identifier) return
+      const personaSignals = mapPersonaSignals(analysis.investor_persona_summaries)
+      const rawSummary = analysis.summary_md ?? analysis.summaryMd ?? null
+      const healthScore =
+        parseNumericScore(analysis.health_score) ?? parseNumericScore(analysis.healthScore)
+      const generatedAt =
+        analysis.analysis_date ||
+        analysis.analysis_datetime ||
+        analysis.created_at ||
+        analysis.updated_at ||
+        new Date().toISOString()
+
+      DashboardStorage.upsertAnalysisSnapshot({
+        analysisId: String(identifier),
+        generatedAt,
+        id: company.id,
+        name: company.name,
+        ticker: company.ticker,
+        exchange: company.exchange,
+        sector: company.sector,
+        industry: company.industry,
+        country: company.country,
+        healthScore,
+        scoreBand: analysis.score_band ?? analysis.scoreBand ?? null,
+        ratingLabel: scoreToRating(healthScore).label,
+        summaryMd: rawSummary,
+        summaryPreview: buildSummaryPreview(rawSummary),
+        personaSignals,
+        filingId: analysis.primary_filing_id ?? analysis.filing_id ?? analysis.filingId ?? null,
+        filingType: analysis.primary_filing_type ?? analysis.filing_type ?? analysis.filingType ?? null,
+        filingDate:
+          analysis.primary_filing_date ??
+          analysis.filing_date ??
+          analysis.filingDate ??
+          null,
+        source: 'analysis',
+      })
+      emitDashboardSync()
+    },
+    [company],
+  )
+
   // Fetch filings mutation
   const fetchFilingsMutation = useMutation({
     mutationFn: () => filingsApi.fetch(companyId),
@@ -436,6 +745,21 @@ export default function CompanyPage() {
     return latestAnalysis
   }, [currentAnalysis, analysisFromSnapshot, latestAnalysis])
 
+  const handleManualDashboardUpdate = useCallback(() => {
+    const candidate = currentAnalysis ?? latestAnalysis ?? analysisFromSnapshot
+    if (!candidate) {
+      alert('Run or open an analysis before updating the dashboard.')
+      return
+    }
+    const overrideId =
+      (currentAnalysis && currentAnalysis.id) ||
+      (latestAnalysis && latestAnalysis.id) ||
+      currentAnalysisId ||
+      (typeof (candidate as any).analysisId === 'string' ? (candidate as any).analysisId : null)
+    persistAnalysisSnapshot(candidate, overrideId ?? null)
+    alert('Dashboard updated with the latest analysis.')
+  }, [currentAnalysis, latestAnalysis, analysisFromSnapshot, currentAnalysisId, persistAnalysisSnapshot])
+
   useEffect(() => {
     if (!company?.id) return
     DashboardStorage.upsertRecentCompany({
@@ -450,37 +774,15 @@ export default function CompanyPage() {
   }, [company])
 
   useEffect(() => {
-    if (!company?.id || !latestAnalysis?.id) return
-    const personaSignals = latestAnalysis.investor_persona_summaries
-      ? Object.entries(latestAnalysis.investor_persona_summaries).map(([personaId, data]: [string, any]) => ({
-          personaId,
-          personaName: data?.persona_name ?? personaId,
-          stance: data?.stance ?? 'Neutral',
-        }))
-      : undefined
-    const generatedAt =
-      latestAnalysis.analysis_date ||
-      latestAnalysis.created_at ||
-      (latestAnalysis.updated_at ? latestAnalysis.updated_at : new Date().toISOString())
+    if (!latestAnalysis) return
+    persistAnalysisSnapshot(latestAnalysis)
+  }, [latestAnalysis, persistAnalysisSnapshot])
 
-    DashboardStorage.upsertAnalysisSnapshot({
-      analysisId: latestAnalysis.id,
-      generatedAt,
-      id: company.id,
-      name: company.name,
-      ticker: company.ticker,
-      exchange: company.exchange,
-      sector: company.sector,
-      industry: company.industry,
-      country: company.country,
-      healthScore: latestAnalysis.health_score,
-      scoreBand: latestAnalysis.score_band,
-      ratingLabel: scoreToRating(latestAnalysis.health_score).label,
-      summaryMd: latestAnalysis.summary_md,
-      summaryPreview: buildSummaryPreview(latestAnalysis.summary_md),
-      personaSignals,
-    })
-  }, [company, latestAnalysis])
+  useEffect(() => {
+    if (isLocalAnalysisId) return
+    if (!currentAnalysis || !currentAnalysisId) return
+    persistAnalysisSnapshot(currentAnalysis, currentAnalysisId)
+  }, [currentAnalysis, currentAnalysisId, isLocalAnalysisId, persistAnalysisSnapshot])
 
   if (authPending) {
     return (
@@ -642,6 +944,20 @@ export default function CompanyPage() {
                       }
                     >
                       {runAnalysisMutation.isPending ? 'Running Analysis...' : 'Run Analysis'}
+                    </Button>
+                    <Button
+                      onClick={handleManualDashboardUpdate}
+                      disabled={!analysisToDisplay}
+                      color="secondary"
+                      size="md"
+                      className="border border-white/10 text-gray-200 hover:border-primary-500/60 hover:text-white"
+                      leftIcon={
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v6h6M20 20v-6h-6M5 19l5-5M19 5l-5 5" />
+                        </svg>
+                      }
+                    >
+                      Update dashboard
                     </Button>
                   </div>
                   
@@ -842,6 +1158,59 @@ export default function CompanyPage() {
                               </div>
                             </div>
 
+                            <div className="bg-white/5 rounded-xl p-4 border border-primary-500/30 space-y-4">
+                              <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                                <div>
+                                  <p className="text-sm font-semibold text-white">Financial health rating</p>
+                                  <p className="text-xs text-gray-400">
+                                    Let the AI score this filing on a 0–100 scale with configurable weighting, strictness, and output style.
+                                  </p>
+                                </div>
+                                <StatefulButton onClick={handleHealthToggle} className="min-w-[200px]">
+                                  {summaryPreferences.healthRating.enabled ? 'Disable health score' : 'Include health score'}
+                                </StatefulButton>
+                              </div>
+                              {summaryPreferences.healthRating.enabled && (
+                                <div className="space-y-4">
+                                  {renderHealthGroup(
+                                    '1. What type of financial health framework should the AI use?',
+                                    'Determines how the rating is calculated.',
+                                    healthFrameworkOptions,
+                                    summaryPreferences.healthRating.framework,
+                                    (value) => updateHealthRatingField('framework', value as HealthFramework),
+                                  )}
+                                  {renderHealthGroup(
+                                    '2. What should be the primary factor weighting?',
+                                    'Determines which category matters most.',
+                                    healthWeightingOptions,
+                                    summaryPreferences.healthRating.weighting,
+                                    (value) => updateHealthRatingField('weighting', value as HealthWeighting),
+                                  )}
+                                  {renderHealthGroup(
+                                    '3. How strict should the AI be when penalizing risks?',
+                                    'Determines penalty severity.',
+                                    healthRiskOptions,
+                                    summaryPreferences.healthRating.riskTolerance,
+                                    (value) => updateHealthRatingField('riskTolerance', value as HealthRiskTolerance),
+                                  )}
+                                  {renderHealthGroup(
+                                    '4. What analysis depth should the AI use to detect red flags?',
+                                    'Determines how deep the AI digs into the filing.',
+                                    healthAnalysisDepthOptions,
+                                    summaryPreferences.healthRating.analysisDepth,
+                                    (value) => updateHealthRatingField('analysisDepth', value as HealthAnalysisDepth),
+                                  )}
+                                  {renderHealthGroup(
+                                    '5. How should the health rating be displayed?',
+                                    'Determines the output format of the score.',
+                                    healthDisplayOptions,
+                                    summaryPreferences.healthRating.displayStyle,
+                                    (value) => updateHealthRatingField('displayStyle', value as HealthDisplayStyle),
+                                  )}
+                                </div>
+                              )}
+                            </div>
+
                             <div>
                               <div className="flex items-center justify-between mb-2">
                                 <p className="text-sm font-semibold text-gray-300">Target length</p>
@@ -976,6 +1345,11 @@ export default function CompanyPage() {
                                 {meta?.targetLength && (
                                   <span className="px-3 py-1 rounded-full text-xs font-semibold bg-primary-500/10 text-primary-200 border border-primary-500/40">
                                     ~{meta.targetLength} words
+                                  </span>
+                                )}
+                                {meta?.healthRating?.enabled && (
+                                  <span className="px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-200 border border-emerald-400/50">
+                                    Includes health rating
                                   </span>
                                 )}
                               </div>

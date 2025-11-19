@@ -173,6 +173,147 @@ def test_custom_preferences_influence_prompt(monkeypatch):
         local_cache.fallback_filing_summaries.pop(filing_id, None)
 
 
+def test_health_rating_only_appears_when_enabled(monkeypatch):
+    """Health rating instructions are only injected when explicitly enabled."""
+    settings = get_settings()
+    settings.gemini_api_key = "test-key"
+
+    filing_id = "default-health"
+    company_id = "default-health-co"
+
+    local_cache.fallback_filings_by_id[filing_id] = {
+        "id": filing_id,
+        "company_id": company_id,
+        "filing_type": "10-K",
+        "filing_date": "2024-01-31",
+    }
+    local_cache.fallback_companies[company_id] = {
+        "id": company_id,
+        "ticker": "HLTH",
+        "name": "Health Default Inc",
+    }
+    local_cache.fallback_financial_statements[filing_id] = {
+        "filing_id": filing_id,
+        "period_start": "2023-02-01",
+        "period_end": "2024-01-31",
+        "statements": {"income_statement": {"totalRevenue": {"2024-01-31": 1000}}},
+    }
+
+    captured_prompts: list[str] = []
+
+    class DummyModel:
+        def generate_content(self, prompt: str):
+            captured_prompts.append(prompt)
+
+            class Response:
+                text = "health summary\nWORD COUNT: 2"
+
+            return Response()
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.model = DummyModel()
+
+    monkeypatch.setattr(filings_api, "get_gemini_client", lambda: DummyClient())
+
+    client = TestClient(app)
+    response = client.post(f"/api/v1/filings/{filing_id}/summary")
+
+    try:
+        assert response.status_code == 200
+        prompt_text = captured_prompts[-1]
+        assert "Financial Health Rating" not in prompt_text
+
+        local_cache.fallback_filing_summaries.pop(filing_id, None)
+
+        response_with_rating = client.post(
+            f"/api/v1/filings/{filing_id}/summary",
+            json={"mode": "default", "health_rating": {"enabled": True}},
+        )
+        assert response_with_rating.status_code == 200
+        prompt_with_rating = captured_prompts[-1]
+        assert "Financial Health Rating" in prompt_with_rating
+        assert "letter grade" in prompt_with_rating.lower()
+    finally:
+        local_cache.fallback_filings_by_id.pop(filing_id, None)
+        local_cache.fallback_companies.pop(company_id, None)
+        local_cache.fallback_financial_statements.pop(filing_id, None)
+        local_cache.fallback_filing_summaries.pop(filing_id, None)
+
+
+def test_custom_health_rating_configuration(monkeypatch):
+    """Custom requests can opt-in to health scoring with bespoke settings."""
+    settings = get_settings()
+    settings.gemini_api_key = "test-key"
+
+    filing_id = "custom-health"
+    company_id = "custom-health-co"
+
+    local_cache.fallback_filings_by_id[filing_id] = {
+        "id": filing_id,
+        "company_id": company_id,
+        "filing_type": "10-Q",
+        "filing_date": "2024-06-30",
+    }
+    local_cache.fallback_companies[company_id] = {
+        "id": company_id,
+        "ticker": "CSTM",
+        "name": "Health Custom Corp",
+    }
+    local_cache.fallback_financial_statements[filing_id] = {
+        "filing_id": filing_id,
+        "period_start": "2024-04-01",
+        "period_end": "2024-06-30",
+        "statements": {"income_statement": {"totalRevenue": {"2024-06-30": 2000}}},
+    }
+
+    captured_prompts: list[str] = []
+
+    class DummyModel:
+        def generate_content(self, prompt: str):
+            captured_prompts.append(prompt)
+
+            class Response:
+                text = "custom health summary\nWORD COUNT: 3"
+
+            return Response()
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.model = DummyModel()
+
+    monkeypatch.setattr(filings_api, "get_gemini_client", lambda: DummyClient())
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/filings/{filing_id}/summary",
+        json={
+            "mode": "custom",
+            "investor_focus": "Call out stress scenarios.",
+            "health_rating": {
+                "enabled": True,
+                "framework": "financial_resilience",
+                "primary_factor_weighting": "liquidity_near_term_risk",
+                "risk_tolerance": "very_conservative",
+                "analysis_depth": "forensic_deep_dive",
+                "display_style": "score_plus_pillars",
+            },
+        },
+    )
+
+    try:
+        assert response.status_code == 200
+        prompt_text = captured_prompts[0]
+        assert "Financial Resilience" in prompt_text
+        assert "liquidity, leverage, refinancing risk" in prompt_text
+        assert "four-pillar breakdown" in prompt_text or "four-pillar" in prompt_text
+    finally:
+        local_cache.fallback_filings_by_id.pop(filing_id, None)
+        local_cache.fallback_companies.pop(company_id, None)
+        local_cache.fallback_financial_statements.pop(filing_id, None)
+        local_cache.fallback_filing_summaries.pop(filing_id, None)
+
+
 def test_summary_enforces_word_length(monkeypatch):
     """Ensure backend re-prompts LLM until summary length is near requested value."""
     settings = get_settings()

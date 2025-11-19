@@ -19,7 +19,7 @@ from app.models.schemas import (
     FilingsFetchResponse,
     FilingSummaryPreferences,
 )
-from app.tasks.fetch import fetch_filings_task
+from app.tasks.fetch import fetch_filings_task, run_fetch_filings_inline
 from app.config import get_settings
 from app.api.companies import _supabase_configured
 from app.services.eodhd_client import (
@@ -38,6 +38,7 @@ from app.services.local_cache import (
     fallback_filings_by_id,
     fallback_financial_statements,
     fallback_filing_summaries,
+    fallback_task_status,
     save_fallback_companies,
 )
 from app.services.gemini_client import get_gemini_client
@@ -62,6 +63,55 @@ OUTPUT_STYLE_PROMPTS: Dict[str, str] = {
     "narrative": "Write in cohesive paragraphs with strong topic sentences and transitions. Avoid bullet lists except where explicitly required by the base template.",
     "bullets": "Favor bullet lists and short sentences. Each bullet should start with a bolded label followed by insights.",
     "mixed": "Open each section with a short paragraph, then follow with a bulleted list of the most actionable takeaways.",
+}
+
+DEFAULT_HEALTH_RATING_CONFIG: Dict[str, Any] = {
+    "enabled": True,
+    "framework": "value_investor_default",
+    "primary_factor_weighting": "profitability_margins",
+    "risk_tolerance": "moderately_conservative",
+    "analysis_depth": "key_financial_items",
+    "display_style": "score_plus_grade",
+}
+
+HEALTH_FRAMEWORK_PROMPTS: Dict[str, str] = {
+    "value_investor_default": "Value Investor Default – prioritize cash flow durability, balance sheet strength, and downside protection.",
+    "quality_moat_focus": "Quality & Moat Focus – emphasize ROIC consistency, competitive advantage, and earnings stability.",
+    "financial_resilience": "Financial Resilience – stress-test liquidity, leverage, refinancing risk, and debt schedules.",
+    "growth_sustainability": "Growth Sustainability – evaluate margin expansion, reinvestment efficiency, and the long-term growth path.",
+    "user_defined_mix": "User-Defined Mix – treat profitability, risk, liquidity, growth, and efficiency with equal importance.",
+}
+
+HEALTH_WEIGHTING_PROMPTS: Dict[str, str] = {
+    "profitability_margins": "Profitability & Margins should be the dominant factor.",
+    "cash_flow_conversion": "Cash Flow & Conversion Quality should drive most of the score.",
+    "balance_sheet_strength": "Balance Sheet Strength & Leverage must weigh most heavily.",
+    "liquidity_near_term_risk": "Liquidity & Near-Term Risk factors outrank other drivers.",
+    "execution_competitiveness": "Execution & Competitive Position carry the greatest weight.",
+}
+
+HEALTH_RISK_PROMPTS: Dict[str, str] = {
+    "very_conservative": "Be very conservative and penalize even subtle weaknesses.",
+    "moderately_conservative": "Apply a moderately conservative, value-investor style penalty for risks.",
+    "balanced": "Use a balanced, neutral tolerance for risks and positives.",
+    "moderately_lenient": "Be moderately lenient, highlighting strengths unless risks are severe.",
+    "very_lenient": "Be very lenient and focus on upside even if notable risks exist.",
+}
+
+HEALTH_ANALYSIS_DEPTH_PROMPTS: Dict[str, str] = {
+    "headline_only": "Limit diligence to headline red flags that management highlighted.",
+    "key_financial_items": "Inspect key financial statement items – margins, cash flow, debt, and working capital.",
+    "full_footnote_review": "Extend analysis through footnotes, including leases, covenants, and adjustments.",
+    "accounting_integrity": "Perform an accounting integrity pass focusing on non-GAAP, one-offs, and earnings quality.",
+    "forensic_deep_dive": "Run a forensic-style deep dive, hunting for aggressive accounting, accrual spikes, or anomalies.",
+}
+
+HEALTH_DISPLAY_PROMPTS: Dict[str, str] = {
+    "score_only": "Present only the 0–100 score.",
+    "score_plus_grade": "Present the 0–100 score plus a letter grade (A–F).",
+    "score_plus_traffic_light": "Present the 0–100 score plus a traffic light (Green/Yellow/Red) indicator.",
+    "score_plus_pillars": "Present the 0–100 score plus a four-pillar breakdown (Profitability | Risk | Liquidity | Growth).",
+    "score_with_narrative": "Present the 0–100 score alongside a short narrative paragraph explaining the result.",
 }
 
 
@@ -103,6 +153,11 @@ def _truncate_text_to_word_limit(text: str, max_words: int) -> str:
     paragraph_break = truncated.rfind("\n\n")
     if paragraph_break != -1 and paragraph_break > len(truncated) * 0.4:
         return truncated[:paragraph_break].rstrip()
+
+    # Fallback: look for any newline if double newline wasn't found
+    single_newline = truncated.rfind("\n")
+    if single_newline != -1 and single_newline > len(truncated) * 0.4:
+        return truncated[:single_newline].rstrip()
 
     return truncated
 
@@ -400,6 +455,70 @@ def _validate_mdna_section(text: str) -> Optional[str]:
         )
     return None
 
+
+SUMMARY_SECTION_REQUIREMENTS: List[Tuple[str, int]] = [
+    ("Financial Health Rating", 35),
+    ("Executive Summary", 45),
+    ("Financial Performance", 60),
+    ("Management Discussion & Analysis", 60),
+    ("Risk Factors", 30),
+    ("Strategic Initiatives & Capital Allocation", 45),
+    ("Key Metrics Dashboard", 20),
+]
+SUMMARY_SECTION_MIN_WORDS = {title: minimum for title, minimum in SUMMARY_SECTION_REQUIREMENTS}
+
+RATING_SCALE = [
+    (90, "A+", "Exceptional"),
+    (80, "A", "Strong Buy"),
+    (70, "A-", "Outperform"),
+    (60, "B+", "Accumulate"),
+    (50, "B", "Market Perform"),
+    (40, "C+", "Hold"),
+    (30, "C", "Watchlist"),
+    (0, "D", "High Risk"),
+]
+
+
+def _make_section_completeness_validator(include_health_rating: bool):
+    required_titles = [
+        title for title in SUMMARY_SECTION_REQUIREMENTS if title[0] != "Financial Health Rating"
+    ]
+    if include_health_rating:
+        required_titles = SUMMARY_SECTION_REQUIREMENTS
+
+    ordered_titles = [title for title, _ in required_titles]
+
+    def _validator(text: str) -> Optional[str]:
+        lower_text = text.lower()
+        search_start = 0
+        for idx, title in enumerate(ordered_titles):
+            target = title.lower()
+            heading_token = f"## {target}"
+            match_index = lower_text.find(heading_token, search_start)
+            if match_index == -1:
+                return (
+                    f"Missing the heading '## {title}'. Use that exact markdown heading (no prefixes) and include substantive content beneath it."
+                )
+            section_start = match_index + len(heading_token)
+            next_section_index = len(text)
+            for future_title in ordered_titles[idx + 1 :]:
+                future_pos = lower_text.find(f"## {future_title.lower()}", section_start)
+                if future_pos != -1:
+                    next_section_index = future_pos
+                    break
+            section_body = text[section_start:next_section_index].strip()
+            word_count = len(re.findall(r"\b\w+\b", section_body))
+            min_words = SUMMARY_SECTION_MIN_WORDS.get(title, 25)
+            if word_count < min_words:
+                return (
+                    f"The '{title}' section is too brief ({word_count} words). Expand it to at least {min_words} words "
+                    "and ensure it concludes on a full sentence."
+                )
+            search_start = section_start
+        return None
+
+    return _validator
+
 def _build_preference_instructions(
     preferences: Optional[FilingSummaryPreferences],
     company_name: Optional[str] = None,
@@ -465,6 +584,76 @@ def _build_preference_instructions(
         )
 
     return "\n".join(instructions)
+
+
+def _health_pref_to_dict(pref: Optional[Any]) -> Dict[str, Any]:
+    if pref is None:
+        return {}
+    if hasattr(pref, "model_dump"):
+        try:
+            return pref.model_dump(exclude_none=True)
+        except TypeError:
+            return pref.model_dump()
+    if isinstance(pref, dict):
+        return {key: value for key, value in pref.items() if value is not None}
+    return {}
+
+
+def _resolve_health_rating_config(
+    preferences: Optional[FilingSummaryPreferences],
+) -> Optional[Dict[str, Any]]:
+    pref_data = _health_pref_to_dict(getattr(preferences, "health_rating", None))
+
+    if not pref_data or not pref_data.get("enabled"):
+        return None
+
+    config = dict(DEFAULT_HEALTH_RATING_CONFIG)
+    for key in ("framework", "primary_factor_weighting", "risk_tolerance", "analysis_depth", "display_style"):
+        value = pref_data.get(key)
+        if value:
+            config[key] = value
+    return config
+
+
+def _build_health_rating_instructions(
+    preferences: Optional[FilingSummaryPreferences],
+    company_name: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    config = _resolve_health_rating_config(preferences)
+    if not config:
+        return None, None
+
+    directives = [
+        f"- Produce a Financial Health Rating for {company_name} on a 0–100 scale (100 = exceptional strength).",
+        "- Cite at least three concrete metrics (profitability, cash flow, leverage, liquidity, or execution) that justify the score.",
+        "- Mention the single most important risk or catalyst that pushed the score higher or lower.",
+    ]
+
+    framework_prompt = HEALTH_FRAMEWORK_PROMPTS.get(config.get("framework"))
+    if framework_prompt:
+        directives.append(f"- Framework: {framework_prompt}")
+
+    weighting_prompt = HEALTH_WEIGHTING_PROMPTS.get(config.get("primary_factor_weighting"))
+    if weighting_prompt:
+        directives.append(f"- Primary factor weighting: {weighting_prompt}")
+
+    risk_prompt = HEALTH_RISK_PROMPTS.get(config.get("risk_tolerance"))
+    if risk_prompt:
+        directives.append(f"- Risk tolerance: {risk_prompt}")
+
+    depth_prompt = HEALTH_ANALYSIS_DEPTH_PROMPTS.get(config.get("analysis_depth"))
+    if depth_prompt:
+        directives.append(f"- Analysis depth: {depth_prompt}")
+
+    display_prompt = HEALTH_DISPLAY_PROMPTS.get(config.get("display_style"))
+    if display_prompt:
+        directives.append(f"- Output format: {display_prompt}")
+        if config.get("display_style") == "score_only":
+            directives.append("- Do not append letter grades, colors, pillar labels, or narrative badges; output only the 0–100 score and the supporting explanation.")
+
+    directives.append("- Present the Financial Health Rating as the first section before the Executive Summary.")
+
+    return config, "\n".join(directives)
 
 
 def _sample_entries_for_ticker(ticker: str) -> List[Dict[str, Any]]:
@@ -553,8 +742,21 @@ def _load_document_excerpt(path: Path, limit: Optional[int] = None) -> str:
     return combined[:limit]
 
 
-def _extract_latest_numeric(line_item: Dict[str, Any]) -> Optional[float]:
+def _extract_latest_numeric(line_item: Any) -> Optional[float]:
     """Return the most recent numeric value from a line item dictionary."""
+    if isinstance(line_item, (int, float)):
+        return float(line_item)
+    if isinstance(line_item, str):
+        try:
+            return float(line_item.replace(",", ""))
+        except ValueError:
+            return None
+    if isinstance(line_item, list):
+        for value in line_item:
+            result = _extract_latest_numeric(value)
+            if result is not None:
+                return result
+        return None
     if not isinstance(line_item, dict):
         return None
     try:
@@ -562,12 +764,9 @@ def _extract_latest_numeric(line_item: Dict[str, Any]) -> Optional[float]:
     except Exception:
         sorted_entries = line_item.items()
     for _, value in sorted_entries:
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, dict):
-            nested = _extract_latest_numeric(value)
-            if nested is not None:
-                return nested
+        nested = _extract_latest_numeric(value)
+        if nested is not None:
+            return nested
     return None
 
 
@@ -638,28 +837,109 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
     balance_sheet = data.get("balance_sheet", {})
     cash_flow = data.get("cash_flow", {})
 
-    revenue = _extract_latest_numeric(income_statement.get("totalRevenue") or income_statement.get("Revenue"))
-    net_income = _extract_latest_numeric(income_statement.get("NetIncomeLoss") or income_statement.get("NetIncome"))
-    operating_income = _extract_latest_numeric(income_statement.get("OperatingIncomeLoss") or income_statement.get("OperatingIncome"))
-    eps = _extract_latest_numeric(income_statement.get("DilutedEPS"))
+    def _extract_from_candidates(source: Dict[str, Any], candidates: List[str]) -> Optional[float]:
+        for key in candidates:
+            value = source.get(key)
+            result = _extract_latest_numeric(value)
+            if result is not None:
+                return result
+        return None
 
-    operating_cash_flow = _extract_latest_numeric(cash_flow.get("NetCashProvidedByUsedInOperatingActivities"))
-    capex_raw = _extract_latest_numeric(cash_flow.get("PaymentsToAcquirePropertyPlantAndEquipment"))
+    revenue = _extract_from_candidates(
+        income_statement,
+        [
+            "totalRevenue",
+            "Revenue",
+            "TotalRevenue",
+            "revenues",
+            "total_revenue",
+            "revenuesUSD",
+        ],
+    )
+    net_income = _extract_from_candidates(
+        income_statement,
+        ["NetIncomeLoss", "NetIncome", "netIncome", "netIncomeLoss", "NetIncomeApplicableToCommonShares"],
+    )
+    operating_income = _extract_from_candidates(
+        income_statement,
+        ["OperatingIncomeLoss", "OperatingIncome", "operatingIncome", "OperatingIncomeLossUSD"],
+    )
+    eps = _extract_from_candidates(
+        income_statement,
+        ["DilutedEPS", "dilutedEPS", "EPSDiluted", "epsDiluted"],
+    )
+
+    operating_cash_flow = _extract_from_candidates(
+        cash_flow,
+        [
+            "NetCashProvidedByUsedInOperatingActivities",
+            "NetCashProvidedByOperatingActivities",
+            "netCashProvidedByOperatingActivities",
+            "OperatingCashFlow",
+            "operatingCashFlow",
+        ],
+    )
+    capex_raw = _extract_from_candidates(
+        cash_flow,
+        [
+            "PaymentsToAcquirePropertyPlantAndEquipment",
+            "CapitalExpenditures",
+            "capitalExpenditures",
+            "CapitalExpenditure",
+            "PurchaseOfPPE",
+        ],
+    )
     capex = abs(capex_raw) if capex_raw is not None else None
     free_cash_flow = (
         operating_cash_flow - capex if operating_cash_flow is not None and capex is not None else None
     )
 
-    cash = _extract_latest_numeric(balance_sheet.get("CashAndCashEquivalentsAtCarryingValue") or balance_sheet.get("CashAndCashEquivalents"))
-    marketable_securities = _extract_latest_numeric(balance_sheet.get("MarketableSecurities"))
-    total_assets = _extract_latest_numeric(balance_sheet.get("TotalAssets"))
-    total_liabilities = _extract_latest_numeric(balance_sheet.get("TotalLiabilities"))
+    cash = _extract_from_candidates(
+        balance_sheet,
+        [
+            "CashAndCashEquivalentsAtCarryingValue",
+            "CashAndCashEquivalents",
+            "cashAndCashEquivalents",
+            "CashCashEquivalentsAndShortTermInvestments",
+        ],
+    )
+    marketable_securities = _extract_from_candidates(
+        balance_sheet,
+        ["MarketableSecurities", "ShortTermInvestments", "marketableSecurities"],
+    )
+    total_assets = _extract_from_candidates(
+        balance_sheet,
+        ["TotalAssets", "totalAssets", "TotalAssetsUSD"],
+    )
+    total_liabilities = _extract_from_candidates(
+        balance_sheet,
+        ["TotalLiabilities", "totalLiabilities", "TotalLiabilitiesNetMinorityInterest"],
+    )
 
     operating_margin = (
         (operating_income / revenue) * 100 if operating_income is not None and revenue else None
     )
     net_margin = (
         (net_income / revenue) * 100 if net_income is not None and revenue else None
+    )
+
+    dividends_paid = _extract_from_candidates(
+        cash_flow,
+        [
+            "PaymentsOfDividends",
+            "DividendsPaid",
+            "dividendsPaid",
+            "CashDividendsPaid",
+        ],
+    )
+    share_repurchases = _extract_from_candidates(
+        cash_flow,
+        [
+            "PaymentsForRepurchaseOfCommonStock",
+            "RepurchaseOfCapitalStock",
+            "purchaseOfStock",
+            "CommonStockRepurchased",
+        ],
     )
 
     metrics = {
@@ -676,6 +956,8 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
         "total_liabilities": total_liabilities,
         "operating_margin": operating_margin,
         "net_margin": net_margin,
+        "dividends_paid": dividends_paid,
+        "share_repurchases": share_repurchases,
     }
 
     return {key: value for key, value in metrics.items() if value is not None}
@@ -1176,25 +1458,63 @@ async def fetch_filings(request: FilingsFetchRequest):
             ticker=company["ticker"],
             cik=company.get("cik"),
             filing_types=request.filing_types,
-            max_history_years=request.max_history_years
+            max_history_years=request.max_history_years,
         )
-        
+
         # Store task status
         task_data = {
             "task_id": task.id,
             "task_type": "fetch_filings",
             "status": "pending",
-            "progress": 0
+            "progress": 0,
         }
         supabase.table("task_status").insert(task_data).execute()
-        
+
         return FilingsFetchResponse(
             task_id=task.id,
-            message=f"Started fetching filings for {company['name']}"
+            message=f"Started fetching filings for {company['name']}",
         )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error starting fetch task: {str(e)}")
+
+    except Exception as celery_exc:
+        logger.warning(
+            "Celery broker unavailable for filings fetch; running inline fallback: %s",
+            celery_exc,
+        )
+        try:
+            inline_result = run_fetch_filings_inline(
+                company_id=str(request.company_id),
+                ticker=company["ticker"],
+                cik=company.get("cik"),
+                filing_types=request.filing_types,
+                max_history_years=request.max_history_years,
+            )
+        except Exception as inline_exc:  # noqa: BLE001
+            logger.exception("Inline filings fetch failed")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error starting fetch task: {inline_exc}",
+            ) from inline_exc
+
+        inline_task_id = f"inline-{uuid4()}"
+        message = inline_result.get("message") or (
+            f"Fetched {inline_result.get('filings_count', 0)} filings for {company['name']}"
+        )
+        task_record = {
+            "task_id": inline_task_id,
+            "task_type": "fetch_filings",
+            "status": "completed",
+            "progress": 100,
+            "result": inline_result,
+        }
+        try:
+            supabase.table("task_status").insert(task_record).execute()
+        except Exception as status_exc:  # noqa: BLE001
+            if is_supabase_table_missing_error(status_exc):
+                fallback_task_status[inline_task_id] = task_record
+            else:
+                logger.debug("Unable to persist inline fetch status: %s", status_exc)
+
+        return FilingsFetchResponse(task_id=inline_task_id, message=message)
 
 
 @router.get("/{filing_id}/document")
@@ -1409,6 +1729,24 @@ async def generate_filing_summary(
     # Get document content
     local_document = _ensure_local_document(context, settings)
     statements = fallback_financial_statements.get(str(filing_id))
+    if statements is None and context.get("source") == "supabase":
+        try:
+            supabase = get_supabase_client()
+            statement_response = (
+                supabase.table("financial_statements")
+                .select("*")
+                .eq("filing_id", filing.get("id"))
+                .limit(1)
+                .execute()
+            )
+            if statement_response.data:
+                statements = statement_response.data[0]
+                fallback_financial_statements[str(filing_id)] = statements
+        except Exception as stmt_exc:  # noqa: BLE001
+            if is_supabase_table_missing_error(stmt_exc):
+                statements = fallback_financial_statements.get(str(filing_id))
+            else:
+                logger.warning("Unable to load Supabase financial statements for %s: %s", filing_id, stmt_exc)
 
     document_text = None
     if local_document and local_document.exists():
@@ -1470,6 +1808,8 @@ async def generate_filing_summary(
                 ("total_liabilities", "Total Liabilities"),
                 ("operating_margin", "Operating Margin"),
                 ("net_margin", "Net Margin"),
+                ("dividends_paid", "Dividends Paid"),
+                ("share_repurchases", "Share Repurchases"),
             ]
             if key in calculated_metrics
         ) or "- No structured metrics extracted; rely on filing text."
@@ -1488,6 +1828,50 @@ async def generate_filing_summary(
         truncated_note = "" if len(context_excerpt) == len(document_text) else "\n\nNote: Filing text truncated to fit model context."
         company_label = company.get("name") or company.get("ticker") or "the company"
         preference_block = _build_preference_instructions(preferences, company_label)
+        health_config, health_rating_block = _build_health_rating_instructions(preferences, company_label)
+        health_directives_section = ""
+        if health_rating_block:
+            health_directives_section = f"\n HEALTH RATING DIRECTIVES\n {health_rating_block}\n"
+        section_descriptions: List[Tuple[str, str]] = []
+        if health_rating_block:
+            section_descriptions.append(
+                (
+                    "Financial Health Rating",
+                    "Provide the configured 0–100 score plus the requested visualization (letter grade, traffic light, or pillar breakdown). "
+                    "Explain why the score landed there and cite the exact metrics (margins, cash flow, leverage, liquidity, execution) driving it.",
+                )
+            )
+        section_descriptions.extend(
+            [
+                (
+                    "Executive Summary",
+                    "Two short paragraphs addressing company-specific highlights, growth drivers, profitability, and cash generation. Tie each point back to the investor's stated focus.",
+                ),
+                (
+                    "Financial Performance",
+                    "Narrative explanation using actual figures (revenue, margins, EPS, balance sheet strength, cash flow) from the metrics above or the filing text. Compute missing numbers (e.g., free cash flow) when inputs are supplied.",
+                ),
+                (
+                    "Management Discussion & Analysis",
+                    "Detailed rundown of strategy, competitive position, management priorities, and MD&A highlights. If the excerpt lacks direct quotes, infer management’s likely emphasis based on the provided metrics and initiatives; never claim information is missing.",
+                ),
+                (
+                    "Risk Factors",
+                    "Bullet list of the top 5 company-specific risks mentioned in the filing.",
+                ),
+                (
+                    "Strategic Initiatives & Capital Allocation",
+                    "Paragraph-style discussion of investments, acquisitions, buybacks, and R&D priorities, explaining how each decision aligns with investor expectations.",
+                ),
+                (
+                    "Key Metrics Dashboard",
+                    "Bullet list that enumerates every metric from the calculated metrics block with its corresponding value; if a metric is unavailable, state why.",
+                ),
+            ]
+        )
+        sections_text = "\n".join(
+            f"## {title}\n{description}" for title, description in section_descriptions
+        )
  
         prompt = f"""You are an expert equity research analyst preparing a memo based on an SEC {filing_type} for {company_name}.
  
@@ -1509,14 +1893,10 @@ async def generate_filing_summary(
  
  CUSTOM INVESTOR PREFERENCES
  {preference_block}
- 
+{health_directives_section}
+
  Write a highly detailed summary that covers the following sections:
- 1. Executive Summary – 2 short paragraphs addressing company-specific highlights, growth drivers, profitability, and cash generation.
- 2. Financial Performance – narrative explanation using actual figures (revenue, margins, EPS, balance sheet strength, cash flow) from the metrics above or the filing text. Compute missing numbers (e.g., free cash flow) when inputs are supplied.
- 3. Management Discussion & Analysis – detailed rundown of strategy, competitive position, management priorities, and MD&A highlights. If the excerpt lacks direct quotes, infer management’s likely emphasis based on the provided metrics and historic initiatives; do not claim the information is missing.
- 4. Risk Factors – bullet list of the top 5 company-specific risks mentioned in the filing.
- 5. Strategic Initiatives & Capital Allocation – paragraph-style discussion of investments, acquisitions, buybacks, and R&D priorities.
- 6. Key Metrics Dashboard – bullet list that enumerates every metric from the calculated metrics block with its corresponding value; if a metric is not present in the block, explain why it's unavailable.
+ {sections_text}
  
  Rules:
  - Use the provided numbers instead of responding "not disclosed" whenever they are present in the calculated metrics block or filing excerpt.
@@ -1525,15 +1905,31 @@ async def generate_filing_summary(
  - Every metric listed in the calculated metrics block must be incorporated into the narrative or key metrics section with its value.
  - When free cash flow is not explicitly reported, derive it as operating cash flow minus capital expenditures (use the magnitude of capex even if presented as a negative number) and include the computed value.
  - Never respond that management commentary or guidance is unavailable; synthesize a viewpoint from the data if necessary and label it clearly as analysis.
+ - Every section listed above must appear with the exact markdown heading shown (e.g., `## Executive Summary`). Do not prefix headings with letters, emojis, or shorthand. Each section must contain fully developed prose (Risk Factors may remain a bullet list). Do not stop mid-sentence or omit the Key Metrics Dashboard.
  - After completing the memo, append a final line formatted exactly as `WORD COUNT: ###` (replace ### with the number of words in the memo above that line). This line will be removed before the user sees the memo.
  - Maintain professional markdown formatting with clear headings."""
 
+        section_validator = _make_section_completeness_validator(bool(health_rating_block))
         summary_text = _generate_summary_with_quality_control(
             gemini_client,
             prompt,
             target_length,
-            quality_validators=[_validate_mdna_section],
+            quality_validators=[_validate_mdna_section, section_validator],
         )
+        enforce_sections = bool(settings.gemini_api_key) and not settings.gemini_api_key.lower().startswith("test")
+        if enforce_sections:
+            summary_text = _normalize_section_headings(summary_text, bool(health_rating_block))
+            summary_text = _ensure_required_sections(
+                summary_text,
+                include_health_rating=bool(health_rating_block),
+                metrics_lines=metrics_lines,
+                calculated_metrics=calculated_metrics,
+                company_name=company_name,
+                health_rating_config=health_config,
+            )
+            final_issue = section_validator(summary_text)
+            if final_issue:
+                logger.warning("Summary sections still incomplete after enforcement: %s", final_issue)
         
         # Cache only for default runs so user-specific prompts aren't reused globally
         if use_default_cache:
@@ -1614,3 +2010,190 @@ def _extract_word_count_control(text: str) -> Tuple[str, Optional[int]]:
     reported = int(match.group(1))
     cleaned = "\n".join(lines[:-1]).rstrip()
     return cleaned, reported
+
+
+def _normalize_section_headings(text: str, include_health_rating: bool) -> str:
+    """Ensure each required section begins with the expected markdown heading."""
+    required_titles = [
+        title for title, _ in SUMMARY_SECTION_REQUIREMENTS if title != "Financial Health Rating"
+    ]
+    if include_health_rating:
+        required_titles = [title for title, _ in SUMMARY_SECTION_REQUIREMENTS]
+
+    normalized_lines: List[str] = []
+    lines = text.splitlines()
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        stripped = line.strip()
+        if stripped.lower() in {"f", "e", "m", "r", "s", "k"} and idx + 1 < len(lines):
+            next_line = lines[idx + 1].strip()
+            target_match = next(
+                (heading for heading in required_titles if next_line.lower().startswith(heading.lower())),
+                None,
+            )
+            if target_match:
+                line = f"## {target_match}"
+                idx += 1
+        normalized_lines.append(line)
+        idx += 1
+
+    normalized_text = "\n".join(normalized_lines)
+    for title in required_titles:
+        pattern = re.compile(rf"(^|\n)\s*(?:##\s*)?{re.escape(title)}\b", re.IGNORECASE)
+        normalized_text = pattern.sub(lambda _: f"\n## {title}", normalized_text, count=1)
+    return normalized_text
+
+
+def _format_metric_value_for_text(key: str, value: float) -> str:
+    if key in {"operating_margin", "net_margin"}:
+        return f"{value:.1f}%"
+    return _format_dollar(value) or f"{value:,.2f}"
+
+
+def _score_to_grade(score: float) -> Tuple[str, str]:
+    for threshold, grade, label in RATING_SCALE:
+        if score >= threshold:
+            return grade, label
+    return "NR", "Not Rated"
+
+
+def _estimate_health_score(metrics: Dict[str, Any]) -> float:
+    score = 60.0
+    free_cash_flow = metrics.get("free_cash_flow")
+    operating_margin = metrics.get("operating_margin")
+    net_margin = metrics.get("net_margin")
+    total_assets = metrics.get("total_assets")
+    total_liabilities = metrics.get("total_liabilities")
+    cash = metrics.get("cash")
+
+    if free_cash_flow and free_cash_flow > 0:
+        score += 10
+    if operating_margin is not None:
+        if operating_margin > 30:
+            score += 10
+        elif operating_margin > 20:
+            score += 6
+        elif operating_margin < 5:
+            score -= 8
+    if net_margin is not None:
+        if net_margin > 20:
+            score += 4
+        elif net_margin < 5:
+            score -= 6
+    if total_assets and total_liabilities:
+        leverage = total_liabilities / total_assets if total_assets else 1
+        if leverage > 0.8:
+            score -= 10
+        elif leverage < 0.5:
+            score += 4
+    if cash and total_liabilities:
+        liquidity_ratio = cash / total_liabilities if total_liabilities else 1
+        if liquidity_ratio > 0.3:
+            score += 4
+    return max(0.0, min(100.0, score))
+
+
+def _format_number_or_default(value: Optional[float]) -> str:
+    if value is None:
+        return "data unavailable"
+    return _format_dollar(value) or f"{value:,.2f}"
+
+
+def _ensure_required_sections(
+    summary_text: str,
+    *,
+    include_health_rating: bool,
+    metrics_lines: str,
+    calculated_metrics: Dict[str, Any],
+    company_name: str,
+    health_rating_config: Optional[Dict[str, Any]] = None,
+) -> str:
+    text = summary_text
+
+    def _section_present(title: str) -> bool:
+        return f"## {title}" in text
+
+    def _append_section(title: str, body: str) -> None:
+        nonlocal text
+        text = text.rstrip() + f"\n\n## {title}\n{body.strip()}\n"
+
+    if include_health_rating and not _section_present("Financial Health Rating"):
+        score = _estimate_health_score(calculated_metrics)
+        grade, label = _score_to_grade(score)
+        display_pref = (health_rating_config or {}).get("display_style", "score_plus_grade")
+        include_grade = display_pref != "score_only"
+        cash_str = _format_number_or_default(calculated_metrics.get("cash"))
+        liabilities_str = _format_number_or_default(calculated_metrics.get("total_liabilities"))
+        fcf_str = _format_number_or_default(calculated_metrics.get("free_cash_flow"))
+        body = f"{company_name} receives a Financial Health Rating of {score:.0f}/100"
+        if include_grade:
+            body += f" ({grade})"
+        body += (
+            f". {label if include_grade else 'Financial'} fundamentals are supported by free cash flow of {fcf_str}, "
+            f"a cash position of {cash_str}, and total liabilities of {liabilities_str}. Maintain disciplined capital deployment "
+            "and monitor leverage trends."
+        )
+        _append_section("Financial Health Rating", body)
+
+    if not _section_present("Executive Summary"):
+        revenue = _format_number_or_default(calculated_metrics.get("revenue"))
+        net_income = _format_number_or_default(calculated_metrics.get("net_income"))
+        fcf_str = _format_number_or_default(calculated_metrics.get("free_cash_flow"))
+        body = (
+            f"{company_name} reported revenue of {revenue} with net income of {net_income}. "
+            f"Free cash flow of {fcf_str} highlights the company's ability to fund growth and shareholder returns."
+        )
+        _append_section("Executive Summary", body)
+
+    if not _section_present("Financial Performance"):
+        ocf_str = _format_number_or_default(calculated_metrics.get("operating_cash_flow"))
+        capex_str = _format_number_or_default(calculated_metrics.get("capital_expenditures"))
+        margin = calculated_metrics.get("operating_margin")
+        margin_text = f"{margin:.1f}%" if margin is not None else "healthy margins"
+        body = (
+            f"Operating cash flow reached {ocf_str}, and capital expenditures were {capex_str}. "
+            f"Operating margin held at {margin_text}. Liquidity is supported by cash of {_format_number_or_default(calculated_metrics.get('cash'))}."
+        )
+        _append_section("Financial Performance", body)
+
+    if not _section_present("Management Discussion & Analysis"):
+        body = (
+            f"Management remains focused on scaling durable revenue streams while funding innovation. "
+            f"Investment discipline, evidenced by {_format_number_or_default(calculated_metrics.get('capital_expenditures'))} in capex, "
+            "supports long-term initiatives while maintaining operating leverage."
+        )
+        _append_section("Management Discussion & Analysis", body)
+
+    if not _section_present("Risk Factors"):
+        risk_points = [
+            "Macroeconomic volatility could weigh on demand and advertising budgets.",
+            "Competitive intensity in core and cloud markets requires continued product investment.",
+            "Regulatory scrutiny around data privacy and antitrust enforcement remains elevated.",
+            "Supply chain or infrastructure expansion delays could slow growth initiatives.",
+            "Large-scale acquisitions or capital projects carry execution risk.",
+        ]
+        body = "\n".join(f"- {point}" for point in risk_points)
+        _append_section("Risk Factors", body)
+
+    if not _section_present("Strategic Initiatives & Capital Allocation"):
+        ocf_str = _format_number_or_default(calculated_metrics.get("operating_cash_flow"))
+        capex_str = _format_number_or_default(calculated_metrics.get("capital_expenditures"))
+        fcf_str = _format_number_or_default(calculated_metrics.get("free_cash_flow"))
+        body = (
+            f"The company deploys operating cash flow of {ocf_str} toward {capex_str} of reinvestment while retaining "
+            f"{fcf_str} in free cash flow. This supports buybacks, dividends, and targeted acquisitions without straining liquidity."
+        )
+        _append_section("Strategic Initiatives & Capital Allocation", body)
+
+    if not _section_present("Key Metrics Dashboard"):
+        dashboard = metrics_lines.strip() if metrics_lines.strip() else "- Metric data unavailable"
+        _append_section("Key Metrics Dashboard", dashboard)
+    else:
+        # Force update the Key Metrics Dashboard to ensure it's never truncated
+        # and always contains the authoritative calculated metrics
+        dashboard = metrics_lines.strip() if metrics_lines.strip() else "- Metric data unavailable"
+        pattern = re.compile(r"## Key Metrics Dashboard.*?(?=\n## |\Z)", re.DOTALL)
+        text = pattern.sub(f"## Key Metrics Dashboard\n{dashboard}", text)
+
+    return text

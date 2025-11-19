@@ -1,7 +1,9 @@
 """Companies API endpoints."""
+import requests
 from datetime import datetime
 from uuid import uuid4
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from typing import List
 
 from app.models.database import get_supabase_client
@@ -60,6 +62,40 @@ async def _hydrate_company_from_ticker(company_id: str, ticker: str) -> Company:
     return fallback_company
 
 router = APIRouter()
+
+
+@router.get("/logo/{ticker}")
+def get_company_logo(ticker: str, exchange: str = "US"):
+    """Proxy for EODHD company logo."""
+    settings = get_settings()
+    api_key = settings.eodhd_api_key
+    
+    if not api_key:
+        raise HTTPException(status_code=500, detail="EODHD API key not configured")
+    
+    # Clean ticker input
+    clean_ticker = ticker.strip().upper()
+    clean_exchange = exchange.strip().upper()
+    
+    url = f"https://eodhd.com/api/logo/{clean_ticker}.{clean_exchange}"
+    params = {"api_token": api_key}
+    
+    try:
+        # Stream the response
+        r = requests.get(url, params=params, stream=True, timeout=10)
+        if r.status_code != 200:
+            # If logo not found, return 404
+            raise HTTPException(status_code=r.status_code, detail="Logo not found")
+            
+        return StreamingResponse(
+            r.iter_content(chunk_size=8192), 
+            media_type=r.headers.get("content-type", "image/png"),
+            headers={"Cache-Control": "public, max-age=86400"}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching logo: {str(e)}")
 
 
 @router.post("/lookup", response_model=CompanyLookupResponse)

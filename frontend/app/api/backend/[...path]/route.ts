@@ -1,11 +1,26 @@
 import { NextRequest, NextResponse } from 'next/server'
 
+const DEFAULT_BACKEND_URL = 'http://127.0.0.1:8000'
 const BACKEND_BASE_URL =
   process.env.BACKEND_API_URL ||
   process.env.NEXT_PUBLIC_API_URL ||
-  'http://localhost:8000'
+  DEFAULT_BACKEND_URL
 
-const normalizeBaseUrl = (value: string) => value.replace(/\/+$/, '')
+const normalizeBaseUrl = (rawValue: string) => {
+  const value = rawValue.trim()
+  if (!value) return DEFAULT_BACKEND_URL
+
+  try {
+    const parsed = new URL(value)
+    if (parsed.hostname === 'localhost') {
+      parsed.hostname = '127.0.0.1'
+    }
+    const normalizedPath = parsed.pathname.replace(/\/+$/, '')
+    return `${parsed.protocol}//${parsed.host}${normalizedPath}`.replace(/\/+$/, '')
+  } catch {
+    return value.replace(/\/+$/, '')
+  }
+}
 const HOP_BY_HOP_HEADERS = [
   'connection',
   'keep-alive',
