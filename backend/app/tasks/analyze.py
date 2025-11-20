@@ -16,7 +16,9 @@ def analyze_company_task(
     analysis_id: str,
     company_id: str,
     filing_ids: List[str],
-    include_personas: Optional[List[str]] = None
+    include_personas: Optional[List[str]] = None,
+    target_length: Optional[int] = None,
+    complexity: str = "intermediate"
 ):
     """
     Background task to analyze a company.
@@ -27,6 +29,8 @@ def analyze_company_task(
         company_id: Company UUID
         filing_ids: List of filing UUIDs to analyze
         include_personas: Optional list of persona IDs to generate
+        target_length: Optional target length for the summary
+        complexity: Complexity level of the summary
     """
     supabase = get_supabase_client()
     
@@ -130,7 +134,9 @@ def analyze_company_task(
             ratios=ratios,
             health_score=health_score_data["overall_score"],
             mda_text=mda_text,
-            risk_factors_text=risk_factors_text
+            risk_factors_text=risk_factors_text,
+            target_length=target_length,
+            complexity=complexity
         )
         
         # Combine summary sections into markdown

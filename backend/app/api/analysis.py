@@ -100,14 +100,21 @@ async def run_analysis(request: AnalysisRunRequest):
     # Start analysis task
     try:
         include_personas = None
+        target_length = None
+        complexity = "intermediate"
+        
         if request.analysis_options:
             include_personas = request.analysis_options.get("include_personas")
+            target_length = request.analysis_options.get("target_length")
+            complexity = request.analysis_options.get("complexity", "intermediate")
         
         task = analyze_company_task.delay(
             analysis_id=analysis_id,
             company_id=str(request.company_id),
             filing_ids=[str(fid) for fid in filing_ids],
-            include_personas=include_personas
+            include_personas=include_personas,
+            target_length=target_length,
+            complexity=complexity
         )
         
         # Store task status
@@ -242,6 +249,11 @@ async def get_task_status(task_id: str):
 @router.delete("/{analysis_id}", status_code=204)
 async def delete_analysis(analysis_id: str):
     """Delete an analysis."""
+    # If it's a client-side summary ID or not a UUID, just return success
+    # as it doesn't exist in the backend analyses table.
+    if analysis_id.startswith("summary-"):
+        return None
+
     settings = get_settings()
 
     if not _supabase_configured(settings):
@@ -259,6 +271,10 @@ async def delete_analysis(analysis_id: str):
     try:
         supabase.table("analyses").delete().eq("id", analysis_id).execute()
     except Exception as e:
+        # Ignore invalid input syntax for UUID errors, as it means the ID doesn't exist
+        if "invalid input syntax for type uuid" in str(e):
+            return None
+            
         if is_supabase_table_missing_error(e):
             return None
         raise HTTPException(status_code=500, detail=f"Error deleting analysis: {str(e)}")

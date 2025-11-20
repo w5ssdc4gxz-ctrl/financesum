@@ -25,7 +25,9 @@ class GeminiClient:
         ratios: Dict[str, float],
         health_score: float,
         mda_text: Optional[str] = None,
-        risk_factors_text: Optional[str] = None
+        risk_factors_text: Optional[str] = None,
+        target_length: Optional[int] = None,
+        complexity: str = "intermediate"
     ) -> Dict[str, str]:
         """
         Generate comprehensive company analysis summary.
@@ -37,6 +39,8 @@ class GeminiClient:
             health_score: Composite health score
             mda_text: MD&A section text
             risk_factors_text: Risk factors text
+            target_length: Optional target length for the summary
+            complexity: Complexity level of the summary
         
         Returns:
             Dictionary with summary components
@@ -47,7 +51,9 @@ class GeminiClient:
             ratios,
             health_score,
             mda_text,
-            risk_factors_text
+            risk_factors_text,
+            target_length,
+            complexity
         )
         
         try:
@@ -74,7 +80,9 @@ class GeminiClient:
         ratios: Dict[str, float],
         health_score: float,
         mda_text: Optional[str],
-        risk_factors_text: Optional[str]
+        risk_factors_text: Optional[str],
+        target_length: Optional[int] = None,
+        complexity: str = "intermediate"
     ) -> str:
         """Build the prompt for company summary generation."""
         # Format financial data
@@ -84,7 +92,28 @@ class GeminiClient:
             if value is not None
         ])
         
+        complexity_instruction = ""
+        if complexity == "simple":
+            complexity_instruction = "Use plain English and avoid jargon. Explain financial concepts simply."
+        elif complexity == "expert":
+            complexity_instruction = "Use sophisticated financial terminology. Assume the reader is an expert investor."
+        else:
+            complexity_instruction = "Use standard financial analysis language."
+
+        length_instruction = ""
+        if target_length:
+            min_words = target_length - 10
+            max_words = target_length + 10
+            length_instruction = f"""
+CRITICAL LENGTH CONSTRAINT:
+The total output MUST be between {min_words} and {max_words} words.
+This is a HARD REQUIREMENT. Do not write less than {min_words} words. Do not write more than {max_words} words.
+Check your word count before finishing.
+"""
+
         prompt = f"""You are an expert equity analyst. Analyze the following company data and produce a comprehensive investment memo.
+{complexity_instruction}
+{length_instruction}
 
 Company: {company_name}
 Health Score: {health_score:.1f}/100
@@ -122,6 +151,8 @@ Please provide the following analysis in a structured format:
 [List 5 key performance indicators investors should track]
 
 Keep tone: factual, succinct, and evidence-based. Include citations where possible.
+
+REMINDER: Your total word count MUST be between {min_words} and {max_words} words.
 """
         
         return prompt

@@ -29,9 +29,9 @@ const InteractiveWorldMap = memo(function InteractiveWorldMap({
   showTooltip = true
 }: InteractiveWorldMapProps) {
   const [hoveredMarker, setHoveredMarker] = useState<string | null>(null)
-  
-  const hoveredData = hoveredMarker 
-    ? data[parseInt(hoveredMarker.split('-')[1])] 
+
+  const hoveredData = hoveredMarker
+    ? data[parseInt(hoveredMarker.split('-')[1])]
     : null
 
   // Calculate marker sizes based on value
@@ -96,74 +96,74 @@ const InteractiveWorldMap = memo(function InteractiveWorldMap({
         </Geographies>
 
         {data.map((point, idx) => {
-            const markerId = `marker-${idx}`
-            const markerSize = getMarkerSize(point.value)
+          const markerId = `marker-${idx}`
+          const markerSize = getMarkerSize(point.value)
 
-            return (
-              <Marker
-                key={markerId}
-                coordinates={point.coordinates}
-                onMouseEnter={() => setHoveredMarker(markerId)}
-                onMouseLeave={() => setHoveredMarker(null)}
+          return (
+            <Marker
+              key={markerId}
+              coordinates={point.coordinates}
+              onMouseEnter={() => setHoveredMarker(markerId)}
+              onMouseLeave={() => setHoveredMarker(null)}
+            >
+              <motion.g
+                initial={{ scale: 0, opacity: 0 }}
+                animate={{ scale: 1, opacity: 1 }}
+                transition={{
+                  duration: 0.4,
+                  delay: idx * 0.05,
+                  ease: [0.4, 0, 0.2, 1]
+                }}
               >
-                <motion.g
-                  initial={{ scale: 0, opacity: 0 }}
-                  animate={{ scale: 1, opacity: 1 }}
+                {/* Pulse animation ring */}
+                <motion.circle
+                  r={markerSize + 4}
+                  fill="#3b82f6"
+                  fillOpacity={0.1}
+                  animate={hoveredMarker === markerId ? {
+                    scale: [1, 1.3, 1],
+                    opacity: [0.3, 0.1, 0.3]
+                  } : {}}
                   transition={{
-                    duration: 0.4,
-                    delay: idx * 0.05,
-                    ease: [0.4, 0, 0.2, 1]
+                    duration: 1.5,
+                    repeat: Infinity,
+                    ease: "easeInOut"
                   }}
-                >
-                  {/* Pulse animation ring */}
-                  <motion.circle
-                    r={markerSize + 4}
-                    fill="#3b82f6"
-                    fillOpacity={0.1}
-                    animate={hoveredMarker === markerId ? {
-                      scale: [1, 1.3, 1],
-                      opacity: [0.3, 0.1, 0.3]
-                    } : {}}
-                    transition={{
-                      duration: 1.5,
-                      repeat: Infinity,
-                      ease: "easeInOut"
-                    }}
-                  />
+                />
 
-                  {/* Main marker */}
-                  <circle
-                    r={markerSize}
-                    fill="#3b82f6"
-                    stroke="white"
-                    strokeWidth={2}
-                    className="cursor-pointer transition-all duration-200"
-                    style={{
-                      filter: hoveredMarker === markerId
-                        ? 'drop-shadow(0 4px 12px rgba(59, 130, 246, 0.5))'
-                        : 'drop-shadow(0 2px 6px rgba(0, 0, 0, 0.1))',
-                      transform: hoveredMarker === markerId ? 'scale(1.2)' : 'scale(1)'
-                    }}
-                    data-tooltip-id="map-tooltip"
-                  />
+                {/* Main marker */}
+                <circle
+                  r={markerSize}
+                  fill="#3b82f6"
+                  stroke="white"
+                  strokeWidth={2}
+                  className="cursor-pointer transition-all duration-200"
+                  style={{
+                    filter: hoveredMarker === markerId
+                      ? 'drop-shadow(0 4px 12px rgba(59, 130, 246, 0.5))'
+                      : 'drop-shadow(0 2px 6px rgba(0, 0, 0, 0.1))',
+                    transform: hoveredMarker === markerId ? 'scale(1.2)' : 'scale(1)'
+                  }}
+                  data-tooltip-id="map-tooltip"
+                />
 
-                  {/* Inner glow */}
-                  <circle
-                    r={markerSize * 0.5}
-                    fill="white"
-                    fillOpacity={0.6}
-                    className="pointer-events-none"
-                  />
-                </motion.g>
-              </Marker>
-            )
-          })}
+                {/* Inner glow */}
+                <circle
+                  r={markerSize * 0.5}
+                  fill="white"
+                  fillOpacity={0.6}
+                  className="pointer-events-none"
+                />
+              </motion.g>
+            </Marker>
+          )
+        })}
       </ComposableMap>
 
       {showTooltip && (
         <Tooltip
           id="map-tooltip"
-          style={{ opacity: 1 }}
+          opacity={1}
           render={({ content }) => {
             if (!hoveredData) return null
             return (
@@ -171,7 +171,7 @@ const InteractiveWorldMap = memo(function InteractiveWorldMap({
                 <div className="font-bold text-sm">{hoveredData.name}</div>
                 <div className="text-xs mb-1">{hoveredData.value} {hoveredData.value === 1 ? 'analysis' : 'analyses'}</div>
                 {hoveredData.tickers && hoveredData.tickers.length > 0 && (
-                  <motion.div 
+                  <motion.div
                     className="flex flex-wrap gap-1 max-w-[200px]"
                     initial="hidden"
                     animate="visible"
@@ -184,8 +184,8 @@ const InteractiveWorldMap = memo(function InteractiveWorldMap({
                     }}
                   >
                     {hoveredData.tickers.slice(0, 12).map((ticker) => (
-                      <motion.div 
-                        key={ticker} 
+                      <motion.div
+                        key={ticker}
                         className="h-6 w-6 rounded-full bg-white p-0.5 shadow-sm overflow-hidden"
                         variants={{
                           hidden: { opacity: 0, scale: 0.5 },

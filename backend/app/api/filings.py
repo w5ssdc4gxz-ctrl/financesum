@@ -40,6 +40,7 @@ from app.services.local_cache import (
     fallback_filing_summaries,
     fallback_task_status,
     save_fallback_companies,
+    progress_cache,
 )
 from app.services.gemini_client import get_gemini_client
 from app.services.sample_data import sample_filings_by_ticker
@@ -63,6 +64,12 @@ OUTPUT_STYLE_PROMPTS: Dict[str, str] = {
     "narrative": "Write in cohesive paragraphs with strong topic sentences and transitions. Avoid bullet lists except where explicitly required by the base template.",
     "bullets": "Favor bullet lists and short sentences. Each bullet should start with a bolded label followed by insights.",
     "mixed": "Open each section with a short paragraph, then follow with a bulleted list of the most actionable takeaways.",
+}
+
+COMPLEXITY_LEVEL_PROMPTS: Dict[str, str] = {
+    "simple": "Use plain English and avoid jargon. Explain financial concepts simply.",
+    "intermediate": "Use standard financial analysis language.",
+    "expert": "Use sophisticated financial terminology. Assume the reader is an expert investor.",
 }
 
 DEFAULT_HEALTH_RATING_CONFIG: Dict[str, Any] = {
@@ -192,17 +199,39 @@ def _rewrite_summary_to_length(
     latest_words = current_words if current_words is not None else _count_words(working_draft)
 
     def _build_prompt() -> str:
-        length_state = "exceeded" if latest_words > upper else "fell short of"
+        diff = latest_words - target_length
+        abs_diff = abs(diff)
+        
+        if latest_words > upper:
+            direction_instruction = (
+                f"You are {abs_diff} words OVER the limit. \n"
+                "ACTION: CONDENSE the text immediately. Remove filler words, merge sentences, and be more direct. "
+                "Do not lose key metrics, but cut down on verbose explanations."
+            )
+        elif latest_words < lower:
+            direction_instruction = (
+                f"You are {abs_diff} words SHORT of the target. \n"
+                "ACTION: EXPAND the content immediately. \n"
+                "- Add 3-4 sentences of detailed analysis to 'Financial Performance'.\n"
+                "- Add 2-3 sentences to 'Management Discussion & Analysis'.\n"
+                "- Add 2-3 sentences to 'Strategic Initiatives'.\n"
+                "- Elaborate on the implications of the risks and opportunities."
+            )
+        else:
+            direction_instruction = "Ensure you stay within the target range."
+
         prompt = (
-            f"You previously drafted an equity research memo containing {latest_words} words, which {length_state} the "
-            f"required range of {lower}–{upper} words (target {target_length}). "
-            "Rewrite the entire memo so it stays inside that range while preserving every section and investor-specific instruction."
+            f"You previously drafted an equity research memo containing {latest_words} words, which is outside the "
+            f"required range of {lower}–{upper} words (target {target_length}). \n\n"
+            f"{direction_instruction}\n\n"
+            "Rewrite the entire memo so it fits the range while preserving every section and investor-specific instruction."
             "\n\nMANDATORY REQUIREMENTS:\n"
             "- Keep all existing section headings (Investor Lens, Executive Summary, Financial Performance, Management Discussion & Analysis, Risk Factors, "
             "Strategic Initiatives & Capital Allocation, Key Metrics/Others) unless they were absent in the draft. Do NOT drop sections to save space.\n"
-            "- Retain the key figures, personas, and conclusions; reduce length by merging redundant sentences and tightening language.\n"
+            "- Retain the key figures, personas, and conclusions.\n"
             "- Ensure each paragraph ends on a complete sentence; do not stop mid-thought.\n"
             "- After rewriting, append a final line formatted exactly as `WORD COUNT: ###` (replace ### with the true count)."
+            f"\n\nCRITICAL LENGTH CONSTRAINT:\nThe total output MUST be between {lower} and {upper} words."
         )
         if corrections:
             prompt += "\n\nADDITIONAL CORRECTIONS:\n" + "\n".join(corrections)
@@ -398,9 +427,25 @@ def _generate_summary_with_quality_control(
             continue
 
         prior_count = reported_count if reported_count is not None else actual_words
+        diff = prior_count - target_length
+        abs_diff = abs(diff)
+        
+        if prior_count > (target_length + tolerance):
+            action = "CONDENSE the text immediately. Remove filler words and be more direct."
+        else:
+            action = (
+                f"EXPAND the content immediately. You are {abs_diff} words short. "
+                "1. Add 3-4 sentences of detailed analysis to 'Financial Performance'. "
+                "2. Add 2-3 sentences to 'Management Discussion & Analysis'. "
+                "3. Add 2-3 sentences to 'Strategic Initiatives'. "
+                "Elaborate on the implications of every metric and risk."
+            )
+
         corrections.append(
             f"LENGTH CORRECTION #{attempt}: Your last draft contained {prior_count} words, but the required range is "
-            f"{target_length - tolerance}–{target_length + tolerance} words (target {target_length}). "
+            f"{target_length - tolerance}–{target_length + tolerance} words (target {target_length}). \n"
+            f"You are {abs_diff} words {'OVER' if diff > 0 else 'SHORT'}. \n"
+            f"ACTION: {action}\n"
             f"Recount while drafting and stop writing the moment you reach that window. If the next draft is outside the range, "
             "it will be rejected. Update the 'WORD COUNT: ###' control line to reflect the exact total."
         )
@@ -573,15 +618,27 @@ def _build_preference_instructions(
     if output_prompt:
         instructions.append(f"- Output style: {output_prompt}")
 
+    complexity_prompt = COMPLEXITY_LEVEL_PROMPTS.get((preferences.complexity or "intermediate").lower())
+    if complexity_prompt:
+        instructions.append(f"- Complexity: {complexity_prompt}")
+
     target_length = _clamp_target_length(preferences.target_length)
     if target_length:
-        tolerance = max(5, int(target_length * 0.05))
-        instructions.extend(
-            [
-                f"- Final deliverable must contain {target_length} words (acceptable band ±{tolerance}). Count the words before responding and revise until it fits.",
-                "- Do NOT mention the counting process or the word count in the output; silently edit to meet the requirement.",
-            ]
+        min_words = target_length - 10
+        max_words = target_length + 10
+        instructions.append(
+            f"""
+CRITICAL LENGTH CONSTRAINT:
+The total output MUST be between {min_words} and {max_words} words.
+This is a HARD REQUIREMENT. Do not write less than {min_words} words. Do not write more than {max_words} words.
+Check your word count before finishing.
+"""
         )
+        if target_length > 450:
+            instructions.append(
+                "- To meet this high word count, you MUST provide extensive detail, historical context, and deep analysis in every section. "
+                "Do NOT be concise. Elaborate on every point."
+            )
 
     return "\n".join(instructions)
 
@@ -652,6 +709,7 @@ def _build_health_rating_instructions(
             directives.append("- Do not append letter grades, colors, pillar labels, or narrative badges; output only the 0–100 score and the supporting explanation.")
 
     directives.append("- Present the Financial Health Rating as the first section before the Executive Summary.")
+    directives.append("- ALSO include the 'Financial Health Rating: X/100' line in the 'Key Metrics/Others' section at the end of the memo.")
 
     return config, "\n".join(directives)
 
@@ -1702,22 +1760,27 @@ async def generate_filing_summary(
     preferences: Optional[FilingSummaryPreferences] = Body(default=None),
 ):
     """
-    Generate AI summary of a filing using Gemini.
     Returns cached summary if already generated.
     """
     settings = get_settings()
     preferences = preferences or FilingSummaryPreferences()
     target_length = _clamp_target_length(preferences.target_length)
     use_default_cache = preferences.mode == "default"
+    include_health_rating = bool(preferences.health_rating and preferences.health_rating.enabled)
+
+    # Reset progress
+    progress_cache[str(filing_id)] = "Initializing AI Agent..."
 
     # Check cache first
     if use_default_cache:
         cached_summary = fallback_filing_summaries.get(str(filing_id))
         if cached_summary:
+            progress_cache[str(filing_id)] = "Complete"
             return JSONResponse(content={"filing_id": filing_id, "summary": cached_summary, "cached": True})
     
     # Get filing context
     try:
+        progress_cache[str(filing_id)] = "Reading Filing Content..."
         context = _resolve_filing_context(filing_id, settings)
         filing = context["filing"]
         company = context["company"]
@@ -1728,6 +1791,7 @@ async def generate_filing_summary(
     
     # Get document content
     local_document = _ensure_local_document(context, settings)
+    progress_cache[str(filing_id)] = "Extracting Financial Data..."
     statements = fallback_financial_statements.get(str(filing_id))
     if statements is None and context.get("source") == "supabase":
         try:
@@ -1792,6 +1856,7 @@ async def generate_filing_summary(
         
         financial_snapshot = _build_financial_snapshot(statements)
         calculated_metrics = _build_calculated_metrics(statements)
+        progress_cache[str(filing_id)] = "Analyzing Risk Factors..."
         metrics_lines = "\n".join(
             f"- {label}: {_format_metric_value(key, calculated_metrics[key])}"
             for key, label in [
@@ -1828,6 +1893,10 @@ async def generate_filing_summary(
         truncated_note = "" if len(context_excerpt) == len(document_text) else "\n\nNote: Filing text truncated to fit model context."
         company_label = company.get("name") or company.get("ticker") or "the company"
         preference_block = _build_preference_instructions(preferences, company_label)
+        
+        if include_health_rating:
+             progress_cache[str(filing_id)] = "Computing Health Score..."
+        
         health_config, health_rating_block = _build_health_rating_instructions(preferences, company_label)
         health_directives_section = ""
         if health_rating_block:
@@ -1869,72 +1938,68 @@ async def generate_filing_summary(
                 ),
             ]
         )
-        sections_text = "\n".join(
+        section_requirements = "\n".join(
             f"## {title}\n{description}" for title, description in section_descriptions
         )
- 
-        prompt = f"""You are an expert equity research analyst preparing a memo based on an SEC {filing_type} for {company_name}.
- 
- COMPANY CONTEXT
- - Company: {company_name}
- - Ticker: {company.get("ticker")}
- - Filing type: {filing_type}
- - Filed on: {filing_date}
- - Period end: {filing.get("period_end")}
+        
+        tone = preferences.tone or "neutral"
+        detail_level = preferences.detail_level or "comprehensive"
+        output_style = preferences.output_style or "paragraph"
 
- KEY FINANCIAL SNAPSHOT (reported amounts)
- {financial_snapshot if financial_snapshot else "- Not available; derive figures directly from the filing text."}
+        base_prompt = f"""
+You are an expert financial analyst writing a briefing for {tone} investors.
+Analyze the following filing for {company_name} ({filing_type}, {filing_date}).
 
- CALCULATED METRICS (use these values in your analysis; do not mark them as unknown)
- {metrics_lines}
+CONTEXT:
+{context_excerpt}{truncated_note}
 
- FILING EXCERPTS (cleaned)
- {context_excerpt}{truncated_note}
- 
- CUSTOM INVESTOR PREFERENCES
- {preference_block}
+FINANCIAL SNAPSHOT (Use these numbers if not found in text):
+{financial_snapshot}
+
+KEY METRICS (Use these for calculations):
+{metrics_lines}
+
+INSTRUCTIONS:
+1. Tone: {tone.title()}
+2. Detail Level: {detail_level.title()}
+3. Output Style: {output_style.title()}
+4. Target Length: {target_length} words (approx)
+
+STRUCTURE & CONTENT REQUIREMENTS:
+{section_requirements}
 {health_directives_section}
+{preference_block}
 
- Write a highly detailed summary that covers the following sections:
- {sections_text}
- 
- Rules:
- - Use the provided numbers instead of responding "not disclosed" whenever they are present in the calculated metrics block or filing excerpt.
- - Keep sections 1, 2, 3, and 5 in narrative paragraph form tailored to this company; avoid bullet lists in those sections.
- - Do not hallucinate figures that are not in the source content; if genuinely missing, explain the gap in plain language.
- - Every metric listed in the calculated metrics block must be incorporated into the narrative or key metrics section with its value.
- - When free cash flow is not explicitly reported, derive it as operating cash flow minus capital expenditures (use the magnitude of capex even if presented as a negative number) and include the computed value.
- - Never respond that management commentary or guidance is unavailable; synthesize a viewpoint from the data if necessary and label it clearly as analysis.
- - Every section listed above must appear with the exact markdown heading shown (e.g., `## Executive Summary`). Do not prefix headings with letters, emojis, or shorthand. Each section must contain fully developed prose (Risk Factors may remain a bullet list). Do not stop mid-sentence or omit the Key Metrics Dashboard.
- - After completing the memo, append a final line formatted exactly as `WORD COUNT: ###` (replace ### with the number of words in the memo above that line). This line will be removed before the user sees the memo.
- - Maintain professional markdown formatting with clear headings."""
-
-        section_validator = _make_section_completeness_validator(bool(health_rating_block))
+CRITICAL RULES:
+- Do NOT use markdown bolding (**) within the text body. Only use it for section headers if needed.
+- Ensure every claim is backed by the provided text or metrics.
+- If data is missing, state "not disclosed" rather than hallucinating.
+"""
+        progress_cache[str(filing_id)] = "Synthesizing Investor Insights..."
         summary_text = _generate_summary_with_quality_control(
             gemini_client,
-            prompt,
-            target_length,
-            quality_validators=[_validate_mdna_section, section_validator],
+            base_prompt,
+            target_length=target_length,
+            quality_validators=[
+                _make_section_completeness_validator(include_health_rating)
+            ],
         )
-        enforce_sections = bool(settings.gemini_api_key) and not settings.gemini_api_key.lower().startswith("test")
-        if enforce_sections:
-            summary_text = _normalize_section_headings(summary_text, bool(health_rating_block))
-            summary_text = _ensure_required_sections(
-                summary_text,
-                include_health_rating=bool(health_rating_block),
-                metrics_lines=metrics_lines,
-                calculated_metrics=calculated_metrics,
-                company_name=company_name,
-                health_rating_config=health_config,
-            )
-            final_issue = section_validator(summary_text)
-            if final_issue:
-                logger.warning("Summary sections still incomplete after enforcement: %s", final_issue)
         
-        # Cache only for default runs so user-specific prompts aren't reused globally
+        progress_cache[str(filing_id)] = "Polishing Output..."
+        # Post-processing to ensure structure
+        summary_text = _normalize_section_headings(summary_text, include_health_rating)
+        summary_text = _ensure_required_sections(
+            summary_text,
+            include_health_rating=include_health_rating,
+            metrics_lines=metrics_lines,
+            calculated_metrics=calculated_metrics,
+            company_name=company_name,
+            health_rating_config=health_config,
+        )
+
+        # Cache result
         if use_default_cache:
             fallback_filing_summaries[str(filing_id)] = summary_text
-        
         return JSONResponse(content={
             "filing_id": filing_id,
             "summary": summary_text,
@@ -2118,24 +2183,54 @@ def _ensure_required_sections(
         nonlocal text
         text = text.rstrip() + f"\n\n## {title}\n{body.strip()}\n"
 
-    if include_health_rating and not _section_present("Financial Health Rating"):
-        score = _estimate_health_score(calculated_metrics)
-        grade, label = _score_to_grade(score)
-        display_pref = (health_rating_config or {}).get("display_style", "score_plus_grade")
-        include_grade = display_pref != "score_only"
-        cash_str = _format_number_or_default(calculated_metrics.get("cash"))
-        liabilities_str = _format_number_or_default(calculated_metrics.get("total_liabilities"))
-        fcf_str = _format_number_or_default(calculated_metrics.get("free_cash_flow"))
-        body = f"{company_name} receives a Financial Health Rating of {score:.0f}/100"
-        if include_grade:
-            body += f" ({grade})"
-        body += (
-            f". {label if include_grade else 'Financial'} fundamentals are supported by free cash flow of {fcf_str}, "
-            f"a cash position of {cash_str}, and total liabilities of {liabilities_str}. Maintain disciplined capital deployment "
-            "and monitor leverage trends."
-        )
-        _append_section("Financial Health Rating", body)
+    # 1. Ensure Financial Health Rating section exists
+    health_score_val = None
+    health_grade_val = None
+    
+    if include_health_rating:
+        # Try to find existing score in the text first
+        # Look for "Financial Health Rating: 85/100" or similar patterns
+        score_match = re.search(r"Financial Health Rating[:\s]+(\d{1,3})", text, re.IGNORECASE)
+        if score_match:
+            health_score_val = float(score_match.group(1))
+            grade, _ = _score_to_grade(health_score_val)
+            health_grade_val = grade
+        
+        if not _section_present("Financial Health Rating"):
+            # Fallback generation if missing
+            if health_score_val is None:
+                health_score_val = _estimate_health_score(calculated_metrics)
+                health_grade_val, label = _score_to_grade(health_score_val)
+            else:
+                _, label = _score_to_grade(health_score_val)
 
+            display_pref = (health_rating_config or {}).get("display_style", "score_plus_grade")
+            include_grade = display_pref != "score_only"
+            
+            # Helper to get metric from calculated or extract from text
+            def _get_metric(key: str, pattern: str) -> str:
+                val = calculated_metrics.get(key)
+                if val is not None:
+                    return _format_number_or_default(val)
+                # Try extraction
+                match = re.search(pattern, text, re.IGNORECASE)
+                return match.group(1) if match else "data unavailable"
+
+            cash_str = _get_metric("cash", r"cash position of\s+([$€£¥]?\d+(?:,\d{3})*(?:\.\d+)?[MB]?)")
+            liabilities_str = _get_metric("total_liabilities", r"total liabilities of\s+([$€£¥]?\d+(?:,\d{3})*(?:\.\d+)?[MB]?)")
+            fcf_str = _get_metric("free_cash_flow", r"free cash flow of\s+([$€£¥]?\d+(?:,\d{3})*(?:\.\d+)?[MB]?)")
+            
+            body = f"{company_name} receives a Financial Health Rating of {health_score_val:.0f}/100"
+            if include_grade and health_grade_val:
+                body += f" ({health_grade_val})"
+            body += (
+                f". {label if include_grade else 'Financial'} fundamentals are supported by free cash flow of {fcf_str}, "
+                f"a cash position of {cash_str}, and total liabilities of {liabilities_str}. Maintain disciplined capital deployment "
+                "and monitor leverage trends."
+            )
+            _append_section("Financial Health Rating", body)
+
+    # 2. Ensure other required sections
     if not _section_present("Executive Summary"):
         revenue = _format_number_or_default(calculated_metrics.get("revenue"))
         net_income = _format_number_or_default(calculated_metrics.get("net_income"))
@@ -2186,14 +2281,28 @@ def _ensure_required_sections(
         )
         _append_section("Strategic Initiatives & Capital Allocation", body)
 
+    # 3. Update Key Metrics Dashboard
+    # Prepare the authoritative dashboard content
+    dashboard_content = metrics_lines.strip() if metrics_lines.strip() else "- Metric data unavailable"
+    
+    # If health rating is enabled, ensure it's in the dashboard
+    if include_health_rating and health_score_val is not None:
+        # Check if it's already in the metrics lines (unlikely given current logic, but safe to check)
+        if "Financial Health Rating" not in dashboard_content:
+            rating_line = f"- Financial Health Rating: {health_score_val:.0f}/100"
+            dashboard_content = f"{rating_line}\n{dashboard_content}"
+
     if not _section_present("Key Metrics Dashboard"):
-        dashboard = metrics_lines.strip() if metrics_lines.strip() else "- Metric data unavailable"
-        _append_section("Key Metrics Dashboard", dashboard)
+        _append_section("Key Metrics Dashboard", dashboard_content)
     else:
         # Force update the Key Metrics Dashboard to ensure it's never truncated
-        # and always contains the authoritative calculated metrics
-        dashboard = metrics_lines.strip() if metrics_lines.strip() else "- Metric data unavailable"
+        # and always contains the authoritative calculated metrics + health score
         pattern = re.compile(r"## Key Metrics Dashboard.*?(?=\n## |\Z)", re.DOTALL)
-        text = pattern.sub(f"## Key Metrics Dashboard\n{dashboard}", text)
+        text = pattern.sub(f"## Key Metrics Dashboard\n{dashboard_content}", text)
 
     return text
+@router.get("/{filing_id}/progress")
+async def get_filing_summary_progress(filing_id: str):
+    """Get real-time progress of summary generation."""
+    status = progress_cache.get(str(filing_id), "Initializing...")
+    return {"status": status}

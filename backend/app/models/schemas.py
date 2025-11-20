@@ -216,6 +216,7 @@ class FilingSummaryPreferences(BaseModel):
     detail_level: Optional[str] = Field(default=None, max_length=50)
     output_style: Optional[str] = Field(default=None, max_length=50)
     target_length: Optional[int] = Field(default=None, ge=50, le=1200)
+    complexity: Literal["simple", "intermediate", "expert"] = "intermediate"
     health_rating: Optional[HealthRatingPreferences] = None
 
 

@@ -11,7 +11,7 @@ export default function AuthCallback() {
     const handleCallback = async () => {
       // The session will be automatically set by Supabase
       const { data: { session } } = await supabase.auth.getSession()
-      
+
       if (session) {
         router.push('/dashboard')
       } else {

@@ -2,6 +2,7 @@
 
 import { ReactNode, useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import { motion } from 'framer-motion'
 import {
   IconBrandTabler,
@@ -15,6 +16,7 @@ import {
   IconBuilding,
   IconFileAnalytics,
   IconWorld,
+  IconActivity,
 } from '@tabler/icons-react'
 import { Sidebar, SidebarBody, SidebarLink } from '@/components/ui/sidebar'
 import { useAuth } from '@/contexts/AuthContext'
@@ -52,29 +54,24 @@ const motionFade = {
 
 const navLinks = [
   {
-    label: 'Home',
-    href: '/dashboard',
-    icon: <IconBrandTabler className="h-5 w-5 shrink-0 text-slate-600" />,
-  },
-  {
-    label: 'Market Pulse',
+    label: 'Overview',
     href: '#overview',
-    icon: <IconSparkles className="h-5 w-5 shrink-0 text-slate-600" />,
-  },
-  {
-    label: 'Workflow',
-    href: '#workflow',
-    icon: <IconCompass className="h-5 w-5 shrink-0 text-slate-600" />,
+    icon: <IconChartHistogram className="h-5 w-5 shrink-0 text-slate-600" />,
   },
   {
     label: 'Coverage',
     href: '#coverage',
-    icon: <IconMap className="h-5 w-5 shrink-0 text-slate-600" />,
+    icon: <IconWorld className="h-5 w-5 shrink-0 text-slate-600" />,
   },
   {
-    label: 'Personas',
-    href: '#personas',
-    icon: <IconUserBolt className="h-5 w-5 shrink-0 text-slate-600" />,
+    label: 'Activity',
+    href: '#activity',
+    icon: <IconActivity className="h-5 w-5 shrink-0 text-slate-600" />,
+  },
+  {
+    label: 'Top Companies',
+    href: '#companies',
+    icon: <IconBuilding className="h-5 w-5 shrink-0 text-slate-600" />,
   },
 ]
 
@@ -269,50 +266,45 @@ export default function DashboardPage() {
   ]
 
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-50">
-      <div className="mx-auto flex w-full max-w-[1600px] flex-col gap-6 px-4 py-8 md:flex-row lg:px-8">
-        <Sidebar open={sidebarOpen} setOpen={setSidebarOpen}>
-          <SidebarBody className="justify-between gap-8 rounded-xl border border-gray-200 bg-white p-4 text-gray-900 shadow-sm dark:border-gray-800 dark:bg-gray-950 dark:text-gray-50">
-            <div className="flex flex-1 flex-col overflow-hidden">
-              <SidebarLogo open={sidebarOpen} />
-              <div className="mt-8 flex flex-col gap-2">
-                {navLinks.map((link, idx) => (
-                  <SidebarLink
-                    key={link.label}
-                    link={{
-                      ...link,
-                      icon: (
-                        <motion.div
-                          initial={{ opacity: 0, x: -4 }}
-                          animate={{ opacity: 1, x: 0 }}
-                          transition={{ delay: 0.05 * idx }}
-                        >
-                          {link.icon}
-                        </motion.div>
-                      ),
-                    }}
-                    className="rounded-lg px-3 py-2 text-sm font-medium text-gray-600 transition hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-900 dark:hover:text-gray-50"
-                  />
-                ))}
-              </div>
+    <div className="min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-50 flex">
+      <Sidebar open={sidebarOpen} setOpen={setSidebarOpen}>
+        <SidebarBody className="justify-between gap-10">
+          <div className="flex flex-col flex-1 overflow-y-auto overflow-x-hidden">
+            <SidebarLogo open={sidebarOpen} />
+            <div className="mt-8 flex flex-col gap-2">
+              {navLinks.map((link, idx) => (
+                <SidebarLink
+                  key={link.label}
+                  link={{
+                    ...link,
+                    icon: (
+                      <div className="h-6 w-6 flex-shrink-0 text-neutral-500 dark:text-neutral-400">
+                        {link.icon}
+                      </div>
+                    ),
+                  }}
+                />
+              ))}
             </div>
-            <div className="rounded-lg border border-gray-200 bg-gray-50 p-3 dark:border-gray-800 dark:bg-gray-900">
-              <SidebarLink
-                link={{
-                  label: user?.user_metadata?.full_name ?? user?.email ?? 'Investor',
-                  href: latestCompanyLink ?? '#',
-                  icon: (
-                    <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-600 text-sm font-bold text-white">
-                      {(user?.user_metadata?.full_name ?? user?.email ?? 'FS').slice(0, 2).toUpperCase()}
-                    </div>
-                  ),
-                }}
-              />
-            </div>
-          </SidebarBody>
-        </Sidebar>
+          </div>
+          <div className="mt-auto">
+            <SidebarLink
+              link={{
+                label: user?.user_metadata?.full_name ?? user?.email ?? 'Investor',
+                href: '#',
+                icon: (
+                  <div className="flex h-8 w-8 items-center justify-center rounded-full bg-indigo-600 text-xs font-bold text-white">
+                    {(user?.user_metadata?.full_name ?? user?.email ?? 'FS').slice(0, 2).toUpperCase()}
+                  </div>
+                ),
+              }}
+            />
+          </div>
+        </SidebarBody>
+      </Sidebar>
 
-                <main className="flex-1">
+      <div className="flex-1 flex flex-col h-screen overflow-y-auto">
+        <div className="mx-auto w-full max-w-[1600px] p-4 md:p-8">
           <DashboardContent
             dashboardData={{
               history,
@@ -324,7 +316,7 @@ export default function DashboardPage() {
             }}
             onRemoveAnalysis={removeHistoryEntry}
           />
-        </main>
+        </div>
       </div>
     </div>
   )
@@ -332,16 +324,18 @@ export default function DashboardPage() {
 
 const SidebarLogo = ({ open }: { open: boolean }) => {
   return (
-    <a href="#" className="flex items-center gap-3">
-      <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-indigo-600 text-white">
-        <IconBrandTabler className="h-6 w-6" />
+    <Link href="/dashboard" className="flex items-center gap-2 py-1">
+      <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-indigo-600 text-white">
+        <IconBrandTabler className="h-5 w-5" />
       </div>
-      {open && (
-        <motion.span initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-lg font-semibold text-slate-900">
-          FinanceSum
-        </motion.span>
-      )}
-    </a>
+      <motion.span
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        className="whitespace-pre text-lg font-semibold text-neutral-900 dark:text-white"
+      >
+        FinanceSum
+      </motion.span>
+    </Link>
   )
 }
 

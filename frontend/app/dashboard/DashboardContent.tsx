@@ -179,11 +179,11 @@ export default function DashboardContent({
   const { sectorBarData, sectorDonutData, sectorPerformanceData } = useMemo(() => {
     // Build a map of sector -> { tickers, healthScores }
     const sectorStatsMap = new Map<string, { tickers: Set<string>, scores: number[] }>()
-    
+
     history.forEach((item: any) => {
       const sector = item.sector || item.companySector
       const score = item.healthScore ?? item.health_score
-      
+
       if (sector) {
         if (!sectorStatsMap.has(sector)) {
           sectorStatsMap.set(sector, { tickers: new Set(), scores: [] })
@@ -195,7 +195,7 @@ export default function DashboardContent({
     })
 
     // Helper to get avg score
-    const getAvgScore = (scores: number[]) => 
+    const getAvgScore = (scores: number[]) =>
       scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0
 
     const barData: BarListItem[] = stats.sectors.slice(0, 5).map((sector: any, idx: number) => ({
@@ -212,14 +212,14 @@ export default function DashboardContent({
     }))
 
     const performanceData: SectorPerformanceItem[] = stats.sectors.slice(0, 5).map((sector: any, idx: number) => {
-        const stats = sectorStatsMap.get(sector.label)
-        return {
-            name: sector.label,
-            count: sector.value,
-            avgScore: stats ? getAvgScore(stats.scores) : 0,
-            topTickers: Array.from(stats?.tickers || []),
-            color: sectorColors[idx % sectorColors.length]
-        }
+      const stats = sectorStatsMap.get(sector.label)
+      return {
+        name: sector.label,
+        count: sector.value,
+        avgScore: stats ? getAvgScore(stats.scores) : 0,
+        topTickers: Array.from(stats?.tickers || []),
+        color: sectorColors[idx % sectorColors.length]
+      }
     })
 
     return { sectorBarData: barData, sectorDonutData: donutData, sectorPerformanceData: performanceData }
@@ -360,7 +360,7 @@ export default function DashboardContent({
           <motion.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
-            className="rounded-lg border border-blue-200 bg-gradient-to-br from-blue-50 via-white to-indigo-50 p-6 shadow-sm dark:border-blue-900 dark:from-blue-950/30 dark:via-gray-950 dark:to-indigo-950/30"
+            className="relative z-20 rounded-lg border border-blue-200 bg-gradient-to-br from-blue-50 via-white to-indigo-50 p-6 shadow-sm dark:border-blue-900 dark:from-blue-950/30 dark:via-gray-950 dark:to-indigo-950/30"
           >
             <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-gray-900 dark:text-gray-50">
               <IconSparkles className="h-4 w-4 text-blue-600 dark:text-blue-400" />
@@ -374,10 +374,12 @@ export default function DashboardContent({
 
           {/* Overview Stats */}
           <motion.div
+            id="overview"
             initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.05 }}
-            className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4"
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true, margin: "-50px" }}
+            transition={{ delay: 0.05, duration: 0.5 }}
+            className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4 scroll-mt-8"
           >
             <StatCard
               title="Total Analyses"
@@ -410,8 +412,9 @@ export default function DashboardContent({
             {/* Performance Gauge */}
             <motion.div
               initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.3 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: "-50px" }}
+              transition={{ duration: 0.5 }}
               className="rounded-lg border border-gray-200 bg-gradient-to-br from-white via-blue-50/30 to-indigo-50/50 p-6 shadow-sm dark:border-gray-800 dark:from-gray-950 dark:via-blue-950/10 dark:to-indigo-950/20"
             >
               <h3 className="mb-4 text-center text-sm font-semibold text-gray-700 dark:text-gray-300">
@@ -427,10 +430,12 @@ export default function DashboardContent({
 
             {/* World Map */}
             <motion.div
+              id="coverage"
               initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.1 }}
-              className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950 lg:col-span-2"
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: "-50px" }}
+              transition={{ delay: 0.1, duration: 0.5 }}
+              className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950 lg:col-span-2 scroll-mt-8"
             >
               <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-gray-900 dark:text-gray-50">
                 <IconMapPin className="h-4 w-4 text-blue-600 dark:text-blue-400" />
@@ -441,10 +446,12 @@ export default function DashboardContent({
           </div>
 
           {/* Charts Row - Activity, Heatmap */}
-          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+          <div id="activity" className="grid grid-cols-1 gap-6 lg:grid-cols-2 scroll-mt-8">
             <motion.div
               initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: "-50px" }}
+              transition={{ duration: 0.5 }}
               className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950"
             >
               <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold text-gray-900 dark:text-gray-50">
@@ -459,8 +466,9 @@ export default function DashboardContent({
 
             <motion.div
               initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.05 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: "-50px" }}
+              transition={{ delay: 0.05, duration: 0.5 }}
               className="flex flex-col justify-between rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950"
             >
               <div>
@@ -480,7 +488,9 @@ export default function DashboardContent({
             {/* Sector Distribution */}
             <motion.div
               initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: "-50px" }}
+              transition={{ duration: 0.5 }}
               className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950"
             >
               <h3 className="mb-4 text-sm font-semibold text-gray-900 dark:text-gray-50">
@@ -494,8 +504,9 @@ export default function DashboardContent({
             {/* Top Sectors */}
             <motion.div
               initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.05 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: "-50px" }}
+              transition={{ delay: 0.05, duration: 0.5 }}
               className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950"
             >
               <h3 className="mb-4 text-sm font-semibold text-gray-900 dark:text-gray-50">
@@ -512,10 +523,12 @@ export default function DashboardContent({
 
             {/* Top Companies */}
             <motion.div
+              id="companies"
               initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.1 }}
-              className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950"
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: "-50px" }}
+              transition={{ delay: 0.1, duration: 0.5 }}
+              className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950 scroll-mt-8"
             >
               <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-gray-900 dark:text-gray-50">
                 <IconChartBar className="h-4 w-4 text-blue-600 dark:text-blue-400" />
@@ -539,7 +552,9 @@ export default function DashboardContent({
           {recentAnalyses.length > 0 && (
             <motion.div
               initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true, margin: "-50px" }}
+              transition={{ duration: 0.5 }}
               className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950"
             >
               <h3 className="mb-4 text-lg font-semibold text-gray-900 dark:text-gray-50">Recent Analyses</h3>
@@ -552,8 +567,9 @@ export default function DashboardContent({
                     <motion.div
                       key={analysis.analysisId || analysis.analysis_id || idx}
                       initial={{ opacity: 0, x: -10 }}
-                      animate={{ opacity: 1, x: 0 }}
-                      transition={{ delay: idx * 0.03 }}
+                      whileInView={{ opacity: 1, x: 0 }}
+                      viewport={{ once: true, margin: "-20px" }}
+                      transition={{ delay: idx * 0.05, duration: 0.4 }}
                       onClick={() => handleOpenBrief(analysis)}
                       className="group cursor-pointer rounded-lg border border-gray-200 bg-gray-50 p-4 transition-all hover:border-blue-300 hover:bg-blue-50 hover:shadow-sm dark:border-gray-800 dark:bg-gray-900 dark:hover:border-blue-800 dark:hover:bg-blue-950/30"
                     >

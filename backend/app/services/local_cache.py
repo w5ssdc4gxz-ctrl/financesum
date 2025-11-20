@@ -65,3 +65,6 @@ fallback_task_status: Dict[str, Dict[str, Any]] = {}
 # Stores cached filing summaries keyed by filing ID (as string)
 fallback_filing_summaries: Dict[str, str] = {}
 
+# Stores real-time progress status keyed by filing ID (as string)
+progress_cache: Dict[str, str] = {}
+

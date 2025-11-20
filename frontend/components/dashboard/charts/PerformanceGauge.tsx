@@ -58,12 +58,12 @@ const PerformanceGauge = memo(function PerformanceGauge({
   const actualColorScheme = colorScheme || getColorSchemeFromValue(value)
   const colors = colorSchemes[actualColorScheme]
 
-  const strokeWidth = size * 0.12
+  const strokeWidth = size * 0.08 // Thinner stroke for elegance
   const radius = (size - strokeWidth) / 2
   const circumference = 2 * Math.PI * radius
-  const gaugeStart = -225 // Start angle in degrees
-  const gaugeEnd = 45 // End angle in degrees
-  const gaugeRange = gaugeEnd - gaugeStart // 270 degrees
+  const gaugeStart = -220 // Slightly more open
+  const gaugeEnd = 40
+  const gaugeRange = gaugeEnd - gaugeStart
   const gaugeCircumference = (gaugeRange / 360) * circumference
 
   const progress = Math.min(Math.max(value, 0), 100)
@@ -71,26 +71,6 @@ const PerformanceGauge = memo(function PerformanceGauge({
 
   const center = size / 2
   const gradientId = `gauge-gradient-${Math.random().toString(36).substr(2, 9)}`
-
-  // Create tick marks
-  const ticks = useMemo(() => {
-    const tickCount = 11
-    const tickMarks = []
-    for (let i = 0; i <= tickCount; i++) {
-      const angle = gaugeStart + (gaugeRange * i) / tickCount
-      const angleRad = (angle * Math.PI) / 180
-      const innerRadius = radius - strokeWidth / 2 - 8
-      const outerRadius = radius - strokeWidth / 2 + 2
-
-      const x1 = center + innerRadius * Math.cos(angleRad)
-      const y1 = center + innerRadius * Math.sin(angleRad)
-      const x2 = center + outerRadius * Math.cos(angleRad)
-      const y2 = center + outerRadius * Math.sin(angleRad)
-
-      tickMarks.push({ x1, y1, x2, y2, value: i * 10 })
-    }
-    return tickMarks
-  }, [size, radius, strokeWidth, gaugeStart, gaugeRange, center])
 
   const trendIcon = {
     up: IconTrendingUp,
@@ -121,14 +101,14 @@ const PerformanceGauge = memo(function PerformanceGauge({
               <stop offset="100%" stopColor={colors.gradient[1]} />
             </linearGradient>
             <filter id="glow">
-              <feGaussianBlur stdDeviation="4" result="coloredBlur" />
+              <feGaussianBlur stdDeviation="2" result="coloredBlur" />
               <feMerge>
                 <feMergeNode in="coloredBlur" />
                 <feMergeNode in="SourceGraphic" />
               </feMerge>
             </filter>
             <filter id="shadow">
-              <feDropShadow dx="0" dy="4" stdDeviation="6" floodOpacity="0.15" />
+              <feDropShadow dx="0" dy="2" stdDeviation="3" floodOpacity="0.1" />
             </filter>
           </defs>
 
@@ -140,33 +120,15 @@ const PerformanceGauge = memo(function PerformanceGauge({
             fill="none"
             stroke={colors.bgTrack}
             strokeWidth={strokeWidth}
-            strokeDasharray={gaugeCircumference}
+            strokeOpacity={0.3} // Subtle background
+            strokeDasharray={`${gaugeCircumference} ${circumference}`}
             strokeDashoffset={0}
             strokeLinecap="round"
             transform={`rotate(${gaugeStart} ${center} ${center})`}
             className="dark:stroke-gray-800"
-            initial={{ strokeDashoffset: gaugeCircumference }}
-            animate={{ strokeDashoffset: 0 }}
-            transition={{ duration: 0.8, ease: "easeOut" }}
           />
 
-          {/* Tick marks */}
-          {ticks.map((tick, idx) => (
-            <motion.line
-              key={idx}
-              x1={tick.x1}
-              y1={tick.y1}
-              x2={tick.x2}
-              y2={tick.y2}
-              stroke="#9ca3af"
-              strokeWidth={idx % 5 === 0 ? 2 : 1}
-              strokeLinecap="round"
-              className="dark:stroke-gray-600"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ delay: 0.3 + idx * 0.02 }}
-            />
-          ))}
+
 
           {/* Progress arc */}
           <motion.circle
@@ -176,27 +138,26 @@ const PerformanceGauge = memo(function PerformanceGauge({
             fill="none"
             stroke={`url(#${gradientId})`}
             strokeWidth={strokeWidth}
-            strokeDasharray={gaugeCircumference}
             strokeLinecap="round"
             transform={`rotate(${gaugeStart} ${center} ${center})`}
             filter="url(#shadow)"
-            initial={{ strokeDashoffset: gaugeCircumference }}
-            animate={{ strokeDashoffset: offset }}
+            initial={{ strokeDasharray: `0 ${circumference}` }}
+            animate={{ strokeDasharray: `${(progress / 100) * gaugeCircumference} ${circumference}` }}
             transition={{ duration: 1.5, delay: 0.3, ease: [0.4, 0, 0.2, 1] }}
           />
 
-          {/* Outer glow ring */}
+          {/* Outer glow ring - simplified */}
           <motion.circle
             cx={center}
             cy={center}
-            r={radius + strokeWidth / 2 + 4}
+            r={radius + strokeWidth / 2 + 8}
             fill="none"
             stroke={colors.gradient[0]}
-            strokeWidth={1.5}
-            strokeOpacity={0.2}
-            initial={{ scale: 0.95, opacity: 0 }}
+            strokeWidth={1}
+            strokeOpacity={0.1}
+            initial={{ scale: 0.9, opacity: 0 }}
             animate={{ scale: 1, opacity: 1 }}
-            transition={{ duration: 0.8, delay: 0.5 }}
+            transition={{ duration: 1, delay: 0.5 }}
           />
         </svg>
 
@@ -209,11 +170,11 @@ const PerformanceGauge = memo(function PerformanceGauge({
             className="text-center"
           >
             <motion.div
-              className="text-6xl font-bold"
+              className="text-7xl font-bold tracking-tighter"
               style={{ color: colors.text }}
-              initial={{ scale: 0.5 }}
-              animate={{ scale: 1 }}
-              transition={{ duration: 0.6, delay: 1, type: "spring", stiffness: 200 }}
+              initial={{ scale: 0.5, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              transition={{ duration: 0.5, delay: 0.2 }}
             >
               {Math.round(progress)}
             </motion.div>
@@ -235,13 +196,12 @@ const PerformanceGauge = memo(function PerformanceGauge({
           initial={{ opacity: 0, y: -10 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.4, delay: 1.2 }}
-          className={`mt-4 inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-sm font-medium ${
-            trendDirection === 'up'
-              ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400'
-              : trendDirection === 'down'
+          className={`mt-4 inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-sm font-medium ${trendDirection === 'up'
+            ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400'
+            : trendDirection === 'down'
               ? 'bg-rose-50 text-rose-700 dark:bg-rose-950/50 dark:text-rose-400'
               : 'bg-gray-50 text-gray-700 dark:bg-gray-900 dark:text-gray-400'
-          }`}
+            }`}
         >
           <TrendIcon className="h-4 w-4" />
           <span>{trendValue > 0 ? '+' : ''}{trendValue}%</span>

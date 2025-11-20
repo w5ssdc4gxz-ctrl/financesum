@@ -137,20 +137,37 @@ body {
 
 /* Custom Scrollbar */
 ::-webkit-scrollbar {
-  width: 10px;
+  width: 12px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #f1f5f9;
+  background: #ffffff;
+  border-left: 2px solid #000000;
+}
+
+.dark ::-webkit-scrollbar-track {
+  background: #000000;
+  border-left: 2px solid #ffffff;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: linear-gradient(180deg, #a855f7, #d946ef);
-  border-radius: 5px;
+  background: #000000;
+  border: 2px solid #000000;
+  border-right: none;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: #ffffff;
+  border: 2px solid #ffffff;
+  border-right: none;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: linear-gradient(180deg, #9333ea, #c026d3);
+  background: #333333;
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #cccccc;
 }
 
 /* Premium Metrics Cards */

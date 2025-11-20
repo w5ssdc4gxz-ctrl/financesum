@@ -1,6 +1,9 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { motion } from 'framer-motion'
+import ReactMarkdown from 'react-markdown'
+import AnimatedList from '@/components/AnimatedList'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import Navbar from '@/components/Navbar'
@@ -8,14 +11,16 @@ import HealthScoreBadge from '@/components/HealthScoreBadge'
 import FinancialCharts from '@/components/FinancialCharts'
 import PersonaSelector from '@/components/PersonaSelector'
 import EnhancedSummary from '@/components/EnhancedSummary'
-import AnimatedList, { AnimatedListItem } from '@/components/AnimatedList'
 import { companyApi, filingsApi, analysisApi, API_BASE_URL, FilingSummaryPreferencesPayload } from '@/lib/api-client'
 import DashboardStorage, { StoredAnalysisSnapshot, StoredSummaryPreferences } from '@/lib/dashboard-storage'
 import { buildSummaryPreview, scoreToRating } from '@/lib/analysis-insights'
-import ReactMarkdown from 'react-markdown'
 import { Button } from '@/components/base/buttons/button'
 import { Button as StatefulButton } from '@/components/ui/stateful-button'
 import { useAuth } from '@/contexts/AuthContext'
+import { BrutalButton } from '@/components/ui/BrutalButton'
+import SummaryWizard from '@/components/SummaryWizard'
+import { cn } from '@/lib/utils'
+import { MultiStepLoader } from '@/components/ui/multi-step-loader'
 
 type SummaryMode = 'default' | 'custom'
 type SummaryTone = 'objective' | 'cautiously optimistic' | 'bullish' | 'bearish'
@@ -60,6 +65,7 @@ type SummaryPreferenceFormState = {
   outputStyle: SummaryOutputStyle
   targetLength: number
   healthRating: HealthRatingFormState
+  includeHealthScore: boolean
 }
 
 type SummaryPreferenceSnapshot = {
@@ -73,7 +79,13 @@ type SummaryPreferenceSnapshot = {
   healthRating?: Partial<HealthRatingFormState>
 }
 
-type FilingSummaryMap = Record<string, { content: string; metadata: SummaryPreferenceSnapshot }>
+type FilingSummary = {
+  content: string
+  metadata: SummaryPreferenceSnapshot
+  healthRating?: number
+}
+
+type FilingSummaryMap = Record<string, FilingSummary>
 
 const focusAreaOptions = [
   'Financial performance',
@@ -155,11 +167,12 @@ const healthRatingDefaults: HealthRatingFormState = {
 const createDefaultSummaryPreferences = (): SummaryPreferenceFormState => ({
   mode: 'default',
   investorFocus: '',
-  focusAreas: [],
+  focusAreas: ['Financial performance', 'Risk factors'],
   tone: 'objective',
   detailLevel: 'balanced',
   outputStyle: 'narrative',
-  targetLength: 300,
+  targetLength: 650,
+  includeHealthScore: true,
   healthRating: { ...healthRatingDefaults },
 })
 
@@ -169,22 +182,30 @@ const clampTargetLength = (value: number) => {
 }
 
 const buildPreferencePayload = (prefs: SummaryPreferenceFormState): FilingSummaryPreferencesPayload | undefined => {
+  // Determine if health score should be enabled (either via granular setting or wizard toggle)
+  const isHealthEnabled = prefs.healthRating.enabled || prefs.includeHealthScore;
+
   const buildHealthRating = () =>
-    prefs.healthRating.enabled
+    isHealthEnabled
       ? {
-          enabled: true,
-          framework: prefs.healthRating.framework,
-          primary_factor_weighting: prefs.healthRating.weighting,
-          risk_tolerance: prefs.healthRating.riskTolerance,
-          analysis_depth: prefs.healthRating.analysisDepth,
-          display_style: prefs.healthRating.displayStyle,
-        }
+        enabled: true,
+        framework: prefs.healthRating.framework,
+        primary_factor_weighting: prefs.healthRating.weighting,
+        risk_tolerance: prefs.healthRating.riskTolerance,
+        analysis_depth: prefs.healthRating.analysisDepth,
+        display_style: prefs.healthRating.displayStyle,
+      }
       : undefined
+
+  // Force health score generation via prompt injection if enabled
+  const healthPromptInjection = isHealthEnabled
+    ? "\n\nIMPORTANT: You MUST calculate and provide a 'Financial Health Rating' (0-100) based on the analysis. Format it exactly as 'Financial Health Rating: X/100'."
+    : "";
 
   if (prefs.mode === 'custom') {
     return {
       mode: 'custom',
-      investor_focus: prefs.investorFocus.trim() || undefined,
+      investor_focus: (prefs.investorFocus.trim() + healthPromptInjection).trim() || undefined,
       focus_areas: prefs.focusAreas.length ? prefs.focusAreas : undefined,
       tone: prefs.tone,
       detail_level: prefs.detailLevel,
@@ -194,10 +215,13 @@ const buildPreferencePayload = (prefs: SummaryPreferenceFormState): FilingSummar
     }
   }
 
-  if (prefs.healthRating.enabled) {
+  if (isHealthEnabled) {
     return {
       mode: 'default',
       health_rating: buildHealthRating(),
+      // For default mode, we can't easily inject into investor_focus if it's not used by the backend for default mode,
+      // but we can try setting it if the backend respects it.
+      investor_focus: healthPromptInjection.trim(),
     }
   }
 
@@ -221,8 +245,8 @@ const snapshotPreferences = (prefs: SummaryPreferenceFormState): SummaryPreferen
     targetLength: clampTargetLength(prefs.targetLength),
     healthRating: prefs.healthRating.enabled
       ? {
-          ...prefs.healthRating,
-        }
+        ...prefs.healthRating,
+      }
       : undefined,
   }
 }
@@ -252,6 +276,7 @@ const sanitizeStoredPreferences = (stored: StoredSummaryPreferences): SummaryPre
   detailLevel: isSummaryDetailValue(stored.detailLevel) ? stored.detailLevel : 'balanced',
   outputStyle: isSummaryOutputStyleValue(stored.outputStyle) ? stored.outputStyle : 'narrative',
   targetLength: clampTargetLength(stored.targetLength),
+  includeHealthScore: stored.healthRating?.enabled ?? false,
   healthRating: {
     enabled: stored.healthRating?.enabled ?? false,
     framework: isHealthFrameworkValue(stored.healthRating?.framework) ? stored.healthRating!.framework : healthRatingDefaults.framework,
@@ -332,8 +357,19 @@ export default function CompanyPage() {
   const [selectedPersonas, setSelectedPersonas] = useState<string[]>([])
   const [currentAnalysisId, setCurrentAnalysisId] = useState<string | null>(analysisIdParam ?? null)
   const [localAnalysisSnapshot, setLocalAnalysisSnapshot] = useState<StoredAnalysisSnapshot | null>(null)
-  const [filingSummaries, setFilingSummaries] = useState<FilingSummaryMap>({})
   const [loadingSummaries, setLoadingSummaries] = useState<Record<string, boolean>>({})
+  const [summaryProgress, setSummaryProgress] = useState<Record<string, string>>({})
+  const [filingSummaries, setFilingSummaries] = useState<Record<string, FilingSummary>>({})
+
+  const LOADING_STEPS = [
+    { text: "Initializing AI Agent..." },
+    { text: "Reading Filing Content..." },
+    { text: "Extracting Financial Data..." },
+    { text: "Analyzing Risk Factors..." },
+    { text: "Computing Health Score..." },
+    { text: "Synthesizing Investor Insights..." },
+    { text: "Polishing Output..." },
+  ];
   const [selectedFilingForSummary, setSelectedFilingForSummary] = useState<string>('')
   const [summaryPreferences, setSummaryPreferences] = useState<SummaryPreferenceFormState>(() => createDefaultSummaryPreferences())
   const [showCustomLengthInput, setShowCustomLengthInput] = useState(false)
@@ -425,20 +461,56 @@ export default function CompanyPage() {
     metadata?: SummaryPreferenceSnapshot,
   ) => {
     setLoadingSummaries(prev => ({ ...prev, [filingId]: true }))
+    setSummaryProgress(prev => ({ ...prev, [filingId]: "Initializing..." }))
+
+    // Start polling
+    const pollInterval = setInterval(async () => {
+      try {
+        const progressRes = await filingsApi.getSummaryProgress(filingId)
+        if (progressRes.data?.status) {
+          setSummaryProgress(prev => ({ ...prev, [filingId]: progressRes.data.status }))
+        }
+      } catch (e) {
+        // Ignore polling errors
+      }
+    }, 1000)
+
     try {
       const response = await filingsApi.summarizeFiling(filingId, preferences)
+
+      // Extract health rating if present
+      let healthRating: number | undefined;
+      if (response.data.health_score !== undefined) {
+        healthRating = response.data.health_score;
+      } else {
+        const extracted = extractHealthRating(response.data.summary);
+        if (extracted.score !== null) {
+          healthRating = extracted.score;
+        }
+      }
+
       setFilingSummaries(prev => ({
         ...prev,
         [filingId]: {
           content: response.data.summary,
           metadata: metadata ?? { mode: 'default' },
+          healthRating,
         },
       }))
     } catch (error: any) {
       const message = error?.response?.data?.detail ?? 'Failed to generate summary'
       alert(message)
     } finally {
-      setLoadingSummaries(prev => ({ ...prev, [filingId]: false }))
+      clearInterval(pollInterval)
+      // Add a small delay to let the user see the completion state if needed
+      setTimeout(() => {
+        setLoadingSummaries(prev => ({ ...prev, [filingId]: false }))
+        setSummaryProgress(prev => {
+          const next = { ...prev }
+          delete next[filingId]
+          return next
+        })
+      }, 1000)
     }
   }
 
@@ -539,11 +611,10 @@ export default function CompanyPage() {
               color="ghost"
               size="sm"
               asMotion={false}
-              className={`min-w-[200px] flex-1 text-left px-4 py-3 rounded-xl border ${
-                active
-                  ? 'bg-primary-500/15 border-primary-500/60 text-white shadow-premium'
-                  : 'bg-white/5 border-white/10 text-gray-300 hover:border-primary-500/40'
-              }`}
+              className={`min-w-[200px] flex-1 text-left px-4 py-3 rounded-xl border ${active
+                ? 'bg-primary-500/15 border-primary-500/60 text-white shadow-premium'
+                : 'bg-white/5 border-white/10 text-gray-300 hover:border-primary-500/40'
+                }`}
             >
               <p className="font-semibold">{option.label}</p>
               <p className="text-xs text-gray-400">{option.description}</p>
@@ -595,25 +666,7 @@ export default function CompanyPage() {
     () => filings?.find((f: any) => f.id === selectedFilingForSummary),
     [filings, selectedFilingForSummary],
   )
-  const filingListItems = useMemo<AnimatedListItem[]>(() => {
-    if (!filings) return []
-    return filings.map((filing: any) => {
-      const formattedDate = filing.filing_date
-        ? new Date(filing.filing_date).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
-        : 'Date unavailable'
 
-      const period = filing.period || filing.period_end || filing.fiscal_period
-      const description = period ? `${formattedDate} • ${period}` : formattedDate
-      const status = filing.status || filing.filing_status
-
-      return {
-        id: filing.id,
-        title: filing.filing_type || 'Filing',
-        description,
-        meta: status,
-      }
-    })
-  }, [filings])
 
   // Fetch analyses
   const { data: analyses, refetch: refetchAnalyses, error: analysesError } = useQuery({
@@ -829,802 +882,425 @@ export default function CompanyPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-dark-900 via-primary-900 to-dark-900">
+    <div className="min-h-screen bg-gray-50 dark:bg-black font-sans text-black dark:text-white selection:bg-yellow-300 selection:text-black">
       <Navbar />
-      
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {/* Header */}
-        <div className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20 mb-8 animate-fade-in">
-          <div className="flex justify-between items-start">
-            <div className="flex-1">
-              <h1 className="text-4xl font-bold text-white mb-3">{company.name}</h1>
-              <div className="flex items-center gap-3 flex-wrap">
-                <span className="px-4 py-2 rounded-lg bg-gradient-to-r from-primary-500 to-accent-500 text-white font-bold text-lg">
-                  {company.ticker}
+
+      <main className="container mx-auto px-4 py-8 max-w-7xl space-y-8">
+        {/* Header Section */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 md:p-8 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)]"
+        >
+          <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
+            <div className="flex items-center gap-6">
+              <div className="w-20 h-20 bg-white dark:bg-black border-2 border-black dark:border-white flex items-center justify-center shrink-0 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)]">
+                {company?.ticker ? (
+                  <img
+                    src={`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/v1/companies/logo/${company.ticker}`}
+                    alt={`${company.name} logo`}
+                    className="w-12 h-12 object-contain"
+                    onError={(e) => {
+                      e.currentTarget.style.display = 'none'
+                      e.currentTarget.nextElementSibling?.classList.remove('hidden')
+                    }}
+                  />
+                ) : null}
+                <span className={`text-2xl font-black ${company?.ticker ? 'hidden' : ''}`}>
+                  {company?.ticker?.slice(0, 2) ?? 'CO'}
                 </span>
-                <span className="px-3 py-1 rounded-lg bg-white/10 text-gray-300 text-sm">
-                  {company.exchange}
-                </span>
-                {company.sector && (
-                  <span className="px-3 py-1 rounded-lg bg-white/10 text-gray-300 text-sm">
-                    {company.sector}
-                  </span>
-                )}
+              </div>
+              <div>
+                <h1 className="text-3xl md:text-4xl font-black uppercase tracking-tight mb-2">
+                  {company?.name ?? 'Loading...'}
+                </h1>
+                <div className="flex flex-wrap gap-3">
+                  {company?.ticker && (
+                    <span className="px-3 py-1 bg-blue-600 text-white text-xs font-bold uppercase border border-black dark:border-white shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)]">
+                      {company.ticker}
+                    </span>
+                  )}
+                  {company?.exchange && (
+                    <span className="px-3 py-1 bg-white dark:bg-black text-black dark:text-white text-xs font-bold uppercase border border-black dark:border-white shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)]">
+                      {company.exchange}
+                    </span>
+                  )}
+                  {company?.sector && (
+                    <span className="px-3 py-1 bg-yellow-400 text-black text-xs font-bold uppercase border border-black dark:border-white shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)]">
+                      {company.sector}
+                    </span>
+                  )}
+                </div>
               </div>
             </div>
-            {latestAnalysis && latestAnalysis.health_score && (
-              <div className="ml-4">
-                <HealthScoreBadge 
-                  score={latestAnalysis.health_score} 
-                  band={latestAnalysis.score_band || 'Unknown'}
+
+            {latestAnalysis?.health_score != null && (
+              <div className="self-end md:self-center">
+                <HealthScoreBadge
+                  score={latestAnalysis.health_score}
+                  band={scoreToRating(latestAnalysis.health_score).label}
                 />
               </div>
             )}
           </div>
+        </motion.div>
+
+        {/* Navigation Tabs */}
+        <div className="flex flex-wrap gap-4 border-b-4 border-black dark:border-white pb-1">
+          {['overview', 'filings', 'analysis', 'personas'].map((tab) => (
+            <button
+              key={tab}
+              onClick={() => setSelectedTab(tab as any)}
+              className={`
+                  px-6 py-3 font-bold uppercase tracking-wider text-sm transition-all duration-200 border-2 border-black dark:border-white
+                  ${selectedTab === tab
+                  ? 'bg-black text-white dark:bg-white dark:text-black shadow-[4px_4px_0px_0px_rgba(128,128,128,1)] translate-y-[-2px] translate-x-[-2px]'
+                  : 'bg-white dark:bg-black text-black dark:text-white hover:bg-gray-100 dark:hover:bg-zinc-900 shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)]'}
+                `}
+            >
+              {tab}
+            </button>
+          ))}
         </div>
 
+        {/* Info Message */}
         {infoMessage && (
-          <div className="mb-6 bg-gradient-to-r from-yellow-500/10 to-orange-500/10 border-2 border-yellow-500/30 text-yellow-300 px-6 py-4 rounded-2xl backdrop-blur-sm animate-slide-down">
-            <div className="flex items-center gap-3">
-              <svg className="w-6 h-6 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
-                <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
-              </svg>
-              <p className="font-medium">{infoMessage}</p>
-            </div>
-          </div>
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            className="bg-red-100 dark:bg-red-900/30 border-2 border-red-600 text-red-700 dark:text-red-300 px-6 py-4 font-bold shadow-[4px_4px_0px_0px_rgba(220,38,38,1)]"
+          >
+            {infoMessage}
+          </motion.div>
         )}
 
-        {/* Tabs */}
-        <div className="glass rounded-2xl border border-white/10 shadow-premium-lg mb-6 overflow-hidden animate-slide-up">
-          <div className="border-b border-white/10">
-            <nav className="flex -mb-px overflow-x-auto">
-              {[
-                { id: 'overview', label: 'Overview' },
-                { id: 'filings', label: 'Filings' },
-                { id: 'analysis', label: 'Analysis' },
-                { id: 'personas', label: 'Investor Personas' },
-              ].map(tab => (
-                <Button
-                  key={tab.id}
-                  onClick={() => setSelectedTab(tab.id as any)}
-                  color="ghost"
-                  size="sm"
-                  asMotion={false}
-                  className={`px-6 py-4 text-sm font-semibold whitespace-nowrap transition-all rounded-none ${
-                    selectedTab === tab.id
-                      ? 'border-b-2 border-primary-500 text-white bg-white/5'
-                      : 'text-gray-400 hover:text-white hover:bg-white/5'
-                  }`}
-                >
-                  {tab.label}
-                </Button>
-              ))}
-            </nav>
-          </div>
+        {/* Tab Content */}
+        <div className="min-h-[400px]">
+          {selectedTab === 'overview' && (
+            <motion.div
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              className="space-y-8"
+            >
+              {/* Quick Actions */}
+              <div className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)]">
+                <h2 className="text-xl font-black uppercase mb-6 flex items-center gap-3">
+                  <span className="w-4 h-4 bg-black dark:bg-white"></span>
+                  Quick Actions
+                </h2>
+                <div className="flex flex-wrap gap-4">
+                  <BrutalButton
+                    onClick={() => fetchFilingsMutation.mutate()}
+                    disabled={fetchFilingsMutation.isPending}
+                    variant="unapologetic"
+                  >
+                    {fetchFilingsMutation.isPending ? 'Fetching...' : 'Fetch Latest Filings'}
+                  </BrutalButton>
 
-          <div className="p-8">
-            {/* Overview Tab */}
-            {selectedTab === 'overview' && (
-              <div className="space-y-8">
-                <div>
-                  <h2 className="text-2xl font-bold text-white mb-6 flex items-center gap-2">
-                    <svg className="w-6 h-6 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                    </svg>
-                    Quick Actions
+                  <BrutalButton
+                    onClick={() => runAnalysisMutation.mutate()}
+                    disabled={runAnalysisMutation.isPending}
+                    variant="outline-rounded"
+                  >
+                    {runAnalysisMutation.isPending ? 'Running...' : 'Run Analysis'}
+                  </BrutalButton>
+                </div>
+              </div>
+
+              {/* Health Analysis Section */}
+              {latestAnalysis?.health_score != null && (
+                <div className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)]">
+                  <h2 className="text-xl font-black uppercase mb-6 flex items-center gap-3">
+                    <span className="w-4 h-4 bg-red-500"></span>
+                    Health Analysis
                   </h2>
-                  <div className="flex flex-wrap gap-4 mb-6">
-                    <Button
-                      onClick={() => fetchFilingsMutation.mutate()}
-                      color="primary"
-                      size="md"
-                      isLoading={fetchFilingsMutation.isPending}
-                      leftIcon={
-                        !fetchFilingsMutation.isPending ? (
-                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
-                          </svg>
-                        ) : undefined
-                      }
-                    >
-                      {fetchFilingsMutation.isPending ? 'Fetching Filings...' : 'Fetch Latest Filings'}
-                    </Button>
-                    <Button
-                      onClick={() => runAnalysisMutation.mutate()}
-                      disabled={!filings || filings.length === 0}
-                      color="success"
-                      size="md"
-                      isLoading={runAnalysisMutation.isPending}
-                      leftIcon={
-                        !runAnalysisMutation.isPending ? (
-                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-                          </svg>
-                        ) : undefined
-                      }
-                    >
-                      {runAnalysisMutation.isPending ? 'Running Analysis...' : 'Run Analysis'}
-                    </Button>
-                    <Button
-                      onClick={handleManualDashboardUpdate}
-                      disabled={!analysisToDisplay}
-                      color="secondary"
-                      size="md"
-                      className="border border-white/10 text-gray-200 hover:border-primary-500/60 hover:text-white"
-                      leftIcon={
-                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v6h6M20 20v-6h-6M5 19l5-5M19 5l-5 5" />
-                        </svg>
-                      }
-                    >
-                      Update dashboard
-                    </Button>
+                  <div className="flex flex-col md:flex-row gap-8 items-center">
+                    <div className="shrink-0">
+                      <HealthScoreBadge
+                        score={latestAnalysis.health_score}
+                        band={scoreToRating(latestAnalysis.health_score).label}
+                      />
+                    </div>
+                    <div className="flex-1">
+                      <h3 className="font-bold uppercase text-lg mb-2">
+                        {scoreToRating(latestAnalysis.health_score).label} Health
+                      </h3>
+                      <p className="font-mono text-sm text-gray-600 dark:text-gray-300">
+                        {latestAnalysis.summary || "No health summary available yet. Run a full analysis to generate detailed health insights."}
+                      </p>
+                    </div>
                   </div>
-                  
-                  {filings && filings.length > 0 && (
-                    <div
-                      ref={summaryCardRef}
-                      id="summary-preferences"
-                      className="card-premium bg-gradient-to-br from-dark-700 to-dark-800 border-primary-500/20 space-y-6"
-                    >
-                      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-                        <div className="flex items-center gap-3">
-                          <svg className="w-6 h-6 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                          </svg>
-                          <div>
-                            <p className="text-lg font-semibold text-white">Personalized AI Summary</p>
-                            <p className="text-sm text-gray-400">
-                              {selectedFilingDetails
-                                ? `${selectedFilingDetails.filing_type} • ${new Date(selectedFilingDetails.filing_date).toLocaleDateString()}`
-                                : 'Choose a filing to get started.'}
-                            </p>
-                          </div>
-                        </div>
-                        {selectedFilingDetails?.status && (
-                          <span className="inline-flex items-center px-3 py-1 rounded-full bg-primary-500/20 text-primary-200 text-xs font-semibold uppercase tracking-wide">
-                            {selectedFilingDetails.status}
-                          </span>
-                        )}
+                </div>
+              )}
+
+              {/* AI Summary Section */}
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                {/* Summary Generation Card */}
+                <div className="lg:col-span-1 bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)] h-fit sticky top-4">
+                  <h3 className="text-lg font-black uppercase mb-6 flex items-center gap-2">
+                    <span className="w-3 h-3 bg-blue-600"></span>
+                    Generate Brief
+                  </h3>
+
+                  <div className="space-y-6">
+                    <SummaryWizard
+                      filings={filings}
+                      selectedFilingId={selectedFilingForSummary}
+                      onFilingChange={setSelectedFilingForSummary}
+                      preferences={summaryPreferences}
+                      onPreferencesChange={setSummaryPreferences}
+                      onGenerate={requestSummaryWithPreferences}
+                      isGenerating={isSummaryGenerating}
+                    />
+                  </div>
+                </div>
+
+                {/* Generated Summaries List */}
+                <div className="lg:col-span-2 space-y-6">
+                  {Object.entries(filingSummaries).length === 0 && Object.keys(dashboardSavedSummaries).length === 0 ? (
+                    <div className="bg-gray-50 dark:bg-zinc-900/50 border-2 border-dashed border-gray-300 dark:border-gray-700 p-12 text-center">
+                      <div className="w-16 h-16 bg-gray-200 dark:bg-zinc-800 mx-auto mb-4 flex items-center justify-center border-2 border-gray-400 dark:border-gray-600">
+                        <span className="text-2xl">📄</span>
                       </div>
-
-                      <div className="space-y-6">
-                        <div>
-                          <div className="flex items-center justify-between mb-2">
-                            <label className="text-sm font-semibold text-gray-300">Select filing</label>
-                            <span className="text-xs text-gray-400">
-                              {selectedFilingForSummary ? 'Press Enter to confirm' : 'Use ↑ ↓ + Enter'}
-                            </span>
-                          </div>
-                          <AnimatedList
-                            items={filingListItems}
-                            selectedId={selectedFilingForSummary}
-                            onItemSelect={(item) => setSelectedFilingForSummary(item.id)}
-                            showGradients
-                            enableArrowNavigation
-                            displayScrollbar={false}
-                          />
-                        </div>
-
-                        <div>
-                          <p className="text-sm font-semibold text-gray-300 mb-3">How should we summarize it?</p>
-                          <div className="grid sm:grid-cols-2 gap-3">
-                            {['default', 'custom'].map((mode) => {
-                              const isSelected = summaryPreferences.mode === mode
-                              return (
-                                <Button
-                                  key={mode}
-                                  type="button"
-                                  onClick={() => setSummaryPreferences(prev => ({ ...prev, mode: mode as SummaryMode }))}
-                                  color="ghost"
-                                  size="md"
-                                  asMotion={false}
-                                  className={`text-left p-4 rounded-xl border transition-all ${
-                                    isSelected
-                                      ? 'border-primary-500/60 bg-primary-500/15 text-white shadow-premium'
-                                      : 'border-white/10 bg-white/5 text-gray-300 hover:border-primary-500/40'
-                                  }`}
-                                >
-                                  <p className="font-semibold mb-1 flex items-center gap-2">
-                                    <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-white/20 text-xs">
-                                      {isSelected ? '✓' : mode === 'default' ? '0' : '?'}
-                                    </span>
-                                    {mode === 'default' ? 'Default summary' : 'Custom brief'}
-                                  </p>
-                                  <p className="text-sm text-gray-300">
-                                    {mode === 'default'
-                                      ? 'Use the Financesum house style with balanced coverage.'
-                                      : 'Answer a few prompts so the AI focuses on what you care about.'}
-                                  </p>
-                                </Button>
-                              )
-                            })}
-                          </div>
-                        </div>
-
-                        {summaryPreferences.mode === 'custom' ? (
-                          <>
+                      <h3 className="text-lg font-bold uppercase text-gray-500 dark:text-gray-400">No summaries yet</h3>
+                      <p className="text-sm text-gray-400 mt-2">Select a filing to generate an AI-powered brief.</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-6">
+                      {Object.entries(filingSummaries).map(([fid, summary]) => (
+                        <motion.div
+                          key={fid}
+                          initial={{ opacity: 0, y: 20 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 shadow-[6px_6px_0px_0px_rgba(0,0,0,1)] dark:shadow-[6px_6px_0px_0px_rgba(255,255,255,1)]"
+                        >
+                          <div className="flex justify-between items-start mb-4 border-b-2 border-gray-100 dark:border-gray-800 pb-4">
                             <div>
-                              <label className="text-sm font-semibold text-gray-300 mb-2 block">
-                                What are you specifically looking for?
-                              </label>
-                              <textarea
-                                value={summaryPreferences.investorFocus}
-                                onChange={(e) => setSummaryPreferences(prev => ({ ...prev, investorFocus: e.target.value }))}
-                                rows={3}
-                                placeholder="e.g. Compare margin trends and call out liquidity risks."
-                                className="w-full px-4 py-3 bg-dark-900 border-2 border-white/10 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-primary-500 focus:ring-4 focus:ring-primary-100/20 transition-all"
-                              />
-                            </div>
-
-                            <div>
-                              <p className="text-sm font-semibold text-gray-300 mb-3">Focus areas</p>
-                              <div className="flex flex-wrap gap-2">
-                                {focusAreaOptions.map(area => {
-                                  const active = summaryPreferences.focusAreas.includes(area)
-                                  return (
-                                    <Button
-                                      key={area}
-                                      type="button"
-                                      onClick={() => toggleFocusArea(area)}
-                                      color="ghost"
-                                      size="sm"
-                                      asMotion={false}
-                                      className={`px-4 py-2 rounded-full text-sm border transition-all ${
-                                        active
-                                          ? 'border-primary-500 text-primary-200 bg-primary-500/15'
-                                          : 'border-white/10 text-gray-300 bg-white/5 hover:border-primary-500/40 hover:text-white'
-                                      }`}
-                                    >
-                                      {area}
-                                    </Button>
-                                  )
-                                })}
-                              </div>
-                            </div>
-
-                            <div className="grid gap-4 lg:grid-cols-3">
-                              <div className="bg-white/5 rounded-xl p-4 border border-white/10">
-                                <p className="text-sm font-semibold text-gray-300 mb-3">Tone</p>
-                                <div className="space-y-2">
-                                  {toneOptions.map(option => {
-                                    const active = summaryPreferences.tone === option.value
-                                    return (
-                                      <Button
-                                        key={option.value}
-                                        type="button"
-                                        onClick={() => setSummaryPreferences(prev => ({ ...prev, tone: option.value }))}
-                                        color="ghost"
-                                        size="sm"
-                                        asMotion={false}
-                                        className={`w-full text-left px-3 py-2 rounded-lg text-sm transition ${
-                                          active ? 'bg-primary-500/20 text-white border border-primary-500/60' : 'bg-dark-900 border border-white/10 text-gray-300 hover:border-primary-500/40'
-                                        }`}
-                                      >
-                                        <p className="font-semibold">{option.label}</p>
-                                        <p className="text-xs text-gray-400">{option.description}</p>
-                                      </Button>
-                                    )
-                                  })}
-                                </div>
-                              </div>
-                              <div className="bg-white/5 rounded-xl p-4 border border-white/10">
-                                <p className="text-sm font-semibold text-gray-300 mb-3">Detail level</p>
-                                <div className="space-y-2">
-                                  {detailOptions.map(option => {
-                                    const active = summaryPreferences.detailLevel === option.value
-                                    return (
-                                      <Button
-                                        key={option.value}
-                                        type="button"
-                                        onClick={() => setSummaryPreferences(prev => ({ ...prev, detailLevel: option.value }))}
-                                        color="ghost"
-                                        size="sm"
-                                        asMotion={false}
-                                        className={`w-full text-left px-3 py-2 rounded-lg text-sm transition ${
-                                          active ? 'bg-primary-500/20 text-white border border-primary-500/60' : 'bg-dark-900 border border-white/10 text-gray-300 hover:border-primary-500/40'
-                                        }`}
-                                      >
-                                        <p className="font-semibold">{option.label}</p>
-                                        <p className="text-xs text-gray-400">{option.description}</p>
-                                      </Button>
-                                    )
-                                  })}
-                                </div>
-                              </div>
-                              <div className="bg-white/5 rounded-xl p-4 border border-white/10">
-                                <p className="text-sm font-semibold text-gray-300 mb-3">Output style</p>
-                                <div className="space-y-2">
-                                  {outputStyleOptions.map(option => {
-                                    const active = summaryPreferences.outputStyle === option.value
-                                    return (
-                                      <Button
-                                        key={option.value}
-                                        type="button"
-                                        onClick={() => setSummaryPreferences(prev => ({ ...prev, outputStyle: option.value }))}
-                                        color="ghost"
-                                        size="sm"
-                                        asMotion={false}
-                                        className={`w-full text-left px-3 py-2 rounded-lg text-sm transition ${
-                                          active ? 'bg-primary-500/20 text-white border border-primary-500/60' : 'bg-dark-900 border border-white/10 text-gray-300 hover:border-primary-500/40'
-                                        }`}
-                                      >
-                                        <p className="font-semibold">{option.label}</p>
-                                        <p className="text-xs text-gray-400">{option.description}</p>
-                                      </Button>
-                                    )
-                                  })}
-                                </div>
-                              </div>
-                            </div>
-
-                            <div className="bg-white/5 rounded-xl p-4 border border-primary-500/30 space-y-4">
-                              <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-                                <div>
-                                  <p className="text-sm font-semibold text-white">Financial health rating</p>
-                                  <p className="text-xs text-gray-400">
-                                    Let the AI score this filing on a 0–100 scale with configurable weighting, strictness, and output style.
-                                  </p>
-                                </div>
-                                <StatefulButton onClick={handleHealthToggle} className="min-w-[200px]">
-                                  {summaryPreferences.healthRating.enabled ? 'Disable health score' : 'Include health score'}
-                                </StatefulButton>
-                              </div>
-                              {summaryPreferences.healthRating.enabled && (
-                                <div className="space-y-4">
-                                  {renderHealthGroup(
-                                    '1. What type of financial health framework should the AI use?',
-                                    'Determines how the rating is calculated.',
-                                    healthFrameworkOptions,
-                                    summaryPreferences.healthRating.framework,
-                                    (value) => updateHealthRatingField('framework', value as HealthFramework),
-                                  )}
-                                  {renderHealthGroup(
-                                    '2. What should be the primary factor weighting?',
-                                    'Determines which category matters most.',
-                                    healthWeightingOptions,
-                                    summaryPreferences.healthRating.weighting,
-                                    (value) => updateHealthRatingField('weighting', value as HealthWeighting),
-                                  )}
-                                  {renderHealthGroup(
-                                    '3. How strict should the AI be when penalizing risks?',
-                                    'Determines penalty severity.',
-                                    healthRiskOptions,
-                                    summaryPreferences.healthRating.riskTolerance,
-                                    (value) => updateHealthRatingField('riskTolerance', value as HealthRiskTolerance),
-                                  )}
-                                  {renderHealthGroup(
-                                    '4. What analysis depth should the AI use to detect red flags?',
-                                    'Determines how deep the AI digs into the filing.',
-                                    healthAnalysisDepthOptions,
-                                    summaryPreferences.healthRating.analysisDepth,
-                                    (value) => updateHealthRatingField('analysisDepth', value as HealthAnalysisDepth),
-                                  )}
-                                  {renderHealthGroup(
-                                    '5. How should the health rating be displayed?',
-                                    'Determines the output format of the score.',
-                                    healthDisplayOptions,
-                                    summaryPreferences.healthRating.displayStyle,
-                                    (value) => updateHealthRatingField('displayStyle', value as HealthDisplayStyle),
-                                  )}
-                                </div>
-                              )}
-                            </div>
-
-                            <div>
-                              <div className="flex items-center justify-between mb-2">
-                                <p className="text-sm font-semibold text-gray-300">Target length</p>
-                                <div className="flex items-center gap-3">
-                                  <span className="text-sm text-primary-200 font-semibold">
-                                    {summaryPreferences.targetLength} words
+                              <div className="flex items-center gap-3">
+                                <h4 className="font-black uppercase text-lg">AI Brief</h4>
+                                {summary.healthRating && (
+                                  <span className={cn(
+                                    "px-2 py-0.5 text-xs font-bold uppercase border border-black dark:border-white",
+                                    summary.healthRating >= 70 ? "bg-green-400 text-black" :
+                                      summary.healthRating >= 40 ? "bg-yellow-400 text-black" :
+                                        "bg-red-400 text-black"
+                                  )}>
+                                    Health: {summary.healthRating}/100
                                   </span>
-                                  <Button
-                                    type="button"
-                                    onClick={() => setShowCustomLengthInput(prev => !prev)}
-                                    color="ghost"
-                                    size="sm"
-                                    asMotion={false}
-                                    className="px-3 py-1 rounded-lg border border-white/10 text-xs text-gray-300 hover:border-primary-500/40 hover:text-white transition"
-                                  >
-                                    {showCustomLengthInput ? 'Hide custom' : 'Custom'}
-                                  </Button>
-                                </div>
+                                )}
                               </div>
-                              <input
-                                type="range"
-                                min={50}
-                                max={5000}
-                                step={50}
-                                value={sliderLengthValue}
-                                onChange={(e) => updateTargetLength(Number(e.target.value))}
-                                className="w-full accent-primary-500"
-                              />
-                              <p className="text-xs text-gray-400 mt-1">
-                                Drag to tell the AI how much detail you want (50–5000 words). Use custom input for finer control (down to 10 words).
+                              <p className="text-xs font-mono text-gray-500 mt-1">
+                                Filing ID: {fid.slice(0, 8)}...
                               </p>
-                              {showCustomLengthInput && (
-                                <div className="mt-3 flex flex-col sm:flex-row gap-2">
-                                  <input
-                                    type="number"
-                                    min={10}
-                                    max={5000}
-                                    value={customLengthInput}
-                                    onChange={(e) => setCustomLengthInput(e.target.value)}
-                                    className="flex-1 px-4 py-2 rounded-lg bg-dark-900 border-2 border-white/10 text-white focus:outline-none focus:border-primary-500 focus:ring-4 focus:ring-primary-100/20"
-                                    placeholder="Enter custom word count"
-                                  />
-                                  <Button
-                                    type="button"
-                                    onClick={handleCustomLengthApply}
-                                    color="primary"
-                                    size="sm"
-                                  >
-                                    Apply
-                                  </Button>
-                                </div>
-                              )}
                             </div>
-                          </>
-                        ) : (
-                          <div className="bg-white/5 border border-white/10 rounded-xl p-4 text-sm text-gray-300">
-                            <p className="font-semibold text-white mb-2">Default house summary</p>
-                            <p>
-                              We will use the standard Financesum memo: executive summary, financial performance, MD&A,
-                              risks, capital allocation, and key metrics — optimized for a balanced ~300 word read. Adjust the target length above if you need more or less detail.
-                            </p>
+                            <div className="flex gap-2">
+                              <BrutalButton
+                                onClick={() => handleAddSummaryToDashboard(fid)}
+                                disabled={dashboardSavedSummaries[fid]}
+                                className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-green-400 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)] disabled:opacity-50 disabled:cursor-not-allowed"
+                              >
+                                {dashboardSavedSummaries[fid] ? 'Saved' : 'Save to Dashboard'}
+                              </BrutalButton>
+                              <BrutalButton
+                                onClick={() => {
+                                  const newSummaries = { ...filingSummaries }
+                                  delete newSummaries[fid]
+                                  setFilingSummaries(newSummaries)
+                                }}
+                                className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-red-400 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)]"
+                              >
+                                Dismiss
+                              </BrutalButton>
+                            </div>
                           </div>
-                        )}
-
-                        <div className="flex flex-wrap gap-3">
-                          <Button
-                            onClick={requestSummaryWithPreferences}
-                            disabled={!selectedFilingForSummary}
-                            isLoading={isSummaryGenerating}
-                            color="primary"
-                            size="md"
-                            className="bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700"
-                            leftIcon={
-                              !isSummaryGenerating ? (
-                                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 4a2 2 0 114 0v1a1 1 0 001 1h3a1 1 0 011 1v3a1 1 0 01-1 1h-1a2 2 0 100 4h1a1 1 0 011 1v3a1 1 0 01-1 1h-3a1 1 0 01-1-1v-1a2 2 0 10-4 0v1a1 1 0 01-1 1H7a1 1 0 01-1-1v-3a1 1 0 00-1-1H4a2 2 0 110-4h1a1 1 0 001-1V7a1 1 0 011-1h3a1 1 0 001-1V4z" />
-                                </svg>
-                              ) : undefined
-                            }
-                          >
-                            {isSummaryGenerating ? 'Generating...' : (summaryPreferences.mode === 'custom' ? 'Generate custom summary' : 'Generate default summary')}
-                          </Button>
-                          <Button
-                            type="button"
-                            onClick={() => {
-                              const defaults = createDefaultSummaryPreferences()
-                              setSummaryPreferences(defaults)
-                              setShowCustomLengthInput(false)
-                              setCustomLengthInput(String(defaults.targetLength))
-                            }}
-                            color="ghost"
-                            size="md"
-                            className="px-5 py-3 rounded-lg border border-white/10 text-sm text-gray-300 hover:border-primary-500/40 hover:text-white transition"
-                          >
-                            Reset questionnaire
-                          </Button>
-                        </div>
-                      </div>
+                          <div className="prose dark:prose-invert max-w-none font-mono text-sm max-h-[600px] overflow-y-auto pr-2 custom-scrollbar">
+                            <ReactMarkdown>{summary.content}</ReactMarkdown>
+                          </div>
+                        </motion.div>
+                      ))}
                     </div>
                   )}
                 </div>
+              </div>
+            </motion.div>
+          )}
 
-                {(() => {
-                  if (Object.keys(filingSummaries).length === 0) return null
-                  
-                  const summaryEntries = Object.entries(filingSummaries)
-                  return summaryEntries.map(([filingId, summaryData]) => {
-                    const filing = filings?.find((f: any) => f.id === filingId)
-                    if (!filing || !summaryData?.content) return null
-                    const meta = summaryData.metadata
+          {selectedTab === 'filings' && (
+            <motion.div
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)]"
+            >
+              <h2 className="text-xl font-black uppercase mb-6 flex items-center gap-3">
+                <span className="w-4 h-4 bg-purple-600"></span>
+                Recent Filings
+              </h2>
 
-                    return (
-                      <div key={filingId} className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/30 animate-scale-in">
-                        <div className="flex justify-between items-start mb-6 gap-4 flex-wrap">
-                          <div className="flex items-center gap-3">
-                            <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-primary-500 to-accent-500 flex items-center justify-center">
-                              <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                              </svg>
-                            </div>
-                            <div>
-                              <h3 className="text-xl font-bold text-white">
-                                {meta?.mode === 'custom' ? 'Custom Summary' : 'AI Summary'}: {filing.filing_type}
-                              </h3>
-                              <p className="text-sm text-gray-400">
-                                {new Date(filing.filing_date).toLocaleDateString()}
-                              </p>
-                              <div className="flex flex-wrap gap-2 mt-2">
-                                <span className="px-3 py-1 rounded-full text-xs font-semibold bg-white/5 text-gray-300 border border-white/10">
-                                  {meta?.mode === 'custom' ? 'Tailored request' : 'Default settings'}
-                                </span>
-                                {meta?.targetLength && (
-                                  <span className="px-3 py-1 rounded-full text-xs font-semibold bg-primary-500/10 text-primary-200 border border-primary-500/40">
-                                    ~{meta.targetLength} words
-                                  </span>
-                                )}
-                                {meta?.healthRating?.enabled && (
-                                  <span className="px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-200 border border-emerald-400/50">
-                                    Includes health rating
-                                  </span>
-                                )}
-                              </div>
-                            </div>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <Button
-                              onClick={() => handleAddSummaryToDashboard(filingId)}
-                              color={dashboardSavedSummaries[filingId] ? 'success' : 'secondary'}
-                              size="sm"
-                              disabled={!company || dashboardSavedSummaries[filingId]}
-                              className="whitespace-nowrap"
-                              leftIcon={
-                                dashboardSavedSummaries[filingId] ? (
-                                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                                  </svg>
-                                ) : (
-                                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-                                  </svg>
-                                )
-                              }
-                            >
-                              {dashboardSavedSummaries[filingId] ? 'Added to dashboard' : 'Add to dashboard'}
-                            </Button>
-                            <Button
-                              onClick={() => {
-                                const newSummaries = { ...filingSummaries }
-                                delete newSummaries[filingId]
-                                setFilingSummaries(newSummaries)
-                              }}
-                              color="ghost"
-                              size="sm"
-                              className="text-gray-400 hover:text-red-400 transition-colors p-2"
-                            >
-                              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                              </svg>
-                            </Button>
-                          </div>
+              {filingsLoading ? (
+                <div className="text-center py-12 font-mono animate-pulse">Loading filings data...</div>
+              ) : !filings?.length ? (
+                <div className="text-center py-12 border-2 border-dashed border-gray-300 dark:border-gray-700">
+                  No filings found.
+                </div>
+              ) : (
+                <AnimatedList
+                  items={filings}
+                  renderItem={(filing: any, index: number, isSelected: boolean) => (
+                    <div className="flex flex-col md:flex-row justify-between gap-4 w-full">
+                      <div>
+                        <div className="flex items-center gap-3 mb-2">
+                          <span className="font-black text-lg uppercase">{filing.filing_type}</span>
+                          <span className={`px-2 py-0.5 text-[10px] font-bold uppercase border border-black dark:border-white ${filing.status === 'Completed' ? 'bg-green-400 text-black' : 'bg-yellow-400 text-black'
+                            }`}>
+                            {filing.status || 'Unknown'}
+                          </span>
+                          {loadingSummaries[filing.id] && (
+                            <MultiStepLoader
+                              loadingStates={LOADING_STEPS}
+                              loading={loadingSummaries[filing.id]}
+                              duration={2000}
+                              loop={false}
+                              currentStep={Math.max(0, LOADING_STEPS.findIndex(s => s.text === (summaryProgress[filing.id] || "Initializing AI Agent...")))}
+                            />
+                          )}
                         </div>
-                        {meta?.investorFocus && (
-                          <div className="mb-4 px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-sm text-gray-200">
-                            <p className="font-semibold text-white mb-1">Investor request</p>
-                            <p>{meta.investorFocus}</p>
-                          </div>
-                        )}
-                        {meta?.focusAreas && meta.focusAreas.length > 0 && (
-                          <div className="mb-4 flex flex-wrap gap-2">
-                            {meta.focusAreas.map(area => (
-                              <span key={area} className="px-3 py-1 rounded-full bg-primary-500/10 text-primary-100 text-xs border border-primary-500/20">
-                                {area}
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                        <EnhancedSummary content={summaryData.content} />
+                        <p className="font-mono text-xs text-gray-600 dark:text-gray-400">
+                          {new Date(filing.filing_date).toLocaleDateString()} • {filing.period || 'N/A'}
+                        </p>
                       </div>
-                    )
-                  })
-                })()}
-
-                {latestAnalysis && latestAnalysis.ratios && (
-                  <FinancialCharts ratios={latestAnalysis.ratios} />
-                )}
-              </div>
-            )}
-
-            {/* Filings Tab */}
-            {selectedTab === 'filings' && (
-              <div>
-                <h2 className="text-2xl font-bold text-white mb-6 flex items-center gap-2">
-                  <svg className="w-6 h-6 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                  </svg>
-                  SEC Filings
-                </h2>
-                {filingsLoading ? (
-                  <div className="text-center py-12">
-                    <div className="spinner mx-auto mb-4"></div>
-                    <p className="text-gray-300">Loading filings...</p>
-                  </div>
-                ) : filings && filings.length > 0 ? (
-                  <div className="space-y-4">
-                    {filings.map((filing: any) => {
-                      const inlineSummary = filingSummaries[filing.id]
-                      return (
-                        <div key={filing.id} className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20 hover:border-primary-500/40">
-                        <div className="flex justify-between items-start gap-4">
-                          <div className="flex-1">
-                            <h3 className="text-lg font-bold text-white mb-2">{filing.filing_type}</h3>
-                            <div className="flex flex-wrap gap-3 text-sm">
-                              <span className="text-gray-400">
-                                📅 {new Date(filing.filing_date).toLocaleDateString()}
-                              </span>
-                              <span className="px-2 py-1 rounded bg-primary-500/20 text-primary-300 text-xs font-semibold">
-                                {filing.status}
-                              </span>
-                            </div>
-                          </div>
-                          <div className="flex gap-2">
-                            <Button
-                              onClick={() => {
-                                setSelectedFilingForSummary(filing.id)
-                                scrollToSummaryCard()
-                              }}
-                              isLoading={loadingSummaries[filing.id]}
-                              color="primary"
-                              size="sm"
-                              className="px-4 py-2 bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-sm"
-                            >
-                              {loadingSummaries[filing.id] ? 'Generating...' : 'AI Summary Options'}
-                            </Button>
-                            {filing.url && (
-                              <a
-                                href={resolveFilingUrl(filing.url)}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="px-4 py-2 text-primary-400 hover:text-primary-300 text-sm border-2 border-primary-500/30 hover:border-primary-500/60 rounded-lg font-semibold transition-all flex items-center gap-2"
-                              >
-                                View Filing
-                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
-                                </svg>
-                              </a>
-                            )}
-                          </div>
-                        </div>
-                        {inlineSummary && (
-                          <div className="mt-6 pt-6 border-t border-white/10">
-                            <div className="flex items-center gap-2 mb-3">
-                              <svg className="w-4 h-4 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" />
-                              </svg>
-                              <h4 className="font-bold text-white text-sm">
-                                {inlineSummary.metadata.mode === 'custom' ? 'Custom AI Summary' : 'AI-Generated Summary'}
-                              </h4>
-                              {inlineSummary.metadata.targetLength && (
-                                <span className="px-2 py-0.5 rounded-full bg-primary-500/10 text-primary-200 text-xs border border-primary-500/20">
-                                  ~{inlineSummary.metadata.targetLength} words
-                                </span>
-                              )}
-                            </div>
-                            {inlineSummary.metadata.investorFocus && (
-                              <p className="text-xs text-gray-400 mb-2">
-                                Focus: {inlineSummary.metadata.investorFocus}
-                              </p>
-                            )}
-                            <div className="prose-premium text-base">
-                              <ReactMarkdown>{inlineSummary.content}</ReactMarkdown>
-                            </div>
-                          </div>
-                        )}
+                      <div className="flex items-center gap-3">
+                        <a
+                          href={resolveFilingUrl(filing.filing_url)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="px-4 py-2 text-xs font-bold uppercase border-2 border-black dark:border-white hover:bg-black hover:text-white dark:hover:bg-white dark:hover:text-black transition-colors"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          View Source
+                        </a>
+                        <BrutalButton
+                          variant="brutal-stacked"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            setSelectedTab('overview')
+                            setSelectedFilingForSummary(filing.id)
+                            window.scrollTo({ top: 0, behavior: 'smooth' })
+                          }}
+                        >
+                          Analyze
+                        </BrutalButton>
                       </div>
-                    )})}
-                  </div>
-                ) : (
-                  <div className="text-center py-12 card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20">
-                    <svg className="w-16 h-16 text-gray-500 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                    </svg>
-                    <p className="text-gray-400 text-lg">
-                      No filings found. Click "Fetch Latest Filings" to retrieve them.
-                    </p>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Analysis Tab */}
-            {selectedTab === 'analysis' && (
-              <div>
-                <h2 className="text-2xl font-bold text-white mb-6 flex items-center gap-2">
-                  <svg className="w-6 h-6 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-                  </svg>
-                  Financial Analysis
-                </h2>
-                {analysisToDisplay && analysisToDisplay.summary_md ? (
-                  <div className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/30">
-                    <EnhancedSummary content={analysisToDisplay.summary_md} />
-                  </div>
-                ) : (
-                  <div className="text-center py-12 card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20">
-                    <svg className="w-16 h-16 text-gray-500 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
-                    </svg>
-                    <p className="text-gray-400 text-lg">
-                      No analysis available yet. Run an analysis to see results.
-                    </p>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Personas Tab */}
-            {selectedTab === 'personas' && (
-              <div className="space-y-6">
-                <PersonaSelector
-                  selectedPersonas={selectedPersonas}
-                  onSelectionChange={setSelectedPersonas}
+                    </div>
+                  )}
+                  itemClassName="bg-white dark:bg-black border-2 border-black dark:border-white p-4 hover:shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)] transition-all duration-200"
                 />
-                
-                <div className="card-premium bg-gradient-to-r from-yellow-500/10 to-orange-500/10 border-yellow-500/30">
-                  <div className="flex items-start gap-3">
-                    <svg className="w-6 h-6 text-yellow-400 flex-shrink-0 mt-1" fill="currentColor" viewBox="0 0 20 20">
-                      <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
-                    </svg>
-                    <p className="text-sm text-yellow-200">
-                      <strong className="font-bold">Disclaimer:</strong> All investor persona outputs are simulations based on publicly 
-                      available writings and investment philosophies. They do not represent actual advice from 
-                      these investors.
-                    </p>
-                  </div>
+              )}
+            </motion.div>
+          )}
+
+          {selectedTab === 'analysis' && (
+            <motion.div
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              className="space-y-8"
+            >
+              <div className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)]">
+                <div className="flex justify-between items-center mb-8">
+                  <h2 className="text-xl font-black uppercase flex items-center gap-3">
+                    <span className="w-4 h-4 bg-emerald-600"></span>
+                    Financial Analysis
+                  </h2>
+                  {analysisToDisplay && (
+                    <BrutalButton
+                      onClick={handleManualDashboardUpdate}
+                      variant="outline-rounded"
+                      className="text-xs"
+                    >
+                      Update Dashboard
+                    </BrutalButton>
+                  )}
                 </div>
 
-                {latestAnalysis && latestAnalysis.investor_persona_summaries ? (
-                  <div className="space-y-6">
-                    {Object.entries(latestAnalysis.investor_persona_summaries).map(([personaId, data]: [string, any]) => (
-                      <div key={personaId} className="card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/30 group">
-                        <div className="flex justify-between items-start mb-6">
-                          <div className="flex items-center gap-4">
-                            <div className="w-12 h-12 rounded-full bg-gradient-to-br from-primary-500 to-accent-500 flex items-center justify-center text-2xl">
-                              👤
-                            </div>
-                            <h3 className="text-2xl font-bold text-white">{data.persona_name}</h3>
-                          </div>
-                          <span className={`px-4 py-2 rounded-full text-sm font-bold shadow-premium ${
-                            data.stance === 'Buy' ? 'bg-gradient-to-r from-green-600 to-emerald-600 text-white' :
-                            data.stance === 'Sell' ? 'bg-gradient-to-r from-red-600 to-rose-600 text-white' :
-                            'bg-gradient-to-r from-yellow-600 to-orange-600 text-white'
-                          }`}>
+                {!analysisToDisplay ? (
+                  <div className="text-center py-12 border-2 border-dashed border-gray-300 dark:border-gray-700">
+                    <p className="font-bold uppercase text-gray-500">No analysis available</p>
+                    <p className="text-sm text-gray-400 mt-2">Run an analysis from the Overview tab to see insights.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-8">
+                    {/* Financial Charts */}
+                    {analysisToDisplay.financial_ratios && (
+                      <FinancialCharts ratios={analysisToDisplay.financial_ratios} />
+                    )}
+
+                    {/* Analysis Content */}
+                    <div className="prose dark:prose-invert max-w-none font-mono border-t-2 border-gray-100 dark:border-gray-800 pt-8">
+                      <ReactMarkdown>
+                        {analysisToDisplay.summary_md || analysisToDisplay.content || ''}
+                      </ReactMarkdown>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          )}
+
+          {selectedTab === 'personas' && (
+            <motion.div
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              className="space-y-8"
+            >
+              <div className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)]">
+                <h2 className="text-xl font-black uppercase mb-6 flex items-center gap-3">
+                  <span className="w-4 h-4 bg-amber-500"></span>
+                  Investor Personas
+                </h2>
+
+                <div className="mb-8">
+                  <PersonaSelector
+                    selectedPersonas={selectedPersonas}
+                    onSelectionChange={setSelectedPersonas}
+                  />
+                </div>
+
+                {analysisToDisplay?.investor_persona_summaries ? (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    {Object.entries(analysisToDisplay.investor_persona_summaries).map(([persona, data]: [string, any]) => (
+                      <div
+                        key={persona}
+                        className="bg-white dark:bg-black border-2 border-black dark:border-white p-6 hover:shadow-[6px_6px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[6px_6px_0px_0px_rgba(255,255,255,1)] transition-all duration-200"
+                      >
+                        <div className="flex justify-between items-start mb-4">
+                          <h3 className="font-black uppercase text-lg">{data.persona_name || persona}</h3>
+                          <span className={`px-3 py-1 text-xs font-bold uppercase border border-black dark:border-white ${data.stance === 'Bullish' ? 'bg-green-400 text-black' :
+                            data.stance === 'Bearish' ? 'bg-red-400 text-black' :
+                              'bg-gray-200 text-black'
+                            }`}>
                             {data.stance}
                           </span>
                         </div>
-                        <div className="prose-premium mb-6">
-                          <ReactMarkdown>{data.summary}</ReactMarkdown>
+                        <p className="font-mono text-sm mb-4">{data.summary}</p>
+                        <div className="space-y-2">
+                          {data.key_points?.map((point: string, i: number) => (
+                            <div key={i} className="flex items-start gap-2 text-xs font-bold">
+                              <span className="text-blue-600">→</span>
+                              <span>{point}</span>
+                            </div>
+                          ))}
                         </div>
-                        {data.key_points && data.key_points.length > 0 && (
-                          <div className="pt-6 border-t border-white/10">
-                            <h4 className="font-bold text-white mb-4 flex items-center gap-2">
-                              <svg className="w-5 h-5 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
-                              </svg>
-                              Key Points:
-                            </h4>
-                            <ul className="space-y-2">
-                              {data.key_points.map((point: string, idx: number) => (
-                                <li key={idx} className="flex items-start gap-3 text-gray-300">
-                                  <svg className="w-5 h-5 text-primary-400 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
-                                    <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
-                                  </svg>
-                                  <span>{point}</span>
-                                </li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
                       </div>
                     ))}
                   </div>
                 ) : (
-                  <div className="text-center py-12 card-premium bg-gradient-to-br from-dark-800 to-dark-900 border-primary-500/20">
-                    <svg className="w-16 h-16 text-gray-500 mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" />
-                    </svg>
-                    <p className="text-gray-400 text-lg">
-                      No investor persona analysis available yet.
-                    </p>
+                  <div className="text-center py-12 border-2 border-dashed border-gray-300 dark:border-gray-700">
+                    <p className="font-bold uppercase text-gray-500">No persona analysis yet</p>
+                    <p className="text-sm text-gray-400 mt-2">Select personas and run analysis to see their perspectives.</p>
                   </div>
                 )}
               </div>
-            )}
-          </div>
+            </motion.div>
+          )}
         </div>
       </main>
     </div>
