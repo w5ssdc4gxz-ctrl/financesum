@@ -1,11 +1,17 @@
 import type { Metadata } from 'next'
-import { Inter } from 'next/font/google'
+import { Inter, Space_Mono } from 'next/font/google'
 import './globals.css'
 import { AuthProvider } from '@/contexts/AuthContext'
 import { QueryProvider } from '@/components/QueryProvider'
 import ClickSpark from '@/components/ClickSpark'
+import { ThemeProvider } from '@/components/theme-provider'
 
-const inter = Inter({ subsets: ['latin'] })
+const inter = Inter({ subsets: ['latin'], variable: '--font-inter' })
+const spaceMono = Space_Mono({
+  weight: ['400', '700'],
+  subsets: ['latin'],
+  variable: '--font-space-mono'
+})
 
 export const metadata: Metadata = {
   title: 'FinanceSum - Financial Analysis Platform',
@@ -21,8 +27,8 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en">
-      <body className={inter.className}>
+    <html lang="en" suppressHydrationWarning>
+      <body className={`${inter.className} ${spaceMono.variable}`}>
         <ClickSpark
           sparkColor="#E6D4FF"
           sparkSize={14}
@@ -32,7 +38,16 @@ export default function RootLayout({
           className="min-h-screen w-full"
         >
           <AuthProvider>
-            <QueryProvider>{children}</QueryProvider>
+            <QueryProvider>
+              <ThemeProvider
+                attribute="class"
+                defaultTheme="dark"
+                enableSystem
+                disableTransitionOnChange
+              >
+                {children}
+              </ThemeProvider>
+            </QueryProvider>
           </AuthProvider>
         </ClickSpark>
       </body>

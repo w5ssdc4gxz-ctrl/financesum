@@ -5,20 +5,12 @@ import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { motion } from 'framer-motion'
 import {
-  IconBrandTabler,
   IconChartHistogram,
   IconCompass,
   IconMap,
   IconNotebook,
   IconSparkles,
-  IconUserBolt,
-  IconTrendingUp,
-  IconBuilding,
-  IconFileAnalytics,
-  IconWorld,
-  IconActivity,
 } from '@tabler/icons-react'
-import { Sidebar, SidebarBody, SidebarLink } from '@/components/ui/sidebar'
 import { useAuth } from '@/contexts/AuthContext'
 import CompanySearch from '@/components/CompanySearch'
 import GeoImpactMap from '@/components/dashboard/GeoImpactMap'
@@ -52,29 +44,6 @@ const motionFade = {
   visible: { opacity: 1, y: 0 },
 }
 
-const navLinks = [
-  {
-    label: 'Overview',
-    href: '#overview',
-    icon: <IconChartHistogram className="h-5 w-5 shrink-0 text-slate-600" />,
-  },
-  {
-    label: 'Coverage',
-    href: '#coverage',
-    icon: <IconWorld className="h-5 w-5 shrink-0 text-slate-600" />,
-  },
-  {
-    label: 'Activity',
-    href: '#activity',
-    icon: <IconActivity className="h-5 w-5 shrink-0 text-slate-600" />,
-  },
-  {
-    label: 'Top Companies',
-    href: '#companies',
-    icon: <IconBuilding className="h-5 w-5 shrink-0 text-slate-600" />,
-  },
-]
-
 const PIN_STORAGE_KEY = 'financesum.dashboardPins'
 
 const resolveCompanyId = (entry?: CompanyIdentifier | null) =>
@@ -107,7 +76,6 @@ const buildCompanyRoute = (companyId?: string | null, ticker?: string | null, an
 export default function DashboardPage() {
   const router = useRouter()
   const { user } = useAuth()
-  const [sidebarOpen, setSidebarOpen] = useState(false)
   const [pinnedBriefs, setPinnedBriefs] = useState<Record<string, boolean>>({})
   const {
     history,
@@ -266,78 +234,21 @@ export default function DashboardPage() {
   ]
 
   return (
-    <div className="min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-50 flex">
-      <Sidebar open={sidebarOpen} setOpen={setSidebarOpen}>
-        <SidebarBody className="justify-between gap-10">
-          <div className="flex flex-col flex-1 overflow-y-auto overflow-x-hidden">
-            <SidebarLogo open={sidebarOpen} />
-            <div className="mt-8 flex flex-col gap-2">
-              {navLinks.map((link, idx) => (
-                <SidebarLink
-                  key={link.label}
-                  link={{
-                    ...link,
-                    icon: (
-                      <div className="h-6 w-6 flex-shrink-0 text-neutral-500 dark:text-neutral-400">
-                        {link.icon}
-                      </div>
-                    ),
-                  }}
-                />
-              ))}
-            </div>
-          </div>
-          <div className="mt-auto">
-            <SidebarLink
-              link={{
-                label: user?.user_metadata?.full_name ?? user?.email ?? 'Investor',
-                href: '#',
-                icon: (
-                  <div className="flex h-8 w-8 items-center justify-center rounded-full bg-indigo-600 text-xs font-bold text-white">
-                    {(user?.user_metadata?.full_name ?? user?.email ?? 'FS').slice(0, 2).toUpperCase()}
-                  </div>
-                ),
-              }}
-            />
-          </div>
-        </SidebarBody>
-      </Sidebar>
-
-      <div className="flex-1 flex flex-col h-screen overflow-y-auto">
-        <div className="mx-auto w-full max-w-[1600px] p-4 md:p-8">
-          <DashboardContent
-            dashboardData={{
-              history,
-              stats,
-              primaryAnalysis,
-              hasAnalyses,
-              mapPoints,
-              preferences
-            }}
-            onRemoveAnalysis={removeHistoryEntry}
-          />
-        </div>
-      </div>
-    </div>
+    <DashboardContent
+      dashboardData={{
+        history,
+        stats,
+        primaryAnalysis,
+        hasAnalyses,
+        mapPoints,
+        preferences
+      }}
+      onRemoveAnalysis={removeHistoryEntry}
+    />
   )
 }
 
-const SidebarLogo = ({ open }: { open: boolean }) => {
-  return (
-    <Link href="/dashboard" className="flex items-center gap-2 py-1">
-      <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-indigo-600 text-white">
-        <IconBrandTabler className="h-5 w-5" />
-      </div>
-      <motion.span
-        initial={{ opacity: 0 }}
-        animate={{ opacity: 1 }}
-        className="whitespace-pre text-lg font-semibold text-neutral-900 dark:text-white"
-      >
-        FinanceSum
-      </motion.span>
-    </Link>
-  )
-}
+
 
 interface SectionHeaderProps {
   eyebrow?: string

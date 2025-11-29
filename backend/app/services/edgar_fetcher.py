@@ -1,5 +1,6 @@
 """SEC EDGAR filing fetcher service - Enhanced with EODHD."""
-import requests
+import httpx
+import asyncio
 import json
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
@@ -9,7 +10,7 @@ from app.services.eodhd_client import EODHDClient
 settings = get_settings()
 
 
-def _enrich_with_yahoo(company: Dict) -> Dict:
+async def _enrich_with_yahoo(company: Dict, client: httpx.AsyncClient) -> Dict:
     """
     Enrich company data with sector/industry from Yahoo Finance.
     Returns the enriched company dict.
@@ -34,7 +35,7 @@ def _enrich_with_yahoo(company: Dict) -> Dict:
             "newsCount": 0,
         }
 
-        response = requests.get(yahoo_url, headers=yahoo_headers, params=params, timeout=10)
+        response = await client.get(yahoo_url, headers=yahoo_headers, params=params, timeout=5.0)
         response.raise_for_status()
         data = response.json()
 
@@ -49,7 +50,7 @@ def _enrich_with_yahoo(company: Dict) -> Dict:
             if not company.get("country"):
                 company["country"] = quote.get("region") or "US"
 
-            print(f"✓ Enriched {ticker} with Yahoo Finance data: sector={company.get('sector')}, industry={company.get('industry')}")
+            print(f"✓ Enriched {ticker} with Yahoo Finance data")
 
     except Exception as e:
         print(f"Could not enrich {ticker} with Yahoo Finance: {e}")
@@ -68,7 +69,8 @@ async def search_company_by_ticker_or_cik(query: str) -> List[Dict]:
     try:
         if settings.eodhd_api_key:
             eodhd_client = EODHDClient()
-            company_info = eodhd_client.search_symbol(query)
+            # Run synchronous EODHD client in a separate thread to avoid blocking
+            company_info = await asyncio.to_thread(eodhd_client.search_symbol, query)
             
             if company_info:
                 return [{
@@ -83,95 +85,101 @@ async def search_company_by_ticker_or_cik(query: str) -> List[Dict]:
     except Exception as e:
         print(f"EODHD search error (falling back to EDGAR): {e}")
     
-    # Fallback to SEC EDGAR (if EODHD not available)
-    tickers_url = "https://www.sec.gov/files/company_tickers.json"
+    async with httpx.AsyncClient() as client:
+        # Fallback to SEC EDGAR (if EODHD not available)
+        tickers_url = "https://www.sec.gov/files/company_tickers.json"
 
-    headers = {
-        "User-Agent": settings.edgar_user_agent,
-        "Accept-Encoding": "gzip, deflate",
-        "Host": "www.sec.gov",
-    }
+        headers = {
+            "User-Agent": settings.edgar_user_agent,
+            "Accept-Encoding": "gzip, deflate",
+            "Host": "www.sec.gov",
+        }
 
-    try:
-        response = requests.get(tickers_url, headers=headers, timeout=10)
-        response.raise_for_status()
+        try:
+            response = await client.get(tickers_url, headers=headers, timeout=10.0)
+            response.raise_for_status()
 
-        companies_data = response.json()
+            companies_data = response.json()
 
-        # Convert to list and search
-        query_upper = query.upper()
+            # Convert to list and search
+            query_upper = query.upper()
 
-        for key, company in companies_data.items():
-            ticker = company.get("ticker", "").upper()
-            cik = str(company.get("cik_str", "")).zfill(10)
-            title = company.get("title", "")
+            for key, company in companies_data.items():
+                ticker = company.get("ticker", "").upper()
+                cik = str(company.get("cik_str", "")).zfill(10)
+                title = company.get("title", "")
 
-            # Match by ticker or CIK
-            if query_upper == ticker or query.zfill(10) == cik or query_upper in title.upper():
+                # Match by ticker or CIK
+                if query_upper == ticker or query.zfill(10) == cik or query_upper in title.upper():
+                    companies.append({
+                        "ticker": ticker,
+                        "cik": cik,
+                        "name": title,
+                        "exchange": "US",
+                        "sector": None,
+                        "industry": None,
+                        "country": "US"
+                    })
+
+                    # If exact ticker match, enrich and return immediately
+                    if query_upper == ticker:
+                        enriched = await _enrich_with_yahoo(companies[-1], client)
+                        return [enriched]
+
+            # Enrich all found companies with Yahoo Finance data in parallel
+            # Limit to top 10 to avoid spamming Yahoo
+            top_companies = companies[:10]
+            if top_companies:
+                enriched_companies = await asyncio.gather(*[_enrich_with_yahoo(c, client) for c in top_companies])
+                return enriched_companies
+            
+            return []
+
+        except Exception as e:
+            print(f"Error searching EDGAR: {e}")
+
+        # Final fallback: Yahoo Finance public search API
+        try:
+            yahoo_url = "https://query2.finance.yahoo.com/v1/finance/search"
+            yahoo_headers = {
+                "User-Agent": "Mozilla/5.0 (compatible; FinanceSum/1.0; +https://financesum.local)",
+                "Accept": "application/json",
+            }
+            params = {
+                "q": query,
+                "quotesCount": 10,
+                "newsCount": 0,
+            }
+
+            response = await client.get(yahoo_url, headers=yahoo_headers, params=params, timeout=5.0)
+            response.raise_for_status()
+            data = response.json()
+
+            quotes = data.get("quotes", [])
+            for quote in quotes:
+                quote_type = quote.get("quoteType")
+                if quote_type not in {"EQUITY", "ETF"}:
+                    continue
+
+                ticker = quote.get("symbol", "").upper()
+                if not ticker:
+                    continue
+
                 companies.append({
                     "ticker": ticker,
-                    "cik": cik,
-                    "name": title,
-                    "exchange": "US",
-                    "sector": None,
-                    "industry": None,
-                    "country": "US"
+                    "cik": quote.get("cik") or quote.get("symbol"),
+                    "name": quote.get("longname") or quote.get("shortname") or ticker,
+                    "exchange": quote.get("exchDisp") or quote.get("exchange") or "US",
+                    "sector": quote.get("sectorDisp") or quote.get("sector"),
+                    "industry": quote.get("industryDisp") or quote.get("industry"),
+                    "country": quote.get("region") or "US",
                 })
 
-                # If exact ticker match, enrich and return immediately
-                if query_upper == ticker:
-                    enriched = _enrich_with_yahoo(companies[-1])
-                    return [enriched]
+            if companies:
+                return companies[:10]
 
-        # Enrich all found companies with Yahoo Finance data
-        enriched_companies = [_enrich_with_yahoo(c) for c in companies[:10]]
-        return enriched_companies
-
-    except Exception as e:
-        print(f"Error searching EDGAR: {e}")
-
-    # Final fallback: Yahoo Finance public search API
-    try:
-        yahoo_url = "https://query2.finance.yahoo.com/v1/finance/search"
-        yahoo_headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; FinanceSum/1.0; +https://financesum.local)",
-            "Accept": "application/json",
-        }
-        params = {
-            "q": query,
-            "quotesCount": 10,
-            "newsCount": 0,
-        }
-
-        response = requests.get(yahoo_url, headers=yahoo_headers, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-
-        quotes = data.get("quotes", [])
-        for quote in quotes:
-            quote_type = quote.get("quoteType")
-            if quote_type not in {"EQUITY", "ETF"}:
-                continue
-
-            ticker = quote.get("symbol", "").upper()
-            if not ticker:
-                continue
-
-            companies.append({
-                "ticker": ticker,
-                "cik": quote.get("cik") or quote.get("symbol"),
-                "name": quote.get("longname") or quote.get("shortname") or ticker,
-                "exchange": quote.get("exchDisp") or quote.get("exchange") or "US",
-                "sector": quote.get("sectorDisp") or quote.get("sector"),
-                "industry": quote.get("industryDisp") or quote.get("industry"),
-                "country": quote.get("region") or "US",
-            })
-
-        if companies:
-            return companies[:10]
-
-    except Exception as e:
-        print(f"Error searching Yahoo Finance: {e}")
+        except Exception as e:
+            print(f"Error searching Yahoo Finance: {e}")
 
     return companies
 
@@ -183,14 +191,8 @@ def get_company_filings(
 ) -> List[Dict]:
     """
     Get filings for a company from SEC EDGAR.
-    
-    Args:
-        cik: Company CIK (will be zero-padded to 10 digits)
-        filing_types: List of filing types to filter (e.g., ['10-K', '10-Q'])
-        max_results: Maximum number of filings to return
-    
-    Returns:
-        List of filing metadata dictionaries
+    Note: Kept synchronous for now as it's usually called in a background task or cached context,
+    but ideally should be async too.
     """
     cik_padded = str(cik).zfill(10)
     
@@ -204,6 +206,9 @@ def get_company_filings(
     }
     
     try:
+        # Using requests here as this function wasn't marked async in the interface
+        # If we change this to async, we need to update callers.
+        # For now, let's leave it but be aware it blocks.
         response = requests.get(submissions_url, headers=headers, timeout=10)
         response.raise_for_status()
         
@@ -255,13 +260,6 @@ def get_company_filings(
 def download_filing(url: str, output_path: str) -> bool:
     """
     Download a filing from SEC EDGAR.
-    
-    Args:
-        url: URL of the filing
-        output_path: Local path to save the file
-    
-    Returns:
-        True if successful, False otherwise
     """
     headers = {
         "User-Agent": settings.edgar_user_agent,

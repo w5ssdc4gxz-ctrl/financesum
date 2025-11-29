@@ -42,7 +42,7 @@ export const Modal: React.FC<ModalProps> = ({ isOpen, onClose, children, classNa
                         >
                             <button
                                 onClick={onClose}
-                                className="absolute top-4 right-4 p-1 hover:bg-gray-100 dark:hover:bg-zinc-800 border-2 border-transparent hover:border-black dark:hover:border-white transition-all"
+                                className="absolute top-6 right-6 p-1 hover:bg-gray-100 dark:hover:bg-zinc-800 border-2 border-transparent hover:border-black dark:hover:border-white transition-all"
                             >
                                 <X className="w-5 h-5" />
                             </button>

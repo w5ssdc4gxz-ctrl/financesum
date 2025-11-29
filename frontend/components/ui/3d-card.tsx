@@ -67,7 +67,7 @@ export const CardBody: React.FC<CardBodyProps> = ({ children, className, as: Com
   return (
     <Component
       className={cn(
-        'relative w-full rounded-3xl border border-white/10 bg-gradient-to-br from-slate-900/80 to-slate-950/90 p-8 shadow-2xl transition-[box-shadow] duration-300 group/card',
+        'relative w-full rounded-3xl bg-gradient-to-br from-slate-900/80 to-slate-950/90 p-8 shadow-2xl transition-[box-shadow] duration-300 group/card',
         className,
       )}
       style={{ transformStyle: 'preserve-3d', ...style }}

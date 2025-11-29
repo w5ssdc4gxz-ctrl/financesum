@@ -28,7 +28,7 @@ const memoSections = [
 export default function ResearchMemoShowcase() {
   return (
     <CardContainer className="max-w-3xl mx-auto">
-      <CardBody className="bg-gradient-to-br from-[#130626] via-[#120922] to-[#070312] border-white/5 text-left text-gray-200 overflow-visible">
+      <CardBody className="bg-gradient-to-br from-[#130626] via-[#120922] to-[#070312] text-left text-gray-200 overflow-visible border-none">
         <CardItem translateZ={55} className="flex items-center gap-3 text-sm text-primary-200 font-semibold mb-4">
           <span className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-primary-500/20 text-primary-100 border border-primary-300/30">
             <span className="w-2 h-2 rounded-full bg-primary-300 animate-pulse" />
@@ -48,7 +48,7 @@ export default function ResearchMemoShowcase() {
           {memoSections.map((section) => (
             <div
               key={section.title}
-              className="rounded-2xl border border-white/5 bg-white/3 backdrop-blur-sm p-4 shadow-inner shadow-black/20"
+              className="rounded-2xl bg-white/3 backdrop-blur-sm p-4 shadow-inner shadow-black/20"
             >
               <div className="flex items-center gap-3 mb-2">
                 <span className="h-8 w-8 rounded-full bg-primary-500/20 text-primary-100 flex items-center justify-center font-bold">
@@ -63,7 +63,7 @@ export default function ResearchMemoShowcase() {
 
         <CardItem
           translateZ={80}
-          className="absolute top-6 right-6 bg-black/60 border border-white/10 rounded-2xl px-4 py-3 shadow-lg backdrop-blur"
+          className="absolute top-6 right-6 bg-black/60 rounded-2xl px-4 py-3 shadow-lg backdrop-blur"
         >
           <p className="text-xs uppercase tracking-wide text-gray-400">Analyst Signals</p>
           <p className="text-2xl font-semibold text-white">Bullish</p>
@@ -72,7 +72,7 @@ export default function ResearchMemoShowcase() {
 
         <CardItem
           translateZ={100}
-          className="absolute -bottom-10 right-8 w-64 bg-gradient-to-br from-primary-500/20 to-accent-500/20 border border-primary-400/30 rounded-2xl px-5 py-4 shadow-2xl text-sm text-white backdrop-blur-md"
+          className="absolute -bottom-10 right-8 w-64 bg-gradient-to-br from-primary-500/20 to-accent-500/20 rounded-2xl px-5 py-4 shadow-2xl text-sm text-white backdrop-blur-md"
         >
           <p className="text-xs uppercase tracking-widest text-gray-200/70 mb-2">Key Metrics</p>
           <ul className="space-y-1.5">

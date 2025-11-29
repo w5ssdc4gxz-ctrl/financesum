@@ -9,8 +9,8 @@ export default function Navbar() {
   const { user, loading, signOut } = useAuth()
 
   return (
-    <motion.nav 
-      className="glass-dark sticky top-0 z-50 border-b border-white/10 backdrop-blur-xl bg-dark-900/80"
+    <motion.nav
+      className="sticky top-0 z-50 backdrop-blur-xl bg-slate-900/80"
       initial={{ y: -100, opacity: 0 }}
       animate={{ y: 0, opacity: 1 }}
       transition={{ duration: 0.6, ease: "easeOut" }}
@@ -19,7 +19,7 @@ export default function Navbar() {
         <div className="flex justify-between h-16">
           <div className="flex items-center">
             <Link href="/" className="flex items-center group">
-              <motion.span 
+              <motion.span
                 className="text-2xl font-bold bg-gradient-to-r from-primary-400 to-accent-400 bg-clip-text text-transparent"
                 whileHover={{ scale: 1.05 }}
                 transition={{ type: 'spring', stiffness: 400, damping: 10 }}
@@ -28,7 +28,7 @@ export default function Navbar() {
               </motion.span>
             </Link>
             {user && (
-              <motion.div 
+              <motion.div
                 className="hidden sm:ml-10 sm:flex sm:space-x-2"
                 initial={{ opacity: 0, x: -20 }}
                 animate={{ opacity: 1, x: 0 }}
@@ -53,7 +53,7 @@ export default function Navbar() {
               </motion.div>
             )}
           </div>
-          <motion.div 
+          <motion.div
             className="flex items-center gap-4"
             initial={{ opacity: 0, x: 20 }}
             animate={{ opacity: 1, x: 0 }}
@@ -63,7 +63,7 @@ export default function Navbar() {
               <div className="spinner"></div>
             ) : user ? (
               <>
-                <motion.span 
+                <motion.span
                   className="hidden sm:block text-sm text-gray-300"
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}

@@ -49,14 +49,12 @@ const ClickSpark = ({
   useEffect(() => {
     if (typeof document === "undefined") return;
     const el = document.createElement("div");
-    el.style.position = "absolute";
+    el.style.position = "fixed";
     el.style.pointerEvents = "none";
     el.style.top = "0";
     el.style.left = "0";
     el.style.width = "100vw";
     el.style.height = "100vh";
-    el.style.transform = "translate3d(0, 0, 0)";
-    el.style.willChange = "transform";
     el.style.zIndex = "2147483647";
     document.body.appendChild(el);
     setPortalEl(el);
@@ -68,35 +66,6 @@ const ClickSpark = ({
       setPortalEl(null);
     };
   }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    if (!portalEl) return;
-
-    let ticking = false;
-
-    const syncPosition = () => {
-      if (!portalEl) return;
-      portalEl.style.transform = `translate3d(${window.scrollX}px, ${window.scrollY}px, 0)`;
-      ticking = false;
-    };
-
-    syncPosition();
-
-    const handleScroll = () => {
-      if (ticking) return;
-      ticking = true;
-      requestAnimationFrame(syncPosition);
-    };
-
-    window.addEventListener("scroll", handleScroll, { passive: true });
-    window.addEventListener("resize", handleScroll);
-
-    return () => {
-      window.removeEventListener("scroll", handleScroll);
-      window.removeEventListener("resize", handleScroll);
-    };
-  }, [portalEl]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -232,17 +201,17 @@ const ClickSpark = ({
       {children}
       {portalEl
         ? createPortal(
-            <canvas
-              ref={canvasRef}
-              style={{
-                width: "100vw",
-                height: "100vh",
-                userSelect: "none",
-                pointerEvents: "none",
-              }}
-            />,
-            portalEl,
-          )
+          <canvas
+            ref={canvasRef}
+            style={{
+              width: "100vw",
+              height: "100vh",
+              userSelect: "none",
+              pointerEvents: "none",
+            }}
+          />,
+          portalEl,
+        )
         : null}
     </div>
   );

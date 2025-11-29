@@ -85,3 +85,5 @@ app.include_router(
     tags=["dashboard"]
 )
 
+
+# Force reload

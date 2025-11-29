@@ -60,22 +60,28 @@ class PDFParser:
         sections = {}
         
         # Common section headers in 10-K and 10-Q filings
+        # Expanded patterns to catch more variations
         section_patterns = {
             "mda": [
                 r"ITEM\s+[27]\.?\s+MANAGEMENT'?S DISCUSSION AND ANALYSIS",
-                r"MANAGEMENT'?S DISCUSSION AND ANALYSIS OF FINANCIAL CONDITION"
+                r"MANAGEMENT'?S DISCUSSION AND ANALYSIS OF FINANCIAL CONDITION",
+                r"MANAGEMENT'?S DISCUSSION AND ANALYSIS",
+                r"OPERATING AND FINANCIAL REVIEW AND PROSPECTS",  # 20-F
             ],
             "risk_factors": [
                 r"ITEM\s+1A\.?\s+RISK FACTORS",
-                r"RISK FACTORS"
+                r"RISK FACTORS",
+                r"PRINCIPAL RISKS AND UNCERTAINTIES"
             ],
             "financial_statements": [
                 r"ITEM\s+[18]\.?\s+FINANCIAL STATEMENTS",
                 r"CONSOLIDATED FINANCIAL STATEMENTS",
-                r"CONDENSED CONSOLIDATED FINANCIAL STATEMENTS"
+                r"CONDENSED CONSOLIDATED FINANCIAL STATEMENTS",
+                r"INDEX TO CONSOLIDATED FINANCIAL STATEMENTS"
             ],
             "notes_to_financials": [
-                r"NOTES TO (?:CONDENSED )?CONSOLIDATED FINANCIAL STATEMENTS"
+                r"NOTES TO (?:CONDENSED )?CONSOLIDATED FINANCIAL STATEMENTS",
+                r"NOTES TO FINANCIAL STATEMENTS"
             ]
         }
         
@@ -84,18 +90,53 @@ class PDFParser:
                 matches = list(re.finditer(pattern, full_text, re.IGNORECASE))
                 if matches:
                     # Find which page this match is on
-                    start_pos = matches[0].start()
-                    char_count = 0
-                    start_page = 1
+                    # Use the LAST match for MD&A because the Table of Contents often has the first one
+                    # But be careful, sometimes the last one is just a reference. 
+                    # Heuristic: TOC usually is in the first 10 pages.
                     
-                    for page_num, text in self.text_content.items():
-                        if char_count + len(text) >= start_pos:
-                            start_page = page_num
-                            break
-                        char_count += len(text) + 2  # +2 for the newlines we added
+                    valid_match = None
+                    for match in matches:
+                        if match.start() > 5000: # Skip TOC entries (rough heuristic)
+                             valid_match = match
+                             break
                     
-                    sections[section_name] = (start_page, start_page + 20)  # Estimate 20 pages
-                    break
+                    if not valid_match and matches:
+                        valid_match = matches[0]
+
+                    if valid_match:
+                        start_pos = valid_match.start()
+                        char_count = 0
+                        start_page = 1
+                        
+                        for page_num, text in self.text_content.items():
+                            if char_count + len(text) >= start_pos:
+                                start_page = page_num
+                                break
+                            char_count += len(text) + 2  # +2 for the newlines we added
+                        
+                        # Estimate length - improved heuristic
+                        # If we can find the next section, use that as end. Otherwise default to 20 pages.
+                        end_page = start_page + 25
+                        sections[section_name] = (start_page, end_page)
+                        break
+        
+        # Fallback for MD&A if not found
+        if "mda" not in sections:
+            # Try to find "Item 7" specifically if other patterns failed
+            matches = list(re.finditer(r"Item\s+7\.", full_text, re.IGNORECASE))
+            if matches:
+                 for match in matches:
+                    if match.start() > 5000:
+                        start_pos = match.start()
+                        char_count = 0
+                        start_page = 1
+                        for page_num, text in self.text_content.items():
+                            if char_count + len(text) >= start_pos:
+                                start_page = page_num
+                                break
+                            char_count += len(text) + 2
+                        sections["mda"] = (start_page, start_page + 25)
+                        break
         
         self.sections = sections
         return sections

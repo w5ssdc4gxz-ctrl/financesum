@@ -25,7 +25,7 @@ const DEFAULT_PREFERENCES: StoredSummaryPreferences = {
     weighting: "profitability_margins",
     riskTolerance: "moderately_conservative",
     analysisDepth: "key_financial_items",
-    displayStyle: "score_plus_grade",
+    displayStyle: "score_only",
   },
 }
 

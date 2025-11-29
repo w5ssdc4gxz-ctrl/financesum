@@ -166,8 +166,15 @@ def analyze_company_task(
         if include_personas:
             persona_engine = get_persona_engine()
             
-            # Use the full summary for context
-            general_summary = summary_md
+            # Build minimal context - just key facts, NOT the formatted summary
+            # This prevents personas from mimicking the generic report structure
+            brief_context = _build_minimal_context(
+                company_name=company_name,
+                ratios=ratios,
+                health_score=health_score_data["overall_score"],
+                mda_text=mda_text,
+                risk_factors_text=risk_factors_text
+            )
             
             for idx, persona_id in enumerate(include_personas):
                 try:
@@ -183,8 +190,9 @@ def analyze_company_task(
                     persona_analysis = persona_engine.generate_persona_analysis(
                         persona_id=persona_id,
                         company_name=company_name,
-                        general_summary=general_summary,
-                        ratios=ratios
+                        general_summary=brief_context,  # Pass minimal context, not formatted report
+                        ratios=ratios,
+                        financial_data=merged_financial_data
                     )
                     
                     persona_summaries[persona_id] = persona_analysis
@@ -252,6 +260,54 @@ def analyze_company_task(
             .execute()
         
         raise
+
+
+def _build_minimal_context(
+    company_name: str,
+    ratios: dict,
+    health_score: float,
+    mda_text: str = None,
+    risk_factors_text: str = None
+) -> str:
+    """
+    Build minimal context for persona analysis.
+    
+    This provides just the key facts without any formatted structure,
+    allowing personas to interpret data through their own lens.
+    """
+    lines = []
+    
+    # Just the raw facts - no formatting, no interpretation
+    lines.append(f"Company: {company_name}")
+    
+    # Key metrics as raw data points
+    if ratios.get("revenue_growth_yoy") is not None:
+        growth = ratios["revenue_growth_yoy"]
+        lines.append(f"Revenue growth: {growth*100:.1f}% YoY")
+    
+    if ratios.get("gross_margin") is not None:
+        lines.append(f"Gross margin: {ratios['gross_margin']*100:.1f}%")
+    
+    if ratios.get("operating_margin") is not None:
+        lines.append(f"Operating margin: {ratios['operating_margin']*100:.1f}%")
+    
+    if ratios.get("fcf") is not None:
+        fcf = ratios["fcf"]
+        fcf_str = f"${fcf/1e9:.1f}B" if abs(fcf) >= 1e9 else f"${fcf/1e6:.0f}M"
+        lines.append(f"Free cash flow: {fcf_str}")
+    
+    if ratios.get("roe") is not None:
+        lines.append(f"ROE: {ratios['roe']*100:.1f}%")
+    
+    if ratios.get("debt_to_equity") is not None:
+        lines.append(f"Debt/Equity: {ratios['debt_to_equity']:.2f}x")
+    
+    # Include MD&A snippet if available (unformatted)
+    if mda_text:
+        snippet = mda_text[:500].replace('\n', ' ').strip()
+        lines.append(f"\nManagement commentary excerpt: {snippet}...")
+    
+    return "\n".join(lines)
 
 
 def _merge_financial_statements(statements: List[dict]) -> dict:

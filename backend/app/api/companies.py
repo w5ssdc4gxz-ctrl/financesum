@@ -1,5 +1,6 @@
 """Companies API endpoints."""
 import requests
+import asyncio
 from datetime import datetime
 from uuid import uuid4
 from fastapi import APIRouter, HTTPException
@@ -110,22 +111,31 @@ async def lookup_company(request: CompanyLookupRequest):
     # Search local database first (only if Supabase is configured)
     if _supabase_configured(settings):
         try:
+            print(f"Searching Supabase for: {query}")
             supabase = get_supabase_client()
-            # Try ticker match
-            response = supabase.table("companies").select("*").eq("ticker", query).execute()
             
-            if not response.data:
+            # Helper to run supabase query in thread
+            def run_supabase_query():
+                # Try ticker match
+                response = supabase.table("companies").select("*").eq("ticker", query).execute()
+                if response.data:
+                    return response
+                
                 # Try CIK match
                 response = supabase.table("companies").select("*").eq("cik", query).execute()
-            
-            if not response.data:
+                if response.data:
+                    return response
+                    
                 # Try name match (case-insensitive partial match)
-                response = supabase.table("companies").select("*").ilike("name", f"%{query}%").execute()
+                return supabase.table("companies").select("*").ilike("name", f"%{query}%").execute()
+
+            response = await asyncio.to_thread(run_supabase_query)
             
-            companies = [Company(**company) for company in response.data]
-            
-            if companies:
-                return CompanyLookupResponse(companies=companies)
+            if response and response.data:
+                companies = [Company(**company) for company in response.data]
+                if companies:
+                    print(f"Found {len(companies)} companies in Supabase")
+                    return CompanyLookupResponse(companies=companies)
         
         except Exception as e:
             print(f"Database search error (skipping): {e}")
@@ -145,16 +155,23 @@ async def lookup_company(request: CompanyLookupRequest):
             try:
                 if _supabase_configured(settings):
                     supabase = get_supabase_client()
-                    # Check if already exists
-                    existing = supabase.table("companies").select("*").eq("ticker", company_data["ticker"]).execute()
                     
-                    if existing.data:
-                        saved_companies.append(Company(**existing.data[0]))
-                    else:
-                        # Insert new company
-                        result = supabase.table("companies").insert(company_data).execute()
-                        if result.data:
-                            saved_companies.append(Company(**result.data[0]))
+                    def check_and_save():
+                        # Check if already exists
+                        existing = supabase.table("companies").select("*").eq("ticker", company_data["ticker"]).execute()
+                        
+                        if existing.data:
+                            return existing.data[0]
+                        else:
+                            # Insert new company
+                            result = supabase.table("companies").insert(company_data).execute()
+                            if result.data:
+                                return result.data[0]
+                        return None
+
+                    saved_data = await asyncio.to_thread(check_and_save)
+                    if saved_data:
+                        saved_companies.append(Company(**saved_data))
                 else:
                     # No database configured, return the company data with stub metadata
                     ticker = company_data.get("ticker", query)

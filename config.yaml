@@ -1,0 +1,12 @@
+model_list:
+  - model_name: claude-opus-4.5
+    litellm_params:
+      model: anthropic/claude-opus-4.5
+      api_base: https://go.fastrouter.ai/api/v1
+      api_key: sk-v1-e95794f7248a6eb304086d9c61c6ea6e56f59abdeb74f4e74f009de817202cd8
+      custom_llm_provider: openai
+
+litellm_settings:
+  drop_params: true
+  success_callback: []
+  failure_callback: []

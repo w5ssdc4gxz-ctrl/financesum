@@ -46,20 +46,23 @@ export default function LayeredScrollBackground() {
     }
   }, [])
 
-  const wavyOpacity = useMemo(() => clamp01(1 - smoothStep(0.05, 0.18, progress)), [progress])
+  // Keep wavy background active longer (covering Hero + Journey)
+  const wavyOpacity = useMemo(() => clamp01(1 - smoothStep(0.35, 0.55, progress)), [progress])
   const wavyTranslate = useMemo(() => -progress * 120, [progress])
 
+  // Delay aurora entry until after Journey section
   const auroraOpacity = useMemo(() => {
-    const fadeIn = smoothStep(0.08, 0.22, progress)
-    const sustain = smoothStep(0.22, 0.4, progress)
+    const fadeIn = smoothStep(0.40, 0.60, progress)
+    const sustain = smoothStep(0.60, 0.8, progress)
     return clamp01(Math.max(fadeIn, sustain))
   }, [progress])
   const auroraTranslate = useMemo(() => (progress - 0.28) * 180, [progress])
 
-  const gradientOpacity = useMemo(() => clamp01(smoothStep(0.25, 0.45, progress)), [progress])
+  const gradientOpacity = useMemo(() => clamp01(smoothStep(0.45, 0.65, progress)), [progress])
   const gradientScale = useMemo(() => 1 + smoothStep(0.45, 1, progress) * 0.18, [progress])
 
-  const tintOpacity = useMemo(() => 0.25 + smoothStep(0.1, 1, progress) * 0.35, [progress])
+  // Delay darkening tint
+  const tintOpacity = useMemo(() => 0.25 + smoothStep(0.4, 1, progress) * 0.35, [progress])
 
   return (
     <div className="pointer-events-none fixed inset-0 z-0 overflow-hidden">

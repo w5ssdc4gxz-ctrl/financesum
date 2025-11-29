@@ -3,8 +3,8 @@
 import Link from "next/link";
 import { useState } from "react";
 import { HiArrowLongRight } from "react-icons/hi2";
-
 import { cn } from "@/lib/utils";
+import { GradientButton } from "@/components/ui/GradientButton";
 
 type NavItem = {
   label: string;
@@ -42,7 +42,7 @@ const navColumns: NavColumn[] = [
     title: "Resources",
     items: [
       { label: "Product tour", href: "#app-demo" },
-      { label: "Case studies", href: "#journey" },
+      { label: "Case studies", href: "/#journey" },
       { label: "Docs & API", href: "/dashboard" },
       { label: "Templates", href: "/dashboard" },
       { label: "Webinars", href: "/dashboard" },
@@ -59,116 +59,83 @@ const navColumns: NavColumn[] = [
       { label: "Changelog", href: "/dashboard" },
     ],
   },
-];
-
-const companyLinks: NavItem[] = [
-  { label: "About FinanceSum", href: "/#journey" },
-  { label: "Compare plans", href: "/compare" },
-  { label: "Product updates", href: "/#app-demo" },
-  { label: "Customer stories", href: "/dashboard" },
+  {
+    title: "Company",
+    items: [
+      { label: "About FinanceSum", href: "/#journey" },
+      { label: "Compare plans", href: "/compare" },
+      { label: "Product updates", href: "/#app-demo" },
+      { label: "Customer stories", href: "/dashboard" },
+    ],
+  },
 ];
 
 export default function MegaFooter() {
+  console.log("MegaFooter rendering");
   const [active, setActive] = useState<string | null>(null);
   const hovering = Boolean(active);
 
+  const mainLinks = [
+    { label: "Platform", href: "#journey" },
+    { label: "Audience", href: "#personas" },
+    { label: "Resources", href: "#visuals" },
+    { label: "Developers", href: "#personas" },
+    { label: "Company", href: "#visuals" },
+  ];
+
   return (
-    <section className="relative mt-20">
-      <div className="overflow-hidden rounded-[48px] border border-white/10 bg-[#05000d] px-6 py-16 text-white shadow-[0_40px_140px_rgba(5,0,21,0.6)] sm:px-10 lg:px-16">
-        <div className="relative flex flex-col gap-14 lg:flex-row">
-          <div className="flex-1">
-            <div className="grid gap-10 sm:grid-cols-2 lg:grid-cols-4">
-              {navColumns.map((column, columnIndex) => (
-                <div
-                  key={column.title}
+    <section className="relative mt-20 border-t border-white/10 bg-[#050015] text-white overflow-hidden">
+      <div className="mx-auto max-w-7xl px-6 py-24 sm:px-10 lg:px-16 relative z-10">
+        <div className="flex flex-col lg:flex-row items-center justify-between gap-12">
+
+          {/* Horizontal Links */}
+          <div className="flex flex-wrap justify-center lg:justify-start gap-8 md:gap-12">
+            {mainLinks.map((item) => {
+              const isActive = active === item.label;
+              const dimmed = hovering && !isActive;
+
+              return (
+                <Link
+                  key={item.label}
+                  href={item.href}
+                  onMouseEnter={() => setActive(item.label)}
+                  onMouseLeave={() => setActive(null)}
                   className={cn(
-                    "space-y-4 border-white/10",
-                    columnIndex > 0 && "lg:border-l lg:pl-8",
+                    "group flex items-center gap-2 text-2xl font-semibold transition-all duration-300",
+                    dimmed && "text-white/30 blur-[0.5px]",
+                    !hovering && "text-white/70",
+                    isActive && "text-white scale-105"
                   )}
                 >
-                  <p className="text-xs font-semibold uppercase tracking-[0.4em] text-white/40">
-                    {column.title}
-                  </p>
-                  <div className="space-y-1">
-                    {column.items.map((item) => {
-                      const id = `${column.title}-${item.label}`;
-                      const isActive = active === id;
-                      const dimmed = hovering && !isActive;
-
-                      return (
-                        <Link
-                          key={id}
-                          href={item.href}
-                          onMouseEnter={() => setActive(id)}
-                          onMouseLeave={() => setActive(null)}
-                          className={cn(
-                            "group flex items-center justify-between gap-4 py-1 text-xl font-semibold transition-all duration-200",
-                            dimmed && "text-white/15",
-                            !hovering && "text-white/70",
-                            isActive && "text-white drop-shadow-[0_0_20px_rgba(255,255,255,0.35)]",
-                          )}
-                        >
-                          <span className="flex items-center gap-3">
-                            {item.label}
-                            {item.tag && (
-                              <span className="rounded-full border border-white/30 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/80">
-                                {item.tag}
-                              </span>
-                            )}
-                          </span>
-                          <HiArrowLongRight
-                            className={cn(
-                              "text-lg transition-all duration-200",
-                              isActive
-                                ? "text-primary-200 opacity-100"
-                                : "opacity-0 text-white/40",
-                              isActive && "translate-x-1",
-                            )}
-                          />
-                        </Link>
-                      );
-                    })}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div className="w-full max-w-sm space-y-6 rounded-3xl border border-white/10 bg-white/5 p-8 backdrop-blur">
-            <p className="text-xs font-semibold uppercase tracking-[0.4em] text-white/50">
-              Company
-            </p>
-            <div className="space-y-3 text-2xl font-semibold text-white">
-              {companyLinks.map((link) => (
-                <Link
-                  key={link.href}
-                  href={link.href}
-                  className="block opacity-70 transition-opacity hover:opacity-100"
-                >
-                  {link.label}
+                  <span>{item.label}</span>
+                  <HiArrowLongRight
+                    className="text-2xl text-primary-400 opacity-0 -translate-x-2 transition-all duration-300 group-hover:opacity-100 group-hover:translate-x-0"
+                  />
                 </Link>
-              ))}
-            </div>
-            <div className="flex pt-6">
-              <Link
-                href="/dashboard"
-                className="w-full rounded-2xl bg-white px-4 py-3 text-center text-lg font-semibold text-[#050015] shadow-[0_10px_30px_rgba(255,255,255,0.15)] transition-all hover:-translate-y-0.5"
-              >
-                Start for free
-              </Link>
-            </div>
+              );
+            })}
+          </div>
+
+          {/* CTA Button */}
+          <div className="flex-shrink-0">
+            <Link href="/signup">
+              <GradientButton className="text-lg px-8 py-4">Start for free</GradientButton>
+            </Link>
           </div>
         </div>
 
-        <div className="mt-16 flex flex-col gap-4 border-t border-white/10 pt-12 text-white/40 lg:flex-row lg:items-center lg:justify-between">
-          <p className="text-5xl font-black uppercase tracking-tight text-white/70 lg:text-7xl">
-            FinanceSum
-          </p>
-          <p className="text-xs uppercase tracking-[0.4em]">
-            © {new Date().getFullYear()} FinanceSum. All rights reserved.
-          </p>
+        <div className="mt-24 flex flex-col md:flex-row justify-between items-center text-xs text-white/30 uppercase tracking-[0.2em] gap-4">
+          <p>© {new Date().getFullYear()} FinanceSum. All rights reserved.</p>
         </div>
+      </div>
+
+      {/* Large Background Logo */}
+      <div className="absolute bottom-0 left-1/2 -translate-x-1/2 translate-y-[15%] w-full text-center pointer-events-none select-none z-0">
+        <h1 className="text-[12vw] md:text-[15vw] font-black tracking-tighter text-white/5 leading-none whitespace-nowrap">
+          FINANCESUM
+        </h1>
       </div>
     </section>
   );
 }
+

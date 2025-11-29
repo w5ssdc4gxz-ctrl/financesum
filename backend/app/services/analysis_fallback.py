@@ -349,11 +349,18 @@ def _build_summary(
     ]
 
     risks = [
-        "Local mode omits qualitative disclosures from MD&A and risk factors.",
-        "Persona insights require Supabase and Gemini integration.",
-        "Ratios rely on cached data that may lag actual filings.",
-        "Validate assumptions against the latest SEC filings before making decisions.",
-        "Market conditions and peer benchmarks are not evaluated here.",
+        f"Customer Concentration: Top customers may represent significant revenue share. Loss of key accounts could materially impact financials.",
+        f"Cyclical Demand: Business may be sensitive to economic cycles affecting {company_name}'s end markets.",
+        f"Margin Sustainability: Current margins ({_format_ratio(ratios.get('operating_margin'), True)} operating) may face pressure from competition or cost inflation.",
+        f"Execution Risk: Management's capital allocation decisions and operational execution in an evolving competitive landscape.",
+        f"Valuation Risk: Current pricing may not fully account for growth deceleration or margin compression scenarios.",
+    ]
+
+    strategic_initiatives = [
+        f"R&D Investment: Monitor R&D spending as % of revenue for innovation pipeline health.",
+        f"Capital Deployment: Track buybacks and dividends relative to free cash flow generation.",
+        f"M&A Strategy: Assess any acquisition activity for strategic fit and integration execution.",
+        f"Operational Focus: Review management commentary on efficiency initiatives and margin targets.",
     ]
 
     catalysts = [
@@ -378,6 +385,10 @@ def _build_summary(
         filing_ids=filing_ids,
     )
 
+    # Build overall takeaway
+    score_descriptor = "strong" if overall and overall >= 70 else "moderate" if overall and overall >= 50 else "cautious"
+    overall_takeaway = gemini_summary.get("overall_takeaway") or f"{company_name} presents a {score_descriptor} financial profile based on available metrics. The key tradeoff is between current profitability and growth sustainability. Best suited for investors seeking exposure to this sector with appropriate risk tolerance."
+
     summary_md = f"""# Investment Analysis: {company_name}
 
 ## TL;DR
@@ -389,6 +400,9 @@ def _build_summary(
 ## Top 5 Risks
 {gemini_summary.get("risks") or chr(10).join(f"- {point}" for point in risks)}
 
+## Strategic Initiatives & Capital Allocation
+{gemini_summary.get("strategic_initiatives") or chr(10).join(f"- {point}" for point in strategic_initiatives)}
+
 ## Catalysts
 {gemini_summary.get("catalysts") or chr(10).join(f"- {point}" for point in catalysts)}
 
@@ -397,6 +411,9 @@ def _build_summary(
 
 ## Financial Highlights
 {highlights}
+
+## Overall Takeaway
+{overall_takeaway}
 
 _Generated in local fallback mode with Gemini analysis._
 """
@@ -413,6 +430,53 @@ def _format_ratio(value: Optional[float], as_percent: bool) -> str:
         return f"{value:.2f}"
     except Exception:
         return "n/a"
+
+
+def _build_persona_context(
+    company_name: str,
+    ratios: Dict[str, Any],
+    health_score: Optional[float],
+) -> str:
+    """
+    Build minimal context for persona analysis.
+    
+    This provides just key facts without any formatted structure,
+    allowing personas to interpret the data through their own lens.
+    """
+    lines = [f"Company: {company_name}"]
+    
+    # Raw metrics only - no interpretation
+    if ratios.get("revenue_growth_yoy") is not None:
+        lines.append(f"Revenue growth: {ratios['revenue_growth_yoy']*100:.1f}% YoY")
+    
+    if ratios.get("gross_margin") is not None:
+        lines.append(f"Gross margin: {ratios['gross_margin']*100:.1f}%")
+    
+    if ratios.get("operating_margin") is not None:
+        lines.append(f"Operating margin: {ratios['operating_margin']*100:.1f}%")
+    
+    if ratios.get("net_margin") is not None:
+        lines.append(f"Net margin: {ratios['net_margin']*100:.1f}%")
+    
+    if ratios.get("fcf") is not None:
+        fcf = ratios["fcf"]
+        try:
+            fcf_val = float(fcf)
+            fcf_str = f"${fcf_val/1e9:.1f}B" if abs(fcf_val) >= 1e9 else f"${fcf_val/1e6:.0f}M"
+            lines.append(f"Free cash flow: {fcf_str}")
+        except (ValueError, TypeError):
+            pass
+    
+    if ratios.get("roe") is not None:
+        lines.append(f"ROE: {ratios['roe']*100:.1f}%")
+    
+    if ratios.get("debt_to_equity") is not None:
+        lines.append(f"Debt/Equity: {ratios['debt_to_equity']:.2f}x")
+    
+    if ratios.get("current_ratio") is not None:
+        lines.append(f"Current ratio: {ratios['current_ratio']:.2f}x")
+    
+    return "\n".join(lines)
 
 
 def _generate_fallback_summary(
@@ -468,12 +532,15 @@ def _generate_ai_sections(
 
     try:
         persona_engine = get_persona_engine()
+        
+        # Build minimal context - raw facts only, no formatted structure
+        # This allows personas to interpret through their own lens
+        minimal_context = _build_persona_context(company_name, ratios, health_score)
+        
         persona_outputs = persona_engine.generate_multiple_personas(
             persona_ids=persona_engine.get_all_persona_ids(),
             company_name=company_name,
-            general_summary=ai_summary.get("full_summary")
-            or ai_summary.get("thesis")
-            or narrative,
+            general_summary=minimal_context,  # Pass minimal context, not formatted summary
             ratios=ratios,
         )
     except Exception as exc:

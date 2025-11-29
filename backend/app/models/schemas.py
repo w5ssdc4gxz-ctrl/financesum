@@ -179,7 +179,7 @@ class CompanyLookupResponse(BaseModel):
 class FilingsFetchRequest(BaseModel):
     company_id: UUID
     filing_types: Optional[List[str]] = ["10-K", "10-Q"]
-    max_history_years: int = 5
+    max_history_years: int = 40
 
 
 class FilingsFetchResponse(BaseModel):
@@ -210,12 +210,12 @@ class HealthRatingPreferences(BaseModel):
 
 class FilingSummaryPreferences(BaseModel):
     mode: Literal["default", "custom"] = "default"
-    investor_focus: Optional[str] = Field(default=None, max_length=600)
+    investor_focus: Optional[str] = Field(default=None, max_length=5000)
     focus_areas: List[str] = Field(default_factory=list)
     tone: Optional[str] = Field(default=None, max_length=50)
     detail_level: Optional[str] = Field(default=None, max_length=50)
     output_style: Optional[str] = Field(default=None, max_length=50)
-    target_length: Optional[int] = Field(default=None, ge=50, le=1200)
+    target_length: Optional[int] = Field(default=None, ge=50, le=5000)
     complexity: Literal["simple", "intermediate", "expert"] = "intermediate"
     health_rating: Optional[HealthRatingPreferences] = None
 

@@ -22,7 +22,7 @@ const colorClasses: Record<ButtonColor, string> = {
   success: 'bg-gradient-to-r from-green-600 to-emerald-600 hover:from-green-700 hover:to-emerald-700 text-white shadow-premium',
   danger: 'bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-700 hover:to-rose-700 text-white shadow-premium',
   warning: 'bg-gradient-to-r from-yellow-600 to-orange-600 hover:from-yellow-700 hover:to-orange-700 text-white shadow-premium',
-  ghost: 'bg-transparent hover:bg-white/5 text-gray-300 hover:text-white border border-transparent hover:border-white/10'
+  ghost: 'bg-transparent hover:bg-slate-100 dark:hover:bg-white/5 text-slate-600 dark:text-gray-300 hover:text-slate-900 dark:hover:text-white border border-transparent hover:border-slate-200 dark:hover:border-white/10'
 }
 
 const sizeClasses: Record<ButtonSize, string> = {

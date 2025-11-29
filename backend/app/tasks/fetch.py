@@ -50,6 +50,7 @@ def _store_filing_and_statements(
     source_url: str,
 ) -> Tuple[int, int]:
     try:
+        # Check if filing exists
         existing = (
             supabase.table("filings")
             .select("id")
@@ -58,23 +59,39 @@ def _store_filing_and_statements(
             .eq("filing_date", date_str)
             .execute()
         )
+        
+        filing_id = None
         if existing.data:
-            return 0, 1
+            filing_id = existing.data[0]["id"]
+            # Check if statements exist for this filing
+            existing_statements = (
+                supabase.table("financial_statements")
+                .select("id")
+                .eq("filing_id", filing_id)
+                .execute()
+            )
+            if existing_statements.data:
+                return 0, 1  # Fully exists, skip
+            
+            # Orphan filing found (filing exists but no statements), proceed to insert statements
+            logger.info(f"Found orphan filing {filing_id} for {ticker} {date_str}, attempting recovery.")
+        else:
+            # Create new filing
+            filing_data = {
+                "company_id": company_id,
+                "filing_type": filing_type,
+                "filing_date": date_str,
+                "period_end": date_str,
+                "url": source_url,
+                "raw_file_path": f"eodhd_{ticker}_{filing_type.replace('-', '')}_{date_str}",
+                "status": "parsed",
+            }
+            filing_response = supabase.table("filings").insert(filing_data).execute()
+            if not filing_response.data:
+                return 0, 0
+            filing_id = filing_response.data[0]["id"]
 
-        filing_data = {
-            "company_id": company_id,
-            "filing_type": filing_type,
-            "filing_date": date_str,
-            "period_end": date_str,
-            "url": source_url,
-            "raw_file_path": f"eodhd_{ticker}_{filing_type.replace('-', '')}_{date_str}",
-            "status": "parsed",
-        }
-        filing_response = supabase.table("filings").insert(filing_data).execute()
-        if not filing_response.data:
-            return 0
-
-        filing_id = filing_response.data[0]["id"]
+        # Insert financial statements
         financial_statement_data = {
             "filing_id": filing_id,
             "period_start": date_str,
@@ -86,8 +103,17 @@ def _store_filing_and_statements(
                 "cash_flow": cashflow_statement,
             },
         }
-        supabase.table("financial_statements").insert(financial_statement_data).execute()
-        return 1, 0
+        
+        try:
+            supabase.table("financial_statements").insert(financial_statement_data).execute()
+            return 1, 0
+        except Exception as stmt_exc:
+            # If we just created this filing and statement insert failed, delete the filing to avoid orphan
+            if not existing.data:
+                logger.warning(f"Failed to insert statements for new filing {filing_id}, rolling back filing.")
+                supabase.table("filings").delete().eq("id", filing_id).execute()
+            raise stmt_exc
+
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "Error processing %s statement on %s for %s: %s", filing_type, date_str, ticker, exc

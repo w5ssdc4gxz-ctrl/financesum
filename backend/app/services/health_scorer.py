@@ -276,6 +276,29 @@ class HealthScorer:
             self.normalized_scores.get("revenue_growth_yoy", 50)
         ]
         self.component_scores["financial_performance"] = statistics.mean(growth_scores)
+
+        # Calculate growth component score more granularly
+        revenue_growth = self.ratios.get("revenue_growth_yoy")
+        if revenue_growth is not None:
+            if revenue_growth >= 0.25:  # 25%+ growth
+                growth_score = 90
+            elif revenue_growth >= 0.15:  # 15-25% growth
+                growth_score = 75
+            elif revenue_growth >= 0.10:  # 10-15% growth
+                growth_score = 65
+            elif revenue_growth >= 0.05:  # 5-10% growth
+                growth_score = 55
+            elif revenue_growth >= 0:  # 0-5% growth
+                growth_score = 45
+            elif revenue_growth >= -0.05:  # 0 to -5% decline
+                growth_score = 30
+            elif revenue_growth >= -0.10:  # -5 to -10% decline
+                growth_score = 20
+            else:  # More than -10% decline
+                growth_score = 10
+            self.component_scores["growth"] = growth_score
+        else:
+            self.component_scores["growth"] = 50  # Neutral if no data
         
         # Profitability
         profitability_scores = [
@@ -314,9 +337,9 @@ class HealthScorer:
         
         # Governance (placeholder - would need footnote/red flag analysis)
         self.component_scores["governance"] = 70  # Default score
-        
-        # Growth prospects (placeholder - would need MD&A sentiment analysis)
-        self.component_scores["growth"] = 65  # Default score
+
+        # Growth component is now calculated above based on revenue_growth_yoy
+        # (replaces the old placeholder default)
     
     def _calculate_weighted_score(self) -> float:
         """Calculate weighted overall score."""

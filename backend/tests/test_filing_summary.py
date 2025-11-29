@@ -12,7 +12,14 @@ WORD_PATTERN = re.compile(r"\b\w+\b")
 
 
 def _backend_word_count(text: str) -> int:
-    return len(WORD_PATTERN.findall(text))
+    import string
+    punct = string.punctuation + "“”’‘—–…"
+    count = 0
+    for raw_token in text.split():
+        token = raw_token.strip(punct)
+        if token:
+            count += 1
+    return count
 
 
 def build_summary_with_word_count(word_count: int) -> str:
@@ -86,9 +93,13 @@ def test_summary_uses_serialized_statements(monkeypatch):
     monkeypatch.setattr(filings_api, "get_gemini_client", lambda: DummyClient())
 
     client = TestClient(app)
+    print("DEBUG: Sending request from test")
     response = client.post(f"/api/v1/filings/{filing_id}/summary")
 
     try:
+        if response.status_code != 200:
+            print(f"DEBUG: Response status: {response.status_code}")
+            print(f"DEBUG: Response body: {response.text}")
         assert response.status_code == 200
         assert response.json()["summary"] == "summary"
     finally:
@@ -369,6 +380,9 @@ def test_summary_enforces_word_length(monkeypatch):
     )
 
     try:
+        if response.status_code != 200:
+            with open("debug_response.txt", "w") as f:
+                f.write(f"Status: {response.status_code}\nBody: {response.text}")
         assert response.status_code == 200
         summary = response.json()["summary"]
         word_count = len(summary.split())
@@ -512,6 +526,224 @@ def test_summary_rewrite_produces_compact_output(monkeypatch):
         assert filings_api.MAX_SUMMARY_ATTEMPTS < dummy_model_holder["model"].calls <= (
             filings_api.MAX_SUMMARY_ATTEMPTS + filings_api.MAX_REWRITE_ATTEMPTS
         )
+    finally:
+        local_cache.fallback_filings_by_id.pop(filing_id, None)
+        local_cache.fallback_companies.pop(company_id, None)
+        local_cache.fallback_financial_statements.pop(filing_id, None)
+        local_cache.fallback_filing_summaries.pop(filing_id, None)
+
+
+def test_final_clamp_holds_length_after_postprocessing(monkeypatch):
+    """Post-processing additions should still respect the requested word target."""
+    settings = get_settings()
+    settings.gemini_api_key = "test-key"
+
+    filing_id = "length-postprocess-filing"
+    company_id = "length-postprocess-company"
+
+    local_cache.fallback_filings_by_id[filing_id] = {
+        "id": filing_id,
+        "company_id": company_id,
+        "filing_type": "10-Q",
+        "filing_date": "2024-11-15",
+    }
+    local_cache.fallback_companies[company_id] = {
+        "id": company_id,
+        "ticker": "POST",
+        "name": "Post Process Corp",
+    }
+    local_cache.fallback_financial_statements[filing_id] = {
+        "filing_id": filing_id,
+        "period_start": "2024-08-01",
+        "period_end": "2024-10-31",
+        "statements": {"income_statement": {"totalRevenue": {"2024-10-31": 700}}},
+    }
+
+    monkeypatch.setattr(filings_api, "_supabase_configured", lambda _settings: False)
+
+    target_length = 150
+    call_counter = {"calls": 0}
+
+    class DummyModel:
+        def generate_content(self, prompt: str):
+            call_counter["calls"] += 1
+
+            class Response:
+                pass
+
+            resp = Response()
+            if call_counter["calls"] == 1:
+                # Initial draft lands inside the tolerance band
+                resp.text = build_summary_with_word_count(target_length - 5)
+            else:
+                # Rewrite attempts stubbornly stay long; final clamp must fix it
+                resp.text = build_summary_with_word_count(target_length + 40)
+            return resp
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.model = DummyModel()
+
+    monkeypatch.setattr(filings_api, "get_gemini_client", lambda: DummyClient())
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/filings/{filing_id}/summary",
+        json={"mode": "custom", "target_length": target_length},
+    )
+
+    try:
+        assert response.status_code == 200
+        summary = response.json()["summary"]
+        word_count = _backend_word_count(summary)
+        assert target_length - 10 <= word_count <= target_length + 10
+        # Ensure sections survive trimming
+        assert "Key Data Appendix" in summary
+        assert "Strategic Initiatives" in summary
+    finally:
+        local_cache.fallback_filings_by_id.pop(filing_id, None)
+        local_cache.fallback_companies.pop(company_id, None)
+        local_cache.fallback_financial_statements.pop(filing_id, None)
+        local_cache.fallback_filing_summaries.pop(filing_id, None)
+
+
+def test_final_output_clamped_to_target_band(monkeypatch):
+    """Even stubbornly short drafts are padded into the requested ±10 word band."""
+    settings = get_settings()
+    settings.gemini_api_key = "test-key"
+
+    filing_id = "length-clamp-filing"
+    company_id = "length-clamp-company"
+
+    local_cache.fallback_filings_by_id[filing_id] = {
+        "id": filing_id,
+        "company_id": company_id,
+        "filing_type": "10-Q",
+        "filing_date": "2024-10-15",
+    }
+    local_cache.fallback_companies[company_id] = {
+        "id": company_id,
+        "ticker": "CLMP",
+        "name": "Clamp Test Corp",
+    }
+    local_cache.fallback_financial_statements[filing_id] = {
+        "filing_id": filing_id,
+        "period_start": "2024-07-01",
+        "period_end": "2024-09-30",
+        "statements": {"income_statement": {"totalRevenue": {"2024-09-30": 500}}},
+    }
+
+    monkeypatch.setattr(filings_api, "_supabase_configured", lambda _settings: False)
+    # Skip section completeness validation to focus purely on length enforcement
+    monkeypatch.setattr(filings_api, "_make_section_completeness_validator", lambda include: (lambda _txt: None))
+
+    class DummyModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_content(self, prompt: str):
+            self.calls += 1
+
+            class Resp:
+                pass
+
+            # Always return a stubbornly short draft (around 617 words)
+            resp = Resp()
+            resp.text = build_summary_with_word_count(617)
+            return resp
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.model = DummyModel()
+
+    monkeypatch.setattr(filings_api, "get_gemini_client", lambda: DummyClient())
+
+    target_length = 650
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/filings/{filing_id}/summary",
+        json={"mode": "custom", "target_length": target_length},
+    )
+
+    try:
+        assert response.status_code == 200
+        summary = response.json()["summary"]
+        word_count = _backend_word_count(summary)
+        assert target_length - 10 <= word_count <= target_length + 10
+        # Ensure key sections remain present after padding/clamping
+        assert "Executive Summary" in summary
+        assert "Key Data Appendix" in summary
+    finally:
+        local_cache.fallback_filings_by_id.pop(filing_id, None)
+        local_cache.fallback_companies.pop(company_id, None)
+        local_cache.fallback_financial_statements.pop(filing_id, None)
+        local_cache.fallback_filing_summaries.pop(filing_id, None)
+
+
+def test_overlong_output_is_trimmed_but_complete(monkeypatch):
+    """Overlong drafts are trimmed into band while preserving Key Data Appendix rows."""
+    settings = get_settings()
+    settings.gemini_api_key = "test-key"
+
+    filing_id = "length-trim-band"
+    company_id = "length-trim-band-co"
+
+    local_cache.fallback_filings_by_id[filing_id] = {
+        "id": filing_id,
+        "company_id": company_id,
+        "filing_type": "10-Q",
+        "filing_date": "2024-10-15",
+    }
+    local_cache.fallback_companies[company_id] = {
+        "id": company_id,
+        "ticker": "TRMB",
+        "name": "Trim Band Corp",
+    }
+    local_cache.fallback_financial_statements[filing_id] = {
+        "filing_id": filing_id,
+        "period_start": "2024-07-01",
+        "period_end": "2024-09-30",
+        "statements": {"income_statement": {"totalRevenue": {"2024-09-30": 500}}},
+    }
+
+    monkeypatch.setattr(filings_api, "_supabase_configured", lambda _settings: False)
+    # Skip section completeness validation to isolate band enforcement
+    monkeypatch.setattr(filings_api, "_make_section_completeness_validator", lambda include: (lambda _txt: None))
+
+    class DummyModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def generate_content(self, prompt: str):
+            self.calls += 1
+
+            class Resp:
+                pass
+
+            # Return an overlong draft (~700 words)
+            resp = Resp()
+            resp.text = build_summary_with_word_count(700)
+            return resp
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.model = DummyModel()
+
+    monkeypatch.setattr(filings_api, "get_gemini_client", lambda: DummyClient())
+
+    target_length = 650
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/filings/{filing_id}/summary",
+        json={"mode": "custom", "target_length": target_length},
+    )
+
+    try:
+        assert response.status_code == 200
+        summary = response.json()["summary"]
+        word_count = _backend_word_count(summary)
+        assert target_length - 10 <= word_count <= target_length + 10
+        assert "Key Data Appendix" in summary
     finally:
         local_cache.fallback_filings_by_id.pop(filing_id, None)
         local_cache.fallback_companies.pop(company_id, None)

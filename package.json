@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "gsap": "^3.13.0",
+    "motion": "^12.23.24",
+    "tailwindcss": "^4.1.17"
+  }
+}
