@@ -37,3 +37,4 @@ def get_supabase_anon_client() -> Client:
 
 
 
+

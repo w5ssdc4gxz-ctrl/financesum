@@ -1,7 +1,7 @@
 """Gemini AI client for generating summaries and analysis."""
 import re
 import google.generativeai as genai
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable
 from app.config import get_settings
 
 
@@ -40,6 +40,53 @@ class GeminiClient:
             )
         )
     
+    def stream_generate_content(
+        self,
+        prompt: str,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        stage_name: str = "Generating",
+        expected_tokens: int = 4000,
+        use_persona_model: bool = False
+    ) -> str:
+        """
+        Generate content with streaming and real-time progress updates.
+        
+        Args:
+            prompt: The prompt to send to Gemini
+            progress_callback: Callback function(percentage, status_message) for progress updates
+            stage_name: Name of the current stage for status messages
+            expected_tokens: Expected number of tokens in response for progress estimation
+            use_persona_model: Whether to use the persona model (higher temperature)
+        
+        Returns:
+            Complete generated text
+        """
+        model = self.persona_model if use_persona_model else self.model
+        accumulated_text = ""
+        chunk_count = 0
+        
+        try:
+            response = model.generate_content(prompt, stream=True)
+            
+            for chunk in response:
+                if chunk.text:
+                    accumulated_text += chunk.text
+                    chunk_count += 1
+                    
+                    if progress_callback and chunk_count % 5 == 0:
+                        estimated_progress = min(95, int((len(accumulated_text) / (expected_tokens * 4)) * 100))
+                        progress_callback(estimated_progress, f"{stage_name}... {estimated_progress}%")
+            
+            if progress_callback:
+                progress_callback(100, f"{stage_name}... Complete")
+            
+            return accumulated_text
+            
+        except Exception as e:
+            print(f"Streaming generation error: {e}")
+            response = model.generate_content(prompt)
+            return response.text
+
     def generate_company_summary(
         self,
         company_name: str,
@@ -192,8 +239,8 @@ Financial Ratios:
         prompt += """
 Please provide the following analysis in a structured format:
 
-## TL;DR (3 sentences)
-[Provide a concise 3-sentence investment summary. State your view: bullish/bearish/neutral.]
+## TL;DR (STRICT: 10 words max)
+[Write ONE powerful sentence. MAXIMUM 10 words. Count them. Include stance (bullish/bearish/neutral). Examples: "AI chip monopoly, 75% margins. Bullish." (7 words) | "Overvalued growth stock burning cash. Bearish." (6 words)]
 
 ## Investment Thesis (5 bullet points)
 [List 5 key reasons why this company could be an attractive investment, with brief explanations]

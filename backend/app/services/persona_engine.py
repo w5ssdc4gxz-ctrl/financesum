@@ -1953,6 +1953,7 @@ def fix_mid_text_ellipsis(output: str) -> str:
     """
     Fix ellipsis (...) that appear in the middle of text, not just at the end.
     This catches patterns like "Cash Flow Quality: 10/25..." in the middle of output.
+    Also handles incomplete trailing phrases without explicit ellipsis.
     """
     if not output:
         return output
@@ -1962,6 +1963,196 @@ def fix_mid_text_ellipsis(output: str) -> str:
 
     for line in lines:
         original_line = line
+
+        # =================================================================
+        # PERSONA-SPECIFIC TRAILING PATTERNS (Howard Marks, etc.)
+        # =================================================================
+        
+        # "I would..." patterns (common for investment personas)
+        line = re.sub(
+            r'I\s+would\s*\.{2,}\s*$',
+            'I would proceed with caution given current valuations.',
+            line,
+            flags=re.IGNORECASE
+        )
+        line = re.sub(
+            r'I\s+would\s*$',
+            'I would proceed with caution given current valuations.',
+            line,
+            flags=re.IGNORECASE
+        )
+
+        # =================================================================
+        # EXECUTIVE SUMMARY / CLOSING PATTERNS
+        # =================================================================
+        
+        # "sustainability and the..." patterns
+        line = re.sub(
+            r'sustainability\s+and\s+the\s*\.{2,}\s*$',
+            'sustainability and the long-term durability of these exceptional margins.',
+            line,
+            flags=re.IGNORECASE
+        )
+        line = re.sub(
+            r'sustainability\s+and\s+the\s*$',
+            'sustainability and the long-term durability of these exceptional margins.',
+            line,
+            flags=re.IGNORECASE
+        )
+        
+        # "and the..." at end
+        line = re.sub(
+            r'\s+and\s+the\s*\.{2,}\s*$',
+            ' and the implications for long-term value creation.',
+            line,
+            flags=re.IGNORECASE
+        )
+        line = re.sub(
+            r'\s+and\s+the\s*$',
+            ' and the implications for long-term value creation.',
+            line,
+            flags=re.IGNORECASE
+        )
+
+        # =================================================================
+        # MD&A / MANAGEMENT PATTERNS
+        # =================================================================
+        
+        # "uncertainties in global..." patterns
+        line = re.sub(
+            r'uncertainties\s+in\s+global\s*\.{2,}\s*$',
+            'uncertainties in the global supply chain and macroeconomic environment.',
+            line,
+            flags=re.IGNORECASE
+        )
+        line = re.sub(
+            r'uncertainties\s+in\s+global\s*$',
+            'uncertainties in the global supply chain and macroeconomic environment.',
+            line,
+            flags=re.IGNORECASE
+        )
+        
+        # "in global..." at end
+        line = re.sub(
+            r'\s+in\s+global\s*\.{2,}\s*$',
+            ' in the global market.',
+            line,
+            flags=re.IGNORECASE
+        )
+        line = re.sub(
+            r'\s+in\s+global\s*$',
+            ' in the global market.',
+            line,
+            flags=re.IGNORECASE
+        )
+
+        # =================================================================
+        # RISK FACTOR PATTERNS
+        # =================================================================
+        
+        # "a geopolitical..." patterns
+        line = re.sub(
+            r',?\s*a\s+geopolitical\s*\.{2,}\s*$',
+            ', a geopolitical risk that warrants close monitoring.',
+            line,
+            flags=re.IGNORECASE
+        )
+        line = re.sub(
+            r',?\s*a\s+geopolitical\s*$',
+            ', a geopolitical risk that warrants close monitoring.',
+            line,
+            flags=re.IGNORECASE
+        )
+        
+        # "in a key market..." patterns
+        line = re.sub(
+            r'in\s+a\s+key\s+market\s*\.{2,}\s*$',
+            'in a key market that could materially impact results.',
+            line,
+            flags=re.IGNORECASE
+        )
+        line = re.sub(
+            r'in\s+a\s+key\s+market\s*$',
+            'in a key market that could materially impact results.',
+            line,
+            flags=re.IGNORECASE
+        )
+
+        # =================================================================
+        # COMPETITIVE LANDSCAPE PATTERNS
+        # =================================================================
+        
+        # "NVIDIA's..." patterns (company possessive without noun)
+        line = re.sub(
+            r"NVIDIA['']s\s*\.{2,}\s*$",
+            "NVIDIA's competitive positioning and pricing power.",
+            line,
+            flags=re.IGNORECASE
+        )
+        line = re.sub(
+            r"NVIDIA['']s\s*$",
+            "NVIDIA's competitive positioning and pricing power.",
+            line,
+            flags=re.IGNORECASE
+        )
+        
+        # "reliance on NVIDIA's..." patterns
+        line = re.sub(
+            r"reliance\s+on\s+NVIDIA['']s\s*\.{2,}\s*$",
+            "reliance on NVIDIA's chips and potentially developing alternatives.",
+            line,
+            flags=re.IGNORECASE
+        )
+        line = re.sub(
+            r"reliance\s+on\s+NVIDIA['']s\s*$",
+            "reliance on NVIDIA's chips and potentially developing alternatives.",
+            line,
+            flags=re.IGNORECASE
+        )
+        
+        # "potentially reducing their..." patterns
+        line = re.sub(
+            r"potentially\s+reducing\s+their\s*\.{2,}\s*$",
+            "potentially reducing their dependency on external suppliers.",
+            line,
+            flags=re.IGNORECASE
+        )
+        line = re.sub(
+            r"potentially\s+reducing\s+their\s*$",
+            "potentially reducing their dependency on external suppliers.",
+            line,
+            flags=re.IGNORECASE
+        )
+
+        # =================================================================
+        # STRATEGIC INITIATIVES PATTERNS
+        # =================================================================
+        
+        # "technological advancements..." patterns
+        line = re.sub(
+            r"technological\s+advancements\s*\.{2,}\s*$",
+            "technological advancements and market adoption milestones.",
+            line,
+            flags=re.IGNORECASE
+        )
+        line = re.sub(
+            r"technological\s+advancements\s*$",
+            "technological advancements and market adoption milestones.",
+            line,
+            flags=re.IGNORECASE
+        )
+        
+        # "along with milestones..." patterns
+        line = re.sub(
+            r"along\s+with\s+milestones\s*\.{2,}\s*$",
+            "along with milestones for key product launches and technological innovations.",
+            line,
+            flags=re.IGNORECASE
+        )
+
+        # =================================================================
+        # ORIGINAL PATTERNS (preserved)
+        # =================================================================
 
         # Pattern: "Category: X/Y..." at end of line → complete it
         line = re.sub(
@@ -2014,6 +2205,27 @@ def fix_mid_text_ellipsis(output: str) -> str:
             line,
             flags=re.IGNORECASE
         )
+
+        # =================================================================
+        # GENERIC TRAILING ARTICLE/PREPOSITION PATTERNS
+        # =================================================================
+        
+        # Ends with articles
+        line = re.sub(r'\s+the\s*\.{2,}\s*$', ' the implications for investors.', line, flags=re.IGNORECASE)
+        line = re.sub(r'\s+a\s*\.{2,}\s*$', ' a key consideration.', line, flags=re.IGNORECASE)
+        line = re.sub(r'\s+an\s*\.{2,}\s*$', ' an important factor.', line, flags=re.IGNORECASE)
+        
+        # Ends with conjunctions
+        line = re.sub(r'\s+and\s*\.{2,}\s*$', ' and other relevant factors.', line, flags=re.IGNORECASE)
+        line = re.sub(r'\s+but\s*\.{2,}\s*$', ' but caution is warranted.', line, flags=re.IGNORECASE)
+        line = re.sub(r'\s+or\s*\.{2,}\s*$', ' or alternative approaches.', line, flags=re.IGNORECASE)
+        
+        # Ends with prepositions
+        line = re.sub(r'\s+to\s*\.{2,}\s*$', ' to monitor closely.', line, flags=re.IGNORECASE)
+        line = re.sub(r'\s+of\s*\.{2,}\s*$', ' of significance.', line, flags=re.IGNORECASE)
+        line = re.sub(r'\s+for\s*\.{2,}\s*$', ' for consideration.', line, flags=re.IGNORECASE)
+        line = re.sub(r'\s+with\s*\.{2,}\s*$', ' with appropriate risk management.', line, flags=re.IGNORECASE)
+        line = re.sub(r'\s+in\s*\.{2,}\s*$', ' in the current environment.', line, flags=re.IGNORECASE)
 
         fixed_lines.append(line)
 
@@ -6583,3 +6795,4 @@ def generate_closing_persona_message(
         closing_message = f"{closing_message} {concluding_line}"
 
     return closing_message
+

@@ -271,11 +271,15 @@ class HealthScorer:
     
     def _calculate_component_scores(self):
         """Calculate scores for each major component."""
-        # Financial Performance & Growth
-        growth_scores = [
-            self.normalized_scores.get("revenue_growth_yoy", 50)
+        # Financial Performance - combines revenue growth and operating performance
+        financial_perf_scores = [
+            self.normalized_scores.get("revenue_growth_yoy", 50),
+            self.normalized_scores.get("operating_margin", 50),
         ]
-        self.component_scores["financial_performance"] = statistics.mean(growth_scores)
+        # Only include scores that have actual data
+        valid_scores = [s for s in financial_perf_scores if s != 50 or 
+                       "revenue_growth_yoy" in self.ratios or "operating_margin" in self.ratios]
+        self.component_scores["financial_performance"] = statistics.mean(valid_scores) if valid_scores else 50
 
         # Calculate growth component score more granularly
         revenue_growth = self.ratios.get("revenue_growth_yoy")
@@ -335,8 +339,10 @@ class HealthScorer:
         ]
         self.component_scores["cash_flow"] = statistics.mean(cash_flow_scores)
         
-        # Governance (placeholder - would need footnote/red flag analysis)
-        self.component_scores["governance"] = 70  # Default score
+        # Governance - neutral score since governance metrics require qualitative analysis
+        # (footnote review, auditor opinions, related party transactions, etc.)
+        # that cannot be reliably extracted from structured financial data alone
+        self.component_scores["governance"] = 50
 
         # Growth component is now calculated above based on revenue_growth_yoy
         # (replaces the old placeholder default)
@@ -381,6 +387,7 @@ def calculate_health_score(
     """
     scorer = HealthScorer(ratios, peer_data)
     return scorer.calculate_health_score()
+
 
 
 

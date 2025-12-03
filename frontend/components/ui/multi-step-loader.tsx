@@ -57,15 +57,19 @@ type LoadingState = {
 const LoaderCore = ({
     loadingStates,
     value = 0,
+    percentage,
+    statusText,
 }: {
     loadingStates: LoadingState[];
     value?: number;
+    percentage?: number | null;
+    statusText?: string;
 }) => {
     return (
         <div className="flex relative justify-start max-w-xl mx-auto flex-col mt-40">
             {loadingStates.map((loadingState, index) => {
                 const distance = Math.abs(index - value);
-                const opacity = Math.max(1 - distance * 0.2, 0); // Fade out distant steps
+                const opacity = Math.max(1 - distance * 0.2, 0);
 
                 return (
                     <motion.div
@@ -90,11 +94,32 @@ const LoaderCore = ({
                                 value === index && "text-black dark:text-white opacity-100"
                             )}
                         >
-                            {loadingState.text}
+                            {index === value && statusText ? statusText : loadingState.text}
                         </span>
                     </motion.div>
                 );
             })}
+            
+            {percentage !== null && percentage !== undefined && (
+                <motion.div
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    className="mt-8 w-full max-w-md"
+                >
+                    <div className="flex justify-between text-sm font-bold mb-2">
+                        <span>Progress</span>
+                        <span>{percentage}%</span>
+                    </div>
+                    <div className="h-4 bg-gray-200 dark:bg-gray-700 border-2 border-black dark:border-white">
+                        <motion.div
+                            className="h-full bg-black dark:bg-white"
+                            initial={{ width: 0 }}
+                            animate={{ width: `${percentage}%` }}
+                            transition={{ duration: 0.3 }}
+                        />
+                    </div>
+                </motion.div>
+            )}
         </div>
     );
 };
@@ -106,6 +131,8 @@ export const MultiStepLoader = ({
     loop = true,
     stopOnLastStep,
     currentStep,
+    percentage,
+    statusText,
 }: {
     loadingStates: LoadingState[];
     loading?: boolean;
@@ -113,6 +140,8 @@ export const MultiStepLoader = ({
     loop?: boolean;
     stopOnLastStep?: boolean;
     currentStep?: number;
+    percentage?: number | null;
+    statusText?: string;
 }) => {
     const [internalState, setInternalState] = useState(0);
 
@@ -155,7 +184,12 @@ export const MultiStepLoader = ({
                     className="w-full h-full fixed inset-0 z-[100] flex items-center justify-center bg-white/90 dark:bg-black/90 backdrop-blur-sm border-2 border-black dark:border-white"
                 >
                     <div className="h-96 relative">
-                        <LoaderCore value={currentState} loadingStates={loadingStates} />
+                        <LoaderCore 
+                            value={currentState} 
+                            loadingStates={loadingStates} 
+                            percentage={percentage}
+                            statusText={statusText}
+                        />
                     </div>
 
                     <div className="bg-gradient-to-t inset-x-0 z-20 bottom-0 bg-white dark:bg-black h-full absolute [mask-image:radial-gradient(900px_at_center,transparent_30%,white)]" />

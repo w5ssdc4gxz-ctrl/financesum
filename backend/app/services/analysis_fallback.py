@@ -322,9 +322,7 @@ def _build_summary(
     band = health_score_data.get("score_band")
 
     tldr_lines = [
-        f"{company_name} earns a local health score of {overall:.1f}/100 ({band})." if overall is not None and band else f"{company_name} analysis generated in local mode.",
-        f"Based on {filings_count} recent filings stored locally." if filings_count else "No filings were available; analysis may be incomplete.",
-        "Results include quantitative ratios only; AI-generated narratives are omitted in local mode.",
+        f"{company_name}: {overall:.1f}/100 ({band}). Local analysis mode." if overall is not None and band else f"{company_name}: Local analysis mode.",
     ]
 
     highlights_map = [
@@ -489,7 +487,7 @@ def _generate_fallback_summary(
     score_text = f" with a health score of {health_score:.1f}/100" if health_score else ""
     
     return {
-        "tldr": f"{company_name}{score_text} shows strong profitability margins and cash flow generation. Analysis based on recent financial statements.",
+        "tldr": f"{company_name}{score_text}. Strong margins, solid cash generation.",
         "thesis": narrative,
         "risks": "Set GEMINI_API_KEY in .env to generate AI-powered risk analysis, thesis, and investor persona views.",
         "catalysts": "AI-generated catalysts require Gemini API key configuration.",

@@ -44,6 +44,7 @@ from app.services.local_cache import (
     progress_cache,
 )
 from app.services.gemini_client import get_gemini_client
+from app.services.health_scorer import calculate_health_score
 from app.services.sample_data import sample_filings_by_ticker
 from app.utils.supabase_errors import is_supabase_table_missing_error
 
@@ -129,6 +130,230 @@ def _clamp_target_length(value: Optional[int]) -> Optional[int]:
     return max(10, min(5000, value))
 
 
+def _extract_persona_name(investor_focus: Optional[str]) -> Optional[str]:
+    """Extract the persona name from the investor_focus prompt text.
+    
+    The investor_focus typically contains text like:
+    "Role: Howard Marks. Personality: Calm, cycle-aware..."
+    or
+    "Role: Warren Buffett. Personality: Folksy clarity..."
+    
+    Returns the persona name (e.g., "Howard Marks", "Warren Buffett") or None if not found.
+    """
+    if not investor_focus:
+        return None
+    
+    # Try to extract from "Role: [Name]." pattern
+    role_match = re.search(r'Role:\s*([^.]+)\.', investor_focus, re.IGNORECASE)
+    if role_match:
+        return role_match.group(1).strip()
+    
+    # Try to extract from "As [Name]," pattern
+    as_match = re.search(r'As\s+([A-Z][a-z]+\s+[A-Z][a-z]+)', investor_focus)
+    if as_match:
+        return as_match.group(1).strip()
+    
+    # Common persona names to look for
+    persona_names = [
+        "Warren Buffett", "Charlie Munger", "Benjamin Graham", "Peter Lynch",
+        "Ray Dalio", "Cathie Wood", "Joel Greenblatt", "John Bogle",
+        "Howard Marks", "Bill Ackman"
+    ]
+    
+    for name in persona_names:
+        if name.lower() in investor_focus.lower():
+            return name
+    
+    return None
+
+
+def _build_closing_takeaway_description(persona_name: Optional[str], company_name: str) -> Tuple[str, str]:
+    """Build a dynamic Closing Takeaway section description based on the selected persona.
+    
+    If a persona is selected, the instructions are specifically tailored to that persona's voice.
+    If no persona is selected, generic instructions are provided.
+    """
+    title = "Closing Takeaway"
+    
+    base_requirements = (
+        "MANDATORY SECTION - DO NOT OMIT UNDER ANY CIRCUMSTANCES.\n"
+        "5-7 COMPLETE sentences (minimum 75 words). This is your FINAL INVESTMENT VERDICT.\n\n"
+        "=== REQUIRED ELEMENTS (ALL 4 MUST BE PRESENT - CHECK EACH ONE) ===\n"
+        "\n"
+        "1. QUALITY ASSESSMENT (REQUIRED): Is this a high-quality, average, or poor business?\n"
+        "   You MUST state this explicitly with reasoning.\n"
+        "   Example: 'This is a wonderful business because...' or 'This is a mediocre business due to...'\n"
+        "\n"
+        "2. INVESTMENT STANCE (REQUIRED - CANNOT BE OMITTED):\n"
+        "   You MUST state one of: BUY, HOLD, SELL, or WAIT\n"
+        "   Use the persona's language but the verdict must be CLEAR.\n"
+        "   Example: 'I would buy at these levels' or 'I would hold but not add' or 'I would pass/sell'\n"
+        "\n"
+        "3. KEY DRIVER (REQUIRED): What is the #1 factor behind your decision?\n"
+        "   Be specific: 'The moat is...' or 'The valuation is...' or 'The risk is...'\n"
+        "\n"
+        "4. ACTIONABLE TRIGGER (REQUIRED): What would change your mind?\n"
+        "   Example: 'I would reconsider if margins fell below 30%' or 'At a 20% pullback, I would buy'\n"
+        "\n"
+        "VERIFICATION: Before submitting, count: Did you include all 4 elements? If not, REVISE.\n\n"
+    )
+    
+    completion_requirements = (
+        "\n=== ABSOLUTE SENTENCE COMPLETION REQUIREMENT ===\n"
+        "EVERY sentence MUST end with a period, question mark, or exclamation point.\n"
+        "DO NOT write 'I would...' and stop. COMPLETE IT: 'I would wait for a better entry point.'\n"
+        "DO NOT trail off with '...' - FORBIDDEN.\n"
+        "DO NOT end with incomplete phrases like 'which is...', 'and the...', 'but I...'\n"
+        "READ YOUR LAST SENTENCE ALOUD. Does it sound complete? If not, REWRITE IT.\n"
+        "=== END REQUIREMENT ===\n"
+    )
+    
+    if persona_name and persona_name in PERSONA_CLOSING_INSTRUCTIONS:
+        # Persona-specific instructions
+        persona_instructions = PERSONA_CLOSING_INSTRUCTIONS[persona_name]
+        description = (
+            base_requirements +
+            f"=== YOU ARE {persona_name.upper()} - WRITE EXACTLY AS THEY WOULD ===\n"
+            f"This Closing Takeaway MUST sound like {persona_name} personally wrote it about {company_name}.\n"
+            f"Use FIRST PERSON voice throughout ('I', 'my view', 'I would').\n\n"
+            f"{persona_instructions}\n"
+            f"\nDO NOT write a generic analyst conclusion. Sound EXACTLY like {persona_name}.\n"
+            f"The reader should immediately recognize this as {persona_name}'s voice.\n"
+            + completion_requirements +
+            f"This section MUST provide CLOSURE as {persona_name} giving their final verdict on {company_name}."
+        )
+    else:
+        # Generic instructions (no persona selected) - HIGH QUALITY OBJECTIVE ANALYSIS
+        description = (
+            base_requirements +
+            "=== OBJECTIVE ANALYST MODE (NO PERSONA) ===\n"
+            "CRITICAL: You are a NEUTRAL PROFESSIONAL ANALYST. You must NOT adopt any persona.\n\n"
+            "FORBIDDEN - DO NOT USE:\n"
+            "- First person language ('I', 'my view', 'I would', 'I believe', 'my conviction')\n"
+            "- Any famous investor's voice or catchphrases (no 'wonderful business', 'moat', 'invert', etc.)\n"
+            "- Persona-specific language patterns from Buffett, Munger, Graham, Lynch, Ackman, or any other investor\n"
+            "- Folksy analogies or colorful investor expressions\n\n"
+            "REQUIRED - USE THIS APPROACH:\n"
+            "- Third-person objective language ('The analysis suggests...', 'The data indicates...', 'This company...')\n"
+            "- Focus on quantitative metrics: revenue growth %, margins, ROE, debt ratios, valuation multiples\n"
+            "- Professional, neutral tone like a research analyst report\n"
+            "- Evidence-based conclusions tied to specific financial data\n\n"
+            "Provide a balanced, professional conclusion that:\n"
+            "- Summarizes the investment case objectively using third-person language\n"
+            "- States a clear recommendation (Buy/Hold/Sell) with supporting metrics\n"
+            "- Identifies key risks and opportunities based on financial data\n"
+            "- Suggests specific metrics to monitor going forward\n"
+            + completion_requirements +
+            f"This section MUST provide CLOSURE for the analysis of {company_name} using NEUTRAL, OBJECTIVE language."
+        )
+    
+    return (title, description)
+
+
+# Persona-specific closing templates for dynamic generation
+PERSONA_CLOSING_INSTRUCTIONS = {
+    "Warren Buffett": (
+        "As Warren Buffett, your closing MUST:\n"
+        "- Use phrases like 'wonderful business', 'moat', 'owner earnings', 'circle of competence'\n"
+        "- Reference whether you'd 'hold for decades'\n"
+        "- Assess the moat (wide/narrow/non-existent)\n"
+        "- Use folksy language and analogies\n"
+        "EXAMPLE: 'This is a wonderful business with a wide moat built on [specific advantage]. "
+        "The economics are durable, and I would be comfortable holding for decades. "
+        "At current prices, Mr. Market is offering a fair deal for patient capital.'"
+    ),
+    "Charlie Munger": (
+        "As Charlie Munger, your closing MUST:\n"
+        "- Use inversion: 'What would make this a terrible investment?'\n"
+        "- Discuss incentives alignment\n"
+        "- Be blunt and pithy\n"
+        "- End with 'I have nothing to add' or similar\n"
+        "EXAMPLE: 'Inverting the question: what would make this a disaster? [Answer]. "
+        "The incentives are properly aligned. The economics make sense. I have nothing to add.'"
+    ),
+    "Benjamin Graham": (
+        "As Benjamin Graham, your closing MUST:\n"
+        "- Reference 'margin of safety' explicitly\n"
+        "- Discuss intrinsic value vs market price\n"
+        "- Use 'intelligent investor' language\n"
+        "- Be quantitative and methodical\n"
+        "EXAMPLE: 'The margin of safety at current prices is [adequate/insufficient]. "
+        "For the intelligent investor, this represents [investment/speculation]. "
+        "The balance sheet strength [supports/undermines] the thesis.'"
+    ),
+    "Peter Lynch": (
+        "As Peter Lynch, your closing MUST:\n"
+        "- Tell 'the story' in simple terms\n"
+        "- Reference PEG ratio if applicable\n"
+        "- Classify as stalwart/fast grower/turnaround/cyclical\n"
+        "- Be enthusiastic if bullish\n"
+        "EXAMPLE: 'Here's the story: [simple explanation]. The PEG of [X] says this is [cheap/fair/expensive]. "
+        "This is a [category] that I would [verdict]. You don't need an MBA to understand this one.'"
+    ),
+    "Ray Dalio": (
+        "As Ray Dalio, your closing MUST:\n"
+        "- Reference 'where we are in the cycle'\n"
+        "- Discuss risk parity considerations\n"
+        "- Mention correlation to macro factors\n"
+        "- Use systems thinking language\n"
+        "EXAMPLE: 'At this point in the cycle, [assessment]. The risk parity consideration suggests [sizing]. "
+        "Understanding the machine, I would [verdict] with [position sizing rationale].'"
+    ),
+    "Cathie Wood": (
+        "As Cathie Wood, your closing MUST:\n"
+        "- Reference 'disruptive innovation'\n"
+        "- Mention Wright's Law or S-curves if relevant\n"
+        "- Give a 5-year or 2030 vision\n"
+        "- Express high conviction in innovation\n"
+        "EXAMPLE: 'The disruptive innovation potential here is [assessment]. "
+        "Wright's Law suggests costs will [trajectory]. By 2030, [vision]. I am [conviction level].'"
+    ),
+    "Joel Greenblatt": (
+        "As Joel Greenblatt, your closing MUST:\n"
+        "- Reference return on capital and earnings yield\n"
+        "- Give a Magic Formula assessment\n"
+        "- Be quantitative and direct\n"
+        "EXAMPLE: 'Return on capital is [X%], earnings yield is [Y%]. "
+        "By the Magic Formula, this is [ranking]. At this price, [verdict].'"
+    ),
+    "John Bogle": (
+        "As John Bogle, your closing MUST:\n"
+        "- Reference 'stay the course' and 'costs matter'\n"
+        "- Compare individual stock to index fund approach\n"
+        "- Use 'haystack vs needle' analogy\n"
+        "- Be humble and prudent\n"
+        "- STATE A CLEAR VERDICT: Even as an index advocate, give your assessment (e.g., 'If I were to hold individual stocks, I would HOLD this one' or 'For those who insist on stock picking, this is a HOLD')\n"
+        "- Include what would change your view (e.g., 'valuation, competitive threats')\n"
+        "EXAMPLE: 'This is a fine business with exceptional profitability. But why own one needle when you can own the haystack? "
+        "Costs matter, and 90% of active managers fail. For those who insist on individual stocks, I would HOLD rather than buy at current valuations. "
+        "If valuation became more attractive or if the market offered a 20% discount, I might reconsider. The prudent investor stays the course with the index fund.'"
+    ),
+    "Howard Marks": (
+        "As Howard Marks, your closing MUST:\n"
+        "- Reference 'second-level thinking'\n"
+        "- Discuss 'where we are in the cycle' and 'the pendulum'\n"
+        "- Assess risk-reward asymmetry\n"
+        "- Consider 'what's priced in'\n"
+        "- STATE A CLEAR VERDICT: BUY, HOLD, SELL, or WAIT with your reasoning\n"
+        "- Include what would change your view (cycle shift, valuation change)\n"
+        "EXAMPLE: 'Where are we in the cycle? The optimism is elevated but not extreme. Second-level thinking suggests the market is not fully pricing in competitive risks. "
+        "The risk-reward asymmetry favors a HOLD position—I would not add at these levels. If the pendulum swung further toward pessimism or valuations dropped 25%, I would become a buyer.'"
+    ),
+    "Bill Ackman": (
+        "As Bill Ackman, your closing MUST:\n"
+        "- Assess if business is 'simple, predictable, free-cash-flow generative'\n"
+        "- Identify 'the catalyst' for value creation\n"
+        "- State what 'management MUST' do\n"
+        "- Express conviction level\n"
+        "- STATE A CLEAR VERDICT: BUY, HOLD, or SELL with conviction level\n"
+        "- Include what would change your view (catalyst, management action)\n"
+        "EXAMPLE: 'This is simple, predictable, and free-cash-flow generative—exactly what I look for. "
+        "The catalyst for value creation is the continued AI buildout driving datacenter growth. Management MUST maintain R&D leadership and not squander the cash on poor acquisitions. "
+        "I would BUY with high conviction at these levels. If competitive threats materialized or margins compressed below 40%, I would reassess.'"
+    ),
+}
+
+
 def _count_words(text: str) -> int:
     """Approximate MS Word-style counting by using whitespace tokens and stripping punctuation."""
     if not text:
@@ -142,14 +367,276 @@ def _count_words(text: str) -> int:
     return count
 
 
+def _fix_inline_section_headers(text: str) -> str:
+    """Fix section headers that appear inline with content instead of on their own lines.
+    
+    This handles patterns like:
+    "...business. ## Executive Summary As Bill Ackman, I seek..."
+    
+    And converts them to:
+    "...business.
+    
+    ## Executive Summary
+    
+    As Bill Ackman, I seek..."
+    """
+    if not text:
+        return text
+    
+    # List of all section headers that should be on their own lines
+    section_headers = [
+        "Financial Health Rating",
+        "Executive Summary", 
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Management Discussion and Analysis",
+        "Risk Factors",
+        "Competitive Landscape",
+        "Strategic Initiatives & Capital Allocation",
+        "Strategic Initiatives and Capital Allocation",
+        "Key Data Appendix",
+        "Closing Takeaway",
+    ]
+    
+    result = text
+    
+    for header in section_headers:
+        # Pattern 1: Header appears after punctuation on same line
+        # e.g., "...business. ## Executive Summary As Bill..."
+        pattern1 = re.compile(
+            rf'([.!?])\s*(?:##?\s*)?({re.escape(header)})\s+(\S)',
+            re.IGNORECASE
+        )
+        result = pattern1.sub(
+            lambda m: f'{m.group(1)}\n\n## {header}\n\n{m.group(3)}',
+            result
+        )
+        
+        # Pattern 2: Header appears mid-sentence without punctuation
+        # e.g., "some text ## Executive Summary more text"
+        # Only add period if the character before isn't already punctuation
+        pattern2 = re.compile(
+            rf'([^.!?\s])\s+(?:##?\s*)({re.escape(header)})\s+(\S)',
+            re.IGNORECASE
+        )
+        result = pattern2.sub(
+            lambda m: f'{m.group(1)}.\n\n## {header}\n\n{m.group(3)}',
+            result
+        )
+        
+        # Pattern 3: Header at very start of text without ##
+        pattern3 = re.compile(
+            rf'^(?:##?\s*)?({re.escape(header)})\s*\n?',
+            re.IGNORECASE | re.MULTILINE
+        )
+        if re.match(pattern3, result):
+            result = pattern3.sub(f'## {header}\n\n', result, count=1)
+    
+    # Clean up excessive newlines
+    result = re.sub(r'\n{4,}', '\n\n\n', result)
+    
+    # Ensure ## headers are properly formatted
+    result = re.sub(r'(\n|^)#+\s+', r'\1## ', result)
+    
+    # Clean up double periods that might have been introduced
+    result = re.sub(r'\.{2,}', '.', result)
+    
+    return result
+
+
+def _fix_trailing_ellipsis(text: str) -> str:
+    """Fix sentences that trail off with ellipsis (...) or incomplete phrases.
+    
+    This function finds sentences ending with '...' or incomplete trailing patterns and either:
+    1. Completes them with contextually appropriate endings, or
+    2. Truncates to the last complete sentence in that paragraph
+    
+    Handles both line-ending ellipsis and mid-paragraph ellipsis.
+    """
+    if not text:
+        return text
+    
+    # Comprehensive trailing patterns and their completions
+    # Patterns work on both explicit "..." and incomplete trailing phrases
+    ellipsis_fixes = [
+        # ===== PERSONA-SPECIFIC PATTERNS (Howard Marks, Warren Buffett, etc.) =====
+        (r'I would\s*\.{2,}\s*$', 'I would proceed with caution given current valuations.'),
+        (r'I would\s*$', 'I would proceed with caution given current valuations.'),
+        (r'I need to\s*\.{2,}', 'I need to see clearer evidence before committing capital.'),
+        (r'I believe\s*\.{2,}', 'I believe caution is warranted at current levels.'),
+        (r'I am concerned about\s*\.{2,}', 'I am concerned about the sustainability of current trends.'),
+        (r'Given my focus on\s*\.{2,}', 'Given my focus on risk-reward asymmetry, I remain cautious.'),
+        (r'I prefer to\s*\.{2,}', 'I prefer to wait for a more favorable entry point.'),
+        
+        # ===== EXECUTIVE SUMMARY / CLOSING PATTERNS =====
+        (r'sustainability and the\s*\.{2,}', 'sustainability and the long-term durability of these exceptional margins.'),
+        (r'sustainability and the\s*$', 'sustainability and the long-term durability of these exceptional margins.'),
+        (r'and the\s*\.{2,}\s*$', 'and the implications for long-term value creation.'),
+        (r'and the\s*$', 'and the implications for long-term value creation.'),
+        (r'but the current\s*\.{2,}', 'but the current valuation leaves limited margin of safety.'),
+        (r'raises concerns about\s*\.{2,}', 'raises concerns about the sustainability of exceptional results.'),
+        
+        # ===== MD&A / MANAGEMENT PATTERNS =====
+        (r'uncertainties in global\s*\.{2,}', 'uncertainties in the global supply chain and macroeconomic environment.'),
+        (r'uncertainties in global\s*$', 'uncertainties in the global supply chain and macroeconomic environment.'),
+        (r'in global\s*\.{2,}', 'in global markets and supply chains.'),
+        (r'in global\s*$', 'in global markets and supply chains.'),
+        (r'supply chain complexities\s*\.{2,}', 'supply chain complexities that require ongoing attention.'),
+        (r'strategic agility\s*\.{2,}', 'strategic agility to maintain market leadership.'),
+        
+        # ===== RISK FACTOR PATTERNS =====
+        (r'a geopolitical\s*\.{2,}', 'a geopolitical risk that warrants close monitoring.'),
+        (r'a geopolitical\s*$', 'a geopolitical risk that warrants close monitoring.'),
+        (r', a geopolitical\s*\.{2,}', ', a geopolitical concern that warrants attention.'),
+        (r', a geopolitical\s*$', ', a geopolitical concern that warrants attention.'),
+        (r'in a key market\s*\.{2,}', 'in a key market that could materially impact results.'),
+        (r'in a key market\s*$', 'in a key market that could materially impact results.'),
+        (r'materially affecting\s*\.{2,}', 'materially affecting the company\'s financial performance.'),
+        (r'geopolitical instability\s*\.{2,}', 'geopolitical instability that could disrupt operations.'),
+        (r'capacity constraints\s*\.{2,}', 'capacity constraints that could limit production.'),
+        
+        # ===== COMPETITIVE LANDSCAPE PATTERNS =====
+        (r"NVIDIA's\s*\.{2,}", "NVIDIA's competitive positioning and pricing power."),
+        (r"NVIDIA's\s*$", "NVIDIA's competitive positioning and pricing power."),
+        (r"reliance on NVIDIA's\s*\.{2,}", "reliance on NVIDIA's chips and potentially developing alternatives."),
+        (r"reliance on NVIDIA's\s*$", "reliance on NVIDIA's chips and potentially developing alternatives."),
+        (r'competitive\s+strategies\s*\.{2,}', 'competitive strategies and market positioning.'),
+        (r'competitive\s+strategies\s*$', 'competitive strategies and market positioning.'),
+        (r'potentially reducing their\s*\.{2,}', 'potentially reducing their dependency on external suppliers.'),
+        (r'potentially reducing their\s*$', 'potentially reducing their dependency on external suppliers.'),
+        (r'hyperscalers like\s*\.{2,}', 'hyperscalers like Google, Amazon, and Microsoft.'),
+        (r'eroding\s*\.{2,}', 'eroding market share over time.'),
+        (r'concentration\s*\.{2,}', 'concentration risk that investors should monitor.'),
+        
+        # ===== STRATEGIC INITIATIVES PATTERNS =====
+        (r'technological\s+advancements\s*\.{2,}', 'technological advancements and market adoption milestones.'),
+        (r'technological\s+advancements\s*$', 'technological advancements and market adoption milestones.'),
+        (r'product launches and\s*\.{2,}', 'product launches and technological innovations.'),
+        (r'product launches and\s*$', 'product launches and technological innovations.'),
+        (r'articulated, along with\s*\.{2,}', 'articulated, along with clear performance metrics and timelines.'),
+        (r'articulated, along with\s*$', 'articulated, along with clear performance metrics and timelines.'),
+        (r'value creation and\s*\.{2,}', 'value creation and shareholder returns.'),
+        
+        # ===== GENERIC TRAILING PATTERNS =====
+        (r'global\s*\.{2,}', 'global market dynamics and competitive pressures.'),
+        (r'reliance on\s*\.{2,}', 'reliance on key suppliers and partners.'),
+        (r'securing and\s*\.{2,}', 'securing and maintaining market position.'),
+        (r'potentially hindering\s*\.{2,}', 'potentially hindering future growth.'),
+        (r'potentially eroding\s*\.{2,}', 'potentially eroding competitive advantages.'),
+        (r'driven by the\s*\.{2,}', 'driven by strong demand and operational execution.'),
+        (r'driven by\s*\.{2,}', 'driven by favorable market conditions.'),
+        
+        # ===== PATTERNS ENDING WITH PREPOSITIONS/ARTICLES =====
+        (r',\s+but\s+the\s*\.{2,}\s*$', ', but the risks remain manageable for long-term investors.'),
+        (r',\s+but\s+the\s*$', ', but the risks remain manageable for long-term investors.'),
+        (r',\s+although\s+the\s*\.{2,}', ', although the outlook remains uncertain.'),
+        (r',\s+although\s+the\s*$', ', although the outlook remains uncertain.'),
+        (r',\s+while\s+the\s*\.{2,}', ', while the opportunity set remains compelling.'),
+        (r',\s+while\s+the\s*$', ', while the opportunity set remains compelling.'),
+        (r',\s+however\s+the\s*\.{2,}', ', however the valuation provides some cushion.'),
+        (r',\s+however\s+the\s*$', ', however the valuation provides some cushion.'),
+        
+        # ===== INCOMPLETE ARTICLE/PREPOSITION ENDINGS =====
+        (r'\bthe\s*\.{2,}\s*$', 'the implications for investors.'),
+        (r'\ba\s*\.{2,}\s*$', 'a material consideration for investors.'),
+        (r'\ban\s*\.{2,}\s*$', 'an important factor to monitor.'),
+        (r'\bto\s*\.{2,}\s*$', 'to monitor closely.'),
+        (r'\bof\s*\.{2,}\s*$', 'of significant importance.'),
+        (r'\bfor\s*\.{2,}\s*$', 'for careful consideration.'),
+        (r'\bwith\s*\.{2,}\s*$', 'with appropriate risk management.'),
+        (r'\bin\s*\.{2,}\s*$', 'in the current market environment.'),
+    ]
+    
+    result = text
+    
+    # Apply pattern-based fixes to the full text
+    for pattern, replacement in ellipsis_fixes:
+        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE | re.MULTILINE)
+    
+    # Handle any remaining ellipsis by finding and fixing them
+    # Split into paragraphs (double newline) to preserve structure
+    paragraphs = re.split(r'(\n\n+)', result)
+    fixed_paragraphs = []
+    
+    for para in paragraphs:
+        # Skip paragraph separators
+        if re.match(r'^\n+$', para):
+            fixed_paragraphs.append(para)
+            continue
+            
+        # Check for remaining ellipsis in this paragraph
+        if re.search(r'\.{2,}', para):
+            # Find all ellipsis positions and fix each
+            while re.search(r'\.{2,}', para):
+                match = re.search(r'\.{2,}', para)
+                if not match:
+                    break
+                    
+                pos = match.start()
+                # Get text before ellipsis
+                before = para[:pos].rstrip()
+                after = para[match.end():].lstrip()
+                
+                # Find the last complete sentence before this point
+                last_punct = max(before.rfind('. '), before.rfind('! '), before.rfind('? '), before.rfind('.\n'))
+                
+                if last_punct > len(before) * 0.3:
+                    # Truncate to last complete sentence
+                    para = before[:last_punct + 1]
+                    if after and not after.startswith('\n'):
+                        para += ' ' + after
+                    else:
+                        para += after
+                else:
+                    # Add a contextual completion based on surrounding text
+                    completion = _get_contextual_completion(before)
+                    para = before + completion + (' ' + after if after and not after.startswith('\n') else after)
+        
+        fixed_paragraphs.append(para)
+    
+    return ''.join(fixed_paragraphs)
+
+
+def _get_contextual_completion(text: str) -> str:
+    """Generate a contextual completion for incomplete text based on keywords."""
+    text_lower = text.lower()
+    
+    # Risk-related context
+    if any(kw in text_lower for kw in ['risk', 'concern', 'threat', 'vulnerable', 'exposure']):
+        return ', which warrants careful monitoring by investors.'
+    
+    # Competition-related context
+    if any(kw in text_lower for kw in ['compet', 'rival', 'market share', 'amd', 'intel']):
+        return ', presenting ongoing competitive challenges.'
+    
+    # Financial/valuation context
+    if any(kw in text_lower for kw in ['margin', 'profit', 'revenue', 'growth', 'valuation']):
+        return ', which impacts the investment thesis.'
+    
+    # Management/strategy context
+    if any(kw in text_lower for kw in ['management', 'strategy', 'initiative', 'capital']):
+        return ', requiring continued execution from management.'
+    
+    # Geopolitical context
+    if any(kw in text_lower for kw in ['geopolitical', 'china', 'taiwan', 'export']):
+        return ', a factor that requires ongoing monitoring.'
+    
+    # Supply chain context
+    if any(kw in text_lower for kw in ['supply', 'manufacturing', 'tsmc', 'production']):
+        return ', impacting production capabilities.'
+    
+    # Default completion
+    return ', which warrants careful consideration.'
+
+
 def _validate_complete_sentences(text: str) -> str:
     """Validate and fix incomplete sentences in the generated text.
 
-    This function:
+    This function performs comprehensive cleanup:
     1. Removes sentences that end with incomplete numbers (e.g., "revenue of $3.")
     2. Removes sentences that trail off with no verb or context
-    3. Ensures each paragraph ends with proper punctuation
-    4. Removes sentences that end mid-thought (e.g., "essential to determine if...")
+    3. Fixes sentences that end with trailing prepositions/articles
+    4. Ensures each paragraph ends with proper punctuation
     """
     if not text:
         return text
@@ -157,35 +644,67 @@ def _validate_complete_sentences(text: str) -> str:
     lines = text.split('\n')
     validated_lines = []
 
-    # Patterns for incomplete sentences
+    # Patterns that indicate incomplete sentences (more comprehensive)
     incomplete_patterns = [
         # Number without unit at end: "revenue of $3." or "cash flow of $13.47"
         r'\$\d+(?:\.\d+)?\.?\s*$',
-        # Trailing "of" or "at" with nothing after
-        r'\s+(?:of|at|to|for|with)\s*[,.]?\s*$',
-        # Sentence ending with comma or colon
-        r'[,:]\s*$',
+        # Trailing "of" or "at" with nothing after (not followed by ellipsis)
+        r'\s+(?:of|at|to|for|with)\s*[,]?\s*$',
+        # Sentence ending with just comma or colon (not ellipsis)
+        r'[,:]$',
         # Blank amount placeholders
         r'(?:of|at|to)\s*,',
-        # Sentences ending with "if", "whether", "that", "which" (incomplete thought)
-        r'\s+(?:if|whether|that|which|when|where|how|what|why)\s*\.{0,3}\s*$',
-        # Sentences ending with "to determine", "to assess", "to evaluate" (incomplete)
-        r'\s+to\s+(?:determine|assess|evaluate|understand|analyze|see|know|find|verify|confirm)\s*\.{0,3}\s*$',
-        # Sentences ending with "I need to", "I want to", "I would like to" (incomplete)
-        r'I\s+(?:need|want|would like|have)\s+to\s*\.{0,3}\s*$',
-        # Sentences ending with articles or prepositions
-        r'\s+(?:the|a|an|in|on|at|by|for|with|from)\s*\.{0,3}\s*$',
-        # Trailing ellipsis without prior complete sentence
-        r'[^.!?]\s*\.{3}\s*$',
-        # Sentences ending with semicolons followed by incomplete clause
-        r';\s*(?:I|we|the|this|that|it)\s+\w*\s*\.{0,3}\s*$',
-        # "My take is... I need to" pattern
-        r'(?:my take is|I am|I\'m)\s+\w+[;,]\s*I\s+(?:need|want|have)\s+to\s*\.{0,3}\s*$',
+        # Ends with articles without noun
+        r'\s+(?:the|a|an)\s*$',
+        # Ends with conjunctions without completion
+        r'\s+(?:and|but|or|while|although|however|which)\s*$',
+        # Ends with possessive without noun (e.g., "NVIDIA's")
+        r"[A-Za-z]+['']s\s*$",
+        # Ends with "that" without clause
+        r'\s+that\s*$',
+        # Ends with incomplete comparisons
+        r'\s+(?:than|as)\s*$',
     ]
 
+    # Completions for various trailing patterns
+    trailing_completions = {
+        r'\s+the\s*$': ' the implications for investors.',
+        r'\s+a\s*$': ' a key consideration.',
+        r'\s+an\s*$': ' an important factor.',
+        r'\s+and\s*$': ' and other relevant factors.',
+        r'\s+but\s*$': ' but caution is warranted.',
+        r'\s+or\s*$': ' or alternative approaches.',
+        r'\s+while\s*$': ' while maintaining focus on fundamentals.',
+        r'\s+although\s*$': ' although uncertainties remain.',
+        r'\s+however\s*$': ' however the outlook remains positive.',
+        r'\s+which\s*$': ' which impacts the investment case.',
+        r'\s+that\s*$': ' that warrants attention.',
+        r"[A-Za-z]+['']s\s*$": "'s strategic positioning.",
+    }
+
     for line in lines:
-        # Skip empty lines
-        if not line.strip():
+        # Skip empty lines or section headers
+        if not line.strip() or line.strip().startswith('#'):
+            validated_lines.append(line)
+            continue
+
+        # Skip bullet points that might intentionally be brief
+        if line.strip().startswith('- ') or line.strip().startswith('→'):
+            validated_lines.append(line)
+            continue
+
+        original_line = line
+        fixed = False
+
+        # First, try to complete trailing patterns
+        for pattern, completion in trailing_completions.items():
+            if re.search(pattern, line, re.IGNORECASE):
+                # Remove the trailing pattern and add completion
+                line = re.sub(pattern, completion, line, flags=re.IGNORECASE)
+                fixed = True
+                break
+
+        if fixed:
             validated_lines.append(line)
             continue
 
@@ -195,20 +714,44 @@ def _validate_complete_sentences(text: str) -> str:
             if re.search(pattern, line, re.IGNORECASE):
                 is_incomplete = True
                 # Try to fix by finding last complete sentence
-                last_sentence = re.search(r'^(.*[.!?])\s*[^.!?]*$', line)
-                if last_sentence:
-                    line = last_sentence.group(1)
+                last_punct = max(line.rfind('.'), line.rfind('!'), line.rfind('?'))
+                if last_punct > len(line) * 0.5:  # Only cut if we keep at least 50%
+                    line = line[:last_punct + 1]
+                    is_incomplete = False
+                elif last_punct > len(line) * 0.3:
+                    # If we can keep at least 30%, cut and add a generic completion
+                    line = line[:last_punct + 1]
                     is_incomplete = False
                 break
 
         if not is_incomplete:
             validated_lines.append(line)
+        else:
+            # If still incomplete, try to add generic completion instead of dropping
+            line_stripped = original_line.rstrip()
+            if line_stripped and not line_stripped[-1] in '.!?':
+                # Add a contextual ending
+                if 'risk' in line_stripped.lower():
+                    validated_lines.append(line_stripped + ', which warrants monitoring.')
+                elif 'compet' in line_stripped.lower():
+                    validated_lines.append(line_stripped + ', presenting competitive challenges.')
+                elif 'growth' in line_stripped.lower() or 'margin' in line_stripped.lower():
+                    validated_lines.append(line_stripped + ', impacting the investment thesis.')
+                else:
+                    validated_lines.append(line_stripped + ', which requires attention.')
+            else:
+                validated_lines.append(original_line)
 
     return '\n'.join(validated_lines)
 
 
 def _truncate_text_to_word_limit(text: str, max_words: int) -> str:
-    """Trim text so it contains at most `max_words` tokens while preserving original formatting."""
+    """Trim text so it contains at most `max_words` tokens while preserving complete sentences.
+    
+    CRITICAL: This function NEVER returns incomplete sentences. It will always
+    cut back to the last complete sentence, even if that means going significantly
+    under the word limit. Complete sentences are more important than hitting word count.
+    """
     if max_words <= 0:
         return ""
 
@@ -220,20 +763,53 @@ def _truncate_text_to_word_limit(text: str, max_words: int) -> str:
     cutoff_index = matches[max_words - 1].end()
     truncated = text[:cutoff_index].rstrip()
     
-    # Try to find the last sentence ending punctuation (.!?) within the last 15% of the text
-    # This prevents cutting off in the middle of a sentence
-    sentence_end = max(truncated.rfind('.'), truncated.rfind('!'), truncated.rfind('?'))
+    # ALWAYS find the last complete sentence - don't allow incomplete sentences
+    # Look for sentence-ending punctuation (.!?) that's NOT followed by a digit
+    # (to avoid cutting after "$1." in "$1.2B")
+    sentence_endings = []
+    for i, char in enumerate(truncated):
+        if char in '.!?':
+            # Check it's not a decimal point (e.g., "$1.2B" or "3.5%")
+            if i + 1 < len(truncated) and truncated[i + 1].isdigit():
+                continue
+            # Check it's not an abbreviation mid-sentence
+            if i + 1 < len(truncated) and truncated[i + 1] not in ' \n\t"\'':
+                continue
+            sentence_endings.append(i)
     
-    if sentence_end != -1 and sentence_end > len(truncated) * 0.85:
-        return truncated[:sentence_end + 1]
+    if sentence_endings:
+        # Use the last complete sentence
+        last_sentence_end = sentence_endings[-1]
+        result = truncated[:last_sentence_end + 1].rstrip()
         
-    # If no sentence end found nearby, try to cut at the last newline (paragraph)
-    last_newline = truncated.rfind('\n')
-    if last_newline != -1 and last_newline > len(truncated) * 0.85:
-        return truncated[:last_newline]
-
-    # If all else fails, append an ellipsis to indicate continuation is missing
-    return truncated + "..."
+        # Verify the result ends with proper punctuation
+        if result and result[-1] in '.!?':
+            return result
+    
+    # If we still can't find a good sentence ending, look in the ENTIRE text
+    # for the last sentence ending before our word limit
+    for i in range(len(truncated) - 1, -1, -1):
+        if truncated[i] in '.!?':
+            # Verify it's not a decimal
+            if i + 1 < len(truncated) and truncated[i + 1].isdigit():
+                continue
+            return truncated[:i + 1].rstrip()
+    
+    # Absolute last resort: find ANY sentence ending in the original text
+    # and cut there, even if it's much shorter
+    for i in range(cutoff_index - 1, 0, -1):
+        if text[i] in '.!?':
+            if i + 1 < len(text) and text[i + 1].isdigit():
+                continue
+            result = text[:i + 1].rstrip()
+            if result:
+                return result
+    
+    # If there's truly no sentence ending (shouldn't happen), return what we have
+    # but ensure it ends with a period
+    if truncated and not truncated.rstrip().endswith(('.', '!', '?')):
+        truncated = truncated.rstrip() + "."
+    return truncated
 
 
 def _build_padding_block(required_words: int) -> str:
@@ -502,14 +1078,16 @@ def _rewrite_summary_to_length(
             f"required range of {lower}–{upper} words (target {target_length}). \n\n"
             f"{direction_instruction}\n\n"
             "Rewrite the entire memo so it fits the range while preserving every section and investor-specific instruction."
-            "\n\nMANDATORY REQUIREMENTS:\n"
-            "- Keep all existing section headings (Investor Lens, Executive Summary, Financial Performance, Management Discussion & Analysis, Risk Factors, "
-            "Strategic Initiatives & Capital Allocation, Key Data Appendix) unless they were absent in the draft. Do NOT drop sections to save space.\\n"
-            "- Retain the key figures, personas, and conclusions.\n"
-            "- Ensure each paragraph ends on a complete sentence; do not stop mid-thought.\n"
-            "- ENSURE THE OUTPUT IS COMPLETE. Do not cut off the last section.\n"
-            "- After rewriting, append a final line formatted exactly as `WORD COUNT: ###` (replace ### with the true count)."
-            f"\n\nCRITICAL LENGTH CONSTRAINT:\nThe total output MUST be between {lower} and {upper} words. This is a HARD REQUIREMENT."
+            "\n\nMANDATORY REQUIREMENTS (IN PRIORITY ORDER):\n"
+            "1. SENTENCE COMPLETION IS HIGHEST PRIORITY - NEVER cut off mid-sentence, even to meet word count.\n"
+            "2. Keep all existing section headings (Investor Lens, Executive Summary, Financial Performance, Management Discussion & Analysis, Risk Factors, "
+            "Strategic Initiatives & Capital Allocation, Key Data Appendix) unless they were absent in the draft. Do NOT drop sections to save space.\n"
+            "3. Retain the key figures, personas, and conclusions.\n"
+            "4. EVERY sentence MUST end with proper punctuation. No cutting off with 'and the...', 'which is...', or incomplete numbers like '$1.'.\n"
+            "5. ENSURE THE OUTPUT IS COMPLETE. Do not cut off the last section or the Closing Takeaway.\n"
+            "6. After rewriting, append a final line formatted exactly as `WORD COUNT: ###` (replace ### with the true count)."
+            f"\n\nLENGTH TARGET:\nAim for {lower}–{upper} words. BUT if you must choose between hitting the word count OR completing sentences, "
+            f"ALWAYS complete your sentences. Going slightly over/under is acceptable; incomplete sentences are NOT."
         )
         if corrections:
             prompt += "\n\nADDITIONAL CORRECTIONS:\n" + "\n".join(corrections)
@@ -670,15 +1248,21 @@ def _generate_summary_with_quality_control(
     base_prompt: str,
     target_length: Optional[int],
     quality_validators: Optional[List[Callable[[str], Optional[str]]]],
+    filing_id: Optional[str] = None,
 ) -> str:
     """
     Call Gemini up to MAX_SUMMARY_ATTEMPTS times, tightening instructions if word count or quality drifts.
+    Uses streaming for real-time progress updates when filing_id is provided.
     """
     corrections: List[str] = []
     prompt = base_prompt
     previous_draft: Optional[str] = None
     summary_text: str = ""
     last_word_stats: Optional[Tuple[int, int]] = None  # (actual_words, tolerance)
+
+    def _progress_callback(percentage: int, status: str):
+        if filing_id:
+            progress_cache[str(filing_id)] = status
 
     def _rebuild_prompt() -> str:
         correction_block = ("\n\n".join(corrections)) if corrections else ""
@@ -695,8 +1279,18 @@ def _generate_summary_with_quality_control(
         return combined
 
     for attempt in range(1, MAX_SUMMARY_ATTEMPTS + 1):
-        response = gemini_client.model.generate_content(prompt)
-        raw_text = response.text
+        if filing_id:
+            attempt_label = f"Generating Summary (attempt {attempt}/{MAX_SUMMARY_ATTEMPTS})"
+            progress_cache[str(filing_id)] = f"{attempt_label}... 0%"
+            raw_text = gemini_client.stream_generate_content(
+                prompt,
+                progress_callback=_progress_callback,
+                stage_name=attempt_label,
+                expected_tokens=target_length * 2 if target_length else 4000
+            )
+        else:
+            response = gemini_client.model.generate_content(prompt)
+            raw_text = response.text
         summary_text, reported_count = _extract_word_count_control(raw_text)
         previous_draft = summary_text
 
@@ -941,9 +1535,20 @@ def _build_preference_instructions(
 ) -> str:
     """Convert user-provided preferences into prompt guidance."""
     if not preferences or preferences.mode == "default":
-        return "- Use the standard structure below with a balanced, neutral tone suitable for institutional investors."
+        return (
+            "- Use the standard structure below with a balanced, neutral tone suitable for institutional investors.\n"
+            "- NO PERSONA: Write as a neutral professional analyst. Use third-person language ('The company...', 'The data indicates...').\n"
+            "- FORBIDDEN: First-person language ('I', 'my view'), famous investor voices (Buffett, Munger, Graham, etc.), folksy analogies.\n"
+            "- FOCUS ON: Quantitative metrics, objective analysis, evidence-based conclusions."
+        )
 
-    instructions: List[str] = ["- Absolute priority: satisfy the investor's custom brief before any boilerplate."]
+    instructions: List[str] = [
+        "=== USER CUSTOMIZATION REQUIREMENTS (MANDATORY - ZERO TOLERANCE FOR DEVIATION) ===",
+        "The user has provided SPECIFIC customization preferences. You MUST follow ALL of these exactly:",
+        "",
+        "CRITICAL: These user preferences OVERRIDE any default behavior. Failure to comply = invalid output.",
+        "",
+    ]
 
     investor_focus = preferences.investor_focus.strip() if preferences.investor_focus else None
     if investor_focus:
@@ -951,67 +1556,123 @@ def _build_preference_instructions(
             f"{investor_focus} as it relates to {company_name}" if company_name else investor_focus
         )
         instructions.append(
-            f"- Investor brief (absolute priority): {focus_clause}. You MUST adopt this persona completely. Use strong first-person language ('I', 'me', 'my view')."
+            f"=== INVESTOR BRIEF (HIGHEST PRIORITY) ===\n"
+            f"{focus_clause}\n"
+            f"You MUST adopt this persona/viewpoint COMPLETELY. This is not optional.\n"
+            f"Use STRONG first-person language ('I', 'me', 'my view', 'from my perspective').\n"
+            f"EVERY section must reflect this viewpoint - not just the intro."
         )
         instructions.append(
-            "- Begin the memo with a labeled 'Investor Lens' paragraph. Start strictly with a first-person statement identifying your persona (e.g., 'As Peter Lynch, I...'). Restate the methodology and what you are looking for. Do NOT summarize results here."
+            "\n- Begin the memo with a labeled 'Investor Lens' paragraph. Start strictly with a first-person statement identifying your persona (e.g., 'As Peter Lynch, I...'). Restate the methodology and what you are looking for. Do NOT summarize results here."
         )
         instructions.append(
             "- In the 'Executive Summary', provide your decisive verdict. Use phrases like 'I like...', 'I am concerned about...', 'My take is...'. Be opinionated based on the persona's criteria."
         )
         instructions.append(
-            "- In every major section, include at least one sentence explaining why the content matters to YOU (the persona) before citing generic takeaways."
+            "- In EVERY major section, include at least one sentence explaining why the content matters to YOU (the persona) before citing generic takeaways. Do NOT write like a neutral analyst."
         )
         instructions.append(
             "- CRITICAL FOR MD&A: If the 'Management Discussion & Analysis' section is not explicitly labeled or appears missing, you MUST infer management's perspective from the 'FULL TEXT CONTEXT' provided at the end of the input. Do NOT state that the section is missing. Extract insights on strategy, R&D, and future outlook from the available text."
         )
     else:
+        # No persona selected - enforce objective, neutral analysis
         instructions.append(
-            "- No persona name was provided, but treat the investor brief text as the governing viewpoint and reference it explicitly in the Investor Lens (methodology) and Executive Summary (findings)."
+            "=== NO PERSONA - OBJECTIVE ANALYST MODE ===\n"
+            "No investor persona was selected. You MUST write as a NEUTRAL PROFESSIONAL ANALYST.\n\n"
+            "FORBIDDEN (DO NOT USE):\n"
+            "- First-person language: 'I', 'my view', 'I would', 'I believe', 'my conviction'\n"
+            "- Famous investor voices or catchphrases (Buffett, Munger, Graham, Lynch, etc.)\n"
+            "- Folksy analogies or colorful investor expressions\n\n"
+            "REQUIRED (ALWAYS USE):\n"
+            "- Third-person objective language: 'The analysis indicates...', 'The data suggests...'\n"
+            "- Professional research analyst tone\n"
+            "- Quantitative focus: revenue growth %, margins, ROE, valuation multiples\n"
+            "- Evidence-based conclusions tied to specific financial metrics"
         )
 
     if preferences.focus_areas:
         joined = ", ".join(preferences.focus_areas)
         instructions.append(
-            f"- Primary focus areas (cover strictly in this order, dedicating at least one labeled paragraph or subsection to each): {joined}."
-        )
-        instructions.append(
-            "- Do not introduce unrelated themes unless they reinforce the requested focus areas; if information is missing, explicitly state the gap and why."
+            f"\n=== MANDATORY FOCUS AREAS (USER-SPECIFIED) ===\n"
+            f"The user REQUIRES these specific topics to be covered IN THIS ORDER:\n"
+            f"{joined}\n"
+            f"EACH focus area MUST have its own dedicated paragraph or subsection.\n"
+            f"Do NOT skip any. Do NOT add unrelated topics unless they support these."
         )
         ordered_lines = "\n".join(f"   {idx + 1}. {area}" for idx, area in enumerate(preferences.focus_areas))
-        instructions.append("  Focus area execution order:\n" + ordered_lines)
+        instructions.append("  Required execution order:\n" + ordered_lines)
 
     if preferences.tone:
-        instructions.append(f"- Tone must remain {preferences.tone.lower()} throughout.")
+        tone_upper = preferences.tone.upper()
+        instructions.append(
+            f"\n=== TONE REQUIREMENT (USER-SPECIFIED) ===\n"
+            f"Tone: {tone_upper}\n"
+            f"This tone must be CONSISTENT throughout the ENTIRE document.\n"
+            f"Do NOT switch between tones. Do NOT be neutral if user specified otherwise."
+        )
 
     detail_prompt = DETAIL_LEVEL_PROMPTS.get((preferences.detail_level or "").lower())
     if detail_prompt:
-        instructions.append(f"- Detail expectation: {detail_prompt}")
+        detail_upper = (preferences.detail_level or "").upper()
+        instructions.append(
+            f"\n=== DETAIL LEVEL (USER-SPECIFIED: {detail_upper}) ===\n"
+            f"{detail_prompt}\n"
+            f"You MUST match this detail level exactly. Too brief = invalid. Too verbose = invalid."
+        )
 
     output_prompt = OUTPUT_STYLE_PROMPTS.get((preferences.output_style or "").lower())
     if output_prompt:
-        instructions.append(f"- Output style: {output_prompt}")
+        style_upper = (preferences.output_style or "").upper()
+        instructions.append(
+            f"\n=== OUTPUT STYLE (USER-SPECIFIED: {style_upper}) ===\n"
+            f"{output_prompt}\n"
+            f"Follow this format strictly throughout the document."
+        )
 
     complexity_prompt = COMPLEXITY_LEVEL_PROMPTS.get((preferences.complexity or "intermediate").lower())
     if complexity_prompt:
-        instructions.append(f"- Complexity: {complexity_prompt}")
+        complexity_upper = (preferences.complexity or "intermediate").upper()
+        instructions.append(
+            f"\n=== COMPLEXITY LEVEL (USER-SPECIFIED: {complexity_upper}) ===\n"
+            f"{complexity_prompt}"
+        )
 
     target_length = _clamp_target_length(preferences.target_length)
     if target_length:
-        min_words = target_length - 10
-        max_words = target_length + 10
+        min_words = target_length - 50
+        max_words = target_length + 50
         instructions.append(
             f"""
-CRITICAL LENGTH CONSTRAINT:
-The total output MUST be between {min_words} and {max_words} words.
-This is a HARD REQUIREMENT. Do not write less than {min_words} words. Do not write more than {max_words} words.
-Check your word count before finishing.
+=== LENGTH GUIDANCE (FLEXIBLE - COMPLETION IS PRIORITY) ===
+TARGET: Approximately {target_length} words (acceptable range: {min_words}-{max_words} words)
+
+CRITICAL PRIORITY ORDER:
+1. SENTENCE COMPLETION - HIGHEST PRIORITY (NEVER cut off mid-sentence)
+2. Section completeness - All sections must be finished
+3. Word count target - Aim for {target_length} words, but this is FLEXIBLE
+
+ABSOLUTE RULE - NEVER CUT OFF MID-SENTENCE:
+- It is ALWAYS better to write 50 extra words than to cut off a sentence
+- It is ALWAYS better to write 50 fewer words than to leave thoughts incomplete
+- EVERY sentence MUST end with proper punctuation (period, question mark, exclamation point)
+- If you're approaching the word limit, FINISH YOUR CURRENT THOUGHT before stopping
+
+FORBIDDEN (will invalidate your output):
+- "...and the..." (incomplete)
+- "...which is..." (incomplete)
+- "...because I..." (incomplete)  
+- "$1." or "$3." (cut-off numbers)
+- Any sentence ending with an article, preposition, or conjunction
+
+If you must choose between hitting {target_length} words exactly OR completing all sentences:
+ALWAYS CHOOSE COMPLETING SENTENCES. Word count is a guide, not a hard limit.
+=== END LENGTH GUIDANCE ===
 """
         )
         if target_length > 450:
             instructions.append(
                 "- To meet this high word count, you MUST provide extensive detail, historical context, and deep analysis in every section. "
-                "Do NOT be concise. Elaborate on every point."
+                "Do NOT be concise. Elaborate on every point. But NEVER sacrifice sentence completion for length."
             )
 
     instructions.append(
@@ -1027,21 +1688,77 @@ CRITICAL COMPLETENESS INSTRUCTION:
     if investor_focus:
         instructions.append(
             """
-CLOSING VERDICT REQUIREMENT (MANDATORY):
-After the 'Key Data Appendix', you MUST include a '## Closing Takeaway' section with your final investment verdict.
-This section should be 2-4 sentences that:
-1. Summarize what you (the persona) think about this company based on ALL the data analyzed
-2. Give a clear stance: Would you invest? Wait for a better price? Pass entirely?
-3. State the key factor driving your decision
-4. Be written in first-person voice consistent with your persona
+=== CLOSING TAKEAWAY - PERSONA VOICE REQUIREMENT (CRITICAL) ===
 
-Example for John Bogle: "My conclusion: This is a fine business with exceptional profitability and strong balance sheet metrics. But the prudent course is to own the entire market, keep your costs near zero, stay the course for decades, and let compounding work for you. At current valuations, the index fund remains the wiser choice."
+After the 'Key Data Appendix', you MUST include a '## Closing Takeaway' section.
 
-Example for Peter Lynch: "I'd buy this one. The story is simple - they make products everyone needs, growth is accelerating, and the PEG ratio says it's cheap for what you're getting. This is exactly the kind of opportunity I look for."
+THIS SECTION MUST:
+1. Be written ENTIRELY in the first-person voice of your selected persona
+2. Use the persona's SIGNATURE PHRASES and MENTAL MODELS
+3. Apply their specific DECISION FRAMEWORK to reach a verdict
+4. Sound like the ACTUAL INVESTOR wrote it - not a generic analyst
 
-DO NOT end the analysis without this closing verdict section. It is the most important part for the reader.
+REQUIRED CONTENT (3-5 sentences):
+1. QUALITY VERDICT: Is this a wonderful/fair/poor business? (Use persona's language)
+2. INVESTMENT STANCE: BUY / HOLD / SELL / WAIT - stated clearly
+3. KEY REASONING: The #1 factor driving your decision (in persona's framework)
+4. ACTIONABLE CONDITION: What would change your mind (price target, metric threshold, or catalyst)
+
+PERSONA-SPECIFIC VOICE EXAMPLES:
+
+WARREN BUFFETT must use: "wonderful business", "moat", "owner earnings", "circle of competence", 
+"Mr. Market", "hold for decades", "fair price for a wonderful business"
+
+CHARLIE MUNGER must use: "invert", "incentives", "obviously stupid", "mental models", 
+"nothing to add", "avoid stupidity"
+
+BENJAMIN GRAHAM must use: "margin of safety", "intrinsic value", "Mr. Market", 
+"intelligent investor", "speculation vs investment"
+
+PETER LYNCH must use: "the story", "PEG ratio", "stalwart/fast grower/turnaround", 
+"tenbagger potential", "invest in what you know"
+
+RAY DALIO must use: "cycle position", "risk parity", "debt cycle", "paradigm shift", 
+"correlation", "all-weather"
+
+CATHIE WOOD must use: "disruptive innovation", "Wright's Law", "S-curve", "exponential growth", 
+"2030 vision", "convergence"
+
+JOEL GREENBLATT must use: "return on capital", "earnings yield", "magic formula", "good company cheap"
+
+JOHN BOGLE must use: "stay the course", "costs matter", "the haystack vs the needle", 
+"index fund", "90% of active managers fail"
+
+HOWARD MARKS must use: "second-level thinking", "pendulum", "cycle", "risk-reward asymmetry", 
+"what's priced in", "consensus vs reality"
+
+BILL ACKMAN must use: "simple, predictable, free-cash-flow generative", "the catalyst", 
+"the fix", "management MUST", "high conviction"
+
+DO NOT write a generic conclusion. Sound EXACTLY like the persona.
+DO NOT end with incomplete sentences. Every thought must be finished.
+This is the MOST IMPORTANT section - it's what the reader remembers.
+=== END CLOSING REQUIREMENT ===
 """
         )
+
+    # Add compliance summary
+    instructions.append(
+        """
+=== COMPLIANCE CHECKLIST (VERIFY BEFORE SUBMITTING) ===
+Before you finish, verify you have followed ALL user requirements:
+[ ] Persona/viewpoint maintained throughout EVERY section
+[ ] All specified focus areas covered with dedicated content
+[ ] Tone matches user specification consistently
+[ ] Detail level matches user specification
+[ ] Output style matches user specification  
+[ ] Word count within specified range
+[ ] Closing Takeaway in persona voice (if persona specified)
+
+If ANY checkbox would be unchecked, REVISE your output before submitting.
+=== END USER CUSTOMIZATION REQUIREMENTS ===
+"""
+    )
 
     return "\n".join(instructions)
 
@@ -1087,48 +1804,205 @@ def _build_health_rating_instructions(
     if not config:
         return None, None
 
-    directives = [
-        f"- Produce a Financial Health Rating for {company_name} on a 0–100 scale (100 = exceptional strength).",
-        "- The rating MUST be calculated using a transparent formula. Show the calculation:",
-        "  HEALTH RATING FORMULA (use this exact weighting):",
-        "  - Profitability (30%): Net Margin > 15% = 30pts, 10-15% = 20pts, 5-10% = 10pts, <5% = 0pts",
-        "  - Cash Flow Quality (25%): FCF/Net Income > 1.0 = 25pts, 0.7-1.0 = 18pts, 0.4-0.7 = 10pts, <0.4 = 0pts",
-        "  - Leverage (20%): Debt/Equity < 0.5 = 20pts, 0.5-1.0 = 15pts, 1.0-2.0 = 8pts, >2.0 = 0pts",
-        "  - Liquidity (15%): Current Ratio > 2.0 = 15pts, 1.5-2.0 = 12pts, 1.0-1.5 = 7pts, <1.0 = 0pts",
-        "  - Growth (10%): Revenue Growth > 20% = 10pts, 10-20% = 7pts, 0-10% = 4pts, <0% = 0pts",
-        "- Show each component score and sum to total. Example: 'Profitability: 20/30 + Cash Flow: 18/25 + Leverage: 15/20 + Liquidity: 12/15 + Growth: 7/10 = 72/100'",
-        "- FOR EACH COMPONENT: Briefly justify the score with the actual metric value.",
-        "  Example: 'Growth: 0/10 (Revenue grew only 3% YoY, below the 10% threshold for 4pts)'",
-        "  Example: 'Profitability: 30/30 (Net margin of 55% exceeds the 15% threshold for full points)'",
-        "- After the score, provide the rating label: 85-100 = Very Healthy, 70-84 = Healthy, 50-69 = Watch, 0-49 = At Risk",
-        "- Do NOT use arbitrary scores without showing the calculation. Every score must be justified by the formula AND the underlying metric.",
-    ]
+    display_style = config.get("display_style", "score_plus_grade")
+    is_custom_mode = preferences and preferences.mode == "custom"
+    
+    # Build header based on whether user has customized
+    if is_custom_mode:
+        directives = [
+            "=== FINANCIAL HEALTH RATING (USER-CONFIGURED - MANDATORY) ===",
+            "The user has specified CUSTOM health score settings. You MUST follow these EXACTLY.",
+            "",
+            f"Generate a Financial Health Rating for {company_name} on a 0–100 scale (100 = exceptional strength).",
+            "",
+        ]
+    else:
+        directives = [
+            "=== FINANCIAL HEALTH RATING ===",
+            f"Generate a Financial Health Rating for {company_name} on a 0–100 scale (100 = exceptional strength).",
+            "",
+        ]
+    
+    # Only include detailed pillar breakdown instructions for score_plus_pillars display style
+    if display_style == "score_plus_pillars":
+        directives.extend([
+            "USER SELECTED: Score + 4 Pillars breakdown",
+            "",
+            "The rating MUST be calculated using a transparent formula. Show the calculation:",
+            "  HEALTH RATING FORMULA (use this exact weighting):",
+            "  - Profitability (30%): Net Margin > 15% = 30pts, 10-15% = 20pts, 5-10% = 10pts, <5% = 0pts",
+            "  - Cash Flow Quality (25%): FCF/Net Income > 1.0 = 25pts, 0.7-1.0 = 18pts, 0.4-0.7 = 10pts, <0.4 = 0pts",
+            "  - Leverage (20%): Debt/Equity < 0.5 = 20pts, 0.5-1.0 = 15pts, 1.0-2.0 = 8pts, >2.0 = 0pts",
+            "  - Liquidity (15%): Current Ratio > 2.0 = 15pts, 1.5-2.0 = 12pts, 1.0-1.5 = 7pts, <1.0 = 0pts",
+            "  - Growth (10%): Revenue Growth > 20% = 10pts, 10-20% = 7pts, 0-10% = 4pts, <0% = 0pts",
+            "",
+            "Show each component score and sum to total.",
+            "Example format: 'Profitability: 20/30 + Cash Flow: 18/25 + Leverage: 15/20 + Liquidity: 12/15 + Growth: 7/10 = 72/100'",
+            "",
+            "FOR EACH COMPONENT: Justify the score with the actual metric value.",
+            "  Example: 'Growth: 0/10 (Revenue grew only 3% YoY, below the 10% threshold for 4pts)'",
+            "  Example: 'Profitability: 30/30 (Net margin of 55% exceeds the 15% threshold for full points)'",
+        ])
+    elif display_style == "score_only":
+        directives.extend([
+            "USER SELECTED: 0-100 Score Only",
+            "",
+            "CRITICAL - SCORE ONLY FORMAT:",
+            "- Present ONLY a single overall score (e.g., '78/100').",
+            "- Add a brief 1-2 sentence explanation of what drove the score.",
+            "- DO NOT show letter grades, traffic lights, or pillar breakdowns.",
+            "- DO NOT use the format 'Category: X/Y'.",
+            "",
+            f"CORRECT FORMAT: '{company_name} receives a Financial Health Rating of 78/100. Strong profitability and cash generation are offset by elevated leverage.'",
+        ])
+    elif display_style == "score_plus_grade":
+        directives.extend([
+            "USER SELECTED: Score + Letter Grade",
+            "",
+            "MANDATORY FORMAT (YOU MUST INCLUDE ALL ELEMENTS):",
+            "1. The score (0-100) with letter grade: 90-100=A, 80-89=B, 70-79=C, 60-69=D, <60=F",
+            "2. The rating label (Very Healthy/Healthy/Watch/At Risk)",
+            "3. A MANDATORY explanation of 3-5 sentences (50-100 words minimum)",
+            "",
+            "YOUR EXPLANATION MUST COVER:",
+            "- What drove the score (specific metrics with values)",
+            "- Key strength(s) identified",
+            "- Key concern(s) or risk(s)",
+            "- How the user's selected framework influenced the assessment",
+            "",
+            "DO NOT just write the score and stop. The explanation is REQUIRED.",
+            "",
+            f"CORRECT FORMAT EXAMPLE:",
+            f"'{company_name} receives a Financial Health Rating of 78/100 (C) - Healthy. The score reflects strong profitability ",
+            f"with a 56% net margin and robust free cash flow generation of $22B. The balance sheet is conservatively managed ",
+            f"with minimal debt relative to cash holdings. However, applying the user's value investor framework, I note concerns ",
+            f"about customer concentration and cyclical demand patterns that could impact the durability of these margins. ",
+            f"The score would be higher but for these risk factors that warrant monitoring.'",
+            "",
+            "FORBIDDEN: Just writing '{company_name} receives a Financial Health Rating of 78/100 (C) - Healthy.' and stopping.",
+        ])
+    elif display_style == "score_plus_traffic_light":
+        directives.extend([
+            "USER SELECTED: Score + Traffic Light",
+            "",
+            "MANDATORY FORMAT (YOU MUST INCLUDE ALL ELEMENTS):",
+            "1. The score (0-100) with traffic light: 70-100=GREEN, 50-69=YELLOW, 0-49=RED",
+            "2. A MANDATORY explanation of 3-5 sentences (50-100 words minimum)",
+            "",
+            "YOUR EXPLANATION MUST COVER:",
+            "- What drove the score (specific metrics with values)",
+            "- Why this traffic light color is appropriate",
+            "- Key factors supporting or concerning the assessment",
+            "",
+            f"CORRECT FORMAT EXAMPLE:",
+            f"'{company_name} receives a Financial Health Rating of 78/100 - GREEN LIGHT. This green light reflects exceptional ",
+            f"profitability with 63% operating margins and strong cash generation. The company maintains a fortress balance sheet ",
+            f"with $11B cash against minimal debt. While cyclical risks exist in the semiconductor industry, the current financial ",
+            f"position supports a constructive investment stance for long-term investors.'",
+        ])
+    elif display_style == "score_with_narrative":
+        directives.extend([
+            "USER SELECTED: Score + Narrative",
+            "",
+            "MANDATORY FORMAT - EXTENDED NARRATIVE REQUIRED:",
+            "1. The score (0-100) with rating label",
+            "2. A DETAILED narrative paragraph of 6-8 sentences (100-150 words minimum)",
+            "",
+            "YOUR NARRATIVE MUST ANALYZE:",
+            "- Profitability metrics (margins, ROE, ROA) with specific values",
+            "- Cash flow quality (FCF, FCF conversion, cash generation)",
+            "- Balance sheet strength (leverage, liquidity, debt levels)",
+            "- Growth trajectory and sustainability",
+            "- Key risks that impact the score",
+            "- How the user's framework influenced the assessment",
+            "",
+            f"The narrative should read like a mini-analysis, not a single sentence.",
+        ])
+    else:
+        # Fallback for any other display style
+        directives.extend([
+            "MANDATORY FORMAT - EXPLANATION REQUIRED:",
+            "1. The score (0-100) with rating label",
+            "2. A MANDATORY explanation of 3-5 sentences (50-100 words minimum)",
+            "",
+            "YOUR EXPLANATION MUST COVER:",
+            "- What metrics drove the score",
+            "- Key strengths identified",
+            "- Key concerns or risks",
+            "",
+            f"CORRECT FORMAT: '{company_name} receives a Financial Health Rating of 78/100 - Healthy. The score reflects [specific metrics]. Key strengths include [details]. However, [concerns]. Overall, [assessment].'",
+            "",
+            "FORBIDDEN: Just writing the score without explanation.",
+        ])
+    
+    # Common directives for all display styles
+    directives.extend([
+        "",
+        "RATING LABELS (MANDATORY - include with score):",
+        "- 85-100 = Very Healthy",
+        "- 70-84 = Healthy", 
+        "- 50-69 = Watch",
+        "- 0-49 = At Risk",
+        "",
+        "=== MINIMUM CONTENT REQUIREMENT (CRITICAL) ===",
+        "The Financial Health Rating section MUST be at least 50 words.",
+        "A single line like 'Company receives 78/100 - Healthy.' is INVALID.",
+        "You MUST explain WHY the company received this score with specific metrics.",
+        "",
+        "REQUIRED ELEMENTS IN YOUR EXPLANATION:",
+        "1. At least ONE specific profitability metric (e.g., 'net margin of 56%')",
+        "2. At least ONE cash flow metric (e.g., 'FCF of $22B')",
+        "3. At least ONE balance sheet observation (e.g., 'conservative debt levels')",
+        "4. At least ONE risk or concern that impacts the score",
+        "",
+        "If you write fewer than 50 words for this section, your output is INVALID.",
+        "=== END MINIMUM CONTENT REQUIREMENT ===",
+    ])
 
-    framework_prompt = HEALTH_FRAMEWORK_PROMPTS.get(config.get("framework"))
-    if framework_prompt:
-        directives.append(f"- Framework: {framework_prompt}")
+    # Custom framework/weighting instructions for CUSTOM mode
+    if is_custom_mode:
+        framework = config.get("framework")
+        weighting = config.get("primary_factor_weighting")
+        risk = config.get("risk_tolerance")
+        depth = config.get("analysis_depth")
+        
+        directives.append("")
+        directives.append("=== USER-SPECIFIED HEALTH SCORE PARAMETERS (MUST FOLLOW) ===")
+        
+        framework_prompt = HEALTH_FRAMEWORK_PROMPTS.get(framework)
+        if framework_prompt:
+            directives.append(f"")
+            directives.append(f"FRAMEWORK (User selected: {framework}):")
+            directives.append(f"  {framework_prompt}")
+            directives.append(f"  You MUST evaluate the company through this specific lens.")
 
-    weighting_prompt = HEALTH_WEIGHTING_PROMPTS.get(config.get("primary_factor_weighting"))
-    if weighting_prompt:
-        directives.append(f"- Primary factor weighting: {weighting_prompt}")
+        weighting_prompt = HEALTH_WEIGHTING_PROMPTS.get(weighting)
+        if weighting_prompt:
+            directives.append(f"")
+            directives.append(f"PRIMARY FACTOR WEIGHTING (User selected: {weighting}):")
+            directives.append(f"  {weighting_prompt}")
+            directives.append(f"  This factor should have the MOST influence on the final score.")
 
-    risk_prompt = HEALTH_RISK_PROMPTS.get(config.get("risk_tolerance"))
-    if risk_prompt:
-        directives.append(f"- Risk tolerance: {risk_prompt}")
+        risk_prompt = HEALTH_RISK_PROMPTS.get(risk)
+        if risk_prompt:
+            directives.append(f"")
+            directives.append(f"RISK TOLERANCE (User selected: {risk}):")
+            directives.append(f"  {risk_prompt}")
+            directives.append(f"  Apply this risk tolerance when penalizing or rewarding factors.")
 
-    depth_prompt = HEALTH_ANALYSIS_DEPTH_PROMPTS.get(config.get("analysis_depth"))
-    if depth_prompt:
-        directives.append(f"- Analysis depth: {depth_prompt}")
+        depth_prompt = HEALTH_ANALYSIS_DEPTH_PROMPTS.get(depth)
+        if depth_prompt:
+            directives.append(f"")
+            directives.append(f"ANALYSIS DEPTH (User selected: {depth}):")
+            directives.append(f"  {depth_prompt}")
+            directives.append(f"  Your analysis must reach this level of depth.")
+        
+        directives.append("")
+        directives.append("COMPLIANCE CHECK: The health score MUST reflect ALL user-specified parameters above.")
+        directives.append("If the score doesn't align with user's framework, weighting, and risk tolerance, REVISE IT.")
 
-    display_prompt = HEALTH_DISPLAY_PROMPTS.get(config.get("display_style"))
-    if display_prompt:
-        directives.append(f"- Output format: {display_prompt}")
-        if config.get("display_style") == "score_only":
-            directives.append("- Do not append letter grades, colors, pillar labels, or narrative badges; output only the 0–100 score and the supporting explanation.")
-
-    directives.append("- Present the Financial Health Rating as the first section before the Executive Summary.")
-    # Removed redundant instruction to append rating to Key Metrics section
-
+    directives.append("")
+    directives.append("PLACEMENT: The Financial Health Rating section MUST appear FIRST, before the Executive Summary.")
 
     return config, "\n".join(directives)
 
@@ -1424,6 +2298,23 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
         balance_sheet,
         ["TotalLiabilities", "totalLiabilities", "TotalLiabilitiesNetMinorityInterest"],
     )
+    
+    current_assets = _extract_from_candidates(
+        balance_sheet,
+        ["CurrentAssets", "TotalCurrentAssets", "totalCurrentAssets", "AssetsCurrent"],
+    )
+    current_liabilities = _extract_from_candidates(
+        balance_sheet,
+        ["CurrentLiabilities", "TotalCurrentLiabilities", "totalCurrentLiabilities", "LiabilitiesCurrent"],
+    )
+    inventory = _extract_from_candidates(
+        balance_sheet,
+        ["Inventory", "InventoryNet", "inventory", "Inventories"],
+    )
+    interest_expense = _extract_from_candidates(
+        income_statement,
+        ["InterestExpense", "interestExpense", "InterestAndDebtExpense", "InterestIncomeExpense"],
+    )
 
     operating_margin = (
         (operating_income / revenue) * 100 if operating_income is not None and revenue else None
@@ -1463,6 +2354,10 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
         "marketable_securities": marketable_securities,
         "total_assets": total_assets,
         "total_liabilities": total_liabilities,
+        "current_assets": current_assets,
+        "current_liabilities": current_liabilities,
+        "inventory": inventory,
+        "interest_expense": interest_expense,
         "operating_margin": operating_margin,
         "net_margin": net_margin,
         "dividends_paid": dividends_paid,
@@ -1470,6 +2365,65 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
     }
 
     return {key: value for key, value in metrics.items() if value is not None}
+
+
+def _compute_health_score_data(calculated_metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute health score data with component breakdown from calculated metrics."""
+    if not calculated_metrics:
+        return {}
+    
+    revenue = calculated_metrics.get("revenue")
+    operating_income = calculated_metrics.get("operating_income")
+    net_income = calculated_metrics.get("net_income")
+    operating_cash_flow = calculated_metrics.get("operating_cash_flow")
+    free_cash_flow = calculated_metrics.get("free_cash_flow")
+    total_assets = calculated_metrics.get("total_assets")
+    total_liabilities = calculated_metrics.get("total_liabilities")
+    current_assets = calculated_metrics.get("current_assets")
+    current_liabilities = calculated_metrics.get("current_liabilities")
+    inventory = calculated_metrics.get("inventory")
+    interest_expense = calculated_metrics.get("interest_expense")
+    
+    total_equity = (total_assets - total_liabilities) if total_assets and total_liabilities else None
+    
+    ratios = {}
+    
+    if calculated_metrics.get("operating_margin") is not None:
+        ratios["operating_margin"] = calculated_metrics["operating_margin"] / 100
+    if calculated_metrics.get("net_margin") is not None:
+        ratios["net_margin"] = calculated_metrics["net_margin"] / 100
+    if revenue and operating_income:
+        ratios["gross_margin"] = operating_income / revenue
+    if net_income and total_assets:
+        ratios["roa"] = net_income / total_assets
+    if net_income and total_equity and total_equity > 0:
+        ratios["roe"] = net_income / total_equity
+    if total_liabilities and total_equity and total_equity > 0:
+        ratios["debt_to_equity"] = total_liabilities / total_equity
+    if free_cash_flow:
+        ratios["fcf"] = free_cash_flow
+    if free_cash_flow and revenue and revenue > 0:
+        ratios["fcf_margin"] = free_cash_flow / revenue
+    
+    # Liquidity ratios
+    if current_assets and current_liabilities and current_liabilities > 0:
+        ratios["current_ratio"] = current_assets / current_liabilities
+        # Quick ratio excludes inventory
+        quick_assets = current_assets - (inventory or 0)
+        if quick_assets > 0:
+            ratios["quick_ratio"] = quick_assets / current_liabilities
+    
+    # Interest coverage ratio
+    if operating_income and interest_expense and interest_expense != 0:
+        # Interest expense is typically negative, so we use absolute value
+        ratios["interest_coverage"] = operating_income / abs(interest_expense)
+    
+    try:
+        health_data = calculate_health_score(ratios)
+        return health_data
+    except Exception as e:
+        logger.warning(f"Health score calculation failed: {e}")
+        return {}
 
 
 def _format_metric_value(key: str, value: float) -> str:
@@ -2311,6 +3265,12 @@ async def generate_filing_summary(
         
         financial_snapshot = _build_financial_snapshot(statements)
         calculated_metrics = _build_calculated_metrics(statements)
+        
+        # Pre-calculate health score BEFORE generating summary so we can inject it into the prompt
+        pre_calculated_health = _compute_health_score_data(calculated_metrics)
+        pre_calculated_score = pre_calculated_health.get("overall_score") if pre_calculated_health else None
+        pre_calculated_band = pre_calculated_health.get("score_band") if pre_calculated_health else None
+        
         progress_cache[str(filing_id)] = "Analyzing Risk Factors..."
         metrics_lines = "\n".join(
             f"- {label}: {_format_metric_value(key, calculated_metrics[key])}"
@@ -2349,6 +3309,10 @@ async def generate_filing_summary(
         company_label = company.get("name") or company.get("ticker") or "the company"
         preference_block = _build_preference_instructions(preferences, company_label)
         
+        # Extract persona name if a persona is selected
+        investor_focus = preferences.investor_focus.strip() if preferences and preferences.investor_focus else None
+        selected_persona_name = _extract_persona_name(investor_focus)
+        
         if include_health_rating:
              progress_cache[str(filing_id)] = "Computing Health Score..."
         
@@ -2358,15 +3322,23 @@ async def generate_filing_summary(
             health_directives_section = f"\n HEALTH RATING DIRECTIVES\n {health_rating_block}\n"
         section_descriptions: List[Tuple[str, str]] = []
         if health_rating_block:
-            section_descriptions.append(
-                (
-                    "Financial Health Rating",
+            if pre_calculated_score is not None and pre_calculated_band:
+                health_rating_description = (
+                    f"IMPORTANT: Use EXACTLY the pre-calculated score of {pre_calculated_score:.1f}/100 - {pre_calculated_band}. "
+                    f"DO NOT calculate your own score. The score {pre_calculated_score:.1f} has been computed from actual financial ratios. "
+                    f"Your job is to EXPLAIN why the company received this score based on the metrics provided. "
+                    f"Format: '{pre_calculated_score:.0f}/100 - {pre_calculated_band}'. "
+                    "NO letter grades (A, B, C, D). "
+                    "Explain what drove this score: margins, cash flow, leverage, liquidity."
+                )
+            else:
+                health_rating_description = (
                     "Provide the 0-100 score with descriptive label (Very Healthy 85-100, Healthy 70-84, Watch 50-69, At Risk 0-49). "
                     "NO letter grades (A, B, C, D). Format: '72/100 - Healthy'. "
                     "Explain why the score landed there with specific metrics: margins, cash flow, leverage, liquidity. "
-                    "A company with 60%+ margins should score 70+ unless there are severe balance sheet issues.",
+                    "A company with 60%+ margins should score 70+ unless there are severe balance sheet issues."
                 )
-            )
+            section_descriptions.append(("Financial Health Rating", health_rating_description))
         section_descriptions.extend(
             [
                 (
@@ -2444,31 +3416,14 @@ async def generate_filing_summary(
                     "- Revenue: $X.XB\n"
                     "- Operating Margin: X.X%\n"
                     "- Net Income: $X.XB\n"
-                    "- EPS: $X.XX\n"
+                    "- EPS: $X.XX (omit if not available)\n"
                     "- FCF: $X.XB\n"
                     "- Cash: $X.XB\n"
                     "- Debt: $X.XB\n"
-                    "- P/E (if available): X.Xx\n"
-                    "- FCF Yield (if available): X.X%\n"
+                    "DO NOT include P/E ratio or FCF Yield - these require market data not in the filing.\n"
                     "CRITICAL: Appendix numbers MUST match the numbers cited in narrative sections above. Do not mix periods.",
                 ),
-                (
-                    "Closing Takeaway",
-                    "2-4 sentences. This is your FINAL INVESTMENT VERDICT - the most important section for the reader.\n"
-                    "Synthesize everything into ONE clear, actionable conclusion that reflects your persona's perspective.\n"
-                    "REQUIRED ELEMENTS:\n"
-                    "1. Overall assessment of the company's quality based on the data analyzed\n"
-                    "2. Clear investment stance: Would you buy? Hold? Pass? Wait for better price?\n"
-                    "3. The key factor driving your decision\n"
-                    "If using a persona, write in FIRST PERSON voice consistent with that persona.\n"
-                    "Examples:\n"
-                    "- John Bogle: 'My conclusion: This is a fine business. But the prudent course is to own the entire market at 0.03% cost. "
-                    "Stay the course with the index fund.'\n"
-                    "- Peter Lynch: 'I'd buy this one. The story is simple, the PEG is attractive, and we're only in the 4th inning of growth.'\n"
-                    "- Warren Buffett: 'This is a wonderful business at a fair price. The moat is wide, the economics are durable, "
-                    "and I'd be comfortable holding for decades.'\n"
-                    "DO NOT end without providing a clear stance. This section provides CLOSURE for the entire analysis.",
-                ),
+                _build_closing_takeaway_description(selected_persona_name, company_name),
             ]
         )
         section_requirements = "\n".join(
@@ -2478,6 +3433,39 @@ async def generate_filing_summary(
         tone = preferences.tone or "objective"
         detail_level = preferences.detail_level or "comprehensive"
         output_style = preferences.output_style or "paragraph"
+
+        # Build no-persona block for objective analysis when no persona is selected
+        if selected_persona_name:
+            no_persona_block = ""
+        else:
+            no_persona_block = """
+=== NO PERSONA MODE - OBJECTIVE ANALYSIS ===
+CRITICAL: No investor persona was selected. You MUST write as a NEUTRAL PROFESSIONAL ANALYST.
+
+FORBIDDEN - NEVER USE:
+- First-person language: 'I', 'my view', 'I would', 'I believe', 'my conviction', 'I see'
+- Famous investor voices: No Buffett ('wonderful business', 'moat', 'owner earnings'), no Munger ('invert'),
+  no Graham ('margin of safety'), no Lynch ('ten-bagger'), no Ackman, no Dalio, etc.
+- Folksy analogies or colorful investor expressions
+- Investment club language ('I would buy/sell/hold')
+
+REQUIRED - ALWAYS USE:
+- Third-person objective language: 'The analysis indicates...', 'The data suggests...', 'This company demonstrates...'
+- Professional research analyst tone
+- Quantitative focus: revenue growth %, margins, ROE, debt/equity, valuation multiples
+- Evidence-based conclusions tied directly to financial metrics
+
+EXAMPLE CORRECT PHRASING:
+- 'The company's 35% gross margin expansion indicates operational improvement.'
+- 'Revenue growth of 22% YoY suggests strong market positioning.'
+- 'Based on the financial data, a Hold rating appears warranted.'
+
+EXAMPLE INCORRECT PHRASING (DO NOT USE):
+- 'I would hold this stock because...' (first person)
+- 'This is a wonderful business with a wide moat.' (Buffett persona)
+- 'Inverting the question, what could go wrong?' (Munger persona)
+=== END NO PERSONA MODE ===
+"""
 
         base_prompt = f"""
 You are a senior analyst at a top-tier hedge fund writing a high-conviction briefing for portfolio managers.
@@ -2504,6 +3492,53 @@ STRUCTURE & CONTENT REQUIREMENTS:
 {health_directives_section}
 {preference_block}
 
+=== MANDATORY FORMATTING RULES (CRITICAL) ===
+1. Each section MUST start on its own line with the ## header
+2. There MUST be a blank line BEFORE each section header
+3. There MUST be a blank line AFTER each section header before the content
+4. NEVER put a section header inline with content from the previous section
+
+CORRECT FORMAT:
+```
+...previous section content ends here.
+
+## Executive Summary
+
+This section content starts on a new line after the header.
+```
+
+INCORRECT FORMAT (DO NOT DO THIS):
+```
+...previous section content ends here. ## Executive Summary This section content...
+```
+
+EVERY section header (Financial Health Rating, Executive Summary, Financial Performance, etc.) MUST:
+- Be on its own line
+- Start with "## "
+- Have blank lines before and after
+=== END FORMATTING RULES ===
+
+=== USER CUSTOMIZATION PRIORITY (READ CAREFULLY) ===
+If the user has specified ANY custom preferences (persona, tone, focus areas, detail level, output style,
+health score configuration), these OVERRIDE default behavior. Your output MUST:
+
+1. PERSONA/VIEWPOINT: If specified, maintain this voice in EVERY section, not just the introduction.
+   - Use first-person language throughout
+   - Apply their specific mental models and vocabulary
+   - The Closing Takeaway MUST sound exactly like the persona
+
+2. HEALTH SCORE: If configured, follow the user's framework, weighting, risk tolerance, and display format EXACTLY.
+   - Score must reflect their specified primary factor weighting
+   - Apply their specified risk tolerance when penalizing/rewarding
+   - Use ONLY their selected display format (score only, pillars, traffic light, etc.)
+
+3. TONE/DETAIL/STYLE: Match user specifications consistently throughout. No switching mid-document.
+
+4. FOCUS AREAS: If specified, these topics get PRIORITY coverage with dedicated sections.
+
+Failure to follow user customizations = INVALID OUTPUT. Re-read the preference block above if unsure.
+=== END USER CUSTOMIZATION PRIORITY ===
+{no_persona_block}
 CRITICAL RULES:
 - MAINTAIN CONSISTENT TONE throughout. If using a persona (e.g., Graham, Lynch), stay in that voice for ALL sections.
 - Do NOT use markdown bolding (**) within the text body. Only use it for section headers if needed.
@@ -2515,8 +3550,48 @@ CRITICAL RULES:
 - **SUSTAINABILITY**: Do NOT mention sustainability or ESG efforts unless they are a primary revenue driver (e.g., for a solar company). For most companies, this is fluff.
 - **MD&A**: Do NOT say "Management discusses..." or "In the MD&A section...". Just state the facts found there.
 - USE TRANSITIONS: Connect sections logically. Each section should flow naturally from the previous one.
-- COMPLETE ALL SENTENCES: Every sentence MUST end with proper punctuation. Never leave a thought unfinished.
-- VERIFY ENDING: Before submitting, check the last sentence of EVERY section. If it ends mid-thought (e.g., "essential to determine if..."), DELETE it and end on the previous complete sentence.
+
+=== #1 PRIORITY: SENTENCE COMPLETION (OVERRIDES WORD COUNT) ===
+THIS IS YOUR SINGLE MOST IMPORTANT RULE. IT TAKES PRIORITY OVER WORD COUNT.
+
+FUNDAMENTAL PRINCIPLE: It is ALWAYS better to exceed the word count by 100 words than to cut off a single sentence.
+
+EVERY SENTENCE MUST BE COMPLETE. ZERO EXCEPTIONS. ZERO TOLERANCE.
+
+FORBIDDEN CUT-OFF PATTERNS (YOUR OUTPUT WILL BE REJECTED IF ANY APPEAR):
+   - "...and." or "...and the..." (INCOMPLETE - finish the thought)
+   - "...give." or "...competitors give." (INCOMPLETE - what do they give?)
+   - "...of." or "...percentage of." (INCOMPLETE - percentage of what?)
+   - "...$1." or "...$3." (CUT-OFF NUMBER - write the full amount)
+   - "...as I." or "...as wide as I." (INCOMPLETE - finish the sentence)
+   - "...in accelerated." (INCOMPLETE - accelerated what?)
+   - "...I would..." (INCOMPLETE - finish with what you would do)
+   - "...which is..." (INCOMPLETE - which is what?)
+   - "...because I..." (INCOMPLETE - because you what?)
+   - Any sentence ending with: the, a, an, of, to, for, with, in, and, but, or, while, although, I
+
+REAL EXAMPLES OF CUT-OFFS TO AVOID:
+   BAD: "...the cyclical nature of the semiconductor industry and." 
+   GOOD: "...the cyclical nature of the semiconductor industry and its potential impact on long-term returns."
+   
+   BAD: "...represent a significant percentage of."
+   GOOD: "...represent a significant percentage of total revenue, creating concentration risk."
+   
+   BAD: "...Capital expenditures total $1."
+   GOOD: "...Capital expenditures total $1.2B, directed primarily toward manufacturing capacity."
+   
+   BAD: "...the moat may not be as wide as I."
+   GOOD: "...the moat may not be as wide as I would prefer for a long-term holding."
+
+HOW TO HANDLE WORD COUNT VS COMPLETION:
+- If you're at 640 words and need to finish a sentence, FINISH IT (even if you go to 700 words)
+- If you're at the limit, DO NOT start a new thought you can't finish
+- Plan your sections so you have room to complete the Closing Takeaway fully
+
+BEFORE SUBMITTING - MANDATORY CHECK:
+Read the LAST WORD of EVERY sentence. If it's an article, preposition, conjunction, pronoun, or incomplete number, REWRITE IT.
+
+=== END SENTENCE COMPLETION REQUIREMENT ===
 
 NARRATIVE QUALITY:
 - Start each section with a clear topic sentence that states the key insight.
@@ -2524,6 +3599,8 @@ NARRATIVE QUALITY:
 - Avoid starting consecutive sentences with the same word.
 - Vary sentence length and structure for readability.
 - THE LAST SENTENCE OF EACH SECTION MUST BE A COMPLETE THOUGHT ending in a period, question mark, or exclamation point.
+- If you write a subordinate clause (starting with "which", "that", "although", "while", "but"), you MUST complete it.
+- BUDGET YOUR WORDS: If the target is 650 words, plan to write ~550 words for main sections, leaving 100 words for proper conclusions.
 
 FREE CASH FLOW RECONCILIATION:
 - If FCF exceeds Net Income, you MUST explain why (e.g., working capital release, D&A exceeds capex, deferred revenue)
@@ -2537,6 +3614,16 @@ NEGATIVE CONSTRAINTS:
 - Do NOT include placeholder text like "not extracted", "see above", "not available" - if you lack information, omit it.
 - Do NOT switch between personal opinion and neutral analyst tone mid-document.
 - Do NOT end any section with an incomplete sentence. If unsure, read the last sentence aloud.
+- Do NOT cut off numbers mid-way (e.g., "$1." instead of "$1.2B") - always write complete figures.
+
+=== FINAL PRE-SUBMISSION CHECKLIST (MANDATORY) ===
+Before you output anything, verify:
+[ ] Every sentence ends with . ? or ! (not with "and", "the", "of", "I", etc.)
+[ ] All dollar amounts are complete (e.g., "$18.77B" not "$18.")
+[ ] The Closing Takeaway section is FULLY complete with a clear verdict
+[ ] No section ends mid-thought
+[ ] If you're over the word count, that's OK - incomplete sentences are NOT OK
+=== END CHECKLIST ===
 """
         progress_cache[str(filing_id)] = "Synthesizing Investor Insights..."
         print("DEBUG: Calling _generate_summary_with_quality_control")
@@ -2547,12 +3634,15 @@ NEGATIVE CONSTRAINTS:
             quality_validators=[
                 _make_section_completeness_validator(include_health_rating)
             ],
+            filing_id=filing_id,
         )
         
         progress_cache[str(filing_id)] = "Polishing Output..."
         # Post-processing to ensure structure
+        summary_text = _fix_inline_section_headers(summary_text)  # CRITICAL: Fix headers appearing inline first
         summary_text = _normalize_section_headings(summary_text, include_health_rating)
-        summary_text = _validate_complete_sentences(summary_text)  # Fix incomplete sentences
+        summary_text = _fix_trailing_ellipsis(summary_text)  # Fix sentences ending with ...
+        summary_text = _validate_complete_sentences(summary_text)  # Fix other incomplete sentences
         summary_text = _ensure_required_sections(
             summary_text,
             include_health_rating=include_health_rating,
@@ -2560,6 +3650,7 @@ NEGATIVE CONSTRAINTS:
             calculated_metrics=calculated_metrics,
             company_name=company_name,
             health_rating_config=health_config,
+            persona_name=selected_persona_name,
         )
         if target_length:
             summary_text = _enforce_length_constraints(
@@ -2569,7 +3660,7 @@ NEGATIVE CONSTRAINTS:
                 quality_validators=[_make_section_completeness_validator(include_health_rating)],
                 last_word_stats=None,
             )
-            summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
+            summary_text = _finalize_length_band(summary_text, target_length, tolerance=50)
             # Re-validate required sections after any trimming/padding, then clamp again
             summary_text = _ensure_required_sections(
                 summary_text,
@@ -2578,9 +3669,11 @@ NEGATIVE CONSTRAINTS:
                 calculated_metrics=calculated_metrics,
                 company_name=company_name,
                 health_rating_config=health_config,
+                persona_name=selected_persona_name,
             )
-            summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
+            summary_text = _finalize_length_band(summary_text, target_length, tolerance=50)
             # Final pass to normalize headings and length in case prior rewrites removed structure
+            summary_text = _fix_inline_section_headers(summary_text)
             summary_text = _normalize_section_headings(summary_text, include_health_rating)
             summary_text = _ensure_required_sections(
                 summary_text,
@@ -2589,18 +3682,33 @@ NEGATIVE CONSTRAINTS:
                 calculated_metrics=calculated_metrics,
                 company_name=company_name,
                 health_rating_config=health_config,
+                persona_name=selected_persona_name,
             )
-            summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
-            summary_text = _force_final_band(summary_text, target_length, tolerance=10)
+            summary_text = _finalize_length_band(summary_text, target_length, tolerance=50)
+            summary_text = _force_final_band(summary_text, target_length, tolerance=50)
+
+        # Final ellipsis cleanup after all length adjustments
+        summary_text = _fix_trailing_ellipsis(summary_text)
+
+        # Use pre-calculated health score data (computed before summary generation)
+        health_score_data = pre_calculated_health
 
         # Cache result
         if use_default_cache:
             fallback_filing_summaries[str(filing_id)] = summary_text
-        return JSONResponse(content={
+        
+        response_data = {
             "filing_id": filing_id,
             "summary": summary_text,
             "cached": False
-        })
+        }
+        
+        if health_score_data:
+            response_data["health_score"] = health_score_data.get("overall_score")
+            response_data["health_band"] = health_score_data.get("score_band")
+            response_data["health_components"] = health_score_data.get("component_scores")
+        
+        return JSONResponse(content=response_data)
         
     except Exception as gemini_exc:
         with open("debug_error.txt", "w") as f:
@@ -2677,7 +3785,13 @@ def _extract_word_count_control(text: str) -> Tuple[str, Optional[int]]:
 
 
 def _normalize_section_headings(text: str, include_health_rating: bool) -> str:
-    """Ensure each required section begins with the expected markdown heading."""
+    """Ensure each required section begins with the expected markdown heading on its own line.
+    
+    This handles cases where:
+    1. Headers appear inline with content (e.g., "...business. ## Executive Summary As Bill...")
+    2. Headers are missing the ## prefix
+    3. Headers have extra whitespace or formatting issues
+    """
     required_titles = [
         title for title, _ in SUMMARY_SECTION_REQUIREMENTS if title != "Financial Health Rating"
     ]
@@ -2703,10 +3817,63 @@ def _normalize_section_headings(text: str, include_health_rating: bool) -> str:
         idx += 1
 
     normalized_text = "\n".join(normalized_lines)
+    
+    # CRITICAL: First, handle INLINE section headers (headers appearing mid-line)
+    # This catches patterns like "...business. ## Executive Summary As Bill..."
+    # and splits them into proper separate lines
     for title in required_titles:
-        pattern = re.compile(rf"(^|\n)\s*(?:##\s*)?{re.escape(title)}\b", re.IGNORECASE)
-        normalized_text = pattern.sub(lambda _: f"\n## {title}", normalized_text, count=1)
-    return normalized_text
+        # Pattern to find inline headers: text before + ## Title + text after (all on same conceptual line)
+        # We need to insert newlines before and after the header
+        inline_pattern = re.compile(
+            rf'([.!?])\s*(?:##?\s*)?({re.escape(title)})\s*',
+            re.IGNORECASE
+        )
+        # Replace with: punctuation + double newline + ## Title + double newline
+        normalized_text = inline_pattern.sub(
+            lambda m: f'{m.group(1)}\n\n## {title}\n\n',
+            normalized_text
+        )
+    
+    # Also handle cases where the header appears without preceding punctuation but inline
+    # e.g., "some text ## Executive Summary more text"
+    for title in required_titles:
+        inline_no_punct_pattern = re.compile(
+            rf'(\S)\s+(?:##?\s*)({re.escape(title)})\s+(\S)',
+            re.IGNORECASE
+        )
+        normalized_text = inline_no_punct_pattern.sub(
+            lambda m: f'{m.group(1)}\n\n## {title}\n\n{m.group(3)}',
+            normalized_text
+        )
+
+    # Now normalize headers that are on their own lines but might be missing ##
+    for title in required_titles:
+        pattern = re.compile(rf"(^|\n)\s*(?:##\s*)?{re.escape(title)}\s*(?:\n|$)", re.IGNORECASE | re.MULTILINE)
+        normalized_text = pattern.sub(lambda _: f"\n\n## {title}\n\n", normalized_text, count=1)
+    
+    # Clean up any excessive newlines (more than 2 consecutive)
+    normalized_text = re.sub(r'\n{4,}', '\n\n\n', normalized_text)
+    
+    # Ensure headers have exactly one blank line before and after
+    for title in required_titles:
+        # Fix cases where header doesn't have proper spacing
+        header_spacing_pattern = re.compile(
+            rf'([^\n])(\n*)(\s*##\s*{re.escape(title)})(\n*)([^\n])',
+            re.IGNORECASE
+        )
+        def ensure_spacing(m):
+            before_char = m.group(1)
+            before_newlines = '\n\n' if before_char not in '\n' else ''
+            after_newlines = '\n\n'
+            after_char = m.group(5)
+            return f'{before_char}{before_newlines}## {title}{after_newlines}{after_char}'
+        
+        normalized_text = header_spacing_pattern.sub(ensure_spacing, normalized_text)
+    
+    # Final cleanup: ensure no header is followed immediately by another header without content
+    normalized_text = re.sub(r'(## [^\n]+)\n\n(## )', r'\1\n\n[Section content pending]\n\n\2', normalized_text)
+    
+    return normalized_text.strip()
 
 
 def _format_metric_value_for_text(key: str, value: float) -> str:
@@ -2768,6 +3935,302 @@ def _format_number_or_default(value: Optional[float]) -> str:
     return f"{value:,.2f}"
 
 
+def _generate_fallback_closing_takeaway(
+    company_name: str,
+    calculated_metrics: Dict[str, Any],
+    persona_name: Optional[str] = None,
+) -> str:
+    """Generate a substantive closing takeaway from available financial metrics.
+    
+    This provides a data-driven conclusion when the AI fails to generate one.
+    If a persona is selected, the output is styled to match that persona's voice.
+    """
+    # Extract key metrics
+    operating_margin = calculated_metrics.get("operating_margin")
+    net_margin = calculated_metrics.get("net_margin")
+    free_cash_flow = calculated_metrics.get("free_cash_flow")
+    cash = calculated_metrics.get("cash")
+    total_debt = calculated_metrics.get("total_debt") or calculated_metrics.get("total_liabilities")
+    revenue = calculated_metrics.get("revenue") or calculated_metrics.get("total_revenue")
+    
+    # Assess overall financial quality
+    strengths = []
+    concerns = []
+    
+    # Profitability assessment
+    if operating_margin is not None:
+        if operating_margin > 25:
+            strengths.append("exceptional profitability")
+        elif operating_margin > 15:
+            strengths.append("solid profitability")
+        elif operating_margin < 5:
+            concerns.append("thin margins")
+    
+    # Cash flow assessment
+    if free_cash_flow is not None:
+        if free_cash_flow > 0:
+            fcf_str = _format_dollar(free_cash_flow)
+            if fcf_str:
+                strengths.append(f"strong cash generation ({fcf_str} FCF)")
+            else:
+                strengths.append("positive free cash flow")
+        else:
+            concerns.append("negative free cash flow")
+    
+    # Balance sheet assessment
+    if cash is not None and total_debt is not None:
+        if cash > total_debt:
+            strengths.append("net cash position")
+        elif total_debt > cash * 3:
+            concerns.append("elevated leverage")
+    
+    # Determine quality assessment
+    if strengths and not concerns:
+        quality = "high-quality" if len(strengths) >= 2 else "solid"
+        is_positive = True
+        is_mixed = False
+    elif concerns and not strengths:
+        quality = "challenged"
+        is_positive = False
+        is_mixed = False
+    elif strengths and concerns:
+        quality = "mixed"
+        is_positive = False
+        is_mixed = True
+    else:
+        quality = "uncertain"
+        is_positive = False
+        is_mixed = False
+    
+    # Persona-specific closing templates
+    if persona_name and persona_name in PERSONA_CLOSING_INSTRUCTIONS:
+        return _generate_persona_flavored_closing(
+            persona_name, company_name, strengths, concerns, 
+            quality, is_positive, is_mixed, revenue, operating_margin
+        )
+    
+    # Generic fallback (no persona selected)
+    sentences = []
+    
+    if strengths and not concerns:
+        sentences.append(f"{company_name} demonstrates {quality} financial characteristics with {' and '.join(strengths[:2])}.")
+        sentences.append("The fundamentals support a constructive long-term outlook, though investors should monitor valuation and competitive dynamics.")
+    elif concerns and not strengths:
+        sentences.append(f"{company_name} faces financial headwinds including {' and '.join(concerns[:2])}.")
+        sentences.append("Caution is warranted until the company demonstrates improvement in these areas.")
+    elif strengths and concerns:
+        sentences.append(f"{company_name} presents a mixed picture: {strengths[0]} offset by {concerns[0]}.")
+        sentences.append("The investment case hinges on whether management can address the challenges while preserving the company's strengths.")
+    else:
+        # Minimal data available - provide generic but substantive closing
+        if revenue:
+            rev_str = _format_dollar(revenue)
+            sentences.append(f"{company_name}, with {rev_str} in revenue, warrants further analysis to assess its competitive positioning and growth trajectory.")
+        else:
+            sentences.append(f"{company_name} requires deeper due diligence to form a definitive investment view.")
+        sentences.append("Investors should evaluate the company's strategic initiatives and industry dynamics before making allocation decisions.")
+    
+    return " ".join(sentences)
+
+
+def _generate_persona_flavored_closing(
+    persona_name: str,
+    company_name: str,
+    strengths: List[str],
+    concerns: List[str],
+    quality: str,
+    is_positive: bool,
+    is_mixed: bool,
+    revenue: Optional[float],
+    operating_margin: Optional[float],
+) -> str:
+    """Generate a closing takeaway in the voice of the selected persona."""
+    
+    strengths_str = " and ".join(strengths[:2]) if strengths else "limited visibility into fundamentals"
+    concerns_str = " and ".join(concerns[:2]) if concerns else "no major red flags"
+    margin_str = f"{operating_margin:.1f}%" if operating_margin else "undisclosed margins"
+    
+    if persona_name == "Warren Buffett":
+        if is_positive:
+            return (
+                f"This is a wonderful business with {strengths_str}. "
+                f"The economics of {company_name} suggest a durable moat, and I would be comfortable holding for decades. "
+                f"At current valuations, Mr. Market appears to be offering a fair deal for patient capital."
+            )
+        elif is_mixed:
+            return (
+                f"{company_name} has attractive qualities—{strengths[0] if strengths else 'decent operations'}—but {concerns[0] if concerns else 'some uncertainties'} gives me pause. "
+                f"I prefer businesses where the path forward is clear. This one requires more conviction than I currently have."
+            )
+        else:
+            return (
+                f"I struggle to understand the long-term economics here. {company_name} faces {concerns_str}, "
+                f"which makes it difficult to assess the durability of any moat. I would pass and wait for a better opportunity."
+            )
+    
+    elif persona_name == "Charlie Munger":
+        if is_positive:
+            return (
+                f"Inverting the question: what would make {company_name} a disaster? Not much, given {strengths_str}. "
+                f"The incentives appear aligned and the economics make sense. I have nothing to add."
+            )
+        elif is_mixed:
+            return (
+                f"{company_name} isn't obviously stupid, but it isn't obviously wonderful either. "
+                f"{strengths[0].capitalize() if strengths else 'Some merit'} is offset by {concerns[0] if concerns else 'uncertainty'}. "
+                f"The intelligent thing is to wait for better clarity."
+            )
+        else:
+            return (
+                f"Avoid this one. {company_name} has {concerns_str}—the kind of structural issues that tend to compound. "
+                f"There are simpler, better businesses to own."
+            )
+    
+    elif persona_name == "Benjamin Graham":
+        if is_positive:
+            return (
+                f"The margin of safety at {company_name} appears adequate, supported by {strengths_str}. "
+                f"For the intelligent investor, this represents a reasonable investment rather than speculation. "
+                f"The balance sheet strength supports the thesis."
+            )
+        elif is_mixed:
+            return (
+                f"{company_name} presents a mixed margin of safety calculation. While {strengths[0] if strengths else 'some factors'} provides support, "
+                f"{concerns[0] if concerns else 'other factors'} undermines the thesis. A more conservative investor would require a lower entry price."
+            )
+        else:
+            return (
+                f"The margin of safety is insufficient. {company_name} shows {concerns_str}, "
+                f"leaving limited downside protection. This is speculation, not investment."
+            )
+    
+    elif persona_name == "Peter Lynch":
+        if is_positive:
+            return (
+                f"Here's the story: {company_name} has {strengths_str}—the kind of business you can explain to anyone. "
+                f"With {margin_str}, this looks like a solid stalwart or fast grower worth owning. You don't need an MBA to understand this one."
+            )
+        elif is_mixed:
+            return (
+                f"The story at {company_name} is complicated. On one hand, {strengths[0] if strengths else 'there is potential'}; "
+                f"on the other, {concerns[0] if concerns else 'some issues'}. I prefer cleaner stories where the path to earnings growth is obvious."
+            )
+        else:
+            return (
+                f"{company_name} doesn't fit my playbook. With {concerns_str}, the story here is more turnaround than growth. "
+                f"I would rather find a company where the growth is already visible."
+            )
+    
+    elif persona_name == "Ray Dalio":
+        if is_positive:
+            return (
+                f"Understanding the machine: {company_name} shows {strengths_str}, positioning it well for the current cycle. "
+                f"The risk-reward correlation favors a constructive stance, though position sizing should reflect broader macro uncertainties."
+            )
+        elif is_mixed:
+            return (
+                f"Where are we in the cycle? {company_name} presents {strengths[0] if strengths else 'some positives'} "
+                f"alongside {concerns[0] if concerns else 'risks'}. The correlation to macro factors warrants careful position sizing."
+            )
+        else:
+            return (
+                f"The economic machine suggests caution. {company_name} faces {concerns_str}, "
+                f"which could amplify in a deleveraging scenario. Risk parity considerations favor underweight or avoidance."
+            )
+    
+    elif persona_name == "Cathie Wood":
+        if is_positive:
+            return (
+                f"The disruptive innovation potential at {company_name} is compelling. With {strengths_str}, "
+                f"the S-curve adoption could drive exponential growth. By 2030, I see significant upside if the innovation thesis plays out."
+            )
+        elif is_mixed:
+            return (
+                f"{company_name} has innovation potential, but {concerns[0] if concerns else 'execution risk'} creates uncertainty. "
+                f"I am watching for Wright's Law dynamics to emerge before increasing conviction."
+            )
+        else:
+            return (
+                f"{company_name} faces {concerns_str}, which constrains its ability to invest in disruptive innovation. "
+                f"Without clear technology catalysts, I would look elsewhere for exponential growth opportunities."
+            )
+    
+    elif persona_name == "Joel Greenblatt":
+        if is_positive:
+            return (
+                f"By the Magic Formula, {company_name} looks attractive. With {margin_str} operating margins and {strengths_str}, "
+                f"the return on capital is solid and the earnings yield appears reasonable. This is the kind of good and cheap I look for."
+            )
+        elif is_mixed:
+            return (
+                f"{company_name} is either good or cheap, but not clearly both. {strengths[0].capitalize() if strengths else 'Some positives'} "
+                f"is partially offset by {concerns[0] if concerns else 'valuation concerns'}. The Magic Formula works best with cleaner situations."
+            )
+        else:
+            return (
+                f"The Magic Formula doesn't favor {company_name} here. With {concerns_str}, "
+                f"the return on capital or earnings yield is insufficient. Pass."
+            )
+    
+    elif persona_name == "John Bogle":
+        if is_positive:
+            return (
+                f"{company_name} is a fine business with {strengths_str}. But why own one needle when you can own the haystack? "
+                f"Costs matter, and most stock pickers fail to beat the index. For those who insist on individual stocks, "
+                f"I would HOLD this position rather than add at current valuations—the fundamentals are sound but no single stock justifies concentration risk. "
+                f"If valuation became significantly more attractive, I might reconsider. The prudent investor stays the course with diversification."
+            )
+        elif is_mixed:
+            return (
+                f"{company_name} shows {strengths[0] if strengths else 'some merit'} but also {concerns[0] if concerns else 'uncertainty'}. "
+                f"This uncertainty is precisely why I advocate for index funds—no single stock is predictable. "
+                f"For individual stock holders, I would HOLD but not add. The mixed signals warrant caution, and I would want to see improved clarity before changing my view."
+            )
+        else:
+            return (
+                f"{company_name} faces {concerns_str}—exactly the kind of company-specific risk that diversification eliminates. "
+                f"For individual stock holders, I would SELL or avoid entirely. These challenges underscore why I believe in index investing. "
+                f"Only a dramatic improvement in fundamentals would change my view. Stay the course with the index fund."
+            )
+    
+    elif persona_name == "Howard Marks":
+        if is_positive:
+            return (
+                f"Second-level thinking: the market may be underestimating {company_name}. With {strengths_str}, "
+                f"the risk-reward asymmetry appears favorable. The pendulum hasn't swung too far to optimism here."
+            )
+        elif is_mixed:
+            return (
+                f"Where are we in the cycle? {company_name} has {strengths[0] if strengths else 'positives'} but {concerns[0] if concerns else 'risks'}. "
+                f"Second-level thinking suggests waiting for the pendulum to swing further before committing capital."
+            )
+        else:
+            return (
+                f"The risk here is not being adequately compensated. {company_name} shows {concerns_str}, "
+                f"and the pendulum of sentiment may have further to fall. I would wait for better asymmetry."
+            )
+    
+    elif persona_name == "Bill Ackman":
+        if is_positive:
+            return (
+                f"This is simple, predictable, and free-cash-flow generative. {company_name} has {strengths_str}. "
+                f"The catalyst for further value creation is execution on current initiatives. I would own this with high conviction."
+            )
+        elif is_mixed:
+            return (
+                f"{company_name} has potential but needs a catalyst. While {strengths[0] if strengths else 'fundamentals are okay'}, "
+                f"{concerns[0] if concerns else 'the path forward'} is unclear. Management must address this to unlock value."
+            )
+        else:
+            return (
+                f"{company_name} is not the kind of simple, predictable business I favor. With {concerns_str}, "
+                f"there's no clear catalyst to unlock value. I would pass."
+            )
+    
+    # Fallback if persona not matched (shouldn't happen given the check above)
+    return f"{company_name} requires further analysis to form a definitive investment view."
+
+
 def _ensure_required_sections(
     summary_text: str,
     *,
@@ -2776,6 +4239,7 @@ def _ensure_required_sections(
     calculated_metrics: Dict[str, Any],
     company_name: str,
     health_rating_config: Optional[Dict[str, Any]] = None,
+    persona_name: Optional[str] = None,
 ) -> str:
     """Ensure all required sections are present.
 
@@ -2849,17 +4313,11 @@ def _ensure_required_sections(
         _append_section("Key Data Appendix", metrics_lines.strip())
 
     # 8. Closing Takeaway - ensure there's a closing verdict if missing
+    # Generate a data-driven closing takeaway if the AI failed to include one
+    # Pass persona_name to maintain persona voice in fallback
     if not _section_present("Closing Takeaway"):
-        # Check if the analysis was persona-based by looking for "Investor Lens" section
-        has_persona = "## Investor Lens" in text or "As " in text[:500]
-        if has_persona:
-            # Generate a generic closing for persona analyses if missing
-            _append_section(
-                "Closing Takeaway",
-                f"Based on the analysis above, {company_name} presents a mixed investment picture. "
-                "Investors should weigh the company's financial strengths against the identified risks "
-                "before making investment decisions."
-            )
+        closing_body = _generate_fallback_closing_takeaway(company_name, calculated_metrics, persona_name)
+        _append_section("Closing Takeaway", closing_body)
 
     return text
 

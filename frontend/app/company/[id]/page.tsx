@@ -82,10 +82,21 @@ type SummaryPreferenceSnapshot = {
   selectedPersona?: string | null
 }
 
+type HealthComponentScores = {
+  financial_performance?: number
+  profitability?: number
+  leverage?: number
+  liquidity?: number
+  cash_flow?: number
+  governance?: number
+  growth?: number
+}
+
 type FilingSummary = {
   content: string
   metadata: SummaryPreferenceSnapshot
   healthRating?: number
+  healthComponents?: HealthComponentScores
 }
 
 type FilingSummaryMap = Record<string, FilingSummary>
@@ -386,8 +397,26 @@ export default function CompanyPage() {
     { text: "Analyzing Risk Factors..." },
     { text: "Computing Health Score..." },
     { text: "Synthesizing Investor Insights..." },
+    { text: "Generating Summary..." },
     { text: "Polishing Output..." },
   ];
+
+  const parseProgressStatus = (status: string): { step: number; percentage: number | null; displayText: string } => {
+    const percentMatch = status.match(/(\d+)%/)
+    const percentage = percentMatch ? parseInt(percentMatch[1], 10) : null
+    
+    if (status.includes("Generating Summary")) {
+      return { step: 6, percentage, displayText: status }
+    }
+    
+    const stepIndex = LOADING_STEPS.findIndex(s => status.startsWith(s.text.replace("...", "")))
+    return { 
+      step: stepIndex >= 0 ? stepIndex : 0, 
+      percentage, 
+      displayText: status 
+    }
+  }
+
   const [selectedFilingForSummary, setSelectedFilingForSummary] = useState<string>('')
   const [summaryPreferences, setSummaryPreferences] = useState<SummaryPreferenceFormState>(() => createDefaultSummaryPreferences())
   const [showCustomLengthInput, setShowCustomLengthInput] = useState(false)
@@ -522,6 +551,8 @@ export default function CompanyPage() {
 
       // Extract health rating if present
       let healthRating: number | undefined;
+      let healthComponents: HealthComponentScores | undefined;
+      
       if (response.data.health_score !== undefined) {
         healthRating = response.data.health_score;
       } else {
@@ -529,6 +560,10 @@ export default function CompanyPage() {
         if (extracted.score !== null) {
           healthRating = extracted.score;
         }
+      }
+      
+      if (response.data.health_components) {
+        healthComponents = response.data.health_components;
       }
 
       if (isMountedRef.current) {
@@ -538,6 +573,7 @@ export default function CompanyPage() {
             content: response.data.summary,
             metadata: metadata ?? { mode: 'default' },
             healthRating,
+            healthComponents,
           },
         }))
       }
@@ -571,8 +607,9 @@ export default function CompanyPage() {
     const filing = filings?.find((item: any) => item.id === filingId)
 
     const generatedAt = new Date().toISOString()
-    const { score: extractedScore } = extractHealthRating(summary.content)
-    const ratingInfo = typeof extractedScore === 'number' ? scoreToRating(extractedScore) : null
+    // Prioritize API-provided healthRating over text extraction
+    const healthScore = summary.healthRating ?? extractHealthRating(summary.content).score
+    const ratingInfo = typeof healthScore === 'number' ? scoreToRating(healthScore) : null
 
     DashboardStorage.upsertAnalysisSnapshot({
       analysisId: `summary-${filingId}`,
@@ -584,7 +621,7 @@ export default function CompanyPage() {
       sector: company.sector,
       industry: company.industry,
       country: company.country,
-      healthScore: extractedScore ?? null,
+      healthScore: healthScore ?? null,
       scoreBand: ratingInfo?.grade ?? null,
       ratingLabel:
         ratingInfo?.label ?? (summary.metadata?.mode === 'custom' ? 'Custom brief' : 'Quick brief'),
@@ -1018,6 +1055,7 @@ export default function CompanyPage() {
                   <HealthScoreBadge
                     score={latestAnalysis.health_score}
                     band={scoreToRating(latestAnalysis.health_score).label}
+                    componentScores={latestAnalysis.health_components}
                   />
                 </div>
               )}
@@ -1087,11 +1125,12 @@ export default function CompanyPage() {
                       <span className="w-4 h-4 bg-red-500"></span>
                       Health Analysis
                     </h2>
-                    <div className="flex flex-col md:flex-row gap-8 items-center">
+                    <div className="flex flex-col md:flex-row gap-8 items-start">
                       <div className="shrink-0">
                         <HealthScoreBadge
                           score={latestAnalysis.health_score}
                           band={scoreToRating(latestAnalysis.health_score).label}
+                          componentScores={latestAnalysis.health_components}
                         />
                       </div>
                       <div className="flex-1">
@@ -1152,14 +1191,12 @@ export default function CompanyPage() {
                                 <div className="flex items-center gap-3">
                                   <h4 className="font-black uppercase text-lg">AI Brief</h4>
                                   {summary.healthRating && (
-                                    <span className={cn(
-                                      "px-2 py-0.5 text-xs font-bold uppercase border border-black dark:border-white",
-                                      summary.healthRating >= 70 ? "bg-green-400 text-black" :
-                                        summary.healthRating >= 40 ? "bg-yellow-400 text-black" :
-                                          "bg-red-400 text-black"
-                                    )}>
-                                      Health: {summary.healthRating}/100
-                                    </span>
+                                    <HealthScoreBadge
+                                      score={summary.healthRating}
+                                      band={scoreToRating(summary.healthRating).label}
+                                      size="sm"
+                                      componentScores={summary.healthComponents}
+                                    />
                                   )}
                                 </div>
                                 <p className="text-xs font-mono text-gray-500 mt-1">
@@ -1230,15 +1267,20 @@ export default function CompanyPage() {
                               }`}>
                               {filing.status || 'Unknown'}
                             </span>
-                            {loadingSummaries[filing.id] && (
-                              <MultiStepLoader
-                                loadingStates={LOADING_STEPS}
-                                loading={loadingSummaries[filing.id]}
-                                duration={2000}
-                                loop={false}
-                                currentStep={Math.max(0, LOADING_STEPS.findIndex(s => s.text === (summaryProgress[filing.id] || "Initializing AI Agent...")))}
-                              />
-                            )}
+                            {loadingSummaries[filing.id] && (() => {
+                              const progress = parseProgressStatus(summaryProgress[filing.id] || "Initializing AI Agent...")
+                              return (
+                                <MultiStepLoader
+                                  loadingStates={LOADING_STEPS}
+                                  loading={loadingSummaries[filing.id]}
+                                  duration={2000}
+                                  loop={false}
+                                  currentStep={progress.step}
+                                  percentage={progress.percentage}
+                                  statusText={progress.displayText}
+                                />
+                              )
+                            })()}
                           </div>
                           <p className="font-mono text-xs text-gray-600 dark:text-gray-400">
                             {new Date(filing.filing_date).toLocaleDateString()}
