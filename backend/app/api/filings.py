@@ -3379,25 +3379,31 @@ async def generate_filing_summary(
                 ),
                 (
                     "Risk Factors",
-                    "EXACTLY 5 risks. Each risk MUST follow this format:\n"
-                    "**[Risk Name]**: [1-2 sentences explaining the risk with specific, quantified details]\n\n"
-                    "REQUIRED RISKS FOR SEMICONDUCTORS (include ALL that apply):\n"
-                    "1. **TSMC Manufacturing Dependency**: X% of chips manufactured by TSMC in Taiwan. Geopolitical risk, natural disaster, or capacity constraints could halt production.\n"
-                    "2. **China Export Restrictions**: US export controls limit sales to China, representing $X.XB (X%) of revenue. Further restrictions could expand.\n"
-                    "3. **Customer Concentration**: Top 3-5 customers represent X% of revenue. Name them if known (Microsoft, Amazon, Google, Tesla, Meta).\n"
-                    "4. **Cyclical Demand**: Semiconductor demand is cyclical. Current AI/datacenter demand could normalize or decline.\n"
-                    "5. **Competition**: AMD, Intel, and custom ASICs from hyperscalers threaten market share. Quantify if possible.\n\n"
-                    "FOR OTHER INDUSTRIES: Identify 5 company-specific risks with similar specificity.\n"
-                    "FORBIDDEN: Generic risks without quantification or company-specific context.",
+                    "EXACTLY 5 risks. Each risk MUST follow this format:\\n"
+                    "**[Risk Name]**: [1-2 sentences explaining the risk with specific, quantified details]\\n\\n"
+                    "CRITICAL: Identify risks that are SPECIFIC to THIS COMPANY and ITS ACTUAL INDUSTRY.\\n"
+                    "DO NOT copy risks from other industries or use generic templates.\\n\\n"
+                    "EXAMPLES OF GOOD COMPANY-SPECIFIC RISKS:\\n"
+                    "- For a rideshare company: Driver supply constraints, regulatory restrictions on gig worker classification, competition from alternatives\\n"
+                    "- For a retailer: Consumer spending sensitivity, inventory management, e-commerce competition\\n"
+                    "- For a bank: Interest rate sensitivity, credit quality deterioration, regulatory capital requirements\\n"
+                    "- For a tech company: Customer concentration, technology obsolescence, key personnel dependency\\n\\n"
+                    "YOUR RISKS MUST BE:\\n"
+                    "1. Relevant to the ACTUAL business model of THIS specific company\\n"
+                    "2. Quantified where possible (X% of revenue, $XB exposure, etc.)\\n"
+                    "3. Based on information found IN THE FILING, not assumed from other companies\\n\\n"
+                    "FORBIDDEN: Do NOT mention risks from other industries or companies. "
+                    "Do NOT copy semiconductor risks (TSMC, chips) for non-semiconductor companies. "
+                    "Do NOT mention NVIDIA, AMD, Intel unless this filing is actually about those companies.",
                 ),
                 (
                     "Competitive Landscape",
                     "MINIMUM 40 words. Analyze competitive positioning:\n"
                     "- Key competitors and market share dynamics\n"
                     "- Competitive advantages/moats (or lack thereof)\n"
-                    "- Emerging threats (e.g., for NVIDIA: AMD, custom ASICs from hyperscalers, Intel)\n"
+                    "- Emerging threats specific to THIS company's industry\n"
                     "- Barriers to entry\n"
-                    "Be specific to the industry and company.",
+                    "Be specific to the ACTUAL industry and company being analyzed. Do NOT use examples from other industries.",
                 ),
                 (
                     "Strategic Initiatives & Capital Allocation",
@@ -3467,9 +3473,36 @@ EXAMPLE INCORRECT PHRASING (DO NOT USE):
 === END NO PERSONA MODE ===
 """
 
+        # Build the opening identity based on whether a persona is selected
+        if selected_persona_name:
+            identity_block = f"""You are a senior analyst at a top-tier hedge fund writing a high-conviction briefing for portfolio managers.
+You are adopting the persona of {selected_persona_name}. Write as if you ARE {selected_persona_name}.
+Your goal is to provide actionable, differentiated insight, not just a summary of facts."""
+        else:
+            identity_block = """=== CRITICAL: NO PERSONA MODE ===
+YOU ARE A NEUTRAL, OBJECTIVE FINANCIAL ANALYST. 
+
+ABSOLUTE PROHIBITION - READ THIS FIRST:
+- You have NOT been assigned any investor persona
+- Do NOT adopt ANY famous investor's voice or perspective
+- Do NOT use first-person language ('I', 'my view', 'I would', 'I believe')
+- Do NOT imitate: Warren Buffett, Charlie Munger, Peter Lynch, Benjamin Graham, Howard Marks, Bill Ackman, Ray Dalio, Cathie Wood, John Bogle, Joel Greenblatt, or ANY other investor
+- Do NOT use phrases like 'As a value investor...', 'As an investor, I...'
+
+REQUIRED WRITING STYLE:
+- Write in THIRD PERSON only ('The analysis indicates...', 'The data suggests...', 'The company demonstrates...')
+- Use professional equity research tone (like Goldman Sachs or Morgan Stanley analyst reports)
+- Focus on quantitative metrics and evidence-based conclusions
+- Provide objective, data-driven analysis
+
+THIS IS YOUR PRIMARY DIRECTIVE. VIOLATION = INVALID OUTPUT.
+=== END CRITICAL INSTRUCTION ===
+
+You are a professional equity research analyst writing a financial briefing.
+Your goal is to provide actionable, differentiated insight, not just a summary of facts."""
+
         base_prompt = f"""
-You are a senior analyst at a top-tier hedge fund writing a high-conviction briefing for portfolio managers.
-Your goal is to provide actionable, differentiated insight, not just a summary of facts.
+{identity_block}
 Analyze the following filing for {company_name} ({filing_type}, {filing_date}).
 
 CONTEXT:
@@ -3540,7 +3573,7 @@ Failure to follow user customizations = INVALID OUTPUT. Re-read the preference b
 === END USER CUSTOMIZATION PRIORITY ===
 {no_persona_block}
 CRITICAL RULES:
-- MAINTAIN CONSISTENT TONE throughout. If using a persona (e.g., Graham, Lynch), stay in that voice for ALL sections.
+- MAINTAIN CONSISTENT TONE throughout the entire document. Do NOT switch tones mid-document.
 - Do NOT use markdown bolding (**) within the text body. Only use it for section headers if needed.
 - Ensure every claim is backed by the provided text or metrics.
 - If data is missing, omit that data point rather than saying "not disclosed" or "not available".
