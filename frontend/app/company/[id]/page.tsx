@@ -92,11 +92,16 @@ type HealthComponentScores = {
   growth?: number
 }
 
+type HealthComponentDescriptions = Partial<Record<keyof HealthComponentScores, string>>
+
 type FilingSummary = {
   content: string
   metadata: SummaryPreferenceSnapshot
   healthRating?: number
   healthComponents?: HealthComponentScores
+  healthComponentWeights?: Partial<Record<keyof HealthComponentScores, number>>  // Dynamic weights from user settings
+  healthComponentDescriptions?: HealthComponentDescriptions  // Dynamic descriptions based on weighting
+  healthComponentMetrics?: Partial<Record<keyof HealthComponentScores, string>>  // Actual metric values for display
 }
 
 type FilingSummaryMap = Record<string, FilingSummary>
@@ -404,16 +409,16 @@ export default function CompanyPage() {
   const parseProgressStatus = (status: string): { step: number; percentage: number | null; displayText: string } => {
     const percentMatch = status.match(/(\d+)%/)
     const percentage = percentMatch ? parseInt(percentMatch[1], 10) : null
-    
+
     if (status.includes("Generating Summary")) {
       return { step: 6, percentage, displayText: status }
     }
-    
+
     const stepIndex = LOADING_STEPS.findIndex(s => status.startsWith(s.text.replace("...", "")))
-    return { 
-      step: stepIndex >= 0 ? stepIndex : 0, 
-      percentage, 
-      displayText: status 
+    return {
+      step: stepIndex >= 0 ? stepIndex : 0,
+      percentage,
+      displayText: status
     }
   }
 
@@ -552,7 +557,7 @@ export default function CompanyPage() {
       // Extract health rating if present
       let healthRating: number | undefined;
       let healthComponents: HealthComponentScores | undefined;
-      
+
       if (response.data.health_score !== undefined) {
         healthRating = response.data.health_score;
       } else {
@@ -561,10 +566,15 @@ export default function CompanyPage() {
           healthRating = extracted.score;
         }
       }
-      
+
       if (response.data.health_components) {
         healthComponents = response.data.health_components;
       }
+
+      // Capture dynamic weights, descriptions, and metrics from user settings
+      const healthComponentWeights = response.data.health_component_weights;
+      const healthComponentDescriptions = response.data.health_component_descriptions;
+      const healthComponentMetrics = response.data.health_component_metrics;
 
       if (isMountedRef.current) {
         setFilingSummaries(prev => ({
@@ -574,6 +584,9 @@ export default function CompanyPage() {
             metadata: metadata ?? { mode: 'default' },
             healthRating,
             healthComponents,
+            healthComponentWeights,
+            healthComponentDescriptions,
+            healthComponentMetrics,
           },
         }))
       }
@@ -886,6 +899,31 @@ export default function CompanyPage() {
     return latestAnalysis
   }, [currentAnalysis, analysisFromSnapshot, latestAnalysis])
 
+  // Get the most recent health display data - prefer from filing summaries (has user preferences) over base analysis
+  const currentHealthDisplay = useMemo(() => {
+    // Find the most recently generated filing summary with health data
+    const summaryEntries = Object.entries(filingSummaries)
+    for (const [, summary] of summaryEntries) {
+      if (summary.healthComponents || summary.healthRating != null) {
+        return {
+          score: summary.healthRating ?? latestAnalysis?.health_score,
+          components: summary.healthComponents ?? latestAnalysis?.health_components,
+          weights: summary.healthComponentWeights,
+          descriptions: summary.healthComponentDescriptions,
+          metrics: summary.healthComponentMetrics,
+        }
+      }
+    }
+    // Fall back to latestAnalysis data
+    return {
+      score: latestAnalysis?.health_score,
+      components: latestAnalysis?.health_components,
+      weights: undefined,
+      descriptions: undefined,
+      metrics: undefined,
+    }
+  }, [filingSummaries, latestAnalysis])
+
   const summaryMarkdownComponents = useMemo(
     () => ({
       h1: ({ node, ...props }: any) => <p className="font-mono font-semibold text-base mt-4 mb-2" {...props} />,
@@ -1050,12 +1088,15 @@ export default function CompanyPage() {
                 </div>
               </div>
 
-              {latestAnalysis?.health_score != null && (
+              {currentHealthDisplay.score != null && (
                 <div className="self-end md:self-center">
                   <HealthScoreBadge
-                    score={latestAnalysis.health_score}
-                    band={scoreToRating(latestAnalysis.health_score).label}
-                    componentScores={latestAnalysis.health_components}
+                    score={currentHealthDisplay.score}
+                    band={scoreToRating(currentHealthDisplay.score).label}
+                    componentScores={currentHealthDisplay.components}
+                    componentWeights={currentHealthDisplay.weights}
+                    componentDescriptions={currentHealthDisplay.descriptions}
+                    componentMetrics={currentHealthDisplay.metrics}
                   />
                 </div>
               )}
@@ -1118,33 +1159,6 @@ export default function CompanyPage() {
                   </div>
                 </div>
 
-                {/* Health Analysis Section */}
-                {latestAnalysis?.health_score != null && (
-                  <div className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)]">
-                    <h2 className="text-xl font-black uppercase mb-6 flex items-center gap-3">
-                      <span className="w-4 h-4 bg-red-500"></span>
-                      Health Analysis
-                    </h2>
-                    <div className="flex flex-col md:flex-row gap-8 items-start">
-                      <div className="shrink-0">
-                        <HealthScoreBadge
-                          score={latestAnalysis.health_score}
-                          band={scoreToRating(latestAnalysis.health_score).label}
-                          componentScores={latestAnalysis.health_components}
-                        />
-                      </div>
-                      <div className="flex-1">
-                        <h3 className="font-bold uppercase text-lg mb-2">
-                          {scoreToRating(latestAnalysis.health_score).label} Health
-                        </h3>
-                        <p className="font-mono text-sm text-gray-600 dark:text-gray-300">
-                          {latestAnalysis.summary || "No health summary available yet. Run a full analysis to generate detailed health insights."}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
                 {/* AI Summary Section */}
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
                   {/* Summary Generation Card */}
@@ -1196,6 +1210,9 @@ export default function CompanyPage() {
                                       band={scoreToRating(summary.healthRating).label}
                                       size="sm"
                                       componentScores={summary.healthComponents}
+                                      componentWeights={summary.healthComponentWeights}
+                                      componentDescriptions={summary.healthComponentDescriptions}
+                                      componentMetrics={summary.healthComponentMetrics}
                                     />
                                   )}
                                 </div>

@@ -177,13 +177,6 @@ class GeminiClient:
             if value is not None
         ])
         
-        priorities = persona_priorities or persona_checklist or []
-        priorities_str = "\n".join([f"- {item}" for item in priorities]) if priorities else "N/A"
-        priorities_inline = ", ".join(priorities) if priorities else "N/A"
-        ignore_clause = ignore_list or "Generic market noise or anything outside this persona's circle of competence."
-        required_vocab_str = ", ".join(required_vocabulary) if required_vocabulary else "None provided"
-        verdict_clause = verdict_style or "Buy / Hold / Sell based on the persona's own rule."
-        
         complexity_instruction = ""
         if complexity == "simple":
             complexity_instruction = "Use plain English and avoid jargon. Explain financial concepts simply."
@@ -194,14 +187,33 @@ class GeminiClient:
 
         length_instruction = ""
         if target_length:
-            min_words = target_length
-            max_words = target_length + 50
+            min_words = target_length - 10
+            max_words = target_length + 10
             length_instruction = f"""
-CRITICAL LENGTH CONSTRAINT:
-The total output MUST be at least {min_words} words.
-Target range: {min_words} - {max_words} words.
-If you write fewer than {min_words} words, you have FAILED.
-Expand on the analysis, add more context, and go deeper into the "Why" and "So What" to meet the length requirement.
+CRITICAL LENGTH CONSTRAINT (STRICT ±10 WORDS - ABSOLUTE REQUIREMENT):
+Target: EXACTLY {target_length} words (acceptable range: {min_words}-{max_words} words).
+
+WORD COUNTING PROTOCOL (MANDATORY):
+1. BEFORE writing: Plan section word allocations to total {target_length} words.
+2. WHILE writing: Track cumulative word count after each major section.
+3. AFTER writing: COUNT EVERY WORD. If outside {min_words}-{max_words}, REWRITE immediately.
+4. FINAL CHECK: Your output MUST be between {min_words} and {max_words} words. No exceptions.
+
+SECTION WORD ALLOCATION GUIDE (adjust proportionally for target):
+- TL;DR: ~10 words (strict max)
+- Investment Thesis: ~{int(target_length * 0.15)} words
+- Top 5 Risks: ~{int(target_length * 0.18)} words
+- Strategic Initiatives: ~{int(target_length * 0.14)} words
+- Competitive Landscape: ~{int(target_length * 0.12)} words
+- Cash Flow Analysis: ~{int(target_length * 0.10)} words
+- Catalysts: ~{int(target_length * 0.08)} words
+- KPIs to Monitor: ~{int(target_length * 0.07)} words
+- Investment Recommendation: ~{int(target_length * 0.06)} words
+
+LENGTH ADJUSTMENT RULES:
+- If running SHORT: Add specific data points, quantified impacts, and analytical depth.
+- If running LONG: Remove adjectives, merge sentences, eliminate redundancy.
+- NEVER cut off mid-sentence to hit word count. Complete thoughts, then adjust.
 """
 
         prompt = f"""You are an expert equity analyst. Analyze the following company data and produce a comprehensive investment memo.
@@ -236,7 +248,20 @@ Financial Ratios:
             risk_snippet = risk_factors_text[:2000] if len(risk_factors_text) > 2000 else risk_factors_text
             prompt += f"\nRisk Factors (excerpt):\n{risk_snippet}\n"
         
-        prompt += """
+        # Define min/max words for the length reminder (use target_length if provided, otherwise skip)
+        if target_length:
+            min_words = target_length - 10
+            max_words = target_length + 10
+            length_reminder = f"""
+FINAL LENGTH VERIFICATION (MANDATORY):
+1. Count your total words before submitting.
+2. Your output MUST be between {min_words} and {max_words} words.
+3. Append this line at the very end: WORD COUNT: [your actual count]
+4. If your count is outside {min_words}-{max_words}, REWRITE until it fits."""
+        else:
+            length_reminder = ""
+        
+        prompt += f"""
 Please provide the following analysis in a structured format:
 
 ## TL;DR (STRICT: 10 words max)
@@ -304,8 +329,7 @@ ABSOLUTE SENTENCE COMPLETION REQUIREMENTS (CRITICAL - DO NOT VIOLATE):
 - If you mention a ratio or metric, ALWAYS explain what it means, don't just state the number
 - VERIFY: Before finishing, re-read your output and ensure EVERY sentence ends with a period, exclamation, or question mark AFTER a complete thought
 - The final sentence of EVERY section must be a complete, standalone thought
-
-REMINDER: Your total word count MUST be between {min_words} and {max_words} words.
+{length_reminder}
 """
         
         return prompt
@@ -471,6 +495,14 @@ FINANCIAL HEALTH CHECK:
             constraints.append("CONSTRAINT: You MUST NOT suggest buybacks or dividends as a capital allocation strategy.")
 
         constraints_str = "\n".join(constraints)
+        
+        # Define helper variables for prompt construction
+        ignore_clause = ignore_list if ignore_list else "N/A"
+        priorities_str = "\n".join([f"{i+1}. {p}" for i, p in enumerate(persona_priorities)]) if persona_priorities else "N/A"
+        priorities_inline = ", ".join(persona_priorities) if persona_priorities else "N/A"
+        verdict_clause = verdict_style if verdict_style else "Provide a clear buy/hold/sell recommendation"
+        required_vocab_str = ", ".join(required_vocabulary) if required_vocabulary else "N/A"
+        
         worldview_switch = f"""
 WORLDVIEW SWITCH (MANDATORY):
 - Abandon generic equity research headings (Executive Summary, Financial Health Rating, Management Discussion & Analysis, Risk Factors, Key Data Appendix). Use ONLY the persona-specific structure below.
@@ -531,6 +563,13 @@ Analysis Structure (FOLLOW EXACTLY):
 [STEP 3: Formulate Verdict. Is this a buy? Why?]
 
 {structure_template}
+
+CLOSING TAKEAWAY REQUIREMENT (MANDATORY - NEVER SKIP):
+If your analysis includes a "Closing Takeaway" or "Conclusion" section, you MUST end that section with {persona_name}'s personal opinion. The FINAL sentence of the Closing Takeaway MUST be a first-person personal recommendation. Use one of these exact formats:
+- "I personally would buy/hold/sell [Company] because..."
+- "For my own portfolio, I would buy/hold/sell here."
+- "My personal recommendation: buy/hold/sell."
+This closing statement should feel like genuine advice from {persona_name} to a friend. The Closing Takeaway is INCOMPLETE without this personal stance.
 
 Task: Think first, then write the analysis. Be extremely concise. No filler.
 """
@@ -670,7 +709,12 @@ UNIFIED DOCUMENT RULES:
   2. Conviction level: High, Medium, or Low
   3. A 2-3 sentence rationale synthesizing your key findings
   4. What conditions would change your recommendation
-  Example format: "**My Verdict: HOLD (Medium Conviction)** - While [Company] demonstrates [strength], the [concern] gives me pause. I would become a buyer if [condition], but would exit if [risk materializes]."
+  5. **PERSONAL CLOSING (MANDATORY - NEVER SKIP)**: The FINAL sentence MUST be a first-person personal recommendation using one of these exact formats:
+     - "I personally would buy/hold/sell [Company] because..."
+     - "For my own portfolio, I would buy/hold/sell here."
+     - "My personal recommendation: buy/hold/sell."
+  This closing statement is genuine advice from {persona_name} to a friend. The analysis is INCOMPLETE without this.
+  Example format: "**My Verdict: HOLD (Medium Conviction)** - While [Company] demonstrates [strength], the [concern] gives me pause. I would become a buyer if [condition], but would exit if [risk materializes]. I personally would hold here and wait for a better entry point."
 
 ABSOLUTE SENTENCE COMPLETION REQUIREMENTS (CRITICAL - DO NOT VIOLATE):
 - EVERY sentence MUST be complete. Never end a sentence mid-thought.
@@ -689,6 +733,13 @@ FINANCIAL PERIOD CONSISTENCY:
 - Always specify the period when citing any financial metric.
 
 {structure_template}
+
+CLOSING TAKEAWAY REQUIREMENT (MANDATORY - NEVER SKIP):
+If your analysis includes a "Closing Takeaway" or "Conclusion" section, you MUST end that section with {persona_name}'s personal opinion. The FINAL sentence of the Closing Takeaway MUST be a first-person personal recommendation. Use one of these exact formats:
+- "I personally would buy/hold/sell [Company] because..."
+- "For my own portfolio, I would buy/hold/sell here."
+- "My personal recommendation: buy/hold/sell."
+This closing statement should feel like genuine advice from {persona_name} to a friend. The Closing Takeaway is INCOMPLETE without this personal stance.
 
 At the end, include ONLY these two lines (no headers, just the content):
 STANCE: [Buy/Hold/Sell]
@@ -1067,3 +1118,123 @@ CONTINUE (do not repeat, just finish the thought):"""
 def get_gemini_client() -> GeminiClient:
     """Get Gemini client instance."""
     return GeminiClient()
+
+
+def generate_growth_assessment(
+    filing_text: str,
+    company_name: str,
+    weighting_preference: Optional[str] = None,
+    ratios: Optional[Dict[str, float]] = None
+) -> Dict[str, Any]:
+    """
+    Generate AI-driven growth assessment based on management perspective and sector context.
+
+    Args:
+        filing_text: The filing text (MD&A, business description, etc.)
+        company_name: Name of the company
+        weighting_preference: User's primary_factor_weighting preference
+        ratios: Optional financial ratios for context
+
+    Returns:
+        Dictionary with score (0-100) and description
+    """
+    client = get_gemini_client()
+
+    # Determine the growth lens based on user preference
+    growth_lens = {
+        "profitability_margins": "Focus on whether growth is PROFITABLE growth. High-quality growth that expands or maintains margins is valued; revenue growth that compresses margins is concerning.",
+        "cash_flow_conversion": "Focus on whether growth is CASH-GENERATING growth. Growth that improves free cash flow is valued; growth that burns cash is concerning.",
+        "balance_sheet_strength": "Focus on whether growth is SUSTAINABLE without excessive leverage. Growth funded by debt is riskier than organic growth.",
+        "liquidity_near_term_risk": "Focus on whether growth PRESERVES LIQUIDITY. Rapid expansion that strains cash reserves is concerning.",
+        "execution_competitiveness": "Focus on COMPETITIVE POSITIONING. Growth that captures market share and strengthens competitive moat is highly valued."
+    }.get(weighting_preference, "Evaluate overall growth potential considering management strategy and sector dynamics.")
+
+    # Build comprehensive context from ratios if available
+    ratios_context = ""
+    if ratios:
+        if ratios.get("revenue_growth_yoy") is not None:
+            ratios_context += f"\n- Revenue Growth YoY: {ratios['revenue_growth_yoy'] * 100:.1f}%"
+        if ratios.get("gross_margin") is not None:
+            ratios_context += f"\n- Gross Margin: {ratios['gross_margin'] * 100:.1f}%"
+        if ratios.get("operating_margin") is not None:
+            ratios_context += f"\n- Operating Margin: {ratios['operating_margin'] * 100:.1f}%"
+        if ratios.get("net_margin") is not None:
+            ratios_context += f"\n- Net Margin: {ratios['net_margin'] * 100:.1f}%"
+        if ratios.get("fcf_margin") is not None:
+            ratios_context += f"\n- FCF Margin: {ratios['fcf_margin'] * 100:.1f}%"
+
+    # Increase filing text context for better MD&A analysis
+    filing_snippet = filing_text[:12000] if len(filing_text) > 12000 else filing_text
+
+    # Define the metrics context with fallback (avoid backslash in f-string expression)
+    metrics_display = ratios_context if ratios_context else "\n- No historical metrics available"
+
+    prompt = f"""You are a financial analyst evaluating the GROWTH potential of {company_name}.
+
+EVALUATION LENS:
+{growth_lens}
+
+FINANCIAL METRICS:{metrics_display}
+
+FILING TEXT (MD&A and Business Description):
+{filing_snippet}
+
+EVALUATION FRAMEWORK:
+1. SECTOR ANALYSIS: Identify the company's sector/industry. Is it high-growth (tech, biotech), cyclical, or mature/declining? What are sector tailwinds/headwinds?
+
+2. HISTORICAL PERFORMANCE: Based on the financial metrics and MD&A, assess recent revenue growth, margin trends, and execution quality.
+
+3. MANAGEMENT STRATEGY: What growth initiatives has management outlined? New products, geographic expansion, M&A, R&D investments?
+
+4. FUTURE OUTLOOK: What is the company's forward guidance? Are there clear catalysts or risks to growth?
+
+OUTPUT FORMAT (return EXACTLY this, no other text):
+SCORE: [number 0-100]
+DESCRIPTION: [10-15 word summary of growth outlook - be specific to this company, not generic]
+
+SCORING GUIDE:
+- 90-100: High-growth company in expanding sector with proven execution
+- 75-89: Strong growth trajectory with favorable sector tailwinds
+- 60-74: Moderate growth, mature sector or mixed execution
+- 45-59: Below-average growth potential, competitive pressures
+- 30-44: Limited growth prospects, unfavorable sector dynamics
+- Below 30: Declining or structurally challenged
+
+Be decisive. Ground your assessment in the filing text and metrics, not speculation."""
+
+    try:
+        response = client.model.generate_content(prompt)
+        result_text = response.text.strip()
+
+        # Parse the response
+        score = 50  # Default neutral
+        description = "Growth outlook based on sector positioning"
+
+        for line in result_text.split('\n'):
+            line = line.strip()
+            if line.upper().startswith('SCORE:'):
+                try:
+                    score_str = line.split(':', 1)[1].strip()
+                    # Extract just the number
+                    score_num = ''.join(c for c in score_str if c.isdigit())
+                    if score_num:
+                        score = min(100, max(0, int(score_num)))
+                except (ValueError, IndexError):
+                    pass
+            elif line.upper().startswith('DESCRIPTION:'):
+                description = line.split(':', 1)[1].strip()
+                # Truncate if too long
+                if len(description) > 100:
+                    description = description[:97] + "..."
+
+        return {
+            "score": score,
+            "description": description
+        }
+
+    except Exception as e:
+        print(f"Error generating growth assessment: {e}")
+        return {
+            "score": 50,
+            "description": "Growth assessment unavailable"
+        }

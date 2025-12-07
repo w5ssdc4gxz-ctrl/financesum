@@ -196,7 +196,7 @@ export function useDashboardData() {
         if (cancelled) return
         const payload = response.data ?? {}
         const normalizedHistory = Array.isArray(payload.history)
-          ? payload.history.map(normalizeHistoryEntry).filter((item): item is StoredAnalysisSnapshot => Boolean(item))
+          ? payload.history.map(normalizeHistoryEntry).filter((item: StoredAnalysisSnapshot | null): item is StoredAnalysisSnapshot => Boolean(item))
           : []
         if (normalizedHistory.length) {
           setHistory((prev) => {
@@ -210,7 +210,7 @@ export function useDashboardData() {
         }
 
         const normalizedCompanies = Array.isArray(payload.companies)
-          ? payload.companies.map(normalizeCompanyEntry).filter((item): item is StoredCompany => Boolean(item))
+          ? payload.companies.map(normalizeCompanyEntry).filter((item: StoredCompany | null): item is StoredCompany => Boolean(item))
           : []
         if (normalizedCompanies.length) {
           setCompanies((prev) => {

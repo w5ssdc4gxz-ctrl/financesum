@@ -181,18 +181,19 @@ export const MultiStepLoader = ({
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
                     exit={{ opacity: 0 }}
-                    className="w-full h-full fixed inset-0 z-[100] flex items-center justify-center bg-white/90 dark:bg-black/90 backdrop-blur-sm border-2 border-black dark:border-white"
+                    className="w-full h-full fixed inset-0 z-[100] flex items-center justify-center backdrop-blur-md"
                 >
-                    <div className="h-96 relative">
-                        <LoaderCore 
-                            value={currentState} 
-                            loadingStates={loadingStates} 
+                    {/* Full opaque background to completely hide content behind */}
+                    <div className="absolute inset-0 bg-white dark:bg-black opacity-95" />
+
+                    <div className="h-96 relative z-10">
+                        <LoaderCore
+                            value={currentState}
+                            loadingStates={loadingStates}
                             percentage={percentage}
                             statusText={statusText}
                         />
                     </div>
-
-                    <div className="bg-gradient-to-t inset-x-0 z-20 bottom-0 bg-white dark:bg-black h-full absolute [mask-image:radial-gradient(900px_at_center,transparent_30%,white)]" />
                 </motion.div>
             )}
         </AnimatePresence>

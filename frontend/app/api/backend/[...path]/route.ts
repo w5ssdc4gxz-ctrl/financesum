@@ -39,8 +39,10 @@ type Params = {
   path?: string[]
 }
 
-async function proxy(request: NextRequest, { params }: { params: Params }) {
-  const pathSegments = params?.path ?? []
+async function proxy(request: NextRequest, context: { params: Promise<Params> }) {
+  // Next.js 14+: params is now a Promise that must be awaited
+  const resolvedParams = await context.params
+  const pathSegments = resolvedParams?.path ?? []
   const targetPath = pathSegments.join('/')
   const search = request.nextUrl.search
   const targetUrl = `${backendBase}/${targetPath}${search}`

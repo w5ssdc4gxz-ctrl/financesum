@@ -43,7 +43,7 @@ from app.services.local_cache import (
     save_fallback_companies,
     progress_cache,
 )
-from app.services.gemini_client import get_gemini_client
+from app.services.gemini_client import get_gemini_client, generate_growth_assessment
 from app.services.health_scorer import calculate_health_score
 from app.services.sample_data import sample_filings_by_ticker
 from app.utils.supabase_errors import is_supabase_table_missing_error
@@ -178,7 +178,7 @@ def _build_closing_takeaway_description(persona_name: Optional[str], company_nam
     base_requirements = (
         "MANDATORY SECTION - DO NOT OMIT UNDER ANY CIRCUMSTANCES.\n"
         "5-7 COMPLETE sentences (minimum 75 words). This is your FINAL INVESTMENT VERDICT.\n\n"
-        "=== REQUIRED ELEMENTS (ALL 4 MUST BE PRESENT - CHECK EACH ONE) ===\n"
+        "=== REQUIRED ELEMENTS (ALL 5 MUST BE PRESENT - CHECK EACH ONE) ===\n"
         "\n"
         "1. QUALITY ASSESSMENT (REQUIRED): Is this a high-quality, average, or poor business?\n"
         "   You MUST state this explicitly with reasoning.\n"
@@ -195,7 +195,15 @@ def _build_closing_takeaway_description(persona_name: Optional[str], company_nam
         "4. ACTIONABLE TRIGGER (REQUIRED): What would change your mind?\n"
         "   Example: 'I would reconsider if margins fell below 30%' or 'At a 20% pullback, I would buy'\n"
         "\n"
-        "VERIFICATION: Before submitting, count: Did you include all 4 elements? If not, REVISE.\n\n"
+        "5. PERSONAL INVESTMENT OPINION (MANDATORY - THE FINAL SENTENCE):\n"
+        "   Your LAST sentence MUST be a first-person investment recommendation.\n"
+        "   You MUST use one of these EXACT formats:\n"
+        "   - 'I personally would BUY/HOLD/SELL [Company] because [reason].'\n"
+        "   - 'For my own portfolio, I would BUY/HOLD/SELL here.'\n"
+        "   - 'My personal recommendation: BUY/HOLD/SELL.'\n"
+        "   This is NON-NEGOTIABLE. The Closing Takeaway is INCOMPLETE without this final sentence.\n"
+        "\n"
+        "VERIFICATION: Before submitting, check: Does your FINAL sentence contain 'I personally would' or 'my personal recommendation'? If not, ADD IT.\n\n"
     )
     
     completion_requirements = (
@@ -251,6 +259,7 @@ def _build_closing_takeaway_description(persona_name: Optional[str], company_nam
 
 
 # Persona-specific closing templates for dynamic generation
+# CRITICAL: All personas MUST end with "I personally would buy/hold/sell" statement
 PERSONA_CLOSING_INSTRUCTIONS = {
     "Warren Buffett": (
         "As Warren Buffett, your closing MUST:\n"
@@ -258,18 +267,19 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Reference whether you'd 'hold for decades'\n"
         "- Assess the moat (wide/narrow/non-existent)\n"
         "- Use folksy language and analogies\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell [Company] because...' or 'For my own portfolio, I would buy/hold/sell here.'\n"
         "EXAMPLE: 'This is a wonderful business with a wide moat built on [specific advantage]. "
         "The economics are durable, and I would be comfortable holding for decades. "
-        "At current prices, Mr. Market is offering a fair deal for patient capital.'"
+        "At current prices, Mr. Market is offering a fair deal for patient capital. I personally would buy and hold for the long term.'"
     ),
     "Charlie Munger": (
         "As Charlie Munger, your closing MUST:\n"
         "- Use inversion: 'What would make this a terrible investment?'\n"
         "- Discuss incentives alignment\n"
         "- Be blunt and pithy\n"
-        "- End with 'I have nothing to add' or similar\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...' or similar personal stance.\n"
         "EXAMPLE: 'Inverting the question: what would make this a disaster? [Answer]. "
-        "The incentives are properly aligned. The economics make sense. I have nothing to add.'"
+        "The incentives are properly aligned. The economics make sense. I personally would buy at these levels.'"
     ),
     "Benjamin Graham": (
         "As Benjamin Graham, your closing MUST:\n"
@@ -277,9 +287,10 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Discuss intrinsic value vs market price\n"
         "- Use 'intelligent investor' language\n"
         "- Be quantitative and methodical\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...' or 'For the intelligent investor, I would...' with clear action.\n"
         "EXAMPLE: 'The margin of safety at current prices is [adequate/insufficient]. "
         "For the intelligent investor, this represents [investment/speculation]. "
-        "The balance sheet strength [supports/undermines] the thesis.'"
+        "The balance sheet strength [supports/undermines] the thesis. I personally would hold until a larger margin of safety appears.'"
     ),
     "Peter Lynch": (
         "As Peter Lynch, your closing MUST:\n"
@@ -287,8 +298,9 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Reference PEG ratio if applicable\n"
         "- Classify as stalwart/fast grower/turnaround/cyclical\n"
         "- Be enthusiastic if bullish\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...' with enthusiasm if bullish.\n"
         "EXAMPLE: 'Here's the story: [simple explanation]. The PEG of [X] says this is [cheap/fair/expensive]. "
-        "This is a [category] that I would [verdict]. You don't need an MBA to understand this one.'"
+        "This is a [category] that I would [verdict]. You don't need an MBA to understand this one. I personally would buy this stalwart and hold on.'"
     ),
     "Ray Dalio": (
         "As Ray Dalio, your closing MUST:\n"
@@ -296,8 +308,9 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Discuss risk parity considerations\n"
         "- Mention correlation to macro factors\n"
         "- Use systems thinking language\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...' with sizing rationale.\n"
         "EXAMPLE: 'At this point in the cycle, [assessment]. The risk parity consideration suggests [sizing]. "
-        "Understanding the machine, I would [verdict] with [position sizing rationale].'"
+        "Understanding the machine, I personally would hold with a moderate position size given the current cycle position.'"
     ),
     "Cathie Wood": (
         "As Cathie Wood, your closing MUST:\n"
@@ -305,16 +318,24 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Mention Wright's Law or S-curves if relevant\n"
         "- Give a 5-year or 2030 vision\n"
         "- Express high conviction in innovation\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...' with conviction.\n"
         "EXAMPLE: 'The disruptive innovation potential here is [assessment]. "
-        "Wright's Law suggests costs will [trajectory]. By 2030, [vision]. I am [conviction level].'"
+        "Wright's Law suggests costs will [trajectory]. By 2030, [vision]. I personally would buy with high conviction for the next 5 years.'"
     ),
     "Joel Greenblatt": (
         "As Joel Greenblatt, your closing MUST:\n"
         "- Reference return on capital and earnings yield\n"
-        "- Give a Magic Formula assessment\n"
-        "- Be quantitative and direct\n"
-        "EXAMPLE: 'Return on capital is [X%], earnings yield is [Y%]. "
-        "By the Magic Formula, this is [ranking]. At this price, [verdict].'"
+        "- Give a clear Magic Formula verdict: Is it GOOD (high ROC), CHEAP (high earnings yield), or BOTH? The Magic Formula works best when a stock is BOTH good AND cheap.\n"
+        "- Be quantitative and direct - cite specific numbers\n"
+        "- Assess if this is a 'clean situation' or if there are complications\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY - FINAL SENTENCE):\n"
+        "  Your VERY LAST sentence MUST be one of these exact formats:\n"
+        "  * 'I personally would buy [Company] at these levels.'\n"
+        "  * 'I personally would hold [Company] but not add here.'\n"
+        "  * 'I personally would sell/pass on [Company].'\n"
+        "  This is NON-NEGOTIABLE. Without this sentence, your analysis is INCOMPLETE.\n"
+        "EXAMPLE: 'Return on capital is 25%, earnings yield is 8%. By the Magic Formula, this is a good business at a fair price - but not clearly cheap. "
+        "The cash generation is strong, but leverage concerns limit the margin of safety. I personally would hold UBER and wait for a better entry point.'"
     ),
     "John Bogle": (
         "As John Bogle, your closing MUST:\n"
@@ -322,11 +343,11 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Compare individual stock to index fund approach\n"
         "- Use 'haystack vs needle' analogy\n"
         "- Be humble and prudent\n"
-        "- STATE A CLEAR VERDICT: Even as an index advocate, give your assessment (e.g., 'If I were to hold individual stocks, I would HOLD this one' or 'For those who insist on stock picking, this is a HOLD')\n"
+        "- STATE A CLEAR VERDICT: Even as an index advocate, give your assessment\n"
         "- Include what would change your view (e.g., 'valuation, competitive threats')\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...' or 'For those who insist on individual stocks, I personally would...'.\n"
         "EXAMPLE: 'This is a fine business with exceptional profitability. But why own one needle when you can own the haystack? "
-        "Costs matter, and 90% of active managers fail. For those who insist on individual stocks, I would HOLD rather than buy at current valuations. "
-        "If valuation became more attractive or if the market offered a 20% discount, I might reconsider. The prudent investor stays the course with the index fund.'"
+        "Costs matter, and 90% of active managers fail. If valuation became more attractive, I might reconsider. I personally would hold this one but still prefer the index fund.'"
     ),
     "Howard Marks": (
         "As Howard Marks, your closing MUST:\n"
@@ -336,8 +357,9 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Consider 'what's priced in'\n"
         "- STATE A CLEAR VERDICT: BUY, HOLD, SELL, or WAIT with your reasoning\n"
         "- Include what would change your view (cycle shift, valuation change)\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...'.\n"
         "EXAMPLE: 'Where are we in the cycle? The optimism is elevated but not extreme. Second-level thinking suggests the market is not fully pricing in competitive risks. "
-        "The risk-reward asymmetry favors a HOLD position—I would not add at these levels. If the pendulum swung further toward pessimism or valuations dropped 25%, I would become a buyer.'"
+        "The risk-reward asymmetry favors caution. I personally would hold at these levels and wait for a better entry point.'"
     ),
     "Bill Ackman": (
         "As Bill Ackman, your closing MUST:\n"
@@ -347,9 +369,9 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Express conviction level\n"
         "- STATE A CLEAR VERDICT: BUY, HOLD, or SELL with conviction level\n"
         "- Include what would change your view (catalyst, management action)\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...' with conviction.\n"
         "EXAMPLE: 'This is simple, predictable, and free-cash-flow generative—exactly what I look for. "
-        "The catalyst for value creation is the continued AI buildout driving datacenter growth. Management MUST maintain R&D leadership and not squander the cash on poor acquisitions. "
-        "I would BUY with high conviction at these levels. If competitive threats materialized or margins compressed below 40%, I would reassess.'"
+        "The catalyst for value creation is clear. Management MUST maintain discipline. I personally would buy with high conviction at these levels.'"
     ),
 }
 
@@ -627,6 +649,69 @@ def _get_contextual_completion(text: str) -> str:
     
     # Default completion
     return ', which warrants careful consideration.'
+
+
+def _fix_health_score_in_summary(
+    summary_text: str,
+    pre_calculated_score: Optional[float],
+    pre_calculated_band: Optional[str],
+) -> str:
+    """
+    Post-process the summary to fix any health score mismatch.
+    
+    The AI sometimes ignores the pre-calculated score instruction and generates
+    its own score. This function finds and replaces incorrect scores in the
+    Financial Health Rating section.
+    """
+    if not summary_text or pre_calculated_score is None or not pre_calculated_band:
+        return summary_text
+    
+    # Pattern to match the Financial Health Rating section header and first line
+    # Matches patterns like: "## Financial Health Rating" followed by score patterns
+    fhr_section_pattern = re.compile(
+        r'(##\s*Financial Health Rating\s*\n+'  # Section header
+        r'[^#]*?)'  # Any content before the score
+        r'(\d{1,3}(?:\.\d+)?/100\s*'  # The score (e.g., "1/100" or "62/100" or "51.1/100")
+        r'(?:\([A-Z]\)\s*)?'  # Optional letter grade in parens
+        r'-?\s*(?:Very Healthy|Healthy|Watch|At Risk)?)',  # Optional band
+        re.IGNORECASE | re.DOTALL
+    )
+    
+    # Also match arrow-prefixed scores like "→\n1/100 (F) - Watch"
+    arrow_score_pattern = re.compile(
+        r'(→\s*\n?\s*)'  # Arrow prefix
+        r'(\d{1,3}(?:\.\d+)?/100\s*'  # Score
+        r'(?:\([A-Z]\)\s*)?'  # Optional letter grade
+        r'-?\s*(?:Very Healthy|Healthy|Watch|At Risk)?)',
+        re.IGNORECASE
+    )
+    
+    # Format the correct score - using band first letter only, no full letter grade
+    band_abbrev = pre_calculated_band[0] if pre_calculated_band else 'W'
+    correct_score = f"{pre_calculated_score:.0f}/100 ({band_abbrev}) - {pre_calculated_band}"
+    
+    # Track if we made any fixes
+    original_text = summary_text
+    
+    # First, try to fix scores in the Financial Health Rating section
+    def replace_fhr_score(match):
+        prefix = match.group(1)
+        return prefix + correct_score
+    
+    summary_text = fhr_section_pattern.sub(replace_fhr_score, summary_text, count=1)
+    
+    # Also fix arrow-prefixed scores
+    def replace_arrow_score(match):
+        arrow = match.group(1)
+        return arrow + correct_score
+    
+    summary_text = arrow_score_pattern.sub(replace_arrow_score, summary_text, count=1)
+    
+    # Log if we made a fix
+    if summary_text != original_text:
+        logger.info(f"Fixed health score mismatch: replaced AI-generated score with {pre_calculated_score:.1f}/100 - {pre_calculated_band}")
+    
+    return summary_text
 
 
 def _validate_complete_sentences(text: str) -> str:
@@ -1054,21 +1139,33 @@ def _rewrite_summary_to_length(
         if latest_words > upper:
             direction_instruction = (
                 f"You are {abs_diff} words OVER the limit. \n"
-                "ACTION: CONDENSE the text immediately. \n"
-                f"1. CUT at least {int(abs_diff * 1.2)} words. Be aggressive.\n"
-                "2. Keep the 'Key Data Appendix' but make it purely tabular/bulleted.\n"
-                "3. Shorten the 'Risk Factors' and 'Strategic Initiatives' sections.\n"
+                "ACTION: CONDENSE the text PROPORTIONALLY across ALL sections. \n"
+                f"1. CUT approximately {int(abs_diff * 1.2)} words total.\n"
+                "2. PROPORTIONAL CUTS - reduce EACH section by a similar percentage:\n"
+                "   - Financial Health Rating: ~10% of cuts\n"
+                "   - Executive Summary: ~15% of cuts\n"
+                "   - Financial Performance: ~20% of cuts\n"
+                "   - Management Discussion & Analysis: ~18% of cuts\n"
+                "   - Risk Factors: ~10% of cuts\n"
+                "   - Strategic Initiatives: ~12% of cuts\n"
+                "   - Closing Takeaway: ~10% of cuts (KEEP AT LEAST 50 words)\n"
+                "3. DO NOT take all cuts from one section (especially Closing Takeaway).\n"
                 "4. Remove adjectives, adverbs, and filler words. Merge sentences.\n"
-                "5. DO NOT append any new summary at the end. Just rewrite the existing sections to be shorter."
+                "5. Keep 'Key Data Appendix' compact but complete.\n"
+                "6. DO NOT append any new summary. Just condense existing sections."
             )
         elif latest_words < lower:
+            words_needed = lower - latest_words
             direction_instruction = (
-                f"You are {abs_diff} words SHORT of the target. \n"
-                "ACTION: EXPAND the content immediately. \n"
-                "- Add 3-4 sentences of detailed analysis to 'Financial Performance'.\n"
-                "- Add 2-3 sentences to 'Management Discussion & Analysis'.\n"
-                "- Add 2-3 sentences to 'Strategic Initiatives'.\n"
-                "- Elaborate on the implications of the risks and opportunities."
+                f"You are {abs_diff} words SHORT of the MINIMUM requirement ({lower} words). \n"
+                f"ACTION: EXPAND the content NOW. You MUST add AT LEAST {int(words_needed * 1.2)} words.\n\n"
+                f"MANDATORY EXPANSION (add exactly these words per section):\n"
+                f"- Financial Performance: Add {max(2, int(words_needed * 0.30))} words (deeper margin analysis)\n"
+                f"- Management Discussion & Analysis: Add {max(2, int(words_needed * 0.25))} words (strategic insights)\n"
+                f"- Risk Factors: Add {max(2, int(words_needed * 0.20))} words (specific scenarios)\n"
+                f"- Strategic Initiatives: Add {max(2, int(words_needed * 0.15))} words (ROI expectations)\n"
+                f"- Competitive Landscape: Add {max(1, int(words_needed * 0.10))} words (moat analysis)\n\n"
+                f"You MUST reach at least {lower} words. Count before finishing."
             )
         else:
             direction_instruction = "Ensure you stay within the target range."
@@ -1348,17 +1445,18 @@ def _generate_summary_with_quality_control(
                 "DO NOT add a summary at the end."
             )
         else:
-            # Much more aggressive expansion
-            sentences_to_add = max(2, int(abs_diff / 12))
+            # Much more aggressive expansion with specific word targets
+            min_words = target_length - tolerance
             action = (
-                f"EXPAND the content immediately. You are {abs_diff} words SHORT of the MINIMUM requirement. "
-                f"Add AT LEAST {sentences_to_add} sentences of substantive analysis. This is CRITICAL.\n"
-                "SPECIFIC ACTIONS:\n"
-                "1. Add 2-3 sentences to 'Financial Performance' with deeper margin analysis and trend interpretation.\n"
-                "2. Add 2-3 sentences to 'Management Discussion & Analysis' with forward-looking strategic commentary.\n"
-                "3. Add 2-3 sentences to 'Risk Factors' with specific scenario analysis (e.g., 'If X happens, then Y').\n"
-                "4. Add 1-2 sentences to 'Strategic Initiatives' explaining WHY these initiatives matter.\n"
-                f"You MUST reach at least {target_length - tolerance} words. Do NOT stop until you hit this minimum."
+                f"EXPAND the content immediately. You are {abs_diff} words SHORT of the MINIMUM ({min_words} words).\n"
+                f"You MUST add AT LEAST {int(abs_diff * 1.2)} words total.\n\n"
+                f"MANDATORY WORD ADDITIONS:\n"
+                f"- Financial Performance: +{max(3, int(abs_diff * 0.30))} words (margin analysis, trend interpretation)\n"
+                f"- Management Discussion & Analysis: +{max(2, int(abs_diff * 0.25))} words (strategic commentary)\n"
+                f"- Risk Factors: +{max(2, int(abs_diff * 0.20))} words (specific 'if-then' scenarios)\n"
+                f"- Strategic Initiatives: +{max(2, int(abs_diff * 0.15))} words (ROI, timelines)\n"
+                f"- Competitive Landscape: +{max(1, int(abs_diff * 0.10))} words (moat sustainability)\n\n"
+                f"COUNT your words before finishing. Target: {target_length} words (min: {min_words})."
             )
 
         corrections.append(
@@ -1467,16 +1565,105 @@ def _validate_mdna_section(text: str) -> Optional[str]:
 
 
 SUMMARY_SECTION_REQUIREMENTS: List[Tuple[str, int]] = [
-    ("Financial Health Rating", 35),
-    ("Executive Summary", 45),
-    ("Financial Performance", 60),
-    ("Management Discussion & Analysis", 60),
-    ("Risk Factors", 30),
-    ("Strategic Initiatives & Capital Allocation", 45),
+    ("Financial Health Rating", 30),
+    ("Executive Summary", 100),  # HERO section - premium insight users pay for
+    ("Financial Performance", 50),
+    ("Management Discussion & Analysis", 50),
+    ("Risk Factors", 25),
+    ("Strategic Initiatives & Capital Allocation", 35),
     ("Key Data Appendix", 20),
-    ("Closing Takeaway", 40),  # Increased min words for proper verdict
+    ("Closing Takeaway", 50),  # Must be substantive verdict - never over-shorten
 ]
 SUMMARY_SECTION_MIN_WORDS = {title: minimum for title, minimum in SUMMARY_SECTION_REQUIREMENTS}
+
+# Section proportional weights for distributing word budgets
+# These represent relative importance/length of each section
+# Sum = 100 (percentages)
+# Executive Summary is the HERO section - the premium insight users pay for
+SECTION_PROPORTIONAL_WEIGHTS: Dict[str, int] = {
+    "Financial Health Rating": 8,
+    "Executive Summary": 25,
+    "Financial Performance": 16,
+    "Management Discussion & Analysis": 14,
+    "Risk Factors": 10,
+    "Strategic Initiatives & Capital Allocation": 10,
+    "Key Data Appendix": 5,
+    "Closing Takeaway": 12,
+}
+
+
+def _calculate_section_word_budgets(
+    target_length: int,
+    include_health_rating: bool = True,
+) -> Dict[str, int]:
+    """
+    Calculate proportional word budgets for each section based on target length.
+    
+    Distributes words across sections using weights, ensuring:
+    1. Each section gets at least its minimum word count
+    2. Remaining words are distributed proportionally
+    3. The Closing Takeaway maintains adequate length (not over-shortened)
+    """
+    # Determine which sections to include
+    sections_to_use = list(SECTION_PROPORTIONAL_WEIGHTS.keys())
+    if not include_health_rating:
+        sections_to_use = [s for s in sections_to_use if s != "Financial Health Rating"]
+    
+    # Calculate total weight for active sections
+    total_weight = sum(
+        SECTION_PROPORTIONAL_WEIGHTS.get(s, 10) for s in sections_to_use
+    )
+    
+    # Calculate budgets
+    budgets: Dict[str, int] = {}
+    for section in sections_to_use:
+        weight = SECTION_PROPORTIONAL_WEIGHTS.get(section, 10)
+        min_words = SUMMARY_SECTION_MIN_WORDS.get(section, 25)
+        
+        # Calculate proportional allocation
+        proportional_words = int((weight / total_weight) * target_length)
+        
+        # Ensure minimum is respected
+        budgets[section] = max(proportional_words, min_words)
+    
+    return budgets
+
+
+def _format_section_word_budgets(
+    target_length: int,
+    include_health_rating: bool = True,
+) -> str:
+    """
+    Format section word budgets as a readable instruction string.
+    """
+    budgets = _calculate_section_word_budgets(target_length, include_health_rating)
+    
+    lines = [
+        "=== SECTION WORD BUDGETS (PROPORTIONAL DISTRIBUTION) ===",
+        "CRITICAL: Distribute your words PROPORTIONALLY across ALL sections.",
+        f"Do NOT take all reduction from one section (especially Closing Takeaway).",
+        "",
+        "TARGET WORD ALLOCATION PER SECTION:",
+    ]
+    
+    for section, budget in budgets.items():
+        lines.append(f"  • {section}: ~{budget} words")
+    
+    total_budgeted = sum(budgets.values())
+    lines.extend([
+        "",
+        f"  TOTAL: ~{total_budgeted} words",
+        "",
+        "IMPORTANT:",
+        "- These are TARGET budgets, not hard limits",
+        "- If you need to reduce length, reduce EACH section proportionally",
+        "- The Closing Takeaway should be a COMPLETE verdict (50-80 words typical)",
+        "- Do NOT sacrifice one section to make room for another",
+        "=== END SECTION WORD BUDGETS ===",
+    ])
+    
+    return "\n".join(lines)
+
 
 # Rating scale - using dashboard-aligned labels only (no letter grades per user decision)
 # Scale: 0-49 = At Risk, 50-69 = Watch, 70-84 = Healthy, 85-100 = Very Healthy
@@ -1639,21 +1826,28 @@ def _build_preference_instructions(
 
     target_length = _clamp_target_length(preferences.target_length)
     if target_length:
-        min_words = target_length - 50
-        max_words = target_length + 50
+        min_words = target_length - 10  # Strict tolerance: ±10 words
+        max_words = target_length + 10
+        
+        # Determine if health rating is included (based on preferences)
+        include_health = bool(preferences and _resolve_health_rating_config(preferences))
+        
+        # Add section word budgets for proportional distribution
+        section_budgets = _format_section_word_budgets(target_length, include_health)
+        
         instructions.append(
             f"""
-=== LENGTH GUIDANCE (FLEXIBLE - COMPLETION IS PRIORITY) ===
-TARGET: Approximately {target_length} words (acceptable range: {min_words}-{max_words} words)
+=== LENGTH GUIDANCE (STRICT - WITHIN 10 WORDS OF TARGET) ===
+TARGET: Exactly {target_length} words (strict range: {min_words}-{max_words} words)
 
 CRITICAL PRIORITY ORDER:
 1. SENTENCE COMPLETION - HIGHEST PRIORITY (NEVER cut off mid-sentence)
 2. Section completeness - All sections must be finished
-3. Word count target - Aim for {target_length} words, but this is FLEXIBLE
+3. Word count target - You MUST hit {target_length} ±10 words
 
 ABSOLUTE RULE - NEVER CUT OFF MID-SENTENCE:
-- It is ALWAYS better to write 50 extra words than to cut off a sentence
-- It is ALWAYS better to write 50 fewer words than to leave thoughts incomplete
+- It is ALWAYS better to write 10 extra words than to cut off a sentence
+- It is ALWAYS better to write 10 fewer words than to leave thoughts incomplete
 - EVERY sentence MUST end with proper punctuation (period, question mark, exclamation point)
 - If you're approaching the word limit, FINISH YOUR CURRENT THOUGHT before stopping
 
@@ -1667,6 +1861,8 @@ FORBIDDEN (will invalidate your output):
 If you must choose between hitting {target_length} words exactly OR completing all sentences:
 ALWAYS CHOOSE COMPLETING SENTENCES. Word count is a guide, not a hard limit.
 === END LENGTH GUIDANCE ===
+
+{section_budgets}
 """
         )
         if target_length > 450:
@@ -1698,11 +1894,13 @@ THIS SECTION MUST:
 3. Apply their specific DECISION FRAMEWORK to reach a verdict
 4. Sound like the ACTUAL INVESTOR wrote it - not a generic analyst
 
-REQUIRED CONTENT (3-5 sentences):
+REQUIRED CONTENT (5-7 sentences):
 1. QUALITY VERDICT: Is this a wonderful/fair/poor business? (Use persona's language)
 2. INVESTMENT STANCE: BUY / HOLD / SELL / WAIT - stated clearly
 3. KEY REASONING: The #1 factor driving your decision (in persona's framework)
-4. ACTIONABLE CONDITION: What would change your mind (price target, metric threshold, or catalyst)
+4. SUPPORTING FACTORS: Secondary considerations that reinforce your stance
+5. ACTIONABLE CONDITION: What would change your mind (price target, metric threshold, or catalyst)
+6. PERSONAL CLOSING (MANDATORY): End with a first-person statement like "I personally would [buy/hold/sell]..." or "For my own portfolio, I would..." - this should feel like genuine advice from the persona to a friend
 
 PERSONA-SPECIFIC VOICE EXAMPLES:
 
@@ -1738,6 +1936,7 @@ BILL ACKMAN must use: "simple, predictable, free-cash-flow generative", "the cat
 DO NOT write a generic conclusion. Sound EXACTLY like the persona.
 DO NOT end with incomplete sentences. Every thought must be finished.
 This is the MOST IMPORTANT section - it's what the reader remembers.
+IMPORTANT: This section counts toward your total word count. Stay within the user's requested length.
 === END CLOSING REQUIREMENT ===
 """
         )
@@ -2231,6 +2430,7 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
     revenue = _extract_from_candidates(
         income_statement,
         [
+            "revenue",  # EODHD normalized
             "totalRevenue",
             "Revenue",
             "TotalRevenue",
@@ -2241,11 +2441,11 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
     )
     net_income = _extract_from_candidates(
         income_statement,
-        ["NetIncomeLoss", "NetIncome", "netIncome", "netIncomeLoss", "NetIncomeApplicableToCommonShares"],
+        ["net_income", "NetIncomeLoss", "NetIncome", "netIncome", "netIncomeLoss", "NetIncomeApplicableToCommonShares"],
     )
     operating_income = _extract_from_candidates(
         income_statement,
-        ["OperatingIncomeLoss", "OperatingIncome", "operatingIncome", "OperatingIncomeLossUSD"],
+        ["operating_income", "OperatingIncomeLoss", "OperatingIncome", "operatingIncome", "OperatingIncomeLossUSD"],
     )
     eps = _extract_from_candidates(
         income_statement,
@@ -2255,6 +2455,8 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
     operating_cash_flow = _extract_from_candidates(
         cash_flow,
         [
+            "operating_cash_flow",  # EODHD normalized format
+            "totalCashFromOperatingActivities",  # EODHD raw format
             "NetCashProvidedByUsedInOperatingActivities",
             "NetCashProvidedByOperatingActivities",
             "netCashProvidedByOperatingActivities",
@@ -2265,6 +2467,7 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
     capex_raw = _extract_from_candidates(
         cash_flow,
         [
+            "capital_expenditures",  # EODHD normalized format
             "PaymentsToAcquirePropertyPlantAndEquipment",
             "CapitalExpenditures",
             "capitalExpenditures",
@@ -2273,13 +2476,21 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
         ],
     )
     capex = abs(capex_raw) if capex_raw is not None else None
-    free_cash_flow = (
-        operating_cash_flow - capex if operating_cash_flow is not None and capex is not None else None
-    )
+    
+    # Calculate FCF - use operating cash flow as fallback if capex is missing
+    if operating_cash_flow is not None and capex is not None:
+        free_cash_flow = operating_cash_flow - capex
+    elif operating_cash_flow is not None:
+        # If no capex data, use operating cash flow as FCF proxy 
+        # (common for service companies with minimal capex)
+        free_cash_flow = operating_cash_flow
+    else:
+        free_cash_flow = None
 
     cash = _extract_from_candidates(
         balance_sheet,
         [
+            "cash",  # EODHD normalized
             "CashAndCashEquivalentsAtCarryingValue",
             "CashAndCashEquivalents",
             "cashAndCashEquivalents",
@@ -2292,28 +2503,28 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
     )
     total_assets = _extract_from_candidates(
         balance_sheet,
-        ["TotalAssets", "totalAssets", "TotalAssetsUSD"],
+        ["total_assets", "TotalAssets", "totalAssets", "TotalAssetsUSD"],
     )
     total_liabilities = _extract_from_candidates(
         balance_sheet,
-        ["TotalLiabilities", "totalLiabilities", "TotalLiabilitiesNetMinorityInterest"],
+        ["total_liabilities", "totalLiab", "TotalLiabilities", "totalLiabilities", "TotalLiabilitiesNetMinorityInterest"],
     )
-    
+
     current_assets = _extract_from_candidates(
         balance_sheet,
-        ["CurrentAssets", "TotalCurrentAssets", "totalCurrentAssets", "AssetsCurrent"],
+        ["current_assets", "CurrentAssets", "TotalCurrentAssets", "totalCurrentAssets", "AssetsCurrent"],
     )
     current_liabilities = _extract_from_candidates(
         balance_sheet,
-        ["CurrentLiabilities", "TotalCurrentLiabilities", "totalCurrentLiabilities", "LiabilitiesCurrent"],
+        ["current_liabilities", "CurrentLiabilities", "TotalCurrentLiabilities", "totalCurrentLiabilities", "LiabilitiesCurrent"],
     )
     inventory = _extract_from_candidates(
         balance_sheet,
-        ["Inventory", "InventoryNet", "inventory", "Inventories"],
+        ["inventories", "Inventory", "InventoryNet", "inventory", "Inventories"],
     )
     interest_expense = _extract_from_candidates(
         income_statement,
-        ["InterestExpense", "interestExpense", "InterestAndDebtExpense", "InterestIncomeExpense"],
+        ["interest_expense", "InterestExpense", "interestExpense", "InterestAndDebtExpense", "InterestIncomeExpense"],
     )
 
     operating_margin = (
@@ -2367,8 +2578,14 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
     return {key: value for key, value in metrics.items() if value is not None}
 
 
-def _compute_health_score_data(calculated_metrics: Dict[str, Any]) -> Dict[str, Any]:
-    """Compute health score data with component breakdown from calculated metrics."""
+def _compute_health_score_data(calculated_metrics: Dict[str, Any], weighting_preset: Optional[str] = None, ai_growth_assessment: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Compute health score data with component breakdown from calculated metrics.
+
+    Args:
+        calculated_metrics: Dictionary of calculated financial metrics
+        weighting_preset: Optional user-selected weighting preset (e.g., 'cash_flow_conversion')
+        ai_growth_assessment: Optional AI-generated growth assessment dict with 'score' and 'description'
+    """
     if not calculated_metrics:
         return {}
     
@@ -2400,10 +2617,16 @@ def _compute_health_score_data(calculated_metrics: Dict[str, Any]) -> Dict[str, 
         ratios["roe"] = net_income / total_equity
     if total_liabilities and total_equity and total_equity > 0:
         ratios["debt_to_equity"] = total_liabilities / total_equity
-    if free_cash_flow:
+    if free_cash_flow is not None:  # Allow negative FCF
         ratios["fcf"] = free_cash_flow
-    if free_cash_flow and revenue and revenue > 0:
+    if free_cash_flow is not None and revenue and revenue > 0:
         ratios["fcf_margin"] = free_cash_flow / revenue
+    
+    # Add net_income and operating_cash_flow for governance/cash flow calculations
+    if net_income is not None:
+        ratios["net_income"] = net_income
+    if operating_cash_flow is not None:
+        ratios["operating_cash_flow"] = operating_cash_flow
     
     # Liquidity ratios
     if current_assets and current_liabilities and current_liabilities > 0:
@@ -2419,7 +2642,10 @@ def _compute_health_score_data(calculated_metrics: Dict[str, Any]) -> Dict[str, 
         ratios["interest_coverage"] = operating_income / abs(interest_expense)
     
     try:
-        health_data = calculate_health_score(ratios)
+        # Debug: log what ratios we're passing to health scorer
+        logger.info(f"Health score ratios being passed: fcf={ratios.get('fcf')}, net_income={ratios.get('net_income')}, operating_cash_flow={ratios.get('operating_cash_flow')}, operating_margin={ratios.get('operating_margin')}, debt_to_equity={ratios.get('debt_to_equity')}, weighting_preset={weighting_preset}")
+        health_data = calculate_health_score(ratios, weighting_preset=weighting_preset, ai_growth_assessment=ai_growth_assessment)
+        logger.info(f"Health score component scores: {health_data.get('component_scores', {})}, weights: {health_data.get('component_weights', {})}")
         return health_data
     except Exception as e:
         logger.warning(f"Health score calculation failed: {e}")
@@ -3266,8 +3492,45 @@ async def generate_filing_summary(
         financial_snapshot = _build_financial_snapshot(statements)
         calculated_metrics = _build_calculated_metrics(statements)
         
+        # Extract user's weighting preference from health_rating settings
+        weighting_preset = None
+        if preferences and preferences.health_rating:
+            weighting_preset = preferences.health_rating.primary_factor_weighting
+
+        # Generate AI growth assessment based on management perspective and sector context
+        ai_growth_assessment = None
+        try:
+            progress_cache[str(filing_id)] = "Analyzing Growth Potential..."
+            # Build comprehensive ratios dict for growth context
+            ratios_for_growth = {}
+            if calculated_metrics.get("operating_margin") is not None:
+                ratios_for_growth["operating_margin"] = calculated_metrics["operating_margin"] / 100
+            if calculated_metrics.get("net_margin") is not None:
+                ratios_for_growth["net_margin"] = calculated_metrics["net_margin"] / 100
+            if calculated_metrics.get("revenue_growth_yoy") is not None:
+                ratios_for_growth["revenue_growth_yoy"] = calculated_metrics["revenue_growth_yoy"] / 100
+            if calculated_metrics.get("fcf_margin") is not None:
+                ratios_for_growth["fcf_margin"] = calculated_metrics["fcf_margin"] / 100
+            if calculated_metrics.get("gross_margin") is not None:
+                ratios_for_growth["gross_margin"] = calculated_metrics["gross_margin"] / 100
+            ai_growth_assessment = generate_growth_assessment(
+                filing_text=document_text,
+                company_name=company_name,
+                weighting_preference=weighting_preset,
+                ratios=ratios_for_growth
+            )
+            logger.info(f"AI growth assessment: score={ai_growth_assessment.get('score')}, description={ai_growth_assessment.get('description')}")
+        except Exception as growth_err:
+            logger.warning(f"AI growth assessment failed: {growth_err}")
+            ai_growth_assessment = None
+
         # Pre-calculate health score BEFORE generating summary so we can inject it into the prompt
-        pre_calculated_health = _compute_health_score_data(calculated_metrics)
+        print(f"DEBUG: calculated_metrics keys = {list(calculated_metrics.keys())}")
+        print(f"DEBUG: free_cash_flow = {calculated_metrics.get('free_cash_flow')}, net_income = {calculated_metrics.get('net_income')}, operating_cash_flow = {calculated_metrics.get('operating_cash_flow')}")
+        print(f"DEBUG: weighting_preset = {weighting_preset}")
+        pre_calculated_health = _compute_health_score_data(calculated_metrics, weighting_preset=weighting_preset, ai_growth_assessment=ai_growth_assessment)
+        print(f"DEBUG: pre_calculated_health component_scores = {pre_calculated_health.get('component_scores', {})}")
+        print(f"DEBUG: pre_calculated_health component_weights = {pre_calculated_health.get('component_weights', {})}")
         pre_calculated_score = pre_calculated_health.get("overall_score") if pre_calculated_health else None
         pre_calculated_band = pre_calculated_health.get("score_band") if pre_calculated_health else None
         
@@ -3324,12 +3587,17 @@ async def generate_filing_summary(
         if health_rating_block:
             if pre_calculated_score is not None and pre_calculated_band:
                 health_rating_description = (
-                    f"IMPORTANT: Use EXACTLY the pre-calculated score of {pre_calculated_score:.1f}/100 - {pre_calculated_band}. "
-                    f"DO NOT calculate your own score. The score {pre_calculated_score:.1f} has been computed from actual financial ratios. "
-                    f"Your job is to EXPLAIN why the company received this score based on the metrics provided. "
-                    f"Format: '{pre_calculated_score:.0f}/100 - {pre_calculated_band}'. "
-                    "NO letter grades (A, B, C, D). "
-                    "Explain what drove this score: margins, cash flow, leverage, liquidity."
+                    f"!!! MANDATORY SCORE - DO NOT CHANGE !!!\n"
+                    f"THE FINANCIAL HEALTH SCORE IS PRE-CALCULATED: {pre_calculated_score:.1f}/100 - {pre_calculated_band}\n\n"
+                    f"YOU MUST WRITE EXACTLY: '{pre_calculated_score:.0f}/100 ({pre_calculated_band[0] if pre_calculated_band else 'W'}) - {pre_calculated_band}'\n\n"
+                    f"CRITICAL RULES:\n"
+                    f"1. The score is {pre_calculated_score:.1f} - DO NOT calculate a different score\n"
+                    f"2. DO NOT write 1/100, 62/100, or ANY other score - ONLY {pre_calculated_score:.0f}/100\n"
+                    f"3. The band is '{pre_calculated_band}' - use this EXACT label\n"
+                    f"4. Start the section with: '{pre_calculated_score:.0f}/100 ({pre_calculated_band[0] if pre_calculated_band else 'W'}) - {pre_calculated_band}. ...'\n"
+                    f"5. Then EXPLAIN why this score was assigned based on the metrics.\n\n"
+                    f"FORBIDDEN: Calculating your own score. The score {pre_calculated_score:.1f} is mathematically computed from actual financial ratios.\n"
+                    f"NO letter grades (A, B, C, D, F). Use the numeric score and band label only."
                 )
             else:
                 health_rating_description = (
@@ -3343,91 +3611,61 @@ async def generate_filing_summary(
             [
                 (
                     "Executive Summary",
-                    "2-3 COMPLETE sentences ONLY. Synthesize your investment view: bullish/bearish/neutral with clear reasoning. "
-                    "Focus on strategic implications (e.g., 'AI pivot validated by 3x Data Center growth'). "
-                    "NO specific numbers here - save those for Financial Performance. "
-                    "CRITICAL: End with a COMPLETE stance statement. Do NOT write 'I need to determine...' or 'I want to see...' - "
-                    "these are incomplete thoughts. End with 'I am bullish/bearish/neutral because [complete reason].' "
-                    "VERIFY: Read your last sentence aloud. If it trails off or sounds incomplete, rewrite it.",
+                    "THIS IS THE HERO SECTION - the premium insight users pay for. MINIMUM 100 WORDS.\n\n"
+                    "Write a compelling, substantive investment thesis that:\n"
+                    "1. OPENS with your conviction level and stance (bullish/bearish/neutral with HIGH/MEDIUM/LOW conviction)\n"
+                    "2. SYNTHESIZES the investment case - why does this company matter RIGHT NOW?\n"
+                    "3. IDENTIFIES the key narrative driving the stock (e.g., 'AI infrastructure play', 'turnaround story', 'secular growth compounder')\n"
+                    "4. ADDRESSES the core tension - what's the bull case vs bear case in 1-2 sentences each?\n"
+                    "5. PROVIDES differentiated insight - what is the market missing or mispricing?\n"
+                    "6. STATES clear catalysts or risks that could change the thesis\n\n"
+                    "This should read like a PREMIUM hedge fund memo opening - sharp, opinionated, and actionable.\n"
+                    "The reader should understand your COMPLETE investment view from this section alone.\n"
+                    "Use strategic language: 'The market is underappreciating...', 'The key unlock is...', 'What makes this interesting is...'\n\n"
+                    "CRITICAL: Every sentence MUST be complete. End with a clear, actionable stance. "
+                    "Do NOT use vague phrases like 'I want to see...' or 'I need to determine...' - TAKE A POSITION.",
                 ),
                 (
                     "Financial Performance",
-                    "MINIMUM 80 words. This is the ONLY section for quantitative analysis. Required elements:\n"
-                    "- Revenue with YoY% change and time period (e.g., '$26.0B Q3 FY25, +94% YoY')\n"
-                    "- Operating margin with trend (expanding/compressing vs prior period)\n"
-                    "- Net income and EPS with comparisons\n"
-                    "- Cash flow quality: OCF vs Net Income ratio, FCF generation\n"
-                    "- Working capital: Distinguish between ENDING BALANCES (how much inventory/AR exists) vs CHANGES (how much it increased/decreased). A positive change means increase, negative means decrease.\n"
-                    "ALWAYS specify the fiscal period for EVERY number. Use consistent period (all Q3 FY25 or all FY24).",
+                    "Concise quantitative overview (50-70 words). Include ONLY the most critical metrics:\n"
+                    "- Revenue with YoY% change and period\n"
+                    "- Operating margin and net margin\n"
+                    "- Net income and FCF\n"
+                    "- Cash flow quality (OCF vs Net Income ratio)\n"
+                    "Keep it tight - the Executive Summary carries the narrative weight. "
+                    "Focus on numbers that support your thesis, not exhaustive data.",
                 ),
                 (
                     "Management Discussion & Analysis",
-                    "MINIMUM 80 words. This section MUST contain ACTUAL MANAGEMENT COMMENTARY from the MD&A section of the filing.\n"
-                    "CRITICAL: The filing DOES contain an MD&A section (Item 7 for 10-K, Item 2 for 10-Q). You MUST extract and cite from it.\n"
-                    "SEC-COMPLIANT REQUIREMENTS:\n"
-                    "- Quote or closely paraphrase ACTUAL statements from the filing's MD&A section\n"
-                    "- Use attributions like 'management stated', 'the company disclosed', 'according to the filing'\n"
-                    "- Include SPECIFIC commentary on: revenue drivers, segment performance, margin trends, outlook\n"
-                    "- Reference the ACTUAL forward guidance if provided (e.g., 'Q4 revenue expected to be $X')\n"
-                    "REQUIRED CONTENT (find these in the MD&A section):\n"
-                    "- Revenue/margin guidance or outlook statements\n"
-                    "- Segment performance commentary (e.g., Data Center grew X%, Gaming declined Y%)\n"
-                    "- Capacity/supply chain updates from management\n"
-                    "- Competitive positioning statements\n"
-                    "- Key drivers of results explained by management\n"
-                    "DO NOT write 'management commentary is limited' - the MD&A section contains substantive commentary. Extract it.",
+                    "Critical management insights (50-70 words). Extract ONLY the most important forward-looking statements:\n"
+                    "- Key revenue drivers or segment trends management highlighted\n"
+                    "- Forward guidance or outlook if provided\n"
+                    "- Strategic priorities or investments mentioned\n"
+                    "Use attributions: 'management stated', 'according to the filing'. "
+                    "Focus on what moves the stock, not comprehensive MD&A coverage.",
                 ),
                 (
                     "Risk Factors",
-                    "EXACTLY 5 risks. Each risk MUST follow this format:\\n"
-                    "**[Risk Name]**: [1-2 sentences explaining the risk with specific, quantified details]\\n\\n"
-                    "CRITICAL: Identify risks that are SPECIFIC to THIS COMPANY and ITS ACTUAL INDUSTRY.\\n"
-                    "DO NOT copy risks from other industries or use generic templates.\\n\\n"
-                    "EXAMPLES OF GOOD COMPANY-SPECIFIC RISKS:\\n"
-                    "- For a rideshare company: Driver supply constraints, regulatory restrictions on gig worker classification, competition from alternatives\\n"
-                    "- For a retailer: Consumer spending sensitivity, inventory management, e-commerce competition\\n"
-                    "- For a bank: Interest rate sensitivity, credit quality deterioration, regulatory capital requirements\\n"
-                    "- For a tech company: Customer concentration, technology obsolescence, key personnel dependency\\n\\n"
-                    "YOUR RISKS MUST BE:\\n"
-                    "1. Relevant to the ACTUAL business model of THIS specific company\\n"
-                    "2. Quantified where possible (X% of revenue, $XB exposure, etc.)\\n"
-                    "3. Based on information found IN THE FILING, not assumed from other companies\\n\\n"
-                    "FORBIDDEN: Do NOT mention risks from other industries or companies. "
-                    "Do NOT copy semiconductor risks (TSMC, chips) for non-semiconductor companies. "
-                    "Do NOT mention NVIDIA, AMD, Intel unless this filing is actually about those companies.",
-                ),
-                (
-                    "Competitive Landscape",
-                    "MINIMUM 40 words. Analyze competitive positioning:\n"
-                    "- Key competitors and market share dynamics\n"
-                    "- Competitive advantages/moats (or lack thereof)\n"
-                    "- Emerging threats specific to THIS company's industry\n"
-                    "- Barriers to entry\n"
-                    "Be specific to the ACTUAL industry and company being analyzed. Do NOT use examples from other industries.",
+                    "Top 2-3 MATERIAL risks only (25-40 words total). Focus on thesis-critical risks:\n"
+                    "**[Risk Name]**: [1 sentence with quantified impact if possible]\n\n"
+                    "Only include risks SPECIFIC to THIS company's actual business model and industry. "
+                    "Skip generic risks. What could actually break the investment thesis?",
                 ),
                 (
                     "Strategic Initiatives & Capital Allocation",
-                    "MINIMUM 50 words. Analyze how the company deploys capital with SPECIFIC numbers:\n"
-                    "- R&D: $X.XB (X% of revenue) - what it funds\n"
-                    "- Capex: $X.XB - capacity expansion, infrastructure\n"
-                    "- Buybacks: $X.XB (X% of FCF) - dilution offset vs return of capital\n"
-                    "- Dividends: $X.XB yield\n"
-                    "- M&A: Recent deals and strategic rationale\n"
-                    "Assess: Is capital allocation value-accretive or value-destructive?",
+                    "Brief capital deployment overview (35-50 words). Key items only:\n"
+                    "- R&D, CapEx, or major investments if material\n"
+                    "- Buybacks/dividends if significant\n"
+                    "- M&A activity if relevant\n"
+                    "Assess: Is capital allocation value-accretive? Skip if nothing material to report.",
                 ),
                 (
                     "Key Data Appendix",
-                    "Bullet list format ONLY. No narrative. ALL figures must be from the SAME fiscal period:\n"
-                    "- Fiscal Period: [Q# FY## or FY##] - STATE THIS FIRST\n"
-                    "- Revenue: $X.XB\n"
-                    "- Operating Margin: X.X%\n"
-                    "- Net Income: $X.XB\n"
-                    "- EPS: $X.XX (omit if not available)\n"
-                    "- FCF: $X.XB\n"
-                    "- Cash: $X.XB\n"
-                    "- Debt: $X.XB\n"
-                    "DO NOT include P/E ratio or FCF Yield - these require market data not in the filing.\n"
-                    "CRITICAL: Appendix numbers MUST match the numbers cited in narrative sections above. Do not mix periods.",
+                    "Quick reference bullets (arrow format). Core metrics only:\n"
+                    "→ Revenue: $X.XB | Operating Income: $X.XB | Net Income: $X.XB\n"
+                    "→ Capital Expenditures: $X.XM | Total Assets: $X.XB\n"
+                    "→ Operating Margin: X.X% | Net Margin: X.X%\n"
+                    "Keep it scannable. Numbers MUST match narrative sections.",
                 ),
                 _build_closing_takeaway_description(selected_persona_name, company_name),
             ]
@@ -3518,7 +3756,7 @@ INSTRUCTIONS:
 1. Tone: {tone.title()} (Professional, Insightful, Direct)
 2. Detail Level: {detail_level.title()}
 3. Output Style: {output_style.title()}
-4. Target Length: {target_length} words (approx)
+4. Target Length: {target_length} words (STRICT: ±10 words tolerance)
 
 STRUCTURE & CONTENT REQUIREMENTS:
 {section_requirements}
@@ -3693,7 +3931,7 @@ Before you output anything, verify:
                 quality_validators=[_make_section_completeness_validator(include_health_rating)],
                 last_word_stats=None,
             )
-            summary_text = _finalize_length_band(summary_text, target_length, tolerance=50)
+            summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
             # Re-validate required sections after any trimming/padding, then clamp again
             summary_text = _ensure_required_sections(
                 summary_text,
@@ -3704,7 +3942,7 @@ Before you output anything, verify:
                 health_rating_config=health_config,
                 persona_name=selected_persona_name,
             )
-            summary_text = _finalize_length_band(summary_text, target_length, tolerance=50)
+            summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
             # Final pass to normalize headings and length in case prior rewrites removed structure
             summary_text = _fix_inline_section_headers(summary_text)
             summary_text = _normalize_section_headings(summary_text, include_health_rating)
@@ -3717,11 +3955,19 @@ Before you output anything, verify:
                 health_rating_config=health_config,
                 persona_name=selected_persona_name,
             )
-            summary_text = _finalize_length_band(summary_text, target_length, tolerance=50)
-            summary_text = _force_final_band(summary_text, target_length, tolerance=50)
+            summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
+            summary_text = _force_final_band(summary_text, target_length, tolerance=10)
 
         # Final ellipsis cleanup after all length adjustments
         summary_text = _fix_trailing_ellipsis(summary_text)
+        
+        # Fix health score if AI generated a different score than pre-calculated
+        if pre_calculated_score is not None and pre_calculated_band:
+            summary_text = _fix_health_score_in_summary(
+                summary_text,
+                pre_calculated_score,
+                pre_calculated_band,
+            )
 
         # Use pre-calculated health score data (computed before summary generation)
         health_score_data = pre_calculated_health
@@ -3740,6 +3986,9 @@ Before you output anything, verify:
             response_data["health_score"] = health_score_data.get("overall_score")
             response_data["health_band"] = health_score_data.get("score_band")
             response_data["health_components"] = health_score_data.get("component_scores")
+            response_data["health_component_weights"] = health_score_data.get("component_weights")
+            response_data["health_component_descriptions"] = health_score_data.get("component_descriptions")
+            response_data["health_component_metrics"] = health_score_data.get("component_metrics")
         
         return JSONResponse(content=response_data)
         
@@ -4042,26 +4291,29 @@ def _generate_fallback_closing_takeaway(
             quality, is_positive, is_mixed, revenue, operating_margin
         )
     
-    # Generic fallback (no persona selected)
+    # Generic fallback (no persona selected) - concise but complete (~40-50 words)
     sentences = []
     
     if strengths and not concerns:
         sentences.append(f"{company_name} demonstrates {quality} financial characteristics with {' and '.join(strengths[:2])}.")
-        sentences.append("The fundamentals support a constructive long-term outlook, though investors should monitor valuation and competitive dynamics.")
+        sentences.append("The fundamentals support a constructive long-term outlook.")
+        sentences.append("Consider initiating positions on valuation pullbacks.")
     elif concerns and not strengths:
         sentences.append(f"{company_name} faces financial headwinds including {' and '.join(concerns[:2])}.")
-        sentences.append("Caution is warranted until the company demonstrates improvement in these areas.")
+        sentences.append("These challenges warrant caution until management demonstrates tangible operational improvement.")
+        sentences.append("Monitor for margin expansion and improved cash conversion before committing capital.")
     elif strengths and concerns:
         sentences.append(f"{company_name} presents a mixed picture: {strengths[0]} offset by {concerns[0]}.")
-        sentences.append("The investment case hinges on whether management can address the challenges while preserving the company's strengths.")
+        sentences.append("A neutral stance is appropriate until greater clarity emerges.")
+        sentences.append("Watch for an inflection point in the problem areas.")
     else:
-        # Minimal data available - provide generic but substantive closing
+        # Minimal data available
         if revenue:
             rev_str = _format_dollar(revenue)
-            sentences.append(f"{company_name}, with {rev_str} in revenue, warrants further analysis to assess its competitive positioning and growth trajectory.")
+            sentences.append(f"{company_name}, with {rev_str} in revenue, requires deeper analysis.")
         else:
-            sentences.append(f"{company_name} requires deeper due diligence to form a definitive investment view.")
-        sentences.append("Investors should evaluate the company's strategic initiatives and industry dynamics before making allocation decisions.")
+            sentences.append(f"{company_name} requires deeper due diligence to form a definitive view.")
+        sentences.append("Evaluate strategic initiatives and management's capital allocation before investing.")
     
     return " ".join(sentences)
 
@@ -4345,11 +4597,26 @@ def _ensure_required_sections(
     if not _section_present("Key Data Appendix") and metrics_lines.strip():
         _append_section("Key Data Appendix", metrics_lines.strip())
 
-    # 8. Closing Takeaway - ensure there's a closing verdict if missing
+    # 8. Closing Takeaway - ensure there's a closing verdict if missing OR too short
     # Generate a data-driven closing takeaway if the AI failed to include one
+    # Also replace if the existing one is under the minimum word count
     # Pass persona_name to maintain persona voice in fallback
-    if not _section_present("Closing Takeaway"):
+    min_closing_words = SUMMARY_SECTION_MIN_WORDS.get("Closing Takeaway", 75)
+    
+    # Check if closing takeaway exists and count its words
+    existing_closing = None
+    closing_match = re.search(r'##\s*Closing\s+Takeaway\s*\n+([\s\S]*?)(?=\n##\s|\Z)', text, re.IGNORECASE)
+    if closing_match:
+        existing_closing = closing_match.group(1).strip()
+        existing_word_count = len(existing_closing.split())
+    else:
+        existing_word_count = 0
+    
+    if not _section_present("Closing Takeaway") or existing_word_count < min_closing_words:
         closing_body = _generate_fallback_closing_takeaway(company_name, calculated_metrics, persona_name)
+        if existing_closing and existing_word_count < min_closing_words:
+            # Remove the short closing takeaway and replace it
+            text = re.sub(r'##\s*Closing\s+Takeaway\s*\n+[\s\S]*?(?=\n##\s|\Z)', '', text, flags=re.IGNORECASE)
         _append_section("Closing Takeaway", closing_body)
 
     return text
