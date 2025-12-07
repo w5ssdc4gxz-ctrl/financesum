@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple, Callable
 from fastapi import APIRouter, Body, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
-from uuid import uuid4
+from uuid import UUID, uuid4
 from app.models.database import get_supabase_client
 from app.models.schemas import (
     Filing,
@@ -2675,15 +2675,15 @@ def _prepare_filing_response(raw_filing: Dict[str, Any], settings) -> Filing:
 def _resolve_filing_context(filing_id: str, settings) -> Dict[str, Any]:
     filing_key = str(filing_id)
 
-    def _resolve_from_fallback() -> Dict[str, Any]:
+    def _get_fallback_context() -> Optional[Dict[str, Any]]:
         filing = fallback_filings_by_id.get(filing_key)
         if not filing:
-            raise HTTPException(status_code=404, detail="Filing not found")
+            return None
 
         company_id = str(filing.get("company_id"))
         company = fallback_companies.get(company_id)
         if not company:
-            raise HTTPException(status_code=404, detail="Company not found for filing")
+            return None
 
         return {
             "filing": filing,
@@ -2691,14 +2691,28 @@ def _resolve_filing_context(filing_id: str, settings) -> Dict[str, Any]:
             "source": "fallback",
         }
 
+    fallback_context = _get_fallback_context()
+
+    # If the ID is not a valid UUID, prefer fallback data (tests use string IDs)
+    try:
+        UUID(filing_key)
+    except ValueError as exc:
+        if fallback_context:
+            return fallback_context
+        raise HTTPException(status_code=400, detail="Invalid filing ID format") from exc
+
     if not _supabase_configured(settings):
-        return _resolve_from_fallback()
+        if fallback_context:
+            return fallback_context
+        raise HTTPException(status_code=404, detail="Filing not found")
 
     supabase = get_supabase_client()
 
     try:
         filing_response = supabase.table("filings").select("*").eq("id", filing_key).execute()
         if not filing_response.data:
+            if fallback_context:
+                return fallback_context
             raise HTTPException(status_code=404, detail="Filing not found")
 
         filing = filing_response.data[0]
@@ -2711,6 +2725,8 @@ def _resolve_filing_context(filing_id: str, settings) -> Dict[str, Any]:
             .execute()
         )
         if not company_response.data:
+            if fallback_context:
+                return fallback_context
             raise HTTPException(status_code=404, detail="Company not found for filing")
 
         company = company_response.data[0]
@@ -2720,11 +2736,28 @@ def _resolve_filing_context(filing_id: str, settings) -> Dict[str, Any]:
             "company": company,
             "source": "supabase",
         }
-    except HTTPException:
+    except HTTPException as http_exc:
+        if http_exc.status_code in {400, 404} and fallback_context:
+            logger.warning(
+                "Supabase lookup failed for %s with status %s. Using fallback cache.",
+                filing_key,
+                http_exc.status_code,
+            )
+            return fallback_context
         raise
     except Exception as exc:  # noqa: BLE001
         if is_supabase_table_missing_error(exc):
-            return _resolve_from_fallback()
+            if fallback_context:
+                return fallback_context
+            raise HTTPException(status_code=404, detail="Filing not found")
+
+        if fallback_context:
+            logger.warning(
+                "Supabase lookup error for filing %s, using fallback cache: %s",
+                filing_key,
+                exc,
+            )
+            return fallback_context
         raise HTTPException(status_code=500, detail=f"Error resolving filing context: {exc}")
 
 

@@ -61,8 +61,17 @@ async function proxy(request: NextRequest, context: { params: Promise<Params> })
     init.duplex = 'half'
   }
 
+  // Use a long timeout for summary generation which can take 2-3+ minutes
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 5 * 60 * 1000) // 5 minute timeout
+
   try {
-    const response = await fetch(targetUrl, init)
+    const response = await fetch(targetUrl, {
+      ...init,
+      signal: controller.signal,
+    })
+    clearTimeout(timeoutId)
+
     const responseHeaders = new Headers(response.headers)
     HOP_BY_HOP_HEADERS.forEach(header => responseHeaders.delete(header))
 
@@ -71,6 +80,18 @@ async function proxy(request: NextRequest, context: { params: Promise<Params> })
       headers: responseHeaders,
     })
   } catch (error: any) {
+    clearTimeout(timeoutId)
+
+    if (error?.name === 'AbortError') {
+      return NextResponse.json(
+        {
+          error: 'Request timeout',
+          detail: 'The backend request took too long to complete',
+        },
+        { status: 504 },
+      )
+    }
+
     return NextResponse.json(
       {
         error: 'Unable to reach backend API',
