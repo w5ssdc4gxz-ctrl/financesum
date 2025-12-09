@@ -2,6 +2,7 @@
 import httpx
 import asyncio
 import json
+import requests  # Used for synchronous SEC calls
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 from app.config import get_settings
@@ -278,4 +279,3 @@ def download_filing(url: str, output_path: str) -> bool:
     except Exception as e:
         print(f"Error downloading filing: {e}")
         return False
-

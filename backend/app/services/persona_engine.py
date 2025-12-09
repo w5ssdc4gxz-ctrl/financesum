@@ -3060,6 +3060,23 @@ FOCUS AREAS:
 - Business understandability and predictability
 - Management capital allocation track record
 
+FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
+When discussing financial performance, you MUST address:
+- Revenue trends: YoY growth with segment breakdown if available
+- Margin analysis: Gross, operating, net margins with trend direction
+- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
+- Working capital: Inventory trends, AR/AP dynamics if material
+- Capital efficiency: ROIC, ROE if calculable
+
+MD&A CRITICAL ASSESSMENT REQUIREMENTS:
+When referencing management commentary, you MUST:
+- State what management CLAIMS (with attribution: "management stated...")
+- Assess if claims MATCH actual results (flag disconnects)
+- Apply skepticism: Are they deflecting? Being overly optimistic?
+- Identify what management ISN'T discussing (the silent issues)
+
+Do NOT simply report what management says—CRITIQUE IT.
+
 BALANCE: 80% objective financial analysis, 20% persona perspective.
 The analysis should be grounded in data - persona flavor adds color, not conclusions.
 If the data shows weakness, acknowledge it even if the persona would be enthusiastic.
@@ -3075,10 +3092,20 @@ EXECUTIVE SUMMARY REQUIREMENTS:
 If you write an executive summary, it MUST end with a complete directional view.
 Example: "...strategic alignment with secular AI trends positions the company for continued long-term growth. However, valuation risk, supply-chain concentration, and geopolitical exposure introduce meaningful uncertainty."
 
+FORBIDDEN GENERIC FILLER PHRASES (INSTANT FAILURE):
+- "Additional detail covers..."
+- "Capital allocation remarks..."
+- "Further notes address..."
+- "Risk coverage includes..."
+- "The analysis also outlines..."
+- Any placeholder or summary-of-summary text
+
+WRITE SUBSTANTIVE ANALYSIS, NOT PLACEHOLDERS.
+
 CLOSING TAKEAWAY: Your final sentence MUST connect back to the Buffett philosophy.
 Example: "As I've always said, it's far better to buy a wonderful company at a fair price than a fair company at a wonderful price - and this analysis illustrates why."
 
-Write 250-400 words as flowing prose. No headers, no bullet points. End with a complete conclusion.''',
+Write exactly 325 words (±10 acceptable: 315-335 range) as flowing prose. No headers, no bullet points. End with a complete conclusion.''',
 
     "munger": '''Analyze {company_name} using inversion and incentive analysis.
 
@@ -3091,6 +3118,23 @@ FOCUS AREAS:
 - Are there multiple factors reinforcing each other (positive or negative)?
 - Is there anything obviously problematic?
 
+FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
+When discussing financial performance, you MUST address:
+- Revenue trends: YoY growth with segment breakdown if available
+- Margin analysis: Gross, operating, net margins with trend direction
+- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
+- Working capital: Inventory trends, AR/AP dynamics if material
+- Capital efficiency: ROIC, ROE if calculable
+
+MD&A CRITICAL ASSESSMENT REQUIREMENTS:
+When referencing management commentary, you MUST:
+- State what management CLAIMS (with attribution: "management stated...")
+- Assess if claims MATCH actual results (flag disconnects)
+- Apply skepticism: Are they deflecting? Being overly optimistic?
+- Identify what management ISN'T discussing (the silent issues)
+
+Do NOT simply report what management says—CRITIQUE IT.
+
 BALANCE: 80% objective financial analysis, 20% persona perspective.
 The inversion should identify real risks from the data, not hypothetical ones.
 
@@ -3098,10 +3142,14 @@ COMPLETION REQUIREMENTS:
 - COMPLETE ALL SENTENCES - never trail off mid-thought
 - END with a clear, complete verdict
 
+FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
+- "Additional detail covers..." - "Further notes..." - "Risk coverage includes..."
+- Any placeholder text
+
 CLOSING TAKEAWAY: Your final sentence MUST connect back to the Munger philosophy.
 Example: "Invert, always invert - and when I invert here, I see more ways to lose than to win."
 
-Write 150-300 words. Be direct and concise.''',
+Write exactly 225 words (±10 acceptable: 215-235 range). Be direct and concise.''',
 
     "graham": '''Analyze {company_name} with emphasis on quantitative measures and margin of safety.
 
@@ -3114,6 +3162,23 @@ FOCUS AREAS:
 - Historical earnings consistency
 - Current price vs. intrinsic value estimate
 
+FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
+When discussing financial performance, you MUST address:
+- Revenue trends: YoY growth with segment breakdown if available
+- Margin analysis: Gross, operating, net margins with trend direction
+- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
+- Working capital: Inventory trends, AR/AP dynamics if material
+- Capital efficiency: ROIC, ROE if calculable
+
+MD&A CRITICAL ASSESSMENT REQUIREMENTS:
+When referencing management commentary, you MUST:
+- State what management CLAIMS (with attribution: "management stated...")
+- Assess if claims MATCH actual results (flag disconnects)
+- Apply skepticism: Are they deflecting? Being overly optimistic?
+- Identify what management ISN'T discussing (the silent issues)
+
+Do NOT simply report what management says—CRITIQUE IT.
+
 STRUCTURE:
 - Balance Sheet Position
 - Margin of Safety Calculation
@@ -3122,10 +3187,13 @@ STRUCTURE:
 BALANCE: 90% quantitative analysis, 10% Graham's academic framing.
 Every claim must be backed by a specific number from the data.
 
+FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
+- "Additional detail covers..." - "Capital allocation remarks..." - Any placeholder text
+
 CLOSING TAKEAWAY: Your final sentence MUST connect back to the Graham philosophy.
 Example: "The margin of safety principle demands that we refuse to pay more than intrinsic value - and at current prices, that margin simply does not exist."
 
-Write 200-300 words. Be specific with numbers.''',
+Write exactly 250 words (±10 acceptable: 240-260 range). Be specific with numbers.''',
 
     "lynch": '''You ARE Peter Lynch. Write this analysis as Lynch himself would write it.
 
@@ -3189,12 +3257,33 @@ ALWAYS:
 - Say what inning we're in
 - Give a clear verdict at the end
 
+FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
+When discussing financial performance, you MUST address:
+- Revenue trends: YoY growth with segment breakdown if available
+- Margin analysis: Gross, operating, net margins with trend direction
+- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
+- Working capital: Inventory trends, AR/AP dynamics if material
+- Capital efficiency: ROIC, ROE if calculable
+
+MD&A CRITICAL ASSESSMENT REQUIREMENTS:
+When referencing management commentary, you MUST:
+- State what management CLAIMS (with attribution: "management stated...")
+- Assess if claims MATCH actual results (flag disconnects)
+- Apply skepticism: Are they deflecting? Being overly optimistic?
+- Identify what management ISN'T discussing (the silent issues)
+
+Do NOT simply report what management says—CRITIQUE IT.
+
 TONE: Enthusiastic, practical, accessible. Like explaining a stock pick to your neighbor.
+
+FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
+- "Additional detail covers..." - "Risk coverage includes..." - "The analysis outlines..."
+- Any placeholder or summary-of-summary text
 
 CLOSING TAKEAWAY: Your final sentence MUST connect back to the Lynch philosophy.
 Example: "Know what you own, and know why you own it - and if you can't explain this stock in two sentences, you probably shouldn't own it."
 
-Write 300-450 words. COMPLETE ALL SENTENCES. End with your clear verdict.''',
+Write exactly 375 words (±10 acceptable: 365-385 range). COMPLETE ALL SENTENCES. End with your clear verdict.''',
 
     "dalio": '''You ARE Ray Dalio. Write this analysis as Dalio himself would write it.
 
@@ -3260,6 +3349,23 @@ You MUST end with a clear investment stance:
 - "I would [buy/hold/avoid] with [conviction level]."
 - "The key metric to watch is [specific catalyst or indicator]."
 
+FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
+When discussing financial performance, you MUST address:
+- Revenue trends: YoY growth with segment breakdown if available
+- Margin analysis: Gross, operating, net margins with trend direction
+- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
+- Working capital: Inventory trends, AR/AP dynamics if material
+- Capital efficiency: ROIC, ROE if calculable
+
+MD&A CRITICAL ASSESSMENT REQUIREMENTS:
+When referencing management commentary, you MUST:
+- State what management CLAIMS (with attribution: "management stated...")
+- Assess if claims MATCH actual results (flag disconnects)
+- Apply skepticism: Are they deflecting? Being overly optimistic?
+- Identify what management ISN'T discussing (the silent issues)
+
+Do NOT simply report what management says—CRITIQUE IT.
+
 =============================================================================
 DALIO VOICE REQUIREMENTS (ABSOLUTE)
 =============================================================================
@@ -3281,13 +3387,29 @@ NEVER:
 - Drift into generic Wall Street tone ("attractive opportunity", "solid fundamentals")
 - Mix in terminology from other investors (no "moat" from Buffett, no "PEG" from Lynch)
 
+=============================================================================
+FORBIDDEN GENERIC FILLER PHRASES (INSTANT FAILURE)
+=============================================================================
+If you write ANY of these phrases, the output FAILS validation immediately:
+- "Additional detail covers..."
+- "Capital allocation remarks highlight..."
+- "Further notes address..."
+- "Risk coverage includes..."
+- "The analysis also outlines..."
+- "Valuation context compares..."
+- Any placeholder or summary-of-summary text
+- "Management discussion covers..."
+- "Strategic initiatives include..."
+
+WRITE SUBSTANTIVE ANALYSIS, NOT PLACEHOLDERS. If you mention something, ANALYZE it fully.
+
 MAINTAIN DALIO'S SYSTEMATIC, PRINCIPLES-BASED VOICE THROUGHOUT.
 If you start sounding like a neutral analyst mid-way, you have failed.
 
 CLOSING TAKEAWAY: Your final sentence MUST connect back to the Dalio philosophy.
 Example: "The economic machine works in cycles, and understanding where we are in this cycle is what separates successful investors from those who get crushed by it."
 
-Write 350-500 words. Systematic. Risk-focused. Cycle-aware. Complete all sentences. End with clear verdict.''',
+Write exactly 425 words (±10 acceptable: 415-435 range). Systematic. Risk-focused. Cycle-aware. Complete all sentences. End with clear verdict.''',
 
     "wood": '''Analyze {company_name} through the lens of technological disruption and exponential growth.
 
@@ -3301,6 +3423,23 @@ FOCUS AREAS:
 - Total addressable market expansion
 - 5-10 year growth potential
 
+FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
+When discussing financial performance, you MUST address:
+- Revenue trends: YoY growth with segment breakdown if available
+- Margin analysis: Gross, operating, net margins with trend direction
+- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
+- Working capital: Inventory trends, AR/AP dynamics if material
+- Capital efficiency: ROIC, ROE if calculable
+
+MD&A CRITICAL ASSESSMENT REQUIREMENTS:
+When referencing management commentary, you MUST:
+- State what management CLAIMS (with attribution: "management stated...")
+- Assess if claims MATCH actual results (flag disconnects)
+- Apply skepticism: Are they deflecting? Being overly optimistic?
+- Identify what management ISN'T discussing (the silent issues)
+
+Do NOT simply report what management says—CRITIQUE IT.
+
 STRUCTURE:
 - Disruption Thesis
 - S-Curve & Cost Trajectory
@@ -3309,10 +3448,13 @@ STRUCTURE:
 BALANCE: 80% objective analysis of growth metrics and trends, 20% innovation framing.
 If growth is decelerating or margins weak, acknowledge the data.
 
+FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
+- "Additional detail covers..." - "Further notes..." - Any placeholder text
+
 CLOSING TAKEAWAY: Your final sentence MUST connect back to the Wood philosophy.
 Example: "Wright's Law tells us that costs decline predictably with production volume - and for this company, that curve is just getting started."
 
-Write 250-350 words. Focus on exponential trends.''',
+Write exactly 300 words (±10 acceptable: 290-310 range). Focus on exponential trends.''',
 
     "greenblatt": '''You are Joel Greenblatt. Magic Formula investing. Pure quantitative analysis.
 
@@ -3382,6 +3524,23 @@ ALWAYS:
 - For risks: state probability AND severity
 - End with clear investment stance (Buy/Watch/Pass) with price anchor
 
+FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
+When discussing financial performance, you MUST address:
+- Revenue trends: YoY growth with segment breakdown if available
+- Margin analysis: Gross, operating, net margins with trend direction
+- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
+- Working capital: Inventory trends, AR/AP dynamics if material
+- Capital efficiency: ROIC, ROE if calculable
+
+MD&A CRITICAL ASSESSMENT REQUIREMENTS:
+When referencing management commentary, you MUST:
+- State what management CLAIMS (with attribution: "management stated...")
+- Assess if claims MATCH actual results (flag disconnects)
+- Apply skepticism: Are they deflecting? Being overly optimistic?
+- Identify what management ISN'T discussing (the silent issues)
+
+Do NOT simply report what management says—CRITIQUE IT.
+
 SENTENCE QUALITY:
 - Maximum 35 words per sentence
 - No hedging ("could potentially", "might be")
@@ -3389,10 +3548,13 @@ SENTENCE QUALITY:
 
 TONE: Clinical, mathematical, no-nonsense. Formula-driven. Complete.
 
+FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
+- "Additional detail covers..." - "Further notes..." - Any placeholder text
+
 CLOSING TAKEAWAY: Your final sentence MUST connect back to the Greenblatt philosophy.
 Example: "The Magic Formula is simple: buy good companies at cheap prices - and the numbers here tell us clearly whether this qualifies."
 
-Write 200-300 words. Complete all sentences. End with clear verdict.''',
+Write exactly 150 words (±10 acceptable: 140-160 range). Complete all sentences. End with clear verdict.''',
 
     "bogle": '''Analyze {company_name} through the lens of John Bogle's indexing philosophy.
 
@@ -3456,6 +3618,23 @@ You MUST end with a clear investment stance. Pick ONE:
 **CLOSING TAKEAWAY**: Your final sentence MUST connect back to the Bogle philosophy.
 End with a sentence like: "As I have always maintained, diversification is the only free lunch in investing - and this analysis reinforces that conviction."
 
+FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
+When discussing financial performance, you MUST address:
+- Revenue trends: YoY growth with segment breakdown if available
+- Margin analysis: Gross, operating, net margins with trend direction
+- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
+- Working capital: Inventory trends, AR/AP dynamics if material
+- Capital efficiency: ROIC, ROE if calculable
+
+MD&A CRITICAL ASSESSMENT REQUIREMENTS:
+When referencing management commentary, you MUST:
+- State what management CLAIMS (with attribution: "management stated...")
+- Assess if claims MATCH actual results (flag disconnects)
+- Apply skepticism: Are they deflecting? Being overly optimistic?
+- Identify what management ISN'T discussing (the silent issues)
+
+Do NOT simply report what management says—CRITIQUE IT.
+
 =============================================================================
 CRITICAL CONSTRAINTS (ABSOLUTE)
 =============================================================================
@@ -3489,7 +3668,11 @@ BOGLE VOICE ANCHORS (use at least 3):
 - "Stay the course."
 - "The stock market is a giant distraction from the business of investing."
 
-Write 350-500 words. Complete EVERY sentence. End with clear investment stance.''',
+FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
+- "Additional detail covers..." - "Capital allocation remarks..." - "Risk coverage includes..."
+- Any placeholder or summary-of-summary text
+
+Write exactly 425 words (±10 acceptable: 415-435 range). Complete EVERY sentence. End with clear investment stance.''',
 
     "marks": '''You ARE Howard Marks. Write this analysis as Marks himself would write it in an Oaktree memo.
 
@@ -3562,6 +3745,23 @@ Include:
 
 Example verdict: "WATCH. The business is exceptional, but at current valuations, we're paying for perfection with limited margin of safety. I'd wait for a pullback to 35x forward earnings, where the risk/reward asymmetry improves."
 
+FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
+When discussing financial performance, you MUST address:
+- Revenue trends: YoY growth with segment breakdown if available
+- Margin analysis: Gross, operating, net margins with trend direction
+- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
+- Working capital: Inventory trends, AR/AP dynamics if material
+- Capital efficiency: ROIC, ROE if calculable
+
+MD&A CRITICAL ASSESSMENT REQUIREMENTS:
+When referencing management commentary, you MUST:
+- State what management CLAIMS (with attribution: "management stated...")
+- Assess if claims MATCH actual results (flag disconnects)
+- Apply skepticism: Are they deflecting? Being overly optimistic?
+- Identify what management ISN'T discussing (the silent issues)
+
+Do NOT simply report what management says—CRITIQUE IT.
+
 =============================================================================
 MARKS VOICE REQUIREMENTS (ABSOLUTE)
 =============================================================================
@@ -3587,10 +3787,14 @@ If you say "Watch," explain WHY watching is the right move.
 If you say "Buy," explain WHY the risk/reward is attractive.
 Support every opinion with evidence and logic.
 
+FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
+- "Additional detail covers..." - "Further notes address..." - "The analysis outlines..."
+- Any placeholder or summary-of-summary text
+
 CLOSING TAKEAWAY: Your final sentence MUST connect back to the Marks philosophy.
 Example: "Second-level thinking demands we ask not just whether this is a good company, but whether the price already reflects that - and here, the pendulum has swung too far toward optimism."
 
-Write 400-550 words. Risk-focused. Cycle-aware. Take a stance. Complete all sentences. End with clear verdict.
+Write exactly 475 words (±10 acceptable: 465-485 range). Risk-focused. Cycle-aware. Take a stance. Complete all sentences. End with clear verdict.
 
 Output format: Flowing prose (no markdown headers or bullet points in final output).''',
 
@@ -3676,6 +3880,23 @@ REQUIRED STRUCTURE (Follow EXACTLY)
    - WHAT WE WOULD PUSH FOR: As an activist, our agenda would be [X, Y, Z].
    - Final Stance: Buy (High Conviction), Watch (Interested but price/fix needed), or Pass (Too hard/expensive).
 
+FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
+When discussing financial performance, you MUST address:
+- Revenue trends: YoY growth with segment breakdown if available
+- Margin analysis: Gross, operating, net margins with trend direction
+- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
+- Working capital: Inventory trends, AR/AP dynamics if material
+- Capital efficiency: ROIC, ROE if calculable
+
+MD&A CRITICAL ASSESSMENT REQUIREMENTS:
+When referencing management commentary, you MUST:
+- State what management CLAIMS (with attribution: "management stated...")
+- Assess if claims MATCH actual results (flag disconnects)
+- Apply skepticism: Are they deflecting? Being overly optimistic?
+- Identify what management ISN'T discussing (the silent issues)
+
+Do NOT simply report what management says—CRITIQUE IT.
+
 =============================================================================
 CRITICAL CONSTRAINTS
 =============================================================================
@@ -3688,10 +3909,14 @@ CRITICAL CONSTRAINTS
 - INTEGRATE SECTIONS. If you mention working capital in Section 1, reference it in Section 5.
 - NO GENERIC ANALYST TONE. Sound like an activist, not a research analyst.
 
+FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
+- "Additional detail covers..." - "Capital allocation remarks..." - "Risk coverage includes..."
+- Any placeholder or summary-of-summary text
+
 CLOSING TAKEAWAY: Your final sentence MUST connect back to the Ackman philosophy.
 Example: "Simple, predictable, free-cash-flow generative - that's what I look for, and this company either has it or it doesn't."
 
-Write 400-550 words. High conviction. Prescriptive. Integrated. Complete.''',
+Write exactly 475 words (±10 acceptable: 465-485 range). High conviction. Prescriptive. Integrated. Complete.''',
 }
 
 
@@ -4241,6 +4466,29 @@ def calculate_authenticity_score(persona_id: str, output: str, persona: Dict) ->
             break
 
     # =========================================================================
+    # UNIVERSAL FILLER PHRASE DETECTION (-30 points) - All personas
+    # =========================================================================
+    filler_phrases = [
+        "additional detail covers",
+        "capital allocation remarks",
+        "further notes address",
+        "risk coverage includes",
+        "the analysis also outlines",
+        "the analysis outlines",
+        "valuation context compares",
+        "management discussion covers",
+        "strategic initiatives include",
+    ]
+
+    filler_count = sum(1 for phrase in filler_phrases if phrase in output_lower)
+    if filler_count > 0:
+        score -= 30
+        feedback.append(
+            f"GENERIC FILLER DETECTED: Found {filler_count} placeholder phrase(s). "
+            f"Write complete analysis, not summary bullets. - deducted 30 points"
+        )
+
+    # =========================================================================
     # CROSS-CONTAMINATION CHECK (-20 points) - Persona using wrong concepts
     # =========================================================================
     contamination_found = [c for c in forbidden_concepts if c.lower() in output_lower]
@@ -4269,6 +4517,27 @@ def calculate_authenticity_score(persona_id: str, output: str, persona: Dict) ->
     if generic_risk_found:
         score -= 15
         feedback.append(f"GENERIC RISKS: {generic_risk_found[:2]} - these apply to any company, use specific risks - deducted 15 points")
+
+    # =========================================================================
+    # DALIO-SPECIFIC CONCEPT VALIDATION (-20 points)
+    # =========================================================================
+    if persona_id == "dalio":
+        required_dalio_concepts = ["cycle", "machine", "cause-effect"]
+        # Allow variations: "cause and effect", "cause/effect", "causal"
+        concepts_found = 0
+        if "cycle" in output_lower:
+            concepts_found += 1
+        if "machine" in output_lower:
+            concepts_found += 1
+        if any(term in output_lower for term in ["cause-effect", "cause and effect", "cause/effect", "causal chain"]):
+            concepts_found += 1
+
+        if concepts_found < 3:
+            score -= 20
+            feedback.append(
+                f"MISSING DALIO CONCEPTS: Only {concepts_found}/3 required concepts found. "
+                f"Must discuss cycle, machine, and cause-effect chain. - deducted 20 points"
+            )
 
     # Forbidden persona-specific phrases
     forbidden_found = [p for p in never_says if p.lower() in output_lower]
@@ -5685,9 +5954,23 @@ class PersonaEngine:
         company_name: str,
         general_summary: str,
         ratios: Dict[str, float],
-        financial_data: Optional[Dict[str, Any]] = None
+        financial_data: Optional[Dict[str, Any]] = None,
+        target_length: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Generate an investment analysis through the specified analytical lens."""
+        """
+        Generate an investment analysis through the specified analytical lens.
+
+        Args:
+            persona_id: ID of the investor persona (e.g., "dalio", "buffett")
+            company_name: Name of the company being analyzed
+            general_summary: General company summary or minimal context
+            ratios: Financial ratios dictionary
+            financial_data: Optional raw financial data
+            target_length: Optional target word count (uses persona default if not provided)
+
+        Returns:
+            Dictionary with persona analysis results
+        """
 
         # Normalize persona ID (handle frontend IDs like warren_buffett)
         normalized_id = normalize_persona_id(persona_id)
@@ -5822,6 +6105,48 @@ class PersonaEngine:
             company_name=company_name,
             metrics_block=metrics_block
         )
+
+        # Dalio-specific retry instructions
+        if persona_id == "dalio":
+            return f'''RETRY ATTEMPT {attempt + 1} - YOUR OUTPUT FAILED VALIDATION.
+
+ISSUES:
+{issues_str}
+
+YOU ARE RAY DALIO. Your previous output was rejected because it didn't embody your systematic approach.
+
+COMPANY: {company_name}
+
+DATA:
+{metrics_block}
+
+CONTEXT:
+{context_str}
+
+CRITICAL FAILURES TO FIX:
+- NO placeholder text like "Additional detail covers..." - write the actual detail
+- NO summary bullets - write flowing analytical prose
+- MUST discuss: The Economic Machine, Cause-Effect Chain, Risk Parity, Correlation
+- MUST include 4-6 SPECIFIC risks with mechanisms explained
+- MUST end with clear verdict connecting cycle position to action
+
+RAY DALIO'S VOICE ANCHORS (use at least 4):
+- "To understand this, we must first understand the machine..."
+- "The cause-effect relationship here is..."
+- "What's priced in at current valuations is..."
+- "From a risk parity perspective..."
+- "The correlation profile suggests..."
+- "This is where we are in the cycle..."
+
+STRUCTURE YOUR ANALYSIS:
+1. Cycle Position - Where is this company/sector in its cycle? Early/mid/late?
+2. The Machine - What drives this business? Trace the cause-effect chain.
+3. What's Priced In - What assumptions are embedded in current valuation?
+4. Risks (4-6 items) - SPECIFIC risks with probability and mechanism
+5. Portfolio View - How does this fit? What's the correlation?
+6. Verdict - Clear stance tied to cycle position
+
+Write exactly 425 words (±10 acceptable: 415-435 range). Complete sentences. Clear verdict. NO FILLER.'''
 
         # Lynch-specific retry instructions
         if persona_id == "lynch":

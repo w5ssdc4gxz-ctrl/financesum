@@ -1,0 +1,13 @@
+UNEXPECTED ERROR: 'DummyClient' object has no attribute 'stream_generate_content'
+Type: <class 'AttributeError'>
+Traceback (most recent call last):
+  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 4177, in generate_filing_summary
+    summary_text = _generate_summary_with_quality_control(
+        gemini_client,
+    ...<6 lines>...
+        timeout_seconds=SUMMARY_TOTAL_TIMEOUT_SECONDS,
+    )
+  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 1615, in _generate_summary_with_quality_control
+    raw_text = gemini_client.stream_generate_content(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'DummyClient' object has no attribute 'stream_generate_content'

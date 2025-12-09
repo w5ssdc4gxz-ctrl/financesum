@@ -11,7 +11,35 @@ interface EnhancedSummaryProps {
   } | null
 }
 
+/**
+ * Preprocess markdown content to ensure proper formatting for ReactMarkdown.
+ * This fixes issues where headers appear inline without proper line breaks.
+ */
+function preprocessContent(text: string): string {
+  if (!text) return text
+
+  let result = text
+
+  // Ensure any ## header has a blank line before it (unless at start of text)
+  // This is critical for ReactMarkdown to recognize headers
+  result = result.replace(/([^\n])\n(#{1,6}\s+)/g, '$1\n\n$2')
+
+  // Also handle cases where ## appears inline after text without any newline
+  result = result.replace(/([^\n])\s+(#{1,6}\s+)/g, '$1\n\n$2')
+
+  // Ensure blank line after headers before content
+  result = result.replace(/(#{1,6}\s+[^\n]+)\n([^#\n])/g, '$1\n\n$2')
+
+  // Clean up excessive newlines (more than 2)
+  result = result.replace(/\n{3,}/g, '\n\n')
+
+  return result
+}
+
 export default function EnhancedSummary({ content, persona }: EnhancedSummaryProps) {
+  // Preprocess content to fix markdown formatting issues
+  const processedContent = preprocessContent(content)
+
   return (
     <div className="relative space-y-6">
       {/* Persona Badge - Top Right */}
@@ -36,10 +64,20 @@ export default function EnhancedSummary({ content, persona }: EnhancedSummaryPro
       )}
 
       {/* Render the full content with premium styling */}
-      <div className={`prose dark:prose-invert max-w-none font-mono ${persona ? 'pt-2 md:pt-16' : ''}`}>
+      <div
+        className={`prose dark:prose-invert max-w-none font-mono normal-case [&_*]:normal-case [&_h2]:uppercase [&_h3]:uppercase ${
+          persona ? 'pt-2 md:pt-16' : ''
+        }`}
+      >
         <ReactMarkdown
+          className="normal-case [&_*]:normal-case"
           components={{
             // Custom renderers for better styling
+            p: ({ children }) => (
+              <p className="normal-case leading-relaxed text-[15px] text-gray-900 dark:text-gray-100">
+                {children}
+              </p>
+            ),
             h2: ({ children }) => (
               <h2 className="flex items-center gap-3 text-xl font-black uppercase mt-8 mb-4 border-b-2 border-black dark:border-white pb-2">
                 <span className="w-4 h-4 bg-black dark:bg-white"></span>
@@ -62,7 +100,7 @@ export default function EnhancedSummary({ content, persona }: EnhancedSummaryPro
               return (
                 <li className="flex items-start gap-2">
                   <span className="text-blue-600 font-bold mt-1">→</span>
-                  <span>{children}</span>
+                  <span className="normal-case">{children}</span>
                 </li>
               )
             },
@@ -78,7 +116,7 @@ export default function EnhancedSummary({ content, persona }: EnhancedSummaryPro
             ),
           }}
         >
-          {content}
+          {processedContent}
         </ReactMarkdown>
       </div>
     </div>

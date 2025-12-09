@@ -1,2 +1,2 @@
 Status: 500
-Body: {"detail":"Error resolving filing context: {'message': 'invalid input syntax for type uuid: \"length-test-filing\"', 'code': '22P02', 'hint': None, 'details': None}"}
+Body: {"detail":{"error":"internal_error","message":"An unexpected error occurred. Our team has been notified.","filing_id":"length-test-filing"}}

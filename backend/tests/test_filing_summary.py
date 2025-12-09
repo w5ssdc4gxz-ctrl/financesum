@@ -170,7 +170,7 @@ def test_custom_preferences_influence_prompt(monkeypatch):
         assert summary_text.startswith("custom summary")
         prompt_text = captured_prompts[0]
         assert "Investor brief (absolute priority): Focus on downside protection and liquidity" in prompt_text
-        assert "Begin the memo with a labeled 'Investor Lens' paragraph" in prompt_text
+        # NOTE: "Investor Lens" section removed - persona voice integrated into Executive Summary
         assert "explicitly reference this persona by name" in prompt_text
         assert "Primary focus areas (cover strictly in this order" in prompt_text
         assert "Focus area execution order" in prompt_text

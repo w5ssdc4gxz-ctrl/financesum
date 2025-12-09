@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import string
+import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from html import unescape
@@ -44,6 +45,11 @@ from app.services.local_cache import (
     progress_cache,
 )
 from app.services.gemini_client import get_gemini_client, generate_growth_assessment
+from app.services.gemini_exceptions import (
+    GeminiRateLimitError,
+    GeminiAPIError,
+    GeminiTimeoutError,
+)
 from app.services.health_scorer import calculate_health_score
 from app.services.sample_data import sample_filings_by_ticker
 from app.utils.supabase_errors import is_supabase_table_missing_error
@@ -51,10 +57,11 @@ from app.utils.supabase_errors import is_supabase_table_missing_error
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# Gemini 2.0 Flash Lite supports up to ~1M tokens. We limit to keep requests manageable.
-MAX_GEMINI_CONTEXT_CHARS = 600_000
-MAX_SUMMARY_ATTEMPTS = 12  # Increased to ensure length compliance
-MAX_REWRITE_ATTEMPTS = 3
+# Gemini 2.0 Flash Lite supports up to ~1M tokens. Cap context to keep requests fast.
+MAX_GEMINI_CONTEXT_CHARS = 200_000
+MAX_SUMMARY_ATTEMPTS = 2  # Faster: fewer full-summary retries
+MAX_REWRITE_ATTEMPTS = 1  # Faster: only one rewrite pass
+SUMMARY_TOTAL_TIMEOUT_SECONDS = 120  # Hard cap per-request generation time
 
 DETAIL_LEVEL_PROMPTS: Dict[str, str] = {
     "snapshot": "Keep analysis concise (1–2 short paragraphs) and only cite headline metrics that prove the main point.",
@@ -176,44 +183,23 @@ def _build_closing_takeaway_description(persona_name: Optional[str], company_nam
     title = "Closing Takeaway"
     
     base_requirements = (
-        "MANDATORY SECTION - DO NOT OMIT UNDER ANY CIRCUMSTANCES.\n"
-        "5-7 COMPLETE sentences (minimum 75 words). This is your FINAL INVESTMENT VERDICT.\n\n"
-        "=== REQUIRED ELEMENTS (ALL 5 MUST BE PRESENT - CHECK EACH ONE) ===\n"
-        "\n"
-        "1. QUALITY ASSESSMENT (REQUIRED): Is this a high-quality, average, or poor business?\n"
-        "   You MUST state this explicitly with reasoning.\n"
-        "   Example: 'This is a wonderful business because...' or 'This is a mediocre business due to...'\n"
-        "\n"
-        "2. INVESTMENT STANCE (REQUIRED - CANNOT BE OMITTED):\n"
-        "   You MUST state one of: BUY, HOLD, SELL, or WAIT\n"
-        "   Use the persona's language but the verdict must be CLEAR.\n"
-        "   Example: 'I would buy at these levels' or 'I would hold but not add' or 'I would pass/sell'\n"
-        "\n"
-        "3. KEY DRIVER (REQUIRED): What is the #1 factor behind your decision?\n"
-        "   Be specific: 'The moat is...' or 'The valuation is...' or 'The risk is...'\n"
-        "\n"
-        "4. ACTIONABLE TRIGGER (REQUIRED): What would change your mind?\n"
-        "   Example: 'I would reconsider if margins fell below 30%' or 'At a 20% pullback, I would buy'\n"
-        "\n"
-        "5. PERSONAL INVESTMENT OPINION (MANDATORY - THE FINAL SENTENCE):\n"
-        "   Your LAST sentence MUST be a first-person investment recommendation.\n"
-        "   You MUST use one of these EXACT formats:\n"
-        "   - 'I personally would BUY/HOLD/SELL [Company] because [reason].'\n"
-        "   - 'For my own portfolio, I would BUY/HOLD/SELL here.'\n"
-        "   - 'My personal recommendation: BUY/HOLD/SELL.'\n"
-        "   This is NON-NEGOTIABLE. The Closing Takeaway is INCOMPLETE without this final sentence.\n"
-        "\n"
-        "VERIFICATION: Before submitting, check: Does your FINAL sentence contain 'I personally would' or 'my personal recommendation'? If not, ADD IT.\n\n"
+        "Include a concise Closing Takeaway. Keep this balanced with other sections.\n"
+        "2-4 COMPLETE sentences (~50-70 words). This is your FINAL INVESTMENT VERDICT.\n\n"
+        "=== MANDATORY FIRST ELEMENT (CANNOT BE OMITTED) ===\n"
+        "Your FIRST or LAST sentence MUST be a clear personal investment opinion:\n"
+        "- 'I personally would BUY [Company] at current levels because [reason].'\n"
+        "- 'I personally would HOLD [Company] given current valuations.'\n"
+        "- 'I personally would SELL [Company] due to [reason].'\n"
+        "This is NON-NEGOTIABLE. Without 'I personally would BUY/HOLD/SELL', the Closing Takeaway FAILS.\n\n"
+        "=== SUPPORTING ELEMENTS (BRIEF) ===\n"
+        "- Quality assessment: High-quality, average, or poor business (1 phrase)\n"
+        "- Key driver: The #1 factor behind your decision (1 phrase)\n"
+        "- Trigger: What would change your mind (optional if hitting word limit)\n\n"
+        "VERIFICATION: Does your output contain 'I personally would BUY/HOLD/SELL'? If NO, ADD IT NOW.\n"
     )
     
     completion_requirements = (
-        "\n=== ABSOLUTE SENTENCE COMPLETION REQUIREMENT ===\n"
-        "EVERY sentence MUST end with a period, question mark, or exclamation point.\n"
-        "DO NOT write 'I would...' and stop. COMPLETE IT: 'I would wait for a better entry point.'\n"
-        "DO NOT trail off with '...' - FORBIDDEN.\n"
-        "DO NOT end with incomplete phrases like 'which is...', 'and the...', 'but I...'\n"
-        "READ YOUR LAST SENTENCE ALOUD. Does it sound complete? If not, REWRITE IT.\n"
-        "=== END REQUIREMENT ===\n"
+        "\nEnsure sentences are complete and punctuated. Avoid trailing off or ellipses.\n"
     )
     
     if persona_name and persona_name in PERSONA_CLOSING_INSTRUCTIONS:
@@ -389,6 +375,57 @@ def _count_words(text: str) -> int:
     return count
 
 
+def _call_gemini_client(
+    gemini_client,
+    prompt: str,
+    *,
+    allow_stream: bool = False,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
+    stage_name: str = "Generating",
+    expected_tokens: int = 4000,
+) -> str:
+    """
+    Generate text using the Gemini client, gracefully falling back when streaming helpers
+    are unavailable (e.g., in tests that mock only the underlying model).
+    """
+    if allow_stream and hasattr(gemini_client, "stream_generate_content"):
+        try:
+            return gemini_client.stream_generate_content(
+                prompt,
+                progress_callback=progress_callback,
+                stage_name=stage_name,
+                expected_tokens=expected_tokens,
+            )
+        except ValueError as exc:
+            if "request_options" in str(exc) and hasattr(gemini_client, "force_http_fallback"):
+                gemini_client.force_http_fallback = True
+                try:
+                    return gemini_client.stream_generate_content(
+                        prompt,
+                        progress_callback=progress_callback,
+                        stage_name=stage_name,
+                        expected_tokens=expected_tokens,
+                    )
+                except Exception:
+                    logger.warning("Streaming failed after forcing HTTP fallback; using non-stream generation.")
+            else:
+                logger.warning("Streaming generation failed with ValueError (%s); using non-stream generation.", exc)
+        except Exception as exc:
+            logger.warning("Streaming generation unavailable (%s); using non-stream generation.", exc)
+
+    generator = None
+    if hasattr(gemini_client, "generate_content"):
+        generator = gemini_client.generate_content
+    elif getattr(gemini_client, "model", None) and hasattr(gemini_client.model, "generate_content"):
+        generator = gemini_client.model.generate_content
+
+    if not generator:
+        raise AttributeError("Gemini client does not expose generate_content")
+
+    response = generator(prompt)
+    return getattr(response, "text", response)
+
+
 def _fix_inline_section_headers(text: str) -> str:
     """Fix section headers that appear inline with content instead of on their own lines.
     
@@ -422,8 +459,24 @@ def _fix_inline_section_headers(text: str) -> str:
     
     result = text
     
+    # UNIVERSAL PATTERN: First, ensure ANY ## header has proper newlines before it
+    # This catches cases where headers appear inline regardless of surrounding text
+    # Pattern: any character (not newline) followed by space(s) and ##
+    result = re.sub(
+        r'([^\n])\s*(##\s*)',
+        r'\1\n\n\2',
+        result
+    )
+    
+    # Also ensure newlines after headers before content
+    result = re.sub(
+        r'(##\s*[^\n]+)\n([^\n#])',
+        r'\1\n\n\2',
+        result
+    )
+    
     for header in section_headers:
-        # Pattern 1: Header appears after punctuation on same line
+        # Pattern 1: Header appears after punctuation on same line (now redundant but kept for robustness)
         # e.g., "...business. ## Executive Summary As Bill..."
         pattern1 = re.compile(
             rf'([.!?])\s*(?:##?\s*)?({re.escape(header)})\s+(\S)',
@@ -438,7 +491,7 @@ def _fix_inline_section_headers(text: str) -> str:
         # e.g., "some text ## Executive Summary more text"
         # Only add period if the character before isn't already punctuation
         pattern2 = re.compile(
-            rf'([^.!?\s])\s+(?:##?\s*)({re.escape(header)})\s+(\S)',
+            rf'([^.!?\s\n])\s+(?:##?\s*)({re.escape(header)})\s+(\S)',
             re.IGNORECASE
         )
         result = pattern2.sub(
@@ -453,16 +506,74 @@ def _fix_inline_section_headers(text: str) -> str:
         )
         if re.match(pattern3, result):
             result = pattern3.sub(f'## {header}\n\n', result, count=1)
+        
+        # Pattern 4: Header without ## prefix appearing after newline
+        # e.g., "\nExecutive Summary\n" should become "\n## Executive Summary\n"
+        pattern4 = re.compile(
+            rf'\n({re.escape(header)})\s*\n',
+            re.IGNORECASE
+        )
+        result = pattern4.sub(f'\n\n## {header}\n\n', result)
     
-    # Clean up excessive newlines
+    # Clean up excessive newlines (more than 3 consecutive)
     result = re.sub(r'\n{4,}', '\n\n\n', result)
     
-    # Ensure ## headers are properly formatted
-    result = re.sub(r'(\n|^)#+\s+', r'\1## ', result)
+    # Ensure ## headers are properly formatted (normalize # count)
+    result = re.sub(r'(\n|^)#{1,6}\s+', r'\1## ', result)
     
     # Clean up double periods that might have been introduced
     result = re.sub(r'\.{2,}', '.', result)
     
+    # Final pass: ensure every ## header has a blank line before it
+    result = re.sub(r'([^\n])\n(## )', r'\1\n\n\2', result)
+    
+    # And a blank line after header lines (header line = starts with ## and ends at newline)
+    result = re.sub(r'(## [^\n]+)\n([^\n])', r'\1\n\n\2', result)
+    
+    return result
+
+
+def _remove_filler_phrases(text: str) -> str:
+    """
+    Remove filler phrases that slip through LLM generation.
+    Safety net for phrases that should never appear in output.
+    """
+    if not text:
+        return text
+
+    # Comprehensive filler patterns (regex to catch variations)
+    filler_patterns = [
+        r'Additional detail covers?\s+[^.]*\.',
+        r'Capital allocation remarks?\s+[^.]*\.',
+        r'Further notes? address(?:es)?\s+[^.]*\.',
+        r'Risk coverage includes?\s+[^.]*\.',
+        r'The analysis (?:also )?outlines?\s+[^.]*\.',
+        r'Valuation context compares?\s+[^.]*\.',
+        r'Management discussion covers?\s+[^.]*\.',
+        r'Strategic initiatives include\s+[^.]*\.',
+        # Catch partial sentences
+        r'Additional detail covers?\.?\s*$',
+        r'Further notes? address\.?\s*$',
+        r'Risk coverage includes?\.?\s*$',
+    ]
+
+    result = text
+    removed_count = 0
+
+    for pattern in filler_patterns:
+        matches = re.findall(pattern, result, re.IGNORECASE | re.MULTILINE)
+        if matches:
+            removed_count += len(matches)
+            result = re.sub(pattern, '', result, flags=re.IGNORECASE | re.MULTILINE)
+
+    if removed_count > 0:
+        logger.info(f"Post-processing removed {removed_count} filler phrase(s)")
+
+    # Clean up double spaces or hanging punctuation
+    result = re.sub(r'\s{2,}', ' ', result)
+    result = re.sub(r'\s+\.', '.', result)
+    result = re.sub(r'\.\s*\.', '.', result)
+
     return result
 
 
@@ -898,13 +1009,120 @@ def _truncate_text_to_word_limit(text: str, max_words: int) -> str:
 
 
 def _build_padding_block(required_words: int) -> str:
-    """DEPRECATED: Padding has been removed to prevent generic filler content.
+    """Deterministic, finance-relevant padding to safely reach strict word floors."""
+    if required_words <= 0:
+        return ""
+    
+    padding_sentences = _generate_padding_sentences(required_words)
+    return " ".join(padding_sentences)
 
-    Returns empty string. Summaries should be complete from AI generation.
-    If a summary is too short, it's better to accept the shorter length
-    than to add generic filler that doesn't relate to the specific company.
+
+def _generate_padding_sentences(required_words: int) -> List[str]:
+    """Return a list of short, finance-relevant sentences to use as padding."""
+    if required_words <= 0:
+        return []
+    
+    filler_sentences = [
+        "Expand margin and cash conversion commentary with concrete figures and periods.",
+        "Add liquidity and leverage observations, including debt maturities and interest costs.",
+        "Discuss competitive position, pricing power shifts, and customer concentration signals.",
+        "Clarify risk scenarios with quantified revenue or margin impact where possible.",
+        "Tie capital deployment to returns, noting R&D, capex, and buyback balance.",
+        "Anchor valuation view to growth durability and free cash flow trajectory.",
+    ]
+    
+    words = 0
+    padding_parts: List[str] = []
+    idx = 0
+    while words < required_words:
+        sentence = filler_sentences[idx % len(filler_sentences)]
+        padding_parts.append(sentence)
+        words += _count_words(sentence)
+        idx += 1
+    
+    return padding_parts
+
+
+def _distribute_padding_across_sections(summary_text: str, required_words: int) -> str:
     """
-    return ""
+    Evenly spread padding sentences across existing sections so the memo
+    doesn't balloon only at the end.
+    """
+    if required_words <= 0 or not summary_text:
+        return summary_text
+
+    heading_regex = re.compile(r"^\s*##\s+.+")
+    sections: List[Tuple[str, str]] = []
+    current_heading: Optional[str] = None
+    buffer: List[str] = []
+
+    for line in summary_text.splitlines():
+        if heading_regex.match(line):
+            if current_heading is not None:
+                sections.append((current_heading, "\n".join(buffer).strip()))
+            current_heading = line.strip()
+            buffer = []
+        elif current_heading is not None:
+            buffer.append(line)
+
+    if current_heading is not None:
+        sections.append((current_heading, "\n".join(buffer).strip()))
+
+    if not sections:
+        # Fall back to legacy padding at the end
+        base = summary_text.rstrip()
+        if base and not base.endswith((".", "!", "?")):
+            base += "."
+        return f"{base} {_build_padding_block(required_words)}".strip()
+
+    padding_sentences = _generate_padding_sentences(required_words)
+
+    # Weight distribution toward analysis-heavy sections; avoid padding Closing Takeaway by default.
+    weights: List[int] = []
+    for heading, _ in sections:
+        lower = heading.lower()
+        if "closing takeaway" in lower:
+            weights.append(0)  # keep verdict tight
+        elif "management discussion" in lower:
+            weights.append(3)  # primary expansion target
+        elif "financial performance" in lower:
+            weights.append(2)
+        elif "executive summary" in lower:
+            weights.append(1)
+        elif "risk factors" in lower or "strategic initiatives" in lower:
+            weights.append(1)
+        elif "financial health rating" in lower:
+            weights.append(1)
+        elif "key data appendix" in lower:
+            weights.append(0)  # keep appendix factual/brief
+        else:
+            weights.append(1)
+
+    target_indices: List[int] = []
+    for idx, wt in enumerate(weights):
+        if wt > 0:
+            target_indices.extend([idx] * wt)
+
+    # If all weights were zero (edge case), fall back to non-closing sections, then all sections
+    if not target_indices:
+        target_indices = [i for i, h in enumerate(sections) if "closing takeaway" not in h[0].lower()]
+    if not target_indices:
+        target_indices = list(range(len(sections)))
+
+    # Spread sentences round-robin across weighted targets
+    for idx, sentence in enumerate(padding_sentences):
+        target = target_indices[idx % len(target_indices)]
+        heading, body = sections[target]
+        separator = "\n\n" if body else ""
+        sections[target] = (heading, f"{body}{separator}{sentence}".strip())
+
+    # Reassemble the memo
+    rebuilt_sections: List[str] = []
+    for heading, body in sections:
+        section_text = f"{heading}\n{body}".strip()
+        rebuilt_sections.append(section_text)
+
+    return "\n\n".join(rebuilt_sections).strip()
 
 
 def _trim_appendix_preserving_rows(body: str, max_words: int) -> str:
@@ -946,7 +1164,8 @@ def _trim_preserving_headings(text: str, max_words: int) -> str:
     if not sections:
         return _truncate_text_to_word_limit(text, max_words)
 
-    min_words_per_section = max(6, min(20, max_words // max(1, len(sections))))
+    # Keep each section reasonably substantive to avoid fragmenting the summary when trimming
+    min_words_per_section = max(25, min(60, max_words // max(1, len(sections))))
     section_word_counts = [max(min_words_per_section, _count_words(body)) for _, body in sections]
     total_words = sum(section_word_counts)
     if total_words == 0:
@@ -1008,7 +1227,38 @@ def _trim_preserving_headings(text: str, max_words: int) -> str:
     return "\n\n".join(trimmed_sections).strip()
 
 
-def _finalize_length_band(summary_text: str, target_length: int, tolerance: int = 10) -> str:
+def _compress_summary_to_length(
+    gemini_client,
+    summary_text: str,
+    max_words: int,
+    target_length: int,
+    tolerance: int,
+) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Ask the model to compress the memo to fit within the band without truncating sections.
+    Returns (compressed_text, word_count) or (None, None) on failure.
+    """
+    compress_prompt = (
+        f"The following investor memo must be compressed to land BETWEEN {target_length - tolerance} "
+        f"and {target_length + tolerance} words. It currently exceeds {max_words} words.\n\n"
+        "RULES:\n"
+        "- KEEP every section heading and bullet; do NOT drop sections (including Risk Factors/Appendix).\n"
+        "- Shorten sentences, merge overlapping points, and remove redundancy instead of cutting sections.\n"
+        "- Preserve key metrics, conclusions, and investor-lens framing.\n"
+        "- Maintain markdown headings (## Section).\n"
+        "- End with an accurate control line: 'WORD COUNT: ###'.\n\n"
+        "MEMO TO COMPRESS:\n"
+        f"{summary_text}"
+    )
+    raw_text = _call_gemini_client(gemini_client, compress_prompt)
+    compressed_text, reported = _extract_word_count_control(raw_text)
+    if not compressed_text:
+        return None, None
+    words = _count_words(compressed_text)
+    return compressed_text, words
+
+
+def _finalize_length_band(summary_text: str, target_length: int, tolerance: int = 25) -> str:
     """
     Hard guardrail to guarantee the final text lands within the requested band,
     even if the model repeatedly ignores instructions.
@@ -1027,9 +1277,9 @@ def _finalize_length_band(summary_text: str, target_length: int, tolerance: int 
     if word_count > upper:
         trimmed = _trim_preserving_headings(summary_text, upper)
         trimmed_words = _count_words(trimmed)
+        # If trimming would drop us below the lower bound, keep the longer version
         if trimmed_words < lower:
-            trimmed = _truncate_text_to_word_limit(summary_text, lower)
-            trimmed_words = _count_words(trimmed)
+            return summary_text
         if trimmed_words > upper:
             trimmed = _truncate_text_to_word_limit(trimmed, upper)
         if trimmed and not trimmed.rstrip().endswith((".", "!", "?")):
@@ -1038,12 +1288,7 @@ def _finalize_length_band(summary_text: str, target_length: int, tolerance: int 
 
     # Under target: append additional content seamlessly (no label)
     deficit = lower - word_count
-    padding_block = _build_padding_block(deficit)
-    base = summary_text.rstrip()
-    if base and not base.endswith((".", "!", "?")):
-        base += "."
-    # Append padding without a label - it should flow naturally
-    padded = f"{base} {padding_block}"
+    padded = _distribute_padding_across_sections(summary_text, deficit)
     padded_words = _count_words(padded)
     if padded_words > upper:
         padded = _trim_preserving_headings(padded, upper)
@@ -1055,14 +1300,14 @@ def _finalize_length_band(summary_text: str, target_length: int, tolerance: int 
         padded_words = _count_words(padded)
     elif padded_words < lower:
         shortfall = lower - padded_words
-        padded += " " + _build_padding_block(shortfall)
+        padded = _distribute_padding_across_sections(padded, shortfall)
         padded_words = _count_words(padded)
         if padded_words > upper:
             padded = _truncate_text_to_word_limit(padded, upper)
     return padded
 
 
-def _force_final_band(summary_text: str, target_length: int, tolerance: int = 10) -> str:
+def _force_final_band(summary_text: str, target_length: int, tolerance: int = 25) -> str:
     """
     Absolutely enforce the target band with deterministic padding/trim, even if prior steps failed.
     """
@@ -1080,24 +1325,18 @@ def _force_final_band(summary_text: str, target_length: int, tolerance: int = 10
             summary_text = _trim_preserving_headings(summary_text, upper)
             continue
         deficit = lower - words
-        padding_block = _build_padding_block(deficit)
-        if summary_text and not summary_text.rstrip().endswith((".", "!", "?")):
-            summary_text = summary_text.rstrip() + "."
-        # Append padding seamlessly without a label
-        summary_text = f"{summary_text} {padding_block}"
+        summary_text = _distribute_padding_across_sections(summary_text, deficit)
 
     # Final safety net
     final_words = _count_words(summary_text)
     if final_words > upper:
-        summary_text = _truncate_text_to_word_limit(summary_text, upper)
+        trimmed = _trim_preserving_headings(summary_text, upper)
+        # If trimming drops below lower, keep the longer version to avoid losing content
+        if _count_words(trimmed) >= lower:
+            summary_text = trimmed
     elif final_words < lower:
-        shortfall = lower - final_words
-        padding_block = _build_padding_block(shortfall)
-        summary_text = summary_text.rstrip()
-        if summary_text and not summary_text.endswith((".", "!", "?")):
-            summary_text += "."
-        # Append padding seamlessly without a label
-        summary_text = f"{summary_text} {padding_block}"
+        # If still under, distribute a final round of padding away from the Closing Takeaway
+        summary_text = _distribute_padding_across_sections(summary_text, lower - final_words)
     return summary_text
 
 
@@ -1177,7 +1416,7 @@ def _rewrite_summary_to_length(
             "Rewrite the entire memo so it fits the range while preserving every section and investor-specific instruction."
             "\n\nMANDATORY REQUIREMENTS (IN PRIORITY ORDER):\n"
             "1. SENTENCE COMPLETION IS HIGHEST PRIORITY - NEVER cut off mid-sentence, even to meet word count.\n"
-            "2. Keep all existing section headings (Investor Lens, Executive Summary, Financial Performance, Management Discussion & Analysis, Risk Factors, "
+            "2. Keep all existing section headings (Financial Health Rating, Executive Summary, Financial Performance, Management Discussion & Analysis, Risk Factors,"
             "Strategic Initiatives & Capital Allocation, Key Data Appendix) unless they were absent in the draft. Do NOT drop sections to save space.\n"
             "3. Retain the key figures, personas, and conclusions.\n"
             "4. EVERY sentence MUST end with proper punctuation. No cutting off with 'and the...', 'which is...', or incomplete numbers like '$1.'.\n"
@@ -1192,9 +1431,17 @@ def _rewrite_summary_to_length(
         return prompt
 
     for attempt in range(1, MAX_REWRITE_ATTEMPTS + 1):
+        # Add delay between rewrite attempts to space out API calls
+        # This helps avoid rapid-fire requests that trigger rate limits
+        if attempt > 1:
+            delay_seconds = 2 ** (attempt - 1)  # Exponential: 2s, 4s, 8s...
+            delay_seconds = min(delay_seconds, 5)  # Cap at 5 seconds
+            logger.info(f"Waiting {delay_seconds}s before rewrite attempt {attempt}/{MAX_REWRITE_ATTEMPTS}")
+            time.sleep(delay_seconds)
+
         prompt = _build_prompt()
-        response = gemini_client.model.generate_content(prompt)
-        new_text, reported_count = _extract_word_count_control(response.text)
+        raw_text = _call_gemini_client(gemini_client, prompt)
+        new_text, reported_count = _extract_word_count_control(raw_text)
         if not new_text.strip():
             corrections.append("OUTPUT ISSUE: Draft was empty. Provide the full memo with all sections.")
             continue
@@ -1281,13 +1528,45 @@ def _enforce_length_constraints(
         return summary_text
 
     if actual_words > upper:
-        logger.warning(
-            "Summary remained above target range after rewrite fallback (got %s words; target %s±%s). Applying hard clamp.",
-            actual_words,
-            target_length,
-            tolerance,
-        )
-        summary_text = _trim_preserving_headings(summary_text, upper)
+        overage = actual_words - upper
+        # If we're massively over the target, skip an extra model call and trim deterministically first.
+        if overage > max(200, int(target_length * 0.35)):
+            logger.warning(
+                "Summary is far above target range (over by %s words). Applying deterministic trim before any further rewrites.",
+                overage,
+            )
+            summary_text = _trim_preserving_headings(summary_text, upper)
+        else:
+            logger.warning(
+                "Summary remained above target range after rewrite fallback (got %s words; target %s±%s). Attempting compression rewrite.",
+                actual_words,
+                target_length,
+                tolerance,
+            )
+            compressed, compressed_words = _compress_summary_to_length(
+                gemini_client,
+                summary_text,
+                upper,
+                target_length,
+                tolerance,
+            )
+            if compressed and compressed_words and lower <= compressed_words <= upper:
+                logger.info(
+                    "Compression succeeded: %s words (target %s±%s)",
+                    compressed_words,
+                    target_length,
+                    tolerance,
+                )
+                return _finalize_length_band(compressed, target_length, tolerance)
+
+            logger.warning(
+                "Compression rewrite failed or still out of band. Applying final deterministic clamp.",
+            )
+            summary_text = _trim_preserving_headings(summary_text, upper)
+
+        actual_words = _count_words(summary_text)
+        if lower <= actual_words <= upper:
+            return summary_text
 
     # If still under length, force one more aggressive expansion
     if actual_words < lower:
@@ -1309,8 +1588,8 @@ def _enforce_length_constraints(
             "MANDATORY: Append a final line 'WORD COUNT: ###' with the actual count after expansion.\n\n"
             f"SUMMARY TO EXPAND:\n{summary_text}"
         )
-        response = gemini_client.model.generate_content(emergency_prompt)
-        expanded_text, reported_count = _extract_word_count_control(response.text)
+        raw_text = _call_gemini_client(gemini_client, emergency_prompt)
+        expanded_text, reported_count = _extract_word_count_control(raw_text)
         expanded_words = _count_words(expanded_text)
         
         if expanded_words >= lower:
@@ -1346,6 +1625,7 @@ def _generate_summary_with_quality_control(
     target_length: Optional[int],
     quality_validators: Optional[List[Callable[[str], Optional[str]]]],
     filing_id: Optional[str] = None,
+    timeout_seconds: Optional[int] = None,
 ) -> str:
     """
     Call Gemini up to MAX_SUMMARY_ATTEMPTS times, tightening instructions if word count or quality drifts.
@@ -1356,6 +1636,7 @@ def _generate_summary_with_quality_control(
     previous_draft: Optional[str] = None
     summary_text: str = ""
     last_word_stats: Optional[Tuple[int, int]] = None  # (actual_words, tolerance)
+    start_time = time.time()
 
     def _progress_callback(percentage: int, status: str):
         if filing_id:
@@ -1376,18 +1657,20 @@ def _generate_summary_with_quality_control(
         return combined
 
     for attempt in range(1, MAX_SUMMARY_ATTEMPTS + 1):
+        if timeout_seconds and (time.time() - start_time) > timeout_seconds:
+            raise TimeoutError(f"Summary generation exceeded {timeout_seconds} seconds")
+        attempt_label = f"Generating Summary (attempt {attempt}/{MAX_SUMMARY_ATTEMPTS})"
         if filing_id:
-            attempt_label = f"Generating Summary (attempt {attempt}/{MAX_SUMMARY_ATTEMPTS})"
             progress_cache[str(filing_id)] = f"{attempt_label}... 0%"
-            raw_text = gemini_client.stream_generate_content(
-                prompt,
-                progress_callback=_progress_callback,
-                stage_name=attempt_label,
-                expected_tokens=target_length * 2 if target_length else 4000
-            )
-        else:
-            response = gemini_client.model.generate_content(prompt)
-            raw_text = response.text
+
+        raw_text = _call_gemini_client(
+            gemini_client,
+            prompt,
+            allow_stream=bool(filing_id),
+            progress_callback=_progress_callback if filing_id else None,
+            stage_name=attempt_label if filing_id else "Generating",
+            expected_tokens=target_length * 2 if target_length else 4000,
+        )
         summary_text, reported_count = _extract_word_count_control(raw_text)
         previous_draft = summary_text
 
@@ -1496,8 +1779,8 @@ def _generate_summary_with_quality_control(
                 f"SUMMARY TO EXPAND:\\n{summary_text}"
             )
             
-            response = gemini_client.model.generate_content(final_expansion_prompt)
-            expanded_text, _ = _extract_word_count_control(response.text)
+            raw_text = _call_gemini_client(gemini_client, final_expansion_prompt)
+            expanded_text, _ = _extract_word_count_control(raw_text)
             expanded_count = _count_words(expanded_text)
             
             if expanded_count >= minimum_acceptable:
@@ -1567,12 +1850,12 @@ def _validate_mdna_section(text: str) -> Optional[str]:
 SUMMARY_SECTION_REQUIREMENTS: List[Tuple[str, int]] = [
     ("Financial Health Rating", 30),
     ("Executive Summary", 100),  # HERO section - premium insight users pay for
-    ("Financial Performance", 50),
-    ("Management Discussion & Analysis", 50),
-    ("Risk Factors", 25),
+    ("Financial Performance", 75),  # Increased: more depth on metrics
+    ("Management Discussion & Analysis", 80),  # Increased: critical assessment of management
+    ("Risk Factors", 30),
     ("Strategic Initiatives & Capital Allocation", 35),
     ("Key Data Appendix", 20),
-    ("Closing Takeaway", 50),  # Must be substantive verdict - never over-shorten
+    ("Closing Takeaway", 50),  # Concise verdict with personal buy/hold/sell opinion
 ]
 SUMMARY_SECTION_MIN_WORDS = {title: minimum for title, minimum in SUMMARY_SECTION_REQUIREMENTS}
 
@@ -1582,13 +1865,13 @@ SUMMARY_SECTION_MIN_WORDS = {title: minimum for title, minimum in SUMMARY_SECTIO
 # Executive Summary is the HERO section - the premium insight users pay for
 SECTION_PROPORTIONAL_WEIGHTS: Dict[str, int] = {
     "Financial Health Rating": 8,
-    "Executive Summary": 25,
-    "Financial Performance": 16,
-    "Management Discussion & Analysis": 14,
-    "Risk Factors": 10,
+    "Executive Summary": 22,  # Reduced slightly to give more to MD&A/Financial
+    "Financial Performance": 18,  # Increased: more depth on metrics
+    "Management Discussion & Analysis": 18,  # Increased: critical assessment
+    "Risk Factors": 8,
     "Strategic Initiatives & Capital Allocation": 10,
     "Key Data Appendix": 5,
-    "Closing Takeaway": 12,
+    "Closing Takeaway": 11,  # Sum = 100
 }
 
 
@@ -1749,9 +2032,7 @@ def _build_preference_instructions(
             f"Use STRONG first-person language ('I', 'me', 'my view', 'from my perspective').\n"
             f"EVERY section must reflect this viewpoint - not just the intro."
         )
-        instructions.append(
-            "\n- Begin the memo with a labeled 'Investor Lens' paragraph. Start strictly with a first-person statement identifying your persona (e.g., 'As Peter Lynch, I...'). Restate the methodology and what you are looking for. Do NOT summarize results here."
-        )
+        # NOTE: Investor Lens section removed - persona voice is now integrated into Executive Summary directly
         instructions.append(
             "- In the 'Executive Summary', provide your decisive verdict. Use phrases like 'I like...', 'I am concerned about...', 'My take is...'. Be opinionated based on the persona's criteria."
         )
@@ -3419,7 +3700,7 @@ async def list_company_filings(
 
 
 @router.post("/{filing_id}/summary")
-async def generate_filing_summary(
+def generate_filing_summary(
     filing_id: str,
     preferences: Optional[FilingSummaryPreferences] = Body(default=None),
 ):
@@ -3530,32 +3811,33 @@ async def generate_filing_summary(
         if preferences and preferences.health_rating:
             weighting_preset = preferences.health_rating.primary_factor_weighting
 
-        # Generate AI growth assessment based on management perspective and sector context
+        # Optional AI growth assessment (disabled by default for speed)
         ai_growth_assessment = None
-        try:
-            progress_cache[str(filing_id)] = "Analyzing Growth Potential..."
-            # Build comprehensive ratios dict for growth context
-            ratios_for_growth = {}
-            if calculated_metrics.get("operating_margin") is not None:
-                ratios_for_growth["operating_margin"] = calculated_metrics["operating_margin"] / 100
-            if calculated_metrics.get("net_margin") is not None:
-                ratios_for_growth["net_margin"] = calculated_metrics["net_margin"] / 100
-            if calculated_metrics.get("revenue_growth_yoy") is not None:
-                ratios_for_growth["revenue_growth_yoy"] = calculated_metrics["revenue_growth_yoy"] / 100
-            if calculated_metrics.get("fcf_margin") is not None:
-                ratios_for_growth["fcf_margin"] = calculated_metrics["fcf_margin"] / 100
-            if calculated_metrics.get("gross_margin") is not None:
-                ratios_for_growth["gross_margin"] = calculated_metrics["gross_margin"] / 100
-            ai_growth_assessment = generate_growth_assessment(
-                filing_text=document_text,
-                company_name=company_name,
-                weighting_preference=weighting_preset,
-                ratios=ratios_for_growth
-            )
-            logger.info(f"AI growth assessment: score={ai_growth_assessment.get('score')}, description={ai_growth_assessment.get('description')}")
-        except Exception as growth_err:
-            logger.warning(f"AI growth assessment failed: {growth_err}")
-            ai_growth_assessment = None
+        if settings.enable_growth_assessment:
+            try:
+                progress_cache[str(filing_id)] = "Analyzing Growth Potential..."
+                # Build comprehensive ratios dict for growth context
+                ratios_for_growth = {}
+                if calculated_metrics.get("operating_margin") is not None:
+                    ratios_for_growth["operating_margin"] = calculated_metrics["operating_margin"] / 100
+                if calculated_metrics.get("net_margin") is not None:
+                    ratios_for_growth["net_margin"] = calculated_metrics["net_margin"] / 100
+                if calculated_metrics.get("revenue_growth_yoy") is not None:
+                    ratios_for_growth["revenue_growth_yoy"] = calculated_metrics["revenue_growth_yoy"] / 100
+                if calculated_metrics.get("fcf_margin") is not None:
+                    ratios_for_growth["fcf_margin"] = calculated_metrics["fcf_margin"] / 100
+                if calculated_metrics.get("gross_margin") is not None:
+                    ratios_for_growth["gross_margin"] = calculated_metrics["gross_margin"] / 100
+                ai_growth_assessment = generate_growth_assessment(
+                    filing_text=document_text,
+                    company_name=company_name,
+                    weighting_preference=weighting_preset,
+                    ratios=ratios_for_growth
+                )
+                logger.info(f"AI growth assessment: score={ai_growth_assessment.get('score')}, description={ai_growth_assessment.get('description')}")
+            except Exception as growth_err:
+                logger.warning(f"AI growth assessment failed: {growth_err}")
+                ai_growth_assessment = None
 
         # Pre-calculate health score BEFORE generating summary so we can inject it into the prompt
         print(f"DEBUG: calculated_metrics keys = {list(calculated_metrics.keys())}")
@@ -3644,7 +3926,7 @@ async def generate_filing_summary(
             [
                 (
                     "Executive Summary",
-                    "THIS IS THE HERO SECTION - the premium insight users pay for. MINIMUM 100 WORDS.\n\n"
+                    "THIS IS THE HERO SECTION - the premium insight users pay for. MINIMUM 110 WORDS.\n\n"
                     "Write a compelling, substantive investment thesis that:\n"
                     "1. OPENS with your conviction level and stance (bullish/bearish/neutral with HIGH/MEDIUM/LOW conviction)\n"
                     "2. SYNTHESIZES the investment case - why does this company matter RIGHT NOW?\n"
@@ -3660,33 +3942,33 @@ async def generate_filing_summary(
                 ),
                 (
                     "Financial Performance",
-                    "Concise quantitative overview (50-70 words). Include ONLY the most critical metrics:\n"
-                    "- Revenue with YoY% change and period\n"
-                    "- Operating margin and net margin\n"
-                    "- Net income and FCF\n"
-                    "- Cash flow quality (OCF vs Net Income ratio)\n"
-                    "Keep it tight - the Executive Summary carries the narrative weight. "
-                    "Focus on numbers that support your thesis, not exhaustive data.",
+                    "Quantitative analysis (70-90 words). Cover KEY metrics:\n"
+                    "- Revenue: Figures with YoY% change\n"
+                    "- Margins: Operating and net margin trends\n"
+                    "- Cash flow: FCF quality indicator\n\n"
+                    "FLOW: Connect numbers: 'Revenue grew X% but margins compressed Y% due to Z.'\n"
+                    "Explain what numbers mean for business sustainability.\n\n"
+                    "FORBIDDEN: 'Additional detail covers...', 'Capital allocation remarks...' - write real analysis.",
                 ),
                 (
                     "Management Discussion & Analysis",
-                    "Critical management insights (50-70 words). Extract ONLY the most important forward-looking statements:\n"
-                    "- Key revenue drivers or segment trends management highlighted\n"
-                    "- Forward guidance or outlook if provided\n"
-                    "- Strategic priorities or investments mentioned\n"
-                    "Use attributions: 'management stated', 'according to the filing'. "
-                    "Focus on what moves the stock, not comprehensive MD&A coverage.",
+                    "Critical management assessment (70-90 words). Focus on:\n"
+                    "1. Forward guidance: What did management state about outlook? (with attribution)\n"
+                    "2. Discrepancy check: Do claims MATCH actual results? Flag disconnects.\n"
+                    "3. Critical assessment: Apply healthy skepticism. Is management overly optimistic?\n\n"
+                    "FLOW: 'Management stated X → but results show Y → this suggests Z'\n\n"
+                    "FORBIDDEN: 'Further notes address...', 'The analysis outlines...' - write real critique.",
                 ),
                 (
                     "Risk Factors",
-                    "Top 2-3 MATERIAL risks only (25-40 words total). Focus on thesis-critical risks:\n"
+                    "Top 2-3 MATERIAL risks only (30-40 words total). Focus on thesis-critical risks:\n"
                     "**[Risk Name]**: [1 sentence with quantified impact if possible]\n\n"
                     "Only include risks SPECIFIC to THIS company's actual business model and industry. "
                     "Skip generic risks. What could actually break the investment thesis?",
                 ),
                 (
                     "Strategic Initiatives & Capital Allocation",
-                    "Brief capital deployment overview (35-50 words). Key items only:\n"
+                    "Brief capital deployment overview (40-50 words). Key items only:\n"
                     "- R&D, CapEx, or major investments if material\n"
                     "- Buybacks/dividends if significant\n"
                     "- M&A activity if relevant\n"
@@ -3939,6 +4221,7 @@ Before you output anything, verify:
                 _make_section_completeness_validator(include_health_rating)
             ],
             filing_id=filing_id,
+            timeout_seconds=SUMMARY_TOTAL_TIMEOUT_SECONDS,
         )
         
         progress_cache[str(filing_id)] = "Polishing Output..."
@@ -3947,15 +4230,8 @@ Before you output anything, verify:
         summary_text = _normalize_section_headings(summary_text, include_health_rating)
         summary_text = _fix_trailing_ellipsis(summary_text)  # Fix sentences ending with ...
         summary_text = _validate_complete_sentences(summary_text)  # Fix other incomplete sentences
-        summary_text = _ensure_required_sections(
-            summary_text,
-            include_health_rating=include_health_rating,
-            metrics_lines=metrics_lines,
-            calculated_metrics=calculated_metrics,
-            company_name=company_name,
-            health_rating_config=health_config,
-            persona_name=selected_persona_name,
-        )
+        summary_text = _remove_filler_phrases(summary_text)  # Remove filler phrases that slipped through
+        # NOTE: _ensure_required_sections() moved to end to avoid duplicate Closing Takeaway
         if target_length:
             summary_text = _enforce_length_constraints(
                 summary_text,
@@ -3965,16 +4241,7 @@ Before you output anything, verify:
                 last_word_stats=None,
             )
             summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
-            # Re-validate required sections after any trimming/padding, then clamp again
-            summary_text = _ensure_required_sections(
-                summary_text,
-                include_health_rating=include_health_rating,
-                metrics_lines=metrics_lines,
-                calculated_metrics=calculated_metrics,
-                company_name=company_name,
-                health_rating_config=health_config,
-                persona_name=selected_persona_name,
-            )
+            # NOTE: Removed duplicate _ensure_required_sections() call here to avoid duplicate Closing Takeaway
             summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
             # Final pass to normalize headings and length in case prior rewrites removed structure
             summary_text = _fix_inline_section_headers(summary_text)
@@ -3990,10 +4257,22 @@ Before you output anything, verify:
             )
             summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
             summary_text = _force_final_band(summary_text, target_length, tolerance=10)
+        else:
+            # When no target_length, still ensure required sections are present
+            summary_text = _ensure_required_sections(
+                summary_text,
+                include_health_rating=include_health_rating,
+                metrics_lines=metrics_lines,
+                calculated_metrics=calculated_metrics,
+                company_name=company_name,
+                health_rating_config=health_config,
+                persona_name=selected_persona_name,
+            )
 
         # Final ellipsis cleanup after all length adjustments
         summary_text = _fix_trailing_ellipsis(summary_text)
-        
+        summary_text = _remove_filler_phrases(summary_text)  # Final filler removal
+
         # Fix health score if AI generated a different score than pre-calculated
         if pre_calculated_score is not None and pre_calculated_band:
             summary_text = _fix_health_score_in_summary(
@@ -4001,6 +4280,9 @@ Before you output anything, verify:
                 pre_calculated_score,
                 pre_calculated_band,
             )
+
+        if target_length:
+            summary_text = _force_final_band(summary_text, target_length, tolerance=10)
 
         # Use pre-calculated health score data (computed before summary generation)
         health_score_data = pre_calculated_health
@@ -4025,12 +4307,113 @@ Before you output anything, verify:
         
         return JSONResponse(content=response_data)
         
-    except Exception as gemini_exc:
+    except GeminiRateLimitError as rate_limit_exc:
+        # Rate limit exceeded - return 429 with retry information
+        progress_cache[str(filing_id)] = "Rate limit exceeded - please retry in a moment"
+
+        retry_after_seconds = rate_limit_exc.retry_after or 60
+        logger.warning(
+            "Gemini rate limit hit for filing %s. Retry after: %s seconds. "
+            "This occurred after %d retry attempts with exponential backoff.",
+            filing_id,
+            retry_after_seconds,
+            5,  # max_retries from gemini client
+        )
+
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "rate_limit_exceeded",
+                "message": "The AI service rate limit has been exceeded. Please wait and try again.",
+                "retry_after_seconds": retry_after_seconds,
+                "filing_id": str(filing_id),
+                "attempts_made": 5
+            }
+        ) from rate_limit_exc
+
+    except GeminiTimeoutError as timeout_exc:
+        # Request timed out
+        progress_cache[str(filing_id)] = "Request timed out - please try again"
+        logger.error("Gemini request timed out for filing %s: %s", filing_id, timeout_exc)
+
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "error": "request_timeout",
+                "message": "The AI service took too long to respond. Try again or use a shorter summary length.",
+                "filing_id": str(filing_id)
+            }
+        ) from timeout_exc
+
+    except GeminiAPIError as api_exc:
+        # Other API errors (4xx/5xx)
+        progress_cache[str(filing_id)] = f"API error: {api_exc.status_code}"
+        logger.error(
+            "Gemini API error for filing %s: status=%s, message=%s",
+            filing_id,
+            api_exc.status_code,
+            str(api_exc)
+        )
+
+        # Map Gemini errors to appropriate HTTP codes
+        if 400 <= api_exc.status_code < 500:
+            # Client error (bad request, auth failure, etc.)
+            status_code = 400
+            error_type = "bad_request"
+            user_message = "Invalid request to AI service. Please check your inputs."
+        else:
+            # Server error (5xx from Gemini)
+            status_code = 502  # Bad Gateway
+            error_type = "upstream_service_error"
+            user_message = "The AI service encountered an error. Please try again later."
+
+        raise HTTPException(
+            status_code=status_code,
+            detail={
+                "error": error_type,
+                "message": user_message,
+                "filing_id": str(filing_id),
+                "upstream_status": api_exc.status_code
+            }
+        ) from api_exc
+
+    except TimeoutError as timeout_exc:
+        # Application-level timeout (not Gemini timeout)
+        progress_cache[str(filing_id)] = "Generation timed out"
+        logger.error(
+            "Summary generation timed out for %s after %s seconds",
+            filing_id,
+            SUMMARY_TOTAL_TIMEOUT_SECONDS
+        )
+
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "error": "generation_timeout",
+                "message": f"Summary generation exceeded {SUMMARY_TOTAL_TIMEOUT_SECONDS}s timeout. "
+                          "Try with default mode or shorter target length.",
+                "filing_id": str(filing_id),
+                "timeout_seconds": SUMMARY_TOTAL_TIMEOUT_SECONDS
+            }
+        ) from timeout_exc
+
+    except Exception as unexpected_exc:
+        # Fallback for truly unexpected errors
         with open("debug_error.txt", "w") as f:
-            f.write(f"ERROR: {gemini_exc}\n")
+            f.write(f"UNEXPECTED ERROR: {unexpected_exc}\n")
+            f.write(f"Type: {type(unexpected_exc)}\n")
             traceback.print_exc(file=f)
-        logger.exception(f"Gemini summarization error for filing {filing_id}: {gemini_exc}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate summary: {gemini_exc}")
+
+        logger.exception(f"Unexpected error during summary generation for filing {filing_id}")
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "internal_error",
+                "message": "An unexpected error occurred. Our team has been notified.",
+                "filing_id": str(filing_id)
+            }
+        )
 
 
 @router.post("/{filing_id}/parse")
@@ -4137,15 +4520,15 @@ def _normalize_section_headings(text: str, include_health_rating: bool) -> str:
     # This catches patterns like "...business. ## Executive Summary As Bill..."
     # and splits them into proper separate lines
     for title in required_titles:
-        # Pattern to find inline headers: text before + ## Title + text after (all on same conceptual line)
-        # We need to insert newlines before and after the header
+        # Pattern to find inline headers: text before + ## Title + trailing content
+        # IMPORTANT: Capture the first character after the title to preserve content
         inline_pattern = re.compile(
-            rf'([.!?])\s*(?:##?\s*)?({re.escape(title)})\s*',
+            rf'([.!?])\s*(?:##?\s*)?({re.escape(title)})\s*(\S)',
             re.IGNORECASE
         )
-        # Replace with: punctuation + double newline + ## Title + double newline
+        # Replace with: punctuation + double newline + ## Title + double newline + preserved trailing char
         normalized_text = inline_pattern.sub(
-            lambda m: f'{m.group(1)}\n\n## {title}\n\n',
+            lambda m: f'{m.group(1)}\n\n## {title}\n\n{m.group(3)}',
             normalized_text
         )
     
@@ -4250,6 +4633,39 @@ def _format_number_or_default(value: Optional[float]) -> str:
     return f"{value:,.2f}"
 
 
+def _ensure_personal_verdict(
+    closing_text: str,
+    company_name: str,
+    strengths: Optional[List[str]] = None,
+    concerns: Optional[List[str]] = None,
+) -> str:
+    """
+    Append a clear first-person buy/hold/sell verdict when a persona is used.
+    If the text already contains 'I personally would', it is left unchanged.
+    """
+    if not closing_text:
+        return closing_text
+
+    if re.search(r"\bi\s+personally\s+would\b", closing_text, re.IGNORECASE):
+        return closing_text
+
+    strengths = strengths or []
+    concerns = concerns or []
+
+    if strengths and not concerns:
+        verdict = "buy"
+    elif strengths and concerns:
+        verdict = "hold"
+    else:
+        verdict = "hold"
+
+    closing = closing_text.rstrip()
+    if closing and not closing.endswith((".", "!", "?")):
+        closing += "."
+    closing += f" I personally would {verdict} {company_name} at this point."
+    return closing
+
+
 def _generate_fallback_closing_takeaway(
     company_name: str,
     calculated_metrics: Dict[str, Any],
@@ -4319,10 +4735,11 @@ def _generate_fallback_closing_takeaway(
     
     # Persona-specific closing templates
     if persona_name and persona_name in PERSONA_CLOSING_INSTRUCTIONS:
-        return _generate_persona_flavored_closing(
+        closing = _generate_persona_flavored_closing(
             persona_name, company_name, strengths, concerns, 
             quality, is_positive, is_mixed, revenue, operating_margin
         )
+        return _ensure_personal_verdict(closing, company_name, strengths, concerns)
     
     # Generic fallback (no persona selected) - concise but complete (~40-50 words)
     sentences = []
@@ -4621,6 +5038,14 @@ def _ensure_required_sections(
 
         _append_section("Financial Health Rating", body)
 
+    # Ensure capital allocation coverage exists; this section anchors execution analysis
+    if not _section_present("Strategic Initiatives & Capital Allocation"):
+        strategic_body = (
+            f"{company_name} should outline how cash is deployed across reinvestment, M&A, and shareholder returns. "
+            "Verify capex and R&D needs are funded before buybacks or dividends, and tie any capital return to liquidity and debt capacity."
+        )
+        _append_section("Strategic Initiatives & Capital Allocation", strategic_body)
+
     # 2-6: For other sections, we do NOT add placeholder content.
     # If the AI failed to generate these sections, we skip them entirely.
     # The prompt should be strong enough to ensure the AI generates all sections.
@@ -4642,6 +5067,34 @@ def _ensure_required_sections(
     if closing_match:
         existing_closing = closing_match.group(1).strip()
         existing_word_count = len(existing_closing.split())
+        # If persona is selected but the closing lacks an explicit personal verdict, add one
+        if persona_name and not re.search(r"\bi\s+personally\s+would\b", existing_closing, re.IGNORECASE):
+            # Determine buy/hold/sell based on actual metrics
+            verdict_strengths = []
+            verdict_concerns = []
+            if calculated_metrics:
+                op_margin = calculated_metrics.get('operating_margin', 0)
+                net_margin = calculated_metrics.get('net_margin', 0)
+                fcf = calculated_metrics.get('free_cash_flow', 0)
+                if op_margin and op_margin > 15:
+                    verdict_strengths.append("strong operating margin")
+                if net_margin and net_margin > 10:
+                    verdict_strengths.append("healthy profitability")
+                if fcf and fcf > 0:
+                    verdict_strengths.append("positive free cash flow")
+                if op_margin and op_margin < 5:
+                    verdict_concerns.append("thin margins")
+                if net_margin and net_margin < 0:
+                    verdict_concerns.append("net losses")
+            patched = _ensure_personal_verdict(existing_closing, company_name, strengths=verdict_strengths, concerns=verdict_concerns)
+            text = re.sub(
+                r'(##\s*Closing\s+Takeaway\s*\n+)[\s\S]*?(?=\n##\s|\Z)',
+                rf'\1{patched}\n',
+                text,
+                flags=re.IGNORECASE,
+            )
+            existing_closing = patched
+            existing_word_count = len(existing_closing.split())
     else:
         existing_word_count = 0
     

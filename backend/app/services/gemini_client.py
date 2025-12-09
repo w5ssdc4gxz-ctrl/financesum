@@ -1,23 +1,87 @@
 """Gemini AI client for generating summaries and analysis."""
+import inspect
+import logging
 import re
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional
+
 import google.generativeai as genai
-from typing import Dict, List, Optional, Any, Callable
+import httpx
+from tenacity import (
+    retry,
+    stop_after_attempt,
+    wait_exponential,
+    retry_if_exception,
+    retry_if_exception_type,
+    before_sleep_log,
+)
+
 from app.config import get_settings
+from app.services.gemini_exceptions import (
+    GeminiRateLimitError,
+    GeminiAPIError,
+    GeminiTimeoutError,
+)
+
+logger = logging.getLogger(__name__)
+
+# Retry configuration constants
+DEFAULT_MAX_RETRIES = 5
+DEFAULT_INITIAL_WAIT = 1  # seconds
+DEFAULT_MAX_WAIT = 60  # seconds
+DEFAULT_EXPONENTIAL_MULTIPLIER = 2
+
+# Persona word count targets (midpoint of recommended range ±10 tolerance)
+PERSONA_DEFAULT_LENGTHS = {
+    "dalio": 425,      # midpoint of 350-500
+    "buffett": 325,    # midpoint of 250-400
+    "lynch": 375,      # midpoint of 300-450
+    "greenblatt": 150, # midpoint of 100-200
+    "marks": 475,      # midpoint of 400-550
+    "ackman": 475,     # midpoint of 400-550
+    "bogle": 425,      # midpoint of 350-500
+    "munger": 225,     # midpoint of 150-300
+    "graham": 250,     # midpoint of 200-300
+    "wood": 300,       # midpoint of 250-350
+}
 
 
 class GeminiClient:
     """Client for interacting with Gemini AI."""
     
-    def __init__(self, model_name: str = "gemini-2.0-flash"):
+    def __init__(
+        self,
+        model_name: str = "gemini-2.5-flash",
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        initial_wait: int = DEFAULT_INITIAL_WAIT,
+        max_wait: int = DEFAULT_MAX_WAIT,
+    ):
         """
         Initialize Gemini client.
-        
+
         Args:
             model_name: Name of the Gemini model to use
+            max_retries: Maximum number of retry attempts for rate-limited requests
+            initial_wait: Initial wait time in seconds before first retry
+            max_wait: Maximum wait time in seconds between retries
         """
         settings = get_settings()
-        genai.configure(api_key=settings.gemini_api_key)
-        
+        self.api_key = settings.gemini_api_key
+        self.request_timeout = 180  # seconds per API call - summary generation can take 2-3 minutes
+        genai.configure(api_key=self.api_key)
+        self.model_name = model_name
+        self.persona_model_name = model_name
+        # Cap output tokens to speed up responses while leaving headroom for long memos
+        self.base_generation_config = {"maxOutputTokens": 9000, "temperature": 0.5}
+        self.persona_generation_config = {"maxOutputTokens": 9000, "temperature": 0.50, "topP": 0.9}
+        # Force HTTP fallback by default to avoid request_options schema mismatches that surface as 500s
+        self.force_http_fallback = True
+
+        # Retry configuration
+        self.max_retries = max_retries
+        self.initial_wait = initial_wait
+        self.max_wait = max_wait
+
         # Standard model for general summaries
         # Increased token limit to prevent truncation of complex analyses
         self.model = genai.GenerativeModel(
@@ -39,7 +103,177 @@ class GeminiClient:
                 top_p=0.9,  # Added for better diversity
             )
         )
+        # ALWAYS use HTTP fallback - the google-generativeai SDK has a known bug where
+        # it passes request_options to the proto which doesn't accept it, causing:
+        # "ValueError: Unknown field for GenerateContentRequest: request_options"
+        # Forcing HTTP fallback bypasses the SDK entirely and makes direct REST calls.
+        self.force_http_fallback = True
     
+    def _resolve_model_path(self, use_persona_model: bool = False) -> str:
+        raw_name = self.persona_model_name if use_persona_model else self.model_name
+        return raw_name if raw_name.startswith("models/") else f"models/{raw_name}"
+
+    def _http_generate_content(
+        self,
+        prompt: str,
+        use_persona_model: bool = False,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        stage_name: str = "Generating",
+    ) -> str:
+        """
+        Lightweight HTTP fallback with proper error handling.
+        Raises specific exceptions for different error types.
+
+        Raises:
+            GeminiRateLimitError: When API returns 429 (rate limit exceeded)
+            GeminiAPIError: When API returns other 4xx/5xx errors
+            GeminiTimeoutError: When request times out
+        """
+        if progress_callback:
+            progress_callback(5, f"{stage_name}... 5% (HTTP fallback)")
+
+        generation_config = (
+            self.persona_generation_config if use_persona_model else self.base_generation_config
+        )
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {k: v for k, v in generation_config.items() if v is not None},
+        }
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/"
+            f"{self._resolve_model_path(use_persona_model)}:generateContent"
+        )
+
+        try:
+            with httpx.Client(timeout=self.request_timeout + 5) as client:
+                response = client.post(url, params={"key": self.api_key}, json=payload)
+
+                # Handle rate limiting (429) specifically
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    retry_seconds = int(retry_after) if retry_after and retry_after.isdigit() else None
+
+                    error_msg = "Gemini API rate limit exceeded."
+                    if retry_seconds:
+                        error_msg += f" Retry after {retry_seconds} seconds."
+
+                    raise GeminiRateLimitError(error_msg, retry_after=retry_seconds)
+
+                # Handle other HTTP errors (4xx/5xx)
+                if response.status_code >= 400:
+                    response_text = response.text[:500]  # Limit error response size
+                    raise GeminiAPIError(
+                        f"Gemini API error: {response.status_code}",
+                        status_code=response.status_code,
+                        response_body=response_text
+                    )
+
+                # Parse successful response
+                data = response.json()
+
+        except httpx.TimeoutException as timeout_exc:
+            raise GeminiTimeoutError(
+                f"Gemini API request timed out after {self.request_timeout}s"
+            ) from timeout_exc
+
+        except (GeminiRateLimitError, GeminiAPIError, GeminiTimeoutError):
+            # Re-raise our custom exceptions as-is
+            raise
+
+        except httpx.HTTPStatusError as http_exc:
+            # Shouldn't reach here, but handle just in case
+            raise GeminiAPIError(
+                f"HTTP error: {http_exc.response.status_code}",
+                status_code=http_exc.response.status_code,
+                response_body=str(http_exc)
+            ) from http_exc
+
+        except Exception as unexpected_exc:
+            # Catch-all for truly unexpected errors
+            raise GeminiAPIError(
+                f"Unexpected error during Gemini API call: {str(unexpected_exc)}",
+                status_code=500,
+                response_body=None
+            ) from unexpected_exc
+
+        # Parse response text
+        text_response = ""
+        for candidate in data.get("candidates") or []:
+            content = candidate.get("content") or {}
+            parts = content.get("parts") or []
+            texts = [part.get("text") for part in parts if isinstance(part, dict) and part.get("text")]
+            if texts:
+                text_response = "".join(texts)
+                break
+
+        if not text_response:
+            raise GeminiAPIError(
+                "Gemini API returned no text content",
+                status_code=500,
+                response_body=str(data)
+            )
+
+        if progress_callback:
+            progress_callback(100, f"{stage_name}... Complete")
+
+        return text_response
+
+    def _http_generate_content_with_retry(
+        self,
+        prompt: str,
+        use_persona_model: bool = False,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        stage_name: str = "Generating",
+    ) -> str:
+        """
+        Wrapper around _http_generate_content with exponential backoff retry logic.
+
+        Retries automatically on:
+        - GeminiRateLimitError (429 Too Many Requests)
+        - GeminiTimeoutError (request timeout)
+
+        Does NOT retry on:
+        - GeminiAPIError with 4xx client errors (except 429)
+        - Could optionally retry on 5xx server errors
+
+        Retry strategy:
+        - Exponential backoff: 1s, 2s, 4s, 8s, 16s
+        - Maximum 5 attempts (configurable)
+        - Logs warnings before each retry
+        """
+
+        def _should_retry(exc: BaseException) -> bool:
+            if isinstance(exc, (GeminiRateLimitError, GeminiTimeoutError)):
+                return True
+            if isinstance(exc, GeminiAPIError) and exc.status_code and exc.status_code >= 500:
+                return True
+            return False
+
+        @retry(
+            retry=retry_if_exception(_should_retry),
+            stop=stop_after_attempt(self.max_retries),
+            wait=wait_exponential(
+                multiplier=DEFAULT_EXPONENTIAL_MULTIPLIER,
+                min=self.initial_wait,
+                max=self.max_wait
+            ),
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+            reraise=True  # Re-raise the exception after all retries exhausted
+        )
+        def _retry_wrapper():
+            return self._http_generate_content(
+                prompt=prompt,
+                use_persona_model=use_persona_model,
+                progress_callback=progress_callback,
+                stage_name=stage_name
+            )
+
+        try:
+            return _retry_wrapper()
+        except (GeminiRateLimitError, GeminiTimeoutError, GeminiAPIError):
+            # Let these bubble up to the API layer
+            raise
+
     def stream_generate_content(
         self,
         prompt: str,
@@ -61,6 +295,14 @@ class GeminiClient:
         Returns:
             Complete generated text
         """
+        if self.force_http_fallback:
+            return self._http_generate_content_with_retry(
+                prompt,
+                use_persona_model=use_persona_model,
+                progress_callback=progress_callback,
+                stage_name=stage_name,
+            )
+
         model = self.persona_model if use_persona_model else self.model
         accumulated_text = ""
         chunk_count = 0
@@ -82,10 +324,70 @@ class GeminiClient:
             
             return accumulated_text
             
-        except Exception as e:
+        except ValueError as e:
+            # Older SDK/proto combinations can raise on request_options mismatches
+            if "request_options" in str(e):
+                print("Streaming generation error due to request_options; retrying with HTTP fallback.")
+                self.force_http_fallback = True
+                return self._http_generate_content_with_retry(
+                    prompt,
+                    use_persona_model=use_persona_model,
+                    progress_callback=progress_callback,
+                    stage_name=stage_name,
+                )
+            raise
+        except Exception as e:  # noqa: BLE001
             print(f"Streaming generation error: {e}")
-            response = model.generate_content(prompt)
-            return response.text
+            try:
+                response = model.generate_content(prompt)
+                return response.text
+            except Exception as secondary:  # noqa: BLE001
+                print(f"Non-stream generation also failed: {secondary}")
+                self.force_http_fallback = True
+                return self._http_generate_content_with_retry(
+                    prompt,
+                    use_persona_model=use_persona_model,
+                    progress_callback=progress_callback,
+                    stage_name=stage_name,
+                )
+
+    def generate_content(
+        self,
+        prompt: str,
+        use_persona_model: bool = False,
+        timeout: Optional[int] = None,
+    ):
+        """Wrapper to enforce request timeouts on non-streaming calls."""
+        if self.force_http_fallback:
+            fallback_text = self._http_generate_content_with_retry(
+                prompt,
+                use_persona_model=use_persona_model,
+                stage_name="Generating",
+            )
+            return SimpleNamespace(text=fallback_text)
+
+        model = self.persona_model if use_persona_model else self.model
+        # Rely on outer timeout guards instead of per-call request_options to avoid SDK/proto mismatches
+        try:
+            return model.generate_content(prompt)
+        except ValueError as exc:
+            if "request_options" in str(exc):
+                fallback_text = self._http_generate_content_with_retry(
+                    prompt,
+                    use_persona_model=use_persona_model,
+                    stage_name="Generating",
+                )
+                self.force_http_fallback = True
+                return SimpleNamespace(text=fallback_text)
+            raise
+        except Exception:
+            fallback_text = self._http_generate_content_with_retry(
+                prompt,
+                use_persona_model=use_persona_model,
+                stage_name="Generating",
+            )
+            self.force_http_fallback = True
+            return SimpleNamespace(text=fallback_text)
 
     def generate_company_summary(
         self,
@@ -130,21 +432,33 @@ class GeminiClient:
         
         while current_try < max_retries:
             try:
-                response = self.model.generate_content(prompt)
+                response = self.generate_content(prompt)
                 summary_text = response.text
                 
-                # Check word count
+                # Check word count with ±10 tolerance
                 word_count = len(summary_text.split())
-                min_words = target_length if target_length else 0
-                
-                if target_length and word_count < min_words:
-                    print(f"Summary too short ({word_count} words). Retrying...")
-                    prompt += f"\n\nSYSTEM FEEDBACK: You generated {word_count} words. The requirement is {min_words} words. You are {min_words - word_count} words short. FAILED. EXPAND the 'Thesis' and 'Risks' sections with specific examples and historical context to meet the length requirement."
-                    current_try += 1
-                    continue
+
+                if target_length:
+                    min_acceptable = target_length - 10
+                    max_acceptable = target_length + 10
+
+                    if word_count < min_acceptable:
+                        delta = min_acceptable - word_count
+                        print(f"Summary too short ({word_count} words, target {target_length}±10). Retrying...")
+                        prompt += f"\n\nSYSTEM FEEDBACK: Word count {word_count} is {delta} words SHORT of minimum {min_acceptable}. Target: {target_length} words (±10 tolerance). You MUST add {delta}+ words of substantive analysis. NO FILLER PHRASES like 'Additional detail covers...' or 'Risk coverage includes...'. Add real analysis to 'Thesis' and 'Risks' sections."
+                        current_try += 1
+                        continue
+                    elif word_count > max_acceptable:
+                        excess = word_count - max_acceptable
+                        print(f"Summary too long ({word_count} words, target {target_length}±10). Retrying...")
+                        prompt += f"\n\nSYSTEM FEEDBACK: Word count {word_count} is {excess} words OVER maximum {max_acceptable}. Target: {target_length} words (±10 tolerance). CUT {excess}+ words. Remove generic phrases, redundancy, and filler. Keep only substantive analysis."
+                        current_try += 1
+                        continue
                 
                 # Parse the response into structured sections
-                return self._parse_summary_response(summary_text)
+                sections = self._parse_summary_response(summary_text)
+                sections["tldr"] = self._clamp_tldr_length(sections.get("tldr", ""))
+                return sections
             
             except Exception as e:
                 print(f"Error generating summary (attempt {current_try}): {e}")
@@ -387,6 +701,22 @@ ABSOLUTE SENTENCE COMPLETION REQUIREMENTS (CRITICAL - DO NOT VIOLATE):
         sections["full_summary"] = response_text
 
         return sections
+
+    def _clamp_tldr_length(self, tldr: str, max_words: int = 10) -> str:
+        """
+        Enforce the TL;DR length cap (hard max words) to match user requirements.
+        """
+        if not tldr:
+            return tldr
+
+        tokens = tldr.split()
+        if len(tokens) <= max_words:
+            return tldr.strip()
+
+        trimmed = " ".join(tokens[:max_words]).strip()
+        if trimmed and trimmed[-1] not in ".!?":
+            trimmed += "."
+        return trimmed
     
     def generate_persona_view(
         self,
@@ -408,7 +738,9 @@ ABSOLUTE SENTENCE COMPLETION REQUIREMENTS (CRITICAL - DO NOT VIOLATE):
         few_shot_examples: str = "",
         verdict_style: str = "",
         ignore_list: str = "",
-        strict_mode: bool = False
+        strict_mode: bool = False,
+        target_length: Optional[int] = None,
+        persona_id: Optional[str] = None
     ) -> Dict[str, str]:
         """
         Generate investor persona-specific view.
@@ -751,14 +1083,35 @@ VERDICT: [One sentence summary of why]
         
         while current_try < max_retries:
             try:
-                response = self.model.generate_content(prompt)
+                response = self.generate_content(prompt, use_persona_model=True)
                 result = self._parse_persona_response(response.text, persona_name)
                 
-                # Check word count of the summary section
+                # Check word count with ±10 tolerance
                 word_count = len(result["summary"].split())
-                if word_count < 150:
-                    print(f"Persona view too short ({word_count} words). Retrying...")
-                    prompt += f"\n\nSYSTEM FEEDBACK: Your analysis was {word_count} words. The requirement is 150-250 words. FAILED. EXPAND your analysis. Add more interpretation of the data."
+
+                # Determine target word count
+                if target_length:
+                    # User specified target_length - use ±10 tolerance
+                    min_acceptable = target_length - 10
+                    max_acceptable = target_length + 10
+                    target_desc = f"{target_length} words (±10 tolerance)"
+                else:
+                    # Use persona-specific defaults with ±10 tolerance
+                    default_target = PERSONA_DEFAULT_LENGTHS.get(persona_id, 300)
+                    min_acceptable = default_target - 10
+                    max_acceptable = default_target + 10
+                    target_desc = f"{default_target} words (±10 tolerance)"
+
+                if word_count < min_acceptable:
+                    delta = min_acceptable - word_count
+                    print(f"{persona_name} view too short ({word_count} words, target {target_desc}). Retrying...")
+                    prompt += f"\n\nSYSTEM FEEDBACK: {word_count} words is below minimum {min_acceptable}. Target: {target_desc}. Add {delta}+ words of substantive analysis. NO FILLER PHRASES like 'Additional detail covers...' or 'Risk coverage includes...'. Add real interpretation and insight."
+                    current_try += 1
+                    continue
+                elif word_count > max_acceptable:
+                    excess = word_count - max_acceptable
+                    print(f"{persona_name} view too long ({word_count} words, target {target_desc}). Retrying...")
+                    prompt += f"\n\nSYSTEM FEEDBACK: {word_count} words exceeds maximum {max_acceptable}. Target: {target_desc}. Cut {excess}+ words of filler. Remove generic phrases, redundancy, and placeholder text. Keep only substantive analysis."
                     current_try += 1
                     continue
                     
@@ -910,7 +1263,7 @@ VERDICT: [One sentence summary of why]
             Dictionary with persona analysis
         """
         try:
-            response = self.persona_model.generate_content(prompt)
+            response = self.generate_content(prompt, use_persona_model=True)
             response_text = response.text
 
             # Check for truncation and attempt completion if needed
@@ -1000,7 +1353,7 @@ TEXT TO COMPLETE:
 
 CONTINUE (do not repeat, just finish the thought):"""
 
-            response = self.persona_model.generate_content(completion_prompt)
+            response = self.generate_content(completion_prompt, use_persona_model=True)
             completion = response.text.strip()
 
             # Validate the completion isn't too long or repetitive
@@ -1116,8 +1469,14 @@ CONTINUE (do not repeat, just finish the thought):"""
 
 
 def get_gemini_client() -> GeminiClient:
-    """Get Gemini client instance."""
-    return GeminiClient()
+    """Get Gemini client instance with settings from config."""
+    settings = get_settings()
+
+    return GeminiClient(
+        max_retries=settings.gemini_max_retries,
+        initial_wait=settings.gemini_initial_wait,
+        max_wait=settings.gemini_max_wait,
+    )
 
 
 def generate_growth_assessment(
@@ -1203,7 +1562,7 @@ SCORING GUIDE:
 Be decisive. Ground your assessment in the filing text and metrics, not speculation."""
 
     try:
-        response = client.model.generate_content(prompt)
+        response = client.generate_content(prompt)
         result_text = response.text.strip()
 
         # Parse the response

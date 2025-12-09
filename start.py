@@ -27,6 +27,24 @@ BACKEND_PYTHON = BACKEND_VENV_DIR / "bin" / "python"
 BACKEND_PID_FILE = ROOT_DIR / ".financesum_backend.pid"
 FRONTEND_PID_FILE = ROOT_DIR / ".financesum_frontend.pid"
 
+def load_env_file(path: Path) -> None:
+    """Lightweight .env loader (KEY=VALUE, ignores comments/blank lines)."""
+    if not path.exists():
+        return
+    try:
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        # Do not block startup if the env file has an unexpected format
+        pass
+
 
 def log(message):
     """Print a message with flush."""
@@ -269,7 +287,12 @@ def select_frontend_port(preferred_port: int, allow_fallback: bool, attempts: in
 def main():
     """Start backend and frontend servers."""
     os.chdir(ROOT_DIR)
-    
+
+    # Load env files early so both backend and frontend receive required keys
+    load_env_file(ROOT_DIR / ".env")
+    load_env_file(BACKEND_DIR / ".env")
+    load_env_file(FRONTEND_DIR / ".env")
+
     log("\n🚀 Starting FinanceSum")
     log("=" * 50)
     
@@ -321,6 +344,8 @@ def main():
         frontend_env = os.environ.copy()
         frontend_env["PORT"] = str(frontend_port)
         frontend_env["NEXT_PUBLIC_API_URL"] = f"http://localhost:{backend_port}"
+        # Bypass Next.js rewrite proxy to avoid dev-server timeouts on long summary requests
+        frontend_env["NEXT_PUBLIC_API_PROXY_BASE"] = ""
         frontend_proc = subprocess.Popen(
             ["npm", "run", "dev"],
             cwd=FRONTEND_DIR,
@@ -373,8 +398,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 
 
 

@@ -33,7 +33,27 @@ class Settings(BaseSettings):
     
     # Gemini AI configuration
     gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
-    
+
+    # Gemini retry configuration
+    gemini_max_retries: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="Maximum retry attempts for rate-limited Gemini requests"
+    )
+    gemini_initial_wait: int = Field(
+        default=1,
+        ge=1,
+        le=10,
+        description="Initial wait time in seconds before first retry"
+    )
+    gemini_max_wait: int = Field(
+        default=60,
+        ge=10,
+        le=300,
+        description="Maximum wait time in seconds between retries"
+    )
+
     # Redis configuration (defaults to localhost)
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
@@ -52,6 +72,7 @@ class Settings(BaseSettings):
     # API configuration
     api_version: str = "v1"
     debug: bool = os.getenv("DEBUG", "False").lower() == "true"
+    enable_growth_assessment: bool = os.getenv("ENABLE_GROWTH_ASSESSMENT", "False").lower() == "true"
     
     # File storage
     data_dir: str = os.getenv("DATA_DIR", "./data")

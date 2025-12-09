@@ -192,7 +192,8 @@ def analyze_company_task(
                         company_name=company_name,
                         general_summary=brief_context,  # Pass minimal context, not formatted report
                         ratios=ratios,
-                        financial_data=merged_financial_data
+                        financial_data=merged_financial_data,
+                        target_length=target_length  # Pass user-specified target length
                     )
                     
                     persona_summaries[persona_id] = persona_analysis
