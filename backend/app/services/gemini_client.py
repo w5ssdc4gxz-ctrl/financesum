@@ -3,6 +3,7 @@ import inspect
 import logging
 import re
 from types import SimpleNamespace
+from uuid import uuid4
 from typing import Any, Callable, Dict, List, Optional
 
 import google.generativeai as genai
@@ -72,8 +73,9 @@ class GeminiClient:
         self.model_name = model_name
         self.persona_model_name = model_name
         # Cap output tokens to speed up responses while leaving headroom for long memos
-        self.base_generation_config = {"maxOutputTokens": 9000, "temperature": 0.5}
-        self.persona_generation_config = {"maxOutputTokens": 9000, "temperature": 0.50, "topP": 0.9}
+        self.base_generation_config = {"maxOutputTokens": 9000, "temperature": 0.55}
+        # Slightly higher temperature/topP for personas to encourage phrasing variance without losing structure
+        self.persona_generation_config = {"maxOutputTokens": 9000, "temperature": 0.65, "topP": 0.92}
         # Force HTTP fallback by default to avoid request_options schema mismatches that surface as 500s
         self.force_http_fallback = True
 
@@ -416,6 +418,9 @@ class GeminiClient:
         Returns:
             Dictionary with summary components
         """
+        # Use a per-request variation token to reduce repetition across runs
+        variation_token = uuid4().hex[:8].upper()
+
         prompt = self._build_summary_prompt(
             company_name,
             financial_data,
@@ -424,7 +429,8 @@ class GeminiClient:
             mda_text,
             risk_factors_text,
             target_length,
-            complexity
+            complexity,
+            variation_token,
         )
         
         max_retries = 3
@@ -481,7 +487,8 @@ class GeminiClient:
         mda_text: Optional[str],
         risk_factors_text: Optional[str],
         target_length: Optional[int] = None,
-        complexity: str = "intermediate"
+        complexity: str = "intermediate",
+        variation_token: Optional[str] = None,
     ) -> str:
         """Build the prompt for company summary generation."""
         # Format financial data
@@ -514,7 +521,7 @@ WORD COUNTING PROTOCOL (MANDATORY):
 4. FINAL CHECK: Your output MUST be between {min_words} and {max_words} words. No exceptions.
 
 SECTION WORD ALLOCATION GUIDE (adjust proportionally for target):
-- TL;DR: ~10 words (strict max)
+- TL;DR: EXACTLY 10 words (strict max - count them!)
 - Investment Thesis: ~{int(target_length * 0.15)} words
 - Top 5 Risks: ~{int(target_length * 0.18)} words
 - Strategic Initiatives: ~{int(target_length * 0.14)} words
@@ -530,9 +537,14 @@ LENGTH ADJUSTMENT RULES:
 - NEVER cut off mid-sentence to hit word count. Complete thoughts, then adjust.
 """
 
+        variation_clause = ""
+        if variation_token:
+            variation_clause = f"\nSTYLE VARIATION TOKEN: {variation_token}\n- Vary sentence openings and word choice from prior runs.\n- Avoid reusing identical phrasing in the Closing Takeaway.\n"
+
         prompt = f"""You are an expert equity analyst. Analyze the following company data and produce a comprehensive investment memo.
 {complexity_instruction}
 {length_instruction}
+{variation_clause}
 
 CRITICAL STYLE GUIDELINES (PREMIUM ANALYSIS):
 1. **NO CORPORATE FLUFF**: Do NOT use generic investor relations language.
@@ -544,6 +556,8 @@ CRITICAL STYLE GUIDELINES (PREMIUM ANALYSIS):
 3. **NO REDUNDANCY**: Do not repeat points across sections. If you mention R&D in the Thesis, do not repeat it in Catalysts unless there is a specific new event.
    - **SUSTAINABILITY**: Do NOT mention sustainability or ESG efforts unless they are a primary revenue driver (e.g., for a solar company). For most companies, this is fluff.
    - **MD&A**: Do NOT say "Management discusses..." or "In the MD&A section...". Just state the facts found there.
+4. **SENTENCE CASE**: Write paragraphs in sentence case. DO NOT use all caps anywhere outside of section headers.
+5. **VARIETY**: Avoid repeating identical phrases or sentence stems across sections or between runs. Rephrase while keeping facts consistent.
 
 Company: {company_name}
 Health Score: {health_score:.1f}/100
@@ -713,7 +727,14 @@ ABSOLUTE SENTENCE COMPLETION REQUIREMENTS (CRITICAL - DO NOT VIOLATE):
         if len(tokens) <= max_words:
             return tldr.strip()
 
-        trimmed = " ".join(tokens[:max_words]).strip()
+        # Try to find a natural sentence break within the limit
+        trimmed = " ".join(tokens[:max_words])
+        for i in range(len(trimmed) - 1, -1, -1):
+            if trimmed[i] in '.!?':
+                return trimmed[:i+1].strip()
+
+        # No sentence break found - truncate and add period
+        trimmed = trimmed.strip()
         if trimmed and trimmed[-1] not in ".!?":
             trimmed += "."
         return trimmed

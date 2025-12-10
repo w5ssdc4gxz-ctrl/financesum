@@ -551,10 +551,17 @@ def _remove_filler_phrases(text: str) -> str:
         r'Valuation context compares?\s+[^.]*\.',
         r'Management discussion covers?\s+[^.]*\.',
         r'Strategic initiatives include\s+[^.]*\.',
+        r'Add liquidity and leverage observations[^.]*\.',
+        r'Tie capital deployment[^.]*\.',
+        r'Clarify risk scenarios[^.]*\.',
+        r'Expand margin and cash conversion commentary[^.]*\.',
         # Catch partial sentences
         r'Additional detail covers?\.?\s*$',
         r'Further notes? address\.?\s*$',
         r'Risk coverage includes?\.?\s*$',
+        r'Add liquidity and leverage observations\.?\s*$',
+        r'Tie capital deployment\.?\s*$',
+        r'Clarify risk scenarios\.?\s*$',
     ]
 
     result = text
@@ -1018,36 +1025,42 @@ def _build_padding_block(required_words: int) -> str:
 
 
 def _generate_padding_sentences(required_words: int) -> List[str]:
-    """Return a list of short, finance-relevant sentences to use as padding."""
+    """Generate concise, finance-relevant padding sentences to reach required word counts."""
     if required_words <= 0:
         return []
-    
-    filler_sentences = [
-        "Expand margin and cash conversion commentary with concrete figures and periods.",
-        "Add liquidity and leverage observations, including debt maturities and interest costs.",
-        "Discuss competitive position, pricing power shifts, and customer concentration signals.",
-        "Clarify risk scenarios with quantified revenue or margin impact where possible.",
-        "Tie capital deployment to returns, noting R&D, capex, and buyback balance.",
-        "Anchor valuation view to growth durability and free cash flow trajectory.",
+
+    templates = [
+        "Monitor revenue trajectory versus peers to confirm share stability.",
+        "Track operating margin direction to gauge pricing power and efficiency.",
+        "Watch free cash flow conversion relative to net income for earnings quality.",
+        "Assess leverage and liquidity to ensure the balance sheet can fund strategy.",
+        "Review capital allocation between reinvestment, M&A, and buybacks for discipline.",
+        "Consider guidance credibility and backlog visibility when sizing position.",
+        "Evaluate unit economics by cohort to test margin durability.",
+        "Compare cash balance to near-term obligations to validate liquidity runway.",
+        "Test sensitivity of margins to incentive spend and promotional intensity.",
+        "Benchmark take rate trends against competitors to spot pricing pressure early.",
     ]
-    
-    words = 0
-    padding_parts: List[str] = []
+
+    sentences: List[str] = []
+    words_added = 0
     idx = 0
-    while words < required_words:
-        sentence = filler_sentences[idx % len(filler_sentences)]
-        padding_parts.append(sentence)
-        words += _count_words(sentence)
+
+    while words_added < required_words:
+        sentence = templates[idx % len(templates)]
+        # Avoid duplicating sentences back-to-back; add a mild variation if reused
+        if sentence in sentences:
+            sentence = f"Additionally, {sentence[0].lower()}{sentence[1:]}"
+            sentence = sentence[0].upper() + sentence[1:]
+        sentences.append(sentence)
+        words_added += len(sentence.split())
         idx += 1
-    
-    return padding_parts
+
+    return sentences
 
 
 def _distribute_padding_across_sections(summary_text: str, required_words: int) -> str:
-    """
-    Evenly spread padding sentences across existing sections so the memo
-    doesn't balloon only at the end.
-    """
+    """Spread deterministic padding across sections to hit strict word minimums."""
     if required_words <= 0 or not summary_text:
         return summary_text
 
@@ -1092,7 +1105,7 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
         elif "risk factors" in lower or "strategic initiatives" in lower:
             weights.append(1)
         elif "financial health rating" in lower:
-            weights.append(1)
+            weights.append(0)  # NEVER pad health rating - it should be tightly written and quantitative
         elif "key data appendix" in lower:
             weights.append(0)  # keep appendix factual/brief
         else:
@@ -1109,12 +1122,41 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
     if not target_indices:
         target_indices = list(range(len(sections)))
 
-    # Spread sentences round-robin across weighted targets
-    for idx, sentence in enumerate(padding_sentences):
-        target = target_indices[idx % len(target_indices)]
+    # Spread sentences round-robin across weighted targets while limiting repetition within a section
+    words_added = 0
+    idx_cycle = 0
+    max_cycles = max(len(padding_sentences), 1) * max(len(target_indices), 1) * 2
+
+    while words_added < required_words and idx_cycle < max_cycles:
+        sentence = padding_sentences[idx_cycle % len(padding_sentences)]
+        target = target_indices[idx_cycle % len(target_indices)]
         heading, body = sections[target]
+
+        # Skip if sentence already present in the section body
+        if sentence in body:
+            idx_cycle += 1
+            continue
+
         separator = "\n\n" if body else ""
         sections[target] = (heading, f"{body}{separator}{sentence}".strip())
+        words_added += len(sentence.split())
+        idx_cycle += 1
+
+    # If still short, append a final non-duplicate padding line to the longest analysis section
+    if words_added < required_words and sections:
+        deficit = required_words - words_added
+        candidate_indices = [
+            idx for idx, (heading, _) in enumerate(sections)
+            if "management discussion" in heading.lower()
+            or "financial performance" in heading.lower()
+            or "strategic initiatives" in heading.lower()
+        ] or list(range(len(sections)))
+        target = candidate_indices[0]
+        sentence = _generate_padding_sentences(deficit)[0]
+        heading, body = sections[target]
+        if sentence not in body:
+            separator = "\n\n" if body else ""
+            sections[target] = (heading, f"{body}{separator}{sentence}".strip())
 
     # Reassemble the memo
     rebuilt_sections: List[str] = []
@@ -1123,6 +1165,68 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
         rebuilt_sections.append(section_text)
 
     return "\n\n".join(rebuilt_sections).strip()
+
+
+def _clamp_to_band(text: str, lower: int, upper: int) -> str:
+    """Deterministically adjust text to land within [lower, upper] words."""
+    if not text:
+        return text
+
+    for _ in range(3):
+        words = _count_words(text)
+        if lower <= words <= upper:
+            return text
+        if words < lower:
+            text = _distribute_padding_across_sections(text, lower - words)
+        else:
+            text = _trim_preserving_headings(text, upper)
+
+    # Final safety: truncate to upper, then pad back to lower if needed
+    text = _truncate_text_to_word_limit(text, upper)
+    words = _count_words(text)
+    if words < lower:
+        text = _distribute_padding_across_sections(text, lower - words)
+    return text
+
+
+def _deduplicate_sentences(text: str) -> str:
+    """
+    Remove duplicate sentences from the text to improve flow.
+    Preserves the first occurrence of each sentence and removes subsequent duplicates.
+    """
+    if not text:
+        return text
+
+    # Split into lines to preserve structure
+    lines = text.splitlines()
+    seen_sentences: set = set()
+    result_lines: List[str] = []
+
+    for line in lines:
+        # Preserve headings and empty lines
+        if not line.strip() or line.strip().startswith("#"):
+            result_lines.append(line)
+            continue
+
+        # Split line into sentences
+        # Match sentences ending with . ! or ? followed by space or end
+        sentences = re.split(r'(?<=[.!?])\s+', line.strip())
+        unique_sentences: List[str] = []
+
+        for sentence in sentences:
+            # Normalize for comparison (lowercase, strip extra whitespace)
+            normalized = " ".join(sentence.lower().split())
+            if normalized and normalized not in seen_sentences:
+                seen_sentences.add(normalized)
+                unique_sentences.append(sentence)
+
+        if unique_sentences:
+            result_lines.append(" ".join(unique_sentences))
+        elif line.strip():
+            # If all sentences were duplicates, add empty line to preserve structure
+            pass
+
+    return "\n".join(result_lines)
 
 
 def _trim_appendix_preserving_rows(body: str, max_words: int) -> str:
@@ -1148,18 +1252,30 @@ def _trim_preserving_headings(text: str, max_words: int) -> str:
     sections: List[Tuple[str, str]] = []
     current_heading: Optional[str] = None
     buffer: List[str] = []
+    preamble: List[str] = []
+    first_heading_seen = False
 
     for line in text.splitlines():
         if heading_regex.match(line):
+            if not first_heading_seen and buffer:
+                preamble = buffer[:]
+                buffer = []
+            first_heading_seen = True
             if current_heading is not None:
                 sections.append((current_heading, "\n".join(buffer).strip()))
             current_heading = line.strip()
             buffer = []
         elif current_heading is not None:
             buffer.append(line)
+        else:
+            # Capture lines before the first heading as preamble
+            preamble.append(line)
+
+    preamble_text = "\n".join(preamble).strip()
 
     if current_heading is not None:
-        sections.append((current_heading, "\n".join(buffer).strip()))
+        section_body = "\n".join(buffer).strip()
+        sections.append((current_heading, section_body))
 
     if not sections:
         return _truncate_text_to_word_limit(text, max_words)
@@ -1224,7 +1340,11 @@ def _trim_preserving_headings(text: str, max_words: int) -> str:
             trimmed_body = _truncate_text_to_word_limit(body, allowed)
         trimmed_sections.append(f"{heading}\n{trimmed_body}".rstrip())
 
-    return "\n\n".join(trimmed_sections).strip()
+    rebuilt = []
+    if preamble_text:
+        rebuilt.append(preamble_text)
+    rebuilt.extend(trimmed_sections)
+    return "\n\n".join(rebuilt).strip()
 
 
 def _compress_summary_to_length(
@@ -1258,13 +1378,16 @@ def _compress_summary_to_length(
     return compressed_text, words
 
 
-def _finalize_length_band(summary_text: str, target_length: int, tolerance: int = 25) -> str:
+def _finalize_length_band(summary_text: str, target_length: int, tolerance: int = 10) -> str:
     """
     Hard guardrail to guarantee the final text lands within the requested band,
     even if the model repeatedly ignores instructions.
     """
     if not summary_text or target_length is None:
         return summary_text
+
+    # First, remove any duplicate sentences to improve flow
+    summary_text = _deduplicate_sentences(summary_text)
 
     lower = target_length - tolerance
     upper = target_length + tolerance
@@ -1277,9 +1400,11 @@ def _finalize_length_band(summary_text: str, target_length: int, tolerance: int 
     if word_count > upper:
         trimmed = _trim_preserving_headings(summary_text, upper)
         trimmed_words = _count_words(trimmed)
-        # If trimming would drop us below the lower bound, keep the longer version
+        # If trimming drops below the lower bound, pad back up to the lower bound
         if trimmed_words < lower:
-            return summary_text
+            deficit = lower - trimmed_words
+            trimmed = _distribute_padding_across_sections(trimmed, deficit)
+            trimmed_words = _count_words(trimmed)
         if trimmed_words > upper:
             trimmed = _truncate_text_to_word_limit(trimmed, upper)
         if trimmed and not trimmed.rstrip().endswith((".", "!", "?")):
@@ -1304,10 +1429,10 @@ def _finalize_length_band(summary_text: str, target_length: int, tolerance: int 
         padded_words = _count_words(padded)
         if padded_words > upper:
             padded = _truncate_text_to_word_limit(padded, upper)
-    return padded
+    return _clamp_to_band(padded, lower, upper)
 
 
-def _force_final_band(summary_text: str, target_length: int, tolerance: int = 25) -> str:
+def _force_final_band(summary_text: str, target_length: int, tolerance: int = 10) -> str:
     """
     Absolutely enforce the target band with deterministic padding/trim, even if prior steps failed.
     """
@@ -1331,13 +1456,20 @@ def _force_final_band(summary_text: str, target_length: int, tolerance: int = 25
     final_words = _count_words(summary_text)
     if final_words > upper:
         trimmed = _trim_preserving_headings(summary_text, upper)
-        # If trimming drops below lower, keep the longer version to avoid losing content
-        if _count_words(trimmed) >= lower:
+        trimmed_words = _count_words(trimmed)
+        if trimmed_words < lower:
+            deficit = lower - trimmed_words
+            trimmed = _distribute_padding_across_sections(trimmed, deficit)
+            trimmed_words = _count_words(trimmed)
+        if lower <= trimmed_words <= upper:
             summary_text = trimmed
+        else:
+            # If still over, hard truncate to upper as last resort
+            summary_text = _truncate_text_to_word_limit(trimmed, upper)
     elif final_words < lower:
         # If still under, distribute a final round of padding away from the Closing Takeaway
         summary_text = _distribute_padding_across_sections(summary_text, lower - final_words)
-    return summary_text
+    return _clamp_to_band(summary_text, lower, upper)
 
 
 def _needs_length_retry(text: str, target_length: int, cached_count: Optional[int] = None) -> Tuple[bool, int, int]:
@@ -1397,14 +1529,15 @@ def _rewrite_summary_to_length(
             words_needed = lower - latest_words
             direction_instruction = (
                 f"You are {abs_diff} words SHORT of the MINIMUM requirement ({lower} words). \n"
-                f"ACTION: EXPAND the content NOW. You MUST add AT LEAST {int(words_needed * 1.2)} words.\n\n"
+                f"ACTION: EXPAND the content NOW. You MUST add AT LEAST {int(words_needed * 1.3)} words.\n\n"
                 f"MANDATORY EXPANSION (add exactly these words per section):\n"
-                f"- Financial Performance: Add {max(2, int(words_needed * 0.30))} words (deeper margin analysis)\n"
-                f"- Management Discussion & Analysis: Add {max(2, int(words_needed * 0.25))} words (strategic insights)\n"
-                f"- Risk Factors: Add {max(2, int(words_needed * 0.20))} words (specific scenarios)\n"
-                f"- Strategic Initiatives: Add {max(2, int(words_needed * 0.15))} words (ROI expectations)\n"
-                f"- Competitive Landscape: Add {max(1, int(words_needed * 0.10))} words (moat analysis)\n\n"
-                f"You MUST reach at least {lower} words. Count before finishing."
+                f"- Financial Performance: Add {max(5, int(words_needed * 0.30))} words (deeper margin analysis, YoY comparisons)\n"
+                f"- Management Discussion & Analysis: Add {max(5, int(words_needed * 0.25))} words (strategic insights, execution risks)\n"
+                f"- Risk Factors: Add {max(5, int(words_needed * 0.20))} words (specific scenarios with probability/impact)\n"
+                f"- Strategic Initiatives: Add {max(3, int(words_needed * 0.15))} words (ROI expectations, timeline milestones)\n"
+                f"- Executive Summary: Add {max(3, int(words_needed * 0.10))} words (conviction rationale)\n\n"
+                f"DO NOT use generic filler sentences. Add SUBSTANTIVE analysis with specific data points.\n"
+                f"You MUST reach at least {lower} words. Count your words before finishing."
             )
         else:
             direction_instruction = "Ensure you stay within the target range."
@@ -1570,37 +1703,47 @@ def _enforce_length_constraints(
 
     # If still under length, force one more aggressive expansion
     if actual_words < lower:
-        logger.warning(
-            "Summary is critically short (%s words; minimum %s). Forcing emergency expansion.",
-            actual_words,
-            lower,
-        )
-        shortfall = lower - actual_words
-        emergency_prompt = (
-            f"The following summary is {shortfall} words SHORT of the ABSOLUTE MINIMUM requirement of {lower} words.\n\n"
-            f"You MUST expand this summary by adding AT LEAST {int(shortfall * 1.2)} words of substantive analysis.\n\n"
-            "CRITICAL EXPANSION REQUIREMENTS:\n"
-            "- Add detailed analysis to 'Financial Performance' (margins, cash flow quality, sustainability).\n"
-            "- Expand 'Management Discussion & Analysis' with strategic insights and forward guidance.\n"
-            "- Elaborate 'Risk Factors' with specific scenarios and quantified impact estimates.\n"
-            "- Enhance 'Strategic Initiatives' with ROI expectations and timeline milestones.\n"
-            "- Keep all existing sections intact. Only ADD content, do not remove anything.\n\n"
-            "MANDATORY: Append a final line 'WORD COUNT: ###' with the actual count after expansion.\n\n"
-            f"SUMMARY TO EXPAND:\n{summary_text}"
-        )
-        raw_text = _call_gemini_client(gemini_client, emergency_prompt)
-        expanded_text, reported_count = _extract_word_count_control(raw_text)
-        expanded_words = _count_words(expanded_text)
-        
-        if expanded_words >= lower:
-            logger.info("Emergency expansion successful: %s words (minimum %s)", expanded_words, lower)
-            return _finalize_length_band(expanded_text, target_length, tolerance)
-        else:
-            logger.error(
-                "Emergency expansion failed. Returning original (%s words; minimum %s).",
+        # Prefer deterministic padding before an extra model call
+        padded = _distribute_padding_across_sections(summary_text, lower - actual_words)
+        padded_words = _count_words(padded)
+        if lower <= padded_words <= upper:
+            return _finalize_length_band(padded, target_length, tolerance)
+
+        summary_text = padded
+        actual_words = padded_words
+
+        if actual_words < lower:
+            logger.warning(
+                "Summary is critically short (%s words; minimum %s). Forcing emergency expansion.",
                 actual_words,
                 lower,
             )
+            shortfall = lower - actual_words
+            emergency_prompt = (
+                f"The following summary is {shortfall} words SHORT of the ABSOLUTE MINIMUM requirement of {lower} words.\n\n"
+                f"You MUST expand this summary by adding AT LEAST {int(shortfall * 1.2)} words of substantive analysis.\n\n"
+                "CRITICAL EXPANSION REQUIREMENTS:\n"
+                "- Add detailed analysis to 'Financial Performance' (margins, cash flow quality, sustainability).\n"
+                "- Expand 'Management Discussion & Analysis' with strategic insights and forward guidance.\n"
+                "- Elaborate 'Risk Factors' with specific scenarios and quantified impact estimates.\n"
+                "- Enhance 'Strategic Initiatives' with ROI expectations and timeline milestones.\n"
+                "- Keep all existing sections intact. Only ADD content, do not remove anything.\n\n"
+                "MANDATORY: Append a final line 'WORD COUNT: ###' with the actual count after expansion.\n\n"
+                f"SUMMARY TO EXPAND:\n{summary_text}"
+            )
+            raw_text = _call_gemini_client(gemini_client, emergency_prompt)
+            expanded_text, reported_count = _extract_word_count_control(raw_text)
+            expanded_words = _count_words(expanded_text)
+            
+            if expanded_words >= lower:
+                logger.info("Emergency expansion successful: %s words (minimum %s)", expanded_words, lower)
+                return _finalize_length_band(expanded_text, target_length, tolerance)
+            else:
+                logger.error(
+                    "Emergency expansion failed. Returning original (%s words; minimum %s).",
+                    actual_words,
+                    lower,
+                )
     
     logger.warning(
         "Summary remained outside target range after rewrites (got %s words; target %s±%s). Applying final clamp.",
@@ -1849,11 +1992,11 @@ def _validate_mdna_section(text: str) -> Optional[str]:
 
 SUMMARY_SECTION_REQUIREMENTS: List[Tuple[str, int]] = [
     ("Financial Health Rating", 30),
-    ("Executive Summary", 100),  # HERO section - premium insight users pay for
-    ("Financial Performance", 75),  # Increased: more depth on metrics
-    ("Management Discussion & Analysis", 80),  # Increased: critical assessment of management
+    ("Executive Summary", 80),  # Tighter: faster read while keeping conviction
+    ("Financial Performance", 95),  # More depth on the numbers that matter
+    ("Management Discussion & Analysis", 110),  # Deeper management context and alignment
     ("Risk Factors", 30),
-    ("Strategic Initiatives & Capital Allocation", 35),
+    ("Strategic Initiatives & Capital Allocation", 40),
     ("Key Data Appendix", 20),
     ("Closing Takeaway", 50),  # Concise verdict with personal buy/hold/sell opinion
 ]
@@ -1864,14 +2007,14 @@ SUMMARY_SECTION_MIN_WORDS = {title: minimum for title, minimum in SUMMARY_SECTIO
 # Sum = 100 (percentages)
 # Executive Summary is the HERO section - the premium insight users pay for
 SECTION_PROPORTIONAL_WEIGHTS: Dict[str, int] = {
-    "Financial Health Rating": 8,
-    "Executive Summary": 22,  # Reduced slightly to give more to MD&A/Financial
-    "Financial Performance": 18,  # Increased: more depth on metrics
-    "Management Discussion & Analysis": 18,  # Increased: critical assessment
+    "Financial Health Rating": 5,  # Keep concise but meaningful
+    "Executive Summary": 14,  # Tighter intro to free room for analysis
+    "Financial Performance": 23,  # Heavier emphasis on the numbers
+    "Management Discussion & Analysis": 23,  # Heavier emphasis on management context
     "Risk Factors": 8,
-    "Strategic Initiatives & Capital Allocation": 10,
+    "Strategic Initiatives & Capital Allocation": 9,
     "Key Data Appendix": 5,
-    "Closing Takeaway": 11,  # Sum = 100
+    "Closing Takeaway": 13,  # Sum = 100
 }
 
 
@@ -2005,12 +2148,17 @@ def _build_preference_instructions(
 ) -> str:
     """Convert user-provided preferences into prompt guidance."""
     if not preferences or preferences.mode == "default":
-        return (
+        base = (
             "- Use the standard structure below with a balanced, neutral tone suitable for institutional investors.\n"
             "- NO PERSONA: Write as a neutral professional analyst. Use third-person language ('The company...', 'The data indicates...').\n"
             "- FORBIDDEN: First-person language ('I', 'my view'), famous investor voices (Buffett, Munger, Graham, etc.), folksy analogies.\n"
             "- FOCUS ON: Quantitative metrics, objective analysis, evidence-based conclusions."
         )
+        if preferences and preferences.target_length:
+            base += f"\nFinal deliverable must contain {preferences.target_length} words (±10 words)."
+        if preferences and preferences.tone:
+            base += f"\nTone must remain {preferences.tone}."
+        return base
 
     instructions: List[str] = [
         "=== USER CUSTOMIZATION REQUIREMENTS (MANDATORY - ZERO TOLERANCE FOR DEVIATION) ===",
@@ -2025,11 +2173,11 @@ def _build_preference_instructions(
         focus_clause = (
             f"{investor_focus} as it relates to {company_name}" if company_name else investor_focus
         )
+        instructions.append(f"Investor brief (absolute priority): {focus_clause}")
+        instructions.append("You must explicitly reference this persona by name in your narrative to prove you adopted the viewpoint.")
         instructions.append(
-            f"=== INVESTOR BRIEF (HIGHEST PRIORITY) ===\n"
-            f"{focus_clause}\n"
-            f"You MUST adopt this persona/viewpoint COMPLETELY. This is not optional.\n"
-            f"Use STRONG first-person language ('I', 'me', 'my view', 'from my perspective').\n"
+            f"You MUST adopt this persona/viewpoint COMPLETELY. This is not optional. "
+            f"Use STRONG first-person language ('I', 'me', 'my view', 'from my perspective'). "
             f"EVERY section must reflect this viewpoint - not just the intro."
         )
         # NOTE: Investor Lens section removed - persona voice is now integrated into Executive Summary directly
@@ -2061,23 +2209,19 @@ def _build_preference_instructions(
     if preferences.focus_areas:
         joined = ", ".join(preferences.focus_areas)
         instructions.append(
-            f"\n=== MANDATORY FOCUS AREAS (USER-SPECIFIED) ===\n"
-            f"The user REQUIRES these specific topics to be covered IN THIS ORDER:\n"
-            f"{joined}\n"
-            f"EACH focus area MUST have its own dedicated paragraph or subsection.\n"
-            f"Do NOT skip any. Do NOT add unrelated topics unless they support these."
+            f"Primary focus areas (cover strictly in this order and dedicate space):\n{joined}\n"
+            f"EACH focus area MUST have its own dedicated paragraph or subsection."
         )
         ordered_lines = "\n".join(f"   {idx + 1}. {area}" for idx, area in enumerate(preferences.focus_areas))
-        instructions.append("  Required execution order:\n" + ordered_lines)
+        instructions.append("Focus area execution order:\n" + ordered_lines)
 
     if preferences.tone:
-        tone_upper = preferences.tone.upper()
         instructions.append(
-            f"\n=== TONE REQUIREMENT (USER-SPECIFIED) ===\n"
-            f"Tone: {tone_upper}\n"
-            f"This tone must be CONSISTENT throughout the ENTIRE document.\n"
-            f"Do NOT switch between tones. Do NOT be neutral if user specified otherwise."
+            f"Tone must remain {preferences.tone}. Use this tone consistently across ALL sections. If tone drifts, rewrite."
         )
+
+    if preferences.target_length:
+        instructions.append(f"Final deliverable must contain {preferences.target_length} words (±10 words).")
 
     detail_prompt = DETAIL_LEVEL_PROMPTS.get((preferences.detail_level or "").lower())
     if detail_prompt:
@@ -2141,6 +2285,11 @@ FORBIDDEN (will invalidate your output):
 
 If you must choose between hitting {target_length} words exactly OR completing all sentences:
 ALWAYS CHOOSE COMPLETING SENTENCES. Word count is a guide, not a hard limit.
+
+CRITICAL: You MUST hit the target word count ({min_words}-{max_words} words).
+- If you are running SHORT: Add more analysis, specific data points, and elaboration to EACH section.
+- Do NOT rely on filler phrases. Add substantive content with real insights.
+- Count your words before submitting. If under {min_words}, go back and expand your analysis.
 === END LENGTH GUIDANCE ===
 
 {section_budgets}
@@ -2158,6 +2307,17 @@ CRITICAL COMPLETENESS INSTRUCTION:
 - You MUST complete all sections. Do not stop mid-sentence.
 - Allocate your word count wisely. Do not spend too many words on early sections if it means cutting off the end.
 - The 'Key Data Appendix' MUST be included at the end.
+"""
+    )
+
+    instructions.append(
+        """
+=== FLOW AND QUALITY REQUIREMENTS ===
+- Ensure each section transitions naturally to the next. The summary should read as a cohesive document.
+- NEVER repeat the same sentence or phrase anywhere in the summary. Each point should be made ONCE.
+- Vary your sentence structure and openings to maintain reader engagement.
+- The Financial Health Rating section should flow naturally into the Executive Summary.
+- Avoid redundancy: if you mention a metric in one section, do not repeat the same observation elsewhere.
 """
     )
 
@@ -2259,10 +2419,6 @@ def _health_pref_to_dict(pref: Optional[Any]) -> Dict[str, Any]:
 def _resolve_health_rating_config(
     preferences: Optional[FilingSummaryPreferences],
 ) -> Optional[Dict[str, Any]]:
-    # If mode is default, we force the default health rating configuration
-    if preferences and preferences.mode == "default":
-        return dict(DEFAULT_HEALTH_RATING_CONFIG)
-
     pref_data = _health_pref_to_dict(getattr(preferences, "health_rating", None))
 
     if not pref_data or not pref_data.get("enabled"):
@@ -2279,6 +2435,7 @@ def _resolve_health_rating_config(
 def _build_health_rating_instructions(
     preferences: Optional[FilingSummaryPreferences],
     company_name: str,
+    persona_id: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     config = _resolve_health_rating_config(preferences)
     if not config:
@@ -2286,7 +2443,7 @@ def _build_health_rating_instructions(
 
     display_style = config.get("display_style", "score_plus_grade")
     is_custom_mode = preferences and preferences.mode == "custom"
-    
+
     # Build header based on whether user has customized
     if is_custom_mode:
         directives = [
@@ -2307,6 +2464,7 @@ def _build_health_rating_instructions(
     if display_style == "score_plus_pillars":
         directives.extend([
             "USER SELECTED: Score + 4 Pillars breakdown",
+            "Deliver a four-pillar breakdown (Profitability | Risk | Liquidity | Growth).",
             "",
             "The rating MUST be calculated using a transparent formula. Show the calculation:",
             "  HEALTH RATING FORMULA (use this exact weighting):",
@@ -2342,7 +2500,7 @@ def _build_health_rating_instructions(
             "MANDATORY FORMAT (YOU MUST INCLUDE ALL ELEMENTS):",
             "1. The score (0-100) with letter grade: 90-100=A, 80-89=B, 70-79=C, 60-69=D, <60=F",
             "2. The rating label (Very Healthy/Healthy/Watch/At Risk)",
-            "3. A MANDATORY explanation of 3-5 sentences (50-100 words minimum)",
+            "3. A MANDATORY explanation of 3-4 sentences (40-75 words)",
             "",
             "YOUR EXPLANATION MUST COVER:",
             "- What drove the score (specific metrics with values)",
@@ -2367,7 +2525,7 @@ def _build_health_rating_instructions(
             "",
             "MANDATORY FORMAT (YOU MUST INCLUDE ALL ELEMENTS):",
             "1. The score (0-100) with traffic light: 70-100=GREEN, 50-69=YELLOW, 0-49=RED",
-            "2. A MANDATORY explanation of 3-5 sentences (50-100 words minimum)",
+            "2. A MANDATORY explanation of 3-4 sentences (40-75 words)",
             "",
             "YOUR EXPLANATION MUST COVER:",
             "- What drove the score (specific metrics with values)",
@@ -2386,7 +2544,7 @@ def _build_health_rating_instructions(
             "",
             "MANDATORY FORMAT - EXTENDED NARRATIVE REQUIRED:",
             "1. The score (0-100) with rating label",
-            "2. A DETAILED narrative paragraph of 6-8 sentences (100-150 words minimum)",
+            "2. A DETAILED narrative paragraph of 5-7 sentences (80-120 words minimum)",
             "",
             "YOUR NARRATIVE MUST ANALYZE:",
             "- Profitability metrics (margins, ROE, ROA) with specific values",
@@ -2403,7 +2561,7 @@ def _build_health_rating_instructions(
         directives.extend([
             "MANDATORY FORMAT - EXPLANATION REQUIRED:",
             "1. The score (0-100) with rating label",
-            "2. A MANDATORY explanation of 3-5 sentences (50-100 words minimum)",
+            "2. A MANDATORY explanation of 3-4 sentences (40-75 words)",
             "",
             "YOUR EXPLANATION MUST COVER:",
             "- What metrics drove the score",
@@ -2425,7 +2583,7 @@ def _build_health_rating_instructions(
         "- 0-49 = At Risk",
         "",
         "=== MINIMUM CONTENT REQUIREMENT (CRITICAL) ===",
-        "The Financial Health Rating section MUST be at least 50 words.",
+        "The Financial Health Rating section MUST be at least 40 words.",
         "A single line like 'Company receives 78/100 - Healthy.' is INVALID.",
         "You MUST explain WHY the company received this score with specific metrics.",
         "",
@@ -2435,7 +2593,7 @@ def _build_health_rating_instructions(
         "3. At least ONE balance sheet observation (e.g., 'conservative debt levels')",
         "4. At least ONE risk or concern that impacts the score",
         "",
-        "If you write fewer than 50 words for this section, your output is INVALID.",
+        "If you write fewer than 40 words for this section, your output is INVALID.",
         "=== END MINIMUM CONTENT REQUIREMENT ===",
     ])
 
@@ -2480,6 +2638,57 @@ def _build_health_rating_instructions(
         directives.append("")
         directives.append("COMPLIANCE CHECK: The health score MUST reflect ALL user-specified parameters above.")
         directives.append("If the score doesn't align with user's framework, weighting, and risk tolerance, REVISE IT.")
+
+        # Add explicit narrative personalization requirements
+        framework_display = (framework or "value_investor").replace("_", " ").title()
+        weighting_display = (weighting or "profitability").replace("_", " ")
+        risk_display = (risk or "moderate").replace("_", " ")
+
+        directives.append("")
+        directives.append("=== NARRATIVE PERSONALIZATION (MANDATORY) ===")
+        directives.append(f"Your explanation MUST explicitly reference the user's selections in the text:")
+        directives.append(f"- Start with a phrase like: 'Applying the {framework_display} framework...' or 'From a {framework_display} perspective...'")
+        directives.append(f"- Reference the weighting: 'With {weighting_display} as the primary factor...' or 'Prioritizing {weighting_display}...'")
+        directives.append(f"- The narrative should feel customized to the user's settings, NOT generic.")
+        directives.append("")
+        directives.append("EXAMPLE OF GOOD PERSONALIZED NARRATIVE:")
+        directives.append(f"'{company_name} receives a Financial Health Rating of 72/100 (W) - Watch. Applying the {framework_display} framework with {weighting_display} as the primary driver, the company's strong 45% gross margins provide a solid foundation. However, taking a {risk_display} approach to risk, the elevated debt-to-equity ratio of 1.8 and declining free cash flow warrant caution. The score would be higher but for these balance sheet concerns that a prudent investor must monitor.'")
+        directives.append("")
+        directives.append("BAD (too generic - DO NOT DO THIS):")
+        directives.append(f"'{company_name} receives a Financial Health Rating of 72/100 - Watch. Strong margins offset by leverage concerns.'")
+
+    # Add persona-specific health rating instructions if persona is selected
+    if persona_id:
+        # Persona intro phrases for health rating
+        persona_health_intros = {
+            "buffett": ("Warren Buffett", "Through my moat-focused lens", ["owner earnings", "durable economics", "moat", "compounding"]),
+            "munger": ("Charlie Munger", "Inverting the usual analysis", ["invert", "incentives", "rational", "avoid stupidity"]),
+            "graham": ("Benjamin Graham", "Applying margin-of-safety analysis", ["margin of safety", "intrinsic value", "balance sheet", "quantitative"]),
+            "lynch": ("Peter Lynch", "Looking at the story behind the numbers", ["the story", "PEG ratio", "growth", "tenbagger"]),
+            "dalio": ("Ray Dalio", "Analyzing cycle position and fundamentals", ["cycle", "debt levels", "economic machine", "paradigm"]),
+            "wood": ("Cathie Wood", "Through a disruptive innovation lens", ["disruption", "innovation", "exponential growth", "S-curve"]),
+            "greenblatt": ("Joel Greenblatt", "Applying Magic Formula criteria", ["return on capital", "earnings yield", "good company cheap"]),
+            "bogle": ("John Bogle", "From an index-investor perspective", ["costs matter", "diversification", "long-term", "simplicity"]),
+            "marks": ("Howard Marks", "Using second-level thinking", ["second-level thinking", "cycles", "risk-reward", "asymmetry"]),
+            "ackman": ("Bill Ackman", "From an activist value standpoint", ["catalysts", "free cash flow", "value creation", "capital allocation"]),
+        }
+
+        persona_info = persona_health_intros.get(persona_id.lower())
+        if persona_info:
+            persona_name, persona_intro, vocabulary = persona_info
+            vocab_str = ", ".join(f'"{w}"' for w in vocabulary[:3])
+
+            directives.append("")
+            directives.append(f"=== PERSONA VOICE: {persona_name} (MANDATORY) ===")
+            directives.append(f"The user has selected {persona_name} as their investment persona.")
+            directives.append(f"Write the health rating narrative in FIRST-PERSON as {persona_name}.")
+            directives.append("")
+            directives.append(f"OPENING: Start with '{persona_intro}...' or a similar persona-authentic phrase.")
+            directives.append(f"VOCABULARY: Use characteristic terms like {vocab_str} where appropriate.")
+            directives.append(f"TONE: The assessment should sound like personal advice from {persona_name} to a trusted colleague.")
+            directives.append("")
+            directives.append(f"EXAMPLE ({persona_name} voice):")
+            directives.append(f"'{company_name} receives a Financial Health Rating of 72/100 (W) - Watch. {persona_intro}, the company's fundamentals present a mixed picture. The strong gross margins suggest pricing power, but I'm concerned about the elevated debt levels. For my own portfolio, I'd want to see improvement in cash conversion before committing significant capital.'")
 
     directives.append("")
     directives.append("PLACEMENT: The Financial Health Rating section MUST appear FIRST, before the Executive Summary.")
@@ -2939,6 +3148,235 @@ def _format_metric_value(key: str, value: float) -> str:
     if key in {"operating_margin", "net_margin"}:
         return f"{value:.1f}%"
     return _format_dollar(value) or f"{value:,.2f}"
+
+
+def _build_health_driver_block(
+    calculated_metrics: Dict[str, Any],
+    health_score_data: Dict[str, Any],
+) -> Optional[str]:
+    """Construct a concise, data-driven health driver block."""
+    if not calculated_metrics or not health_score_data:
+        return None
+
+    def _pct(val: Optional[float]) -> Optional[str]:
+        return f"{val:.1f}%" if isinstance(val, (int, float)) else None
+
+    def _ratio(val: Optional[float]) -> Optional[str]:
+        return f"{val:.1f}x" if isinstance(val, (int, float)) else None
+
+    revenue = calculated_metrics.get("revenue") or calculated_metrics.get("total_revenue")
+    operating_income = calculated_metrics.get("operating_income")
+    operating_margin = calculated_metrics.get("operating_margin")
+    net_margin = calculated_metrics.get("net_margin")
+    operating_cash_flow = calculated_metrics.get("operating_cash_flow")
+    free_cash_flow = calculated_metrics.get("free_cash_flow")
+    total_assets = calculated_metrics.get("total_assets")
+    total_liabilities = calculated_metrics.get("total_liabilities")
+    current_assets = calculated_metrics.get("current_assets")
+    current_liabilities = calculated_metrics.get("current_liabilities")
+    interest_expense = calculated_metrics.get("interest_expense")
+    marketable_securities = calculated_metrics.get("marketable_securities")
+    cash = calculated_metrics.get("cash")
+
+    fcf_margin = None
+    if free_cash_flow is not None and revenue:
+        try:
+            fcf_margin = (free_cash_flow / revenue) * 100
+        except Exception:
+            fcf_margin = None
+
+    leverage = None
+    if total_liabilities and total_assets:
+        try:
+            leverage = total_liabilities / total_assets
+        except Exception:
+            leverage = None
+
+    current_ratio = None
+    if current_assets and current_liabilities:
+        try:
+            current_ratio = current_assets / current_liabilities if current_liabilities != 0 else None
+        except Exception:
+            current_ratio = None
+
+    interest_coverage = None
+    if operating_income and interest_expense:
+        try:
+            interest_coverage = operating_income / abs(interest_expense) if interest_expense != 0 else None
+        except Exception:
+            interest_coverage = None
+
+    cash_reserves = (cash or 0) + (marketable_securities or 0)
+
+    lines: List[str] = ["Health Score Drivers:"]
+
+    profitability_bits: List[str] = []
+    if operating_margin is not None:
+        profitability_bits.append(f"operating margin {_pct(operating_margin)}")
+    if net_margin is not None:
+        profitability_bits.append(f"net margin {_pct(net_margin)}")
+    if profitability_bits:
+        lines.append(f"- Profitability: {', '.join(bit for bit in profitability_bits if bit)}.")
+
+    cash_bits: List[str] = []
+    if operating_cash_flow is not None:
+        ocf_str = _format_dollar(operating_cash_flow)
+        if ocf_str:
+            cash_bits.append(f"operating cash flow {ocf_str}")
+    if free_cash_flow is not None:
+        fcf_str = _format_dollar(free_cash_flow)
+        if fcf_str:
+            cash_bits.append(f"FCF {fcf_str}")
+    if fcf_margin is not None:
+        cash_bits.append(f"FCF margin {_pct(fcf_margin)}")
+    if cash_bits:
+        lines.append(f"- Cash conversion: {', '.join(bit for bit in cash_bits if bit)}.")
+
+    balance_bits: List[str] = []
+    if cash_reserves and cash_reserves > 0:
+        cash_str = _format_dollar(cash_reserves)
+        if cash_str:
+            balance_bits.append(f"cash + securities of {cash_str}")
+    if total_liabilities is not None:
+        liabilities_str = _format_dollar(total_liabilities)
+        if liabilities_str:
+            balance_bits.append(f"liabilities of {liabilities_str}")
+    if leverage is not None:
+        balance_bits.append(f"leverage {_ratio(leverage)} assets")
+    if interest_coverage is not None:
+        balance_bits.append(f"interest coverage {_ratio(interest_coverage)}")
+    if balance_bits:
+        lines.append(f"- Balance sheet: {', '.join(bit for bit in balance_bits if bit)}.")
+
+    liquidity_bits: List[str] = []
+    if current_ratio is not None:
+        liquidity_bits.append(f"current ratio {_ratio(current_ratio)}")
+    if liquidity_bits:
+        lines.append(f"- Liquidity: {', '.join(bit for bit in liquidity_bits if bit)}.")
+
+    return "\n".join(lines) if len(lines) > 1 else None
+
+
+def _inject_health_drivers(
+    summary_text: str,
+    calculated_metrics: Dict[str, Any],
+    health_score_data: Dict[str, Any],
+) -> str:
+    """Insert a concise Health Score Drivers block under the health section."""
+    block = _build_health_driver_block(calculated_metrics, health_score_data)
+    if not block or "Health Score Drivers" in (summary_text or ""):
+        return summary_text
+
+    lines = summary_text.splitlines()
+    insert_idx: Optional[int] = None
+
+    for idx, line in enumerate(lines):
+        if re.match(r"^\s*##\s*Financial Health Rating", line, re.IGNORECASE) or line.strip().lower().startswith("financial health rating"):
+            insert_idx = idx + 1
+            # skip blank lines immediately after the heading
+            while insert_idx < len(lines) and lines[insert_idx].strip() == "":
+                insert_idx += 1
+            break
+
+    if insert_idx is None:
+        return f"{block}\n\n{summary_text}"
+
+    lines.insert(insert_idx, block)
+    return "\n".join(lines)
+
+
+def _ensure_health_rating_section(
+    summary_text: str,
+    health_score_data: Dict[str, Any],
+    calculated_metrics: Dict[str, Any],
+    company_name: str,
+) -> str:
+    """Guarantee the health rating heading, score line, and a substantive narrative are present."""
+    if not health_score_data:
+        return summary_text
+
+    score = health_score_data.get("overall_score")
+    band = health_score_data.get("score_band")
+    if score is None:
+        return summary_text
+
+    heading_pattern = re.compile(r"^\s*##\s*Financial Health Rating", re.IGNORECASE | re.MULTILINE)
+    lines = summary_text.splitlines()
+
+    heading_idx = None
+    for idx, line in enumerate(lines):
+        if heading_pattern.match(line):
+            heading_idx = idx
+            break
+
+    score_line = f"{company_name} receives a Financial Health Rating of {score:.0f}/100 ({band}) based on profitability, cash conversion, and balance sheet resilience."
+
+    if heading_idx is None:
+        narrative = _build_health_narrative(calculated_metrics, band)
+        return f"## Financial Health Rating\n{score_line}\n\n{narrative}\n\n{summary_text}".strip()
+
+    has_score_line = False
+    for j in range(heading_idx + 1, min(len(lines), heading_idx + 6)):
+        if re.search(r"\bFinancial Health Rating\b", lines[j], re.IGNORECASE) or re.search(r"\b/100\b", lines[j]):
+            has_score_line = True
+            break
+    if not has_score_line:
+        lines.insert(heading_idx + 1, score_line)
+
+    # Ensure the narrative under the health section is meaningful and long enough
+    next_heading = len(lines)
+    for k in range(heading_idx + 1, len(lines)):
+        if re.match(r"^\s*##\s+", lines[k]):
+            next_heading = k
+            break
+
+    body_lines = lines[heading_idx + 1:next_heading]
+    body_text = "\n".join(body_lines).strip()
+    if _count_words(body_text) < 40 or "Health Score Drivers" in body_text:
+        narrative = _build_health_narrative(calculated_metrics, band)
+        # Insert narrative after score line (which may be first body line)
+        insert_at = heading_idx + 2 if has_score_line else heading_idx + 1
+        lines.insert(insert_at, narrative)
+
+    return "\n".join(lines)
+
+
+def _build_health_narrative(calculated_metrics: Dict[str, Any], band: Optional[str]) -> str:
+    """Compose a concise, metric-backed health explanation."""
+    margin = calculated_metrics.get("operating_margin")
+    net_margin = calculated_metrics.get("net_margin")
+    ocf = calculated_metrics.get("operating_cash_flow")
+    fcf = calculated_metrics.get("free_cash_flow")
+    liabilities = calculated_metrics.get("total_liabilities")
+    cash = calculated_metrics.get("cash")
+    current_assets = calculated_metrics.get("current_assets")
+    current_liabilities = calculated_metrics.get("current_liabilities")
+
+    liquidity_ratio = None
+    if current_assets and current_liabilities:
+        liquidity_ratio = current_assets / current_liabilities if current_liabilities != 0 else None
+
+    bits: List[str] = []
+    if margin is not None or net_margin is not None:
+        m = f"{margin:.1f}%" if margin is not None else None
+        nm = f"{net_margin:.1f}%" if net_margin is not None else None
+        bits.append(f"Profitability sits around operating margin {m or 'n/a'} and net margin {nm or 'n/a'}, showing room for efficiency gains.")
+    if ocf is not None or fcf is not None:
+        ocf_str = _format_dollar(ocf) if ocf is not None else None
+        fcf_str = _format_dollar(fcf) if fcf is not None else None
+        bits.append(f"Cash generation is anchored by operating cash flow of {ocf_str or 'n/a'} and free cash flow of {fcf_str or 'n/a'}, supporting reinvestment.")
+    if cash is not None or liabilities is not None:
+        cash_str = _format_dollar(cash) if cash is not None else None
+        liab_str = _format_dollar(liabilities) if liabilities is not None else None
+        bits.append(f"Balance sheet shows cash of {cash_str or 'n/a'} against liabilities of {liab_str or 'n/a'}, framing leverage and flexibility.")
+    if liquidity_ratio is not None:
+        bits.append(f"Liquidity coverage of {liquidity_ratio:.1f}x indicates near-term obligations are manageable.")
+
+    if not bits:
+        bits.append("Profitability, cash conversion, and leverage trends warrant monitoring to validate durability.")
+
+    risk_tail = "Key watchpoints include cost discipline and cash conversion consistency." if not band or band.lower().startswith(("w", "a")) else "Strengths stem from balanced margins and cash generation."
+    return " ".join(bits + [risk_tail])
 
 
 def _prepare_filing_response(raw_filing: Dict[str, Any], settings) -> Filing:
@@ -3712,10 +4150,7 @@ def generate_filing_summary(
     target_length = _clamp_target_length(preferences.target_length)
     use_default_cache = preferences.mode == "default"
     
-    if preferences.mode == "default":
-        include_health_rating = True
-    else:
-        include_health_rating = bool(preferences.health_rating and preferences.health_rating.enabled)
+    include_health_rating = bool(preferences.health_rating and preferences.health_rating.enabled)
 
     # Reset progress
     progress_cache[str(filing_id)] = "Initializing AI Agent..."
@@ -3893,8 +4328,22 @@ def generate_filing_summary(
         
         if include_health_rating:
              progress_cache[str(filing_id)] = "Computing Health Score..."
-        
-        health_config, health_rating_block = _build_health_rating_instructions(preferences, company_label)
+
+        # Convert full persona name to persona_id for health rating instructions
+        persona_id_for_health = None
+        if selected_persona_name:
+            # Map full names to persona IDs
+            name_to_id = {
+                "warren buffett": "buffett", "charlie munger": "munger", "benjamin graham": "graham",
+                "peter lynch": "lynch", "ray dalio": "dalio", "cathie wood": "wood",
+                "joel greenblatt": "greenblatt", "john bogle": "bogle", "howard marks": "marks", "bill ackman": "ackman"
+            }
+            persona_id_for_health = name_to_id.get(selected_persona_name.lower())
+
+        health_config = None
+        health_rating_block = None
+        if include_health_rating:
+            health_config, health_rating_block = _build_health_rating_instructions(preferences, company_label, persona_id_for_health)
         health_directives_section = ""
         if health_rating_block:
             health_directives_section = f"\n HEALTH RATING DIRECTIVES\n {health_rating_block}\n"
@@ -3926,7 +4375,7 @@ def generate_filing_summary(
             [
                 (
                     "Executive Summary",
-                    "THIS IS THE HERO SECTION - the premium insight users pay for. MINIMUM 110 WORDS.\n\n"
+                    "THIS IS THE HERO SECTION - the premium insight users pay for. KEEP IT TIGHT (70-100 WORDS).\n\n"
                     "Write a compelling, substantive investment thesis that:\n"
                     "1. OPENS with your conviction level and stance (bullish/bearish/neutral with HIGH/MEDIUM/LOW conviction)\n"
                     "2. SYNTHESIZES the investment case - why does this company matter RIGHT NOW?\n"
@@ -3942,21 +4391,21 @@ def generate_filing_summary(
                 ),
                 (
                     "Financial Performance",
-                    "Quantitative analysis (70-90 words). Cover KEY metrics:\n"
-                    "- Revenue: Figures with YoY% change\n"
-                    "- Margins: Operating and net margin trends\n"
-                    "- Cash flow: FCF quality indicator\n\n"
-                    "FLOW: Connect numbers: 'Revenue grew X% but margins compressed Y% due to Z.'\n"
-                    "Explain what numbers mean for business sustainability.\n\n"
+                    "Quantitative analysis (110-150 words). Cover KEY metrics:\n"
+                    "- Revenue with YoY% change and mix shifts (e.g., Mobility vs Delivery)\n"
+                    "- Margin bridge: revenue growth → operating margin → net margin gap (explain drivers)\n"
+                    "- Cash conversion: OCF to FCF, QoQ changes, capex context\n\n"
+                    "FLOW: Connect numbers: 'Revenue grew X% but margins compressed Y% due to Z; cash conversion improved/eroded because...'.\n"
+                    "Explain what numbers mean for sustainability and earnings quality.\n\n"
                     "FORBIDDEN: 'Additional detail covers...', 'Capital allocation remarks...' - write real analysis.",
                 ),
                 (
                     "Management Discussion & Analysis",
-                    "Critical management assessment (70-90 words). Focus on:\n"
-                    "1. Forward guidance: What did management state about outlook? (with attribution)\n"
-                    "2. Discrepancy check: Do claims MATCH actual results? Flag disconnects.\n"
-                    "3. Critical assessment: Apply healthy skepticism. Is management overly optimistic?\n\n"
-                    "FLOW: 'Management stated X → but results show Y → this suggests Z'\n\n"
+                    "Critical management assessment (110-150 words). Focus on:\n"
+                    "1. Forward guidance and capital deployment priorities (with figures where possible)\n"
+                    "2. Alignment check: Do claims MATCH operating margin trajectory and cash conversion?\n"
+                    "3. Underpriced/overstated elements: what the market may be missing about cash durability or leverage.\n\n"
+                    "FLOW: 'Management stated X → results show Y → this implies Z for margins/cash/investment pacing.'\n\n"
                     "FORBIDDEN: 'Further notes address...', 'The analysis outlines...' - write real critique.",
                 ),
                 (
@@ -4054,6 +4503,11 @@ THIS IS YOUR PRIMARY DIRECTIVE. VIOLATION = INVALID OUTPUT.
 You are a professional equity research analyst writing a financial briefing.
 Your goal is to provide actionable, differentiated insight, not just a summary of facts."""
 
+        section_header_example = "Financial Health Rating, Executive Summary, Financial Performance, etc."
+        if not include_health_rating:
+            section_header_example = "Executive Summary, Financial Performance, etc."
+        health_constraint_line = "- Do NOT repeat the Financial Health Rating in the Key Data Appendix.\n" if include_health_rating else ""
+
         base_prompt = f"""
 {identity_block}
 Analyze the following filing for {company_name} ({filing_type}, {filing_date}).
@@ -4098,7 +4552,7 @@ INCORRECT FORMAT (DO NOT DO THIS):
 ...previous section content ends here. ## Executive Summary This section content...
 ```
 
-EVERY section header (Financial Health Rating, Executive Summary, Financial Performance, etc.) MUST:
+EVERY section header ({section_header_example}) MUST:
 - Be on its own line
 - Start with "## "
 - Have blank lines before and after
@@ -4194,8 +4648,7 @@ FREE CASH FLOW RECONCILIATION:
 - Never present FCF > Net Income as normal without explanation
 
 NEGATIVE CONSTRAINTS:
-- Do NOT repeat the Financial Health Rating in the Key Data Appendix.
-- Do NOT repeat the same metrics across multiple sections.
+{health_constraint_line}- Do NOT repeat the same metrics across multiple sections.
 - Do NOT use generic filler phrases like "management remains focused" or "the company continues to execute".
 - Do NOT include placeholder text like "not extracted", "see above", "not available" - if you lack information, omit it.
 - Do NOT switch between personal opinion and neutral analyst tone mid-document.
@@ -4231,15 +4684,11 @@ Before you output anything, verify:
         summary_text = _fix_trailing_ellipsis(summary_text)  # Fix sentences ending with ...
         summary_text = _validate_complete_sentences(summary_text)  # Fix other incomplete sentences
         summary_text = _remove_filler_phrases(summary_text)  # Remove filler phrases that slipped through
+        summary_text = _normalize_casing(summary_text)  # Convert shouty/all-caps body text to sentence case
+        summary_text = _strip_directive_lines(summary_text)
+        summary_text = _dedupe_consecutive_sentences(summary_text)
         # NOTE: _ensure_required_sections() moved to end to avoid duplicate Closing Takeaway
         if target_length:
-            summary_text = _enforce_length_constraints(
-                summary_text,
-                target_length,
-                gemini_client,
-                quality_validators=[_make_section_completeness_validator(include_health_rating)],
-                last_word_stats=None,
-            )
             summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
             # NOTE: Removed duplicate _ensure_required_sections() call here to avoid duplicate Closing Takeaway
             summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
@@ -4258,20 +4707,24 @@ Before you output anything, verify:
             summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
             summary_text = _force_final_band(summary_text, target_length, tolerance=10)
         else:
-            # When no target_length, still ensure required sections are present
-            summary_text = _ensure_required_sections(
-                summary_text,
-                include_health_rating=include_health_rating,
-                metrics_lines=metrics_lines,
-                calculated_metrics=calculated_metrics,
-                company_name=company_name,
-                health_rating_config=health_config,
-                persona_name=selected_persona_name,
-            )
+            # When no target_length, only backfill sections if the model produced headers
+            if re.search(r"^\s*##\s", summary_text or "", re.MULTILINE):
+                summary_text = _ensure_required_sections(
+                    summary_text,
+                    include_health_rating=include_health_rating,
+                    metrics_lines=metrics_lines,
+                    calculated_metrics=calculated_metrics,
+                    company_name=company_name,
+                    health_rating_config=health_config,
+                    persona_name=selected_persona_name,
+                )
 
         # Final ellipsis cleanup after all length adjustments
         summary_text = _fix_trailing_ellipsis(summary_text)
         summary_text = _remove_filler_phrases(summary_text)  # Final filler removal
+        summary_text = _normalize_casing(summary_text)
+        summary_text = _strip_directive_lines(summary_text)
+        summary_text = _dedupe_consecutive_sentences(summary_text)
 
         # Fix health score if AI generated a different score than pre-calculated
         if pre_calculated_score is not None and pre_calculated_band:
@@ -4286,6 +4739,27 @@ Before you output anything, verify:
 
         # Use pre-calculated health score data (computed before summary generation)
         health_score_data = pre_calculated_health
+        has_health_section = bool(
+            re.search(r"^\s*##\s*Financial Health Rating", summary_text or "", re.IGNORECASE | re.MULTILINE)
+        )
+
+        # Final cleanup after any length adjustments to remove stray directives
+        if include_health_rating and (target_length is not None or has_health_section):
+            summary_text = _ensure_health_rating_section(
+                summary_text,
+                health_score_data or {},
+                calculated_metrics,
+                company_name,
+            )
+            summary_text = _inject_health_drivers(summary_text, calculated_metrics, health_score_data or {})
+        summary_text = _strip_directive_lines(summary_text)
+        summary_text = _dedupe_consecutive_sentences(summary_text)
+        summary_text = _normalize_casing(summary_text)
+        if target_length:
+            # Re-enforce strict word band after cleanup while preserving quality
+            summary_text = _force_final_band(summary_text, target_length, tolerance=10)
+            summary_text = _clamp_to_band(summary_text, target_length - 10, target_length + 10)
+            summary_text = _normalize_casing(summary_text)
 
         # Cache result
         if use_default_cache:
@@ -4480,6 +4954,105 @@ def _extract_word_count_control(text: str) -> Tuple[str, Optional[int]]:
     reported = int(match.group(1))
     cleaned = "\n".join(lines[:-1]).rstrip()
     return cleaned, reported
+
+
+def _normalize_casing(summary_text: str) -> str:
+    """
+    Convert shouty/all-caps body lines to sentence case while preserving headings.
+    Only adjusts lines where most alphabetic characters are uppercase.
+    """
+    def _sentence_case(line: str) -> str:
+        lowered = line.lower()
+        return re.sub(
+            r'(^|[\.!?]\s+)(\w)',
+            lambda m: m.group(1) + m.group(2).upper(),
+            lowered
+        )
+
+    normalized_lines: List[str] = []
+    for line in summary_text.splitlines():
+        if line.strip().startswith("##"):
+            normalized_lines.append(line)
+            continue
+        letters_only = ''.join(c for c in line if c.isalpha())
+        if not letters_only:
+            normalized_lines.append(line)
+            continue
+        upper_ratio = sum(1 for c in letters_only if c.isupper()) / len(letters_only)
+        is_all_caps = letters_only.isupper()
+        # Treat lines as shouty if all caps or majority caps (>=40%)
+        if is_all_caps or upper_ratio >= 0.4:
+            normalized_lines.append(_sentence_case(line))
+        else:
+            normalized_lines.append(line)
+    return "\n".join(normalized_lines)
+
+
+def _strip_directive_lines(text: str) -> str:
+    """
+    Remove residual directive lines (e.g., "Add liquidity...", "Expand margin...") that degrade quality.
+    """
+    directive_patterns = [
+        r'^\s*Add liquidity and leverage observations',
+        r'^\s*Tie capital deployment',
+        r'^\s*Clarify risk scenarios',
+        r'^\s*Expand margin and cash conversion commentary',
+        r'^\s*Anchor valuation view',
+        r'^\s*Discuss competitive position',
+        r'^\s*Highlight how revenue growth translated into operating margin movement',
+        r'^\s*Highlight how leverage and liquidity shape flexibility',
+        r'^\s*Address how leverage and liquidity shape flexibility',
+        r'^\s*Call out whether cash conversion improved quarter over quarter and why',
+        r'^\s*Point to the key catalyst or risk that could change the rating in the next 12 months',
+        r'^\s*Emphasize what the market may be underpricing about cash generation durability',
+        r'^\s*Note any mix shift between Mobility and Delivery that affected unit economics',
+    ]
+    compiled = [re.compile(pat, re.IGNORECASE) for pat in directive_patterns]
+    cleaned_lines: List[str] = []
+    for line in text.splitlines():
+        if any(p.search(line) for p in compiled):
+            continue
+        cleaned_lines.append(line)
+    cleaned = "\n".join(cleaned_lines)
+
+    # Remove lingering directive sentences even if embedded mid-paragraph
+    phrase_patterns = [
+        r'Highlight how revenue growth translated into operating margin movement over the latest period\.?',
+        r'Call out whether cash conversion improved quarter over quarter and why\.?',
+        r'Note any mix shift between Mobility and Delivery that affected unit economics\.?',
+        r'Address how leverage and liquidity shape flexibility for capital deployment\.?',
+        r'Point to the key catalyst or risk that could change the rating in the next 12 months\.?',
+        r'Emphasize what the market may be underpricing about cash generation durability\.?',
+    ]
+    for pat in phrase_patterns:
+        cleaned = re.sub(pat, '', cleaned, flags=re.IGNORECASE)
+
+    # Remove standalone imperative lines or bullets that start with directive verbs
+    cleaned = re.sub(
+        r'^\s*(?:[-•→]?\s*)?(?:Highlight|Call out|Note|Address|Point to|Emphasize)\b[^\n]*',
+        '',
+        cleaned,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+
+    # Tidy up extra whitespace left after removals
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+    return cleaned.strip()
+
+
+def _dedupe_consecutive_sentences(text: str) -> str:
+    """
+    Remove consecutive duplicate sentences to reduce repetition.
+    """
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    result: List[str] = []
+    prev = None
+    for sent in sentences:
+        if sent and sent != prev:
+            result.append(sent)
+        prev = sent
+    return " ".join(result)
 
 
 def _normalize_section_headings(text: str, include_health_rating: bool) -> str:
@@ -4989,7 +5562,13 @@ def _ensure_required_sections(
     text = summary_text
 
     def _section_present(title: str) -> bool:
-        return f"## {title}" in text
+        # Check for exact match first
+        if f"## {title}" in text:
+            return True
+        # For Strategic Initiatives, also check for partial match to avoid duplicates
+        if "strategic initiatives" in title.lower():
+            return "## strategic initiatives" in text.lower()
+        return False
 
     def _append_section(title: str, body: str) -> None:
         nonlocal text
@@ -5038,6 +5617,52 @@ def _ensure_required_sections(
 
         _append_section("Financial Health Rating", body)
 
+    def _synthesize_financial_performance() -> str:
+        parts: List[str] = []
+        rev_match = re.search(r"Revenue[:\s]+\$?([\d.,]+)", metrics_lines)
+        op_inc_match = re.search(r"Operating Income[:\s]+\$?([\d.,]+)", metrics_lines)
+        net_inc_match = re.search(r"Net Income[:\s]+\$?([\d.,]+)", metrics_lines)
+        op_margin_match = re.search(r"Operating Margin[:\s]+([-\d.]+)%", metrics_lines)
+        net_margin_match = re.search(r"Net Margin[:\s]+([-\d.]+)%", metrics_lines)
+        fcf_match = re.search(r"Free Cash Flow[:\s]+\$?([\d.,]+)", metrics_lines)
+        ocf_match = re.search(r"Operating Cash Flow[:\s]+\$?([\d.,]+)", metrics_lines)
+        capex_match = re.search(r"Capital Expenditures[:\s]+\$?([\d.,]+)", metrics_lines)
+
+        if rev_match and op_inc_match:
+            parts.append(
+                f"Revenue of ${rev_match.group(1)} with operating income of ${op_inc_match.group(1)} frames current scale."
+            )
+        if op_margin_match:
+            parts.append(f"Operating margin of {op_margin_match.group(1)}% shows core profitability.")
+        if net_margin_match:
+            parts.append(f"Net margin of {net_margin_match.group(1)}% highlights the impact of below-the-line items.")
+        if ocf_match:
+            ocf = ocf_match.group(1)
+            fcf_text = f"free cash flow of ${fcf_match.group(1)}" if fcf_match else "free cash flow not provided"
+            capex_text = f"capex of ${capex_match.group(1)}" if capex_match else "capex not disclosed"
+            parts.append(f"Operating cash flow of ${ocf} converts to {fcf_text} with {capex_text}.")
+        elif fcf_match:
+            parts.append(f"Free cash flow of ${fcf_match.group(1)} suggests healthy cash conversion.")
+
+        if not parts:
+            parts.append("Financial performance commentary not provided in the draft; add revenue, margin, and cash flow context.")
+        parts.append("Connect revenue trends to margin direction and cash conversion to show sustainability.")
+        return " ".join(parts)
+
+    def _has_numeric_content(section_body: str) -> bool:
+        return bool(re.search(r"\d", section_body))
+
+    def _synthesize_mdna() -> str:
+        lines: List[str] = []
+        lines.append(f"Management discussion should focus on how {company_name} is deploying capital and managing cost levers.")
+        if calculated_metrics.get("operating_cash_flow") is not None:
+            lines.append(
+                f"Reference operating cash flow of {_format_metric_value('operating_cash_flow', calculated_metrics.get('operating_cash_flow'))} to anchor guidance credibility."
+            )
+        lines.append("Flag any gaps between stated strategy and the reported operating margin trajectory.")
+        lines.append("Call out liquidity and debt maturity profile if leverage is material.")
+        return " ".join(lines)
+
     # Ensure capital allocation coverage exists; this section anchors execution analysis
     if not _section_present("Strategic Initiatives & Capital Allocation"):
         strategic_body = (
@@ -5046,10 +5671,20 @@ def _ensure_required_sections(
         )
         _append_section("Strategic Initiatives & Capital Allocation", strategic_body)
 
-    # 2-6: For other sections, we do NOT add placeholder content.
-    # If the AI failed to generate these sections, we skip them entirely.
-    # The prompt should be strong enough to ensure the AI generates all sections.
-    # Adding "not extracted" or "see above" placeholders degrades quality.
+    # Add minimal Financial Performance and MD&A sections if the model omitted them
+    if not _section_present("Financial Performance"):
+        _append_section("Financial Performance", _synthesize_financial_performance())
+    else:
+        # If section exists but lacks numbers, append a concise metric summary
+        fp_match = re.search(r'##\s*Financial Performance\s*\n+([\s\S]*?)(?=\n##\s|\Z)', text, re.IGNORECASE)
+        if fp_match:
+            body = fp_match.group(1).strip()
+            if not _has_numeric_content(body):
+                supplement = _synthesize_financial_performance()
+                text = text.replace(fp_match.group(0), f"## Financial Performance\n{body}\n\n{supplement}\n")
+
+    if not _section_present("Management Discussion & Analysis"):
+        _append_section("Management Discussion & Analysis", _synthesize_mdna())
 
     # 7. Key Data Appendix - this is just raw metrics, always useful to include
     if not _section_present("Key Data Appendix") and metrics_lines.strip():

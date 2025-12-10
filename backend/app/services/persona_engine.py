@@ -2,6 +2,7 @@
 from typing import Dict, List, Optional, Any, Tuple
 from app.services.gemini_client import GeminiClient
 import re
+from uuid import uuid4
 
 
 # =============================================================================
@@ -5979,6 +5980,8 @@ class PersonaEngine:
             raise ValueError(f"Persona {persona_id} (normalized: {normalized_id}) not found")
         
         persona = self.personas[normalized_id]
+        # Per-request variation token to reduce repetitive phrasing across runs
+        variation_token = uuid4().hex[:8].upper()
         
         # Extract company-specific context for relevant risks
         company_context = extract_company_specific_context(
@@ -5992,7 +5995,7 @@ class PersonaEngine:
         
         # Build prompt with company context
         prompt = self._build_prompt(
-            normalized_id, company_name, metrics_block, general_summary, company_context
+            normalized_id, company_name, metrics_block, general_summary, company_context, variation_token=variation_token
         )
         
         # Generate with validation retry
@@ -6006,7 +6009,7 @@ class PersonaEngine:
                 if attempt > 0 and last_issues:
                     prompt = self._build_retry_prompt(
                         normalized_id, company_name, metrics_block, 
-                        company_context, last_issues, attempt
+                        company_context, last_issues, attempt, variation_token=variation_token
                     )
                 
                 result = self.gemini_client.generate_premium_persona_view(
@@ -6084,7 +6087,8 @@ class PersonaEngine:
         metrics_block: str,
         company_context: Dict[str, Any],
         previous_issues: List[str],
-        attempt: int
+        attempt: int,
+        variation_token: Optional[str] = None
     ) -> str:
         """
         Build a cleaner retry prompt when previous attempt failed validation.
@@ -6099,12 +6103,21 @@ class PersonaEngine:
 
         # Format issues
         issues_str = "\n".join(f"  - {issue}" for issue in previous_issues[:3])
+        if variation_token:
+            issues_str += f"\nSTYLE VARIATION TOKEN: {variation_token}\n  - Use distinct wording from prior attempts, especially in the verdict."
 
         # Build the prompt with the template
         formatted_template = template.format(
             company_name=company_name,
             metrics_block=metrics_block
         )
+
+        variation_clause = ""
+        if variation_token:
+            variation_clause = (
+                f"\nSTYLE VARIATION TOKEN: {variation_token}\n"
+                "- Use distinct wording from previous attempts, especially in the verdict.\n"
+            )
 
         # Dalio-specific retry instructions
         if persona_id == "dalio":
@@ -6539,7 +6552,8 @@ YOUR OUTPUT MUST BE THE OPPOSITE OF THIS.
         company_name: str,
         metrics_block: str,
         general_summary: str,
-        company_context: Dict[str, Any]
+        company_context: Dict[str, Any],
+        variation_token: Optional[str] = None
     ) -> str:
         """
         Build an objective analysis prompt with persona-flavored analytical lens.
@@ -6566,7 +6580,16 @@ YOUR OUTPUT MUST BE THE OPPOSITE OF THIS.
             metrics_block=metrics_block
         )
 
+        variation_clause = ""
+        if variation_token:
+            variation_clause = (
+                f"\nSTYLE VARIATION TOKEN: {variation_token}\n"
+                "- Vary phrasing and sentence openings compared to prior runs.\n"
+                "- Avoid reusing identical closing verdict wording.\n"
+            )
+
         return f'''{formatted_template}
+{variation_clause}
 
 BUSINESS CONTEXT:
 {context_str}
@@ -6591,6 +6614,8 @@ OUTPUT QUALITY REQUIREMENTS:
     - This section must appear at the very end, before the STANCE/VERDICT lines.
     - Content: A 2-3 sentence summary of your final recommendation (Buy/Hold/Sell) and the core reasoning, written in the persona's voice.
     - Example: "## Final Recommendation Summary\nAs Howard Marks, I recommend a HOLD. While the company is high quality, the current valuation leaves no margin of safety, and I prefer to wait for a better entry point when the pendulum swings back."
+14. SENTENCE CASE: Keep paragraphs in normal sentence case. Do NOT use all caps.
+15. VARIETY: Vary wording and sentence openings across runs and sections; avoid repeating identical phrases or verdict language.
 
 Begin your analysis:'''
     
@@ -7120,4 +7145,3 @@ def generate_closing_persona_message(
         closing_message = f"{closing_message} {concluding_line}"
 
     return closing_message
-
