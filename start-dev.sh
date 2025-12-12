@@ -87,10 +87,8 @@ fi
 
 # Start frontend in development mode
 log "\n🎨 Starting frontend..."
-log "   URL: http://localhost:3000"
+log "   Next.js will print the URL (port may change if 3000 is busy)."
 log "\nPress Ctrl+C to stop all services"
 
 cd frontend
-npm run dev
-
-
+npm run dev:clean

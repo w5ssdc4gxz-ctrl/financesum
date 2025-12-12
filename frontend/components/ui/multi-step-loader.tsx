@@ -2,6 +2,7 @@
 import { cn } from "@/lib/utils";
 import { AnimatePresence, motion } from "framer-motion";
 import { useState, useEffect } from "react";
+import { createPortal } from "react-dom";
 
 const CheckIcon = ({ className }: { className?: string }) => {
     return (
@@ -144,9 +145,15 @@ export const MultiStepLoader = ({
     statusText?: string;
 }) => {
     const [internalState, setInternalState] = useState(0);
+    const [mounted, setMounted] = useState(false);
 
     // Use external state if provided, otherwise internal
     const currentState = currentStep !== undefined ? currentStep : internalState;
+
+    useEffect(() => {
+        setMounted(true);
+        return () => setMounted(false);
+    }, []);
 
     useEffect(() => {
         if (!loading) {
@@ -174,19 +181,17 @@ export const MultiStepLoader = ({
         return () => clearTimeout(timeout);
     }, [internalState, loading, loop, loadingStates.length, duration, stopOnLastStep, currentStep]);
 
-    return (
+    const overlay = (
         <AnimatePresence mode="wait">
             {loading && (
                 <motion.div
                     initial={{ opacity: 0 }}
                     animate={{ opacity: 1 }}
                     exit={{ opacity: 0 }}
-                    className="w-full h-full fixed inset-0 z-[100] flex items-center justify-center backdrop-blur-md"
+                    className="fixed inset-0 flex items-center justify-center bg-white/90 dark:bg-black/90 backdrop-blur-xl"
+                    style={{ zIndex: 100000 }}
                 >
-                    {/* Full opaque background to completely hide content behind */}
-                    <div className="absolute inset-0 bg-white dark:bg-black opacity-95" />
-
-                    <div className="h-96 relative z-10">
+                    <div className="h-96 relative">
                         <LoaderCore
                             value={currentState}
                             loadingStates={loadingStates}
@@ -198,4 +203,8 @@ export const MultiStepLoader = ({
             )}
         </AnimatePresence>
     );
+
+    // Render at the document body level to avoid stacking context issues (e.g. transformed parents).
+    if (!mounted) return null;
+    return createPortal(overlay, document.body);
 };

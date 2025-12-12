@@ -243,7 +243,7 @@ def test_health_rating_only_appears_when_enabled(monkeypatch):
         assert response_with_rating.status_code == 200
         prompt_with_rating = captured_prompts[-1]
         assert "Financial Health Rating" in prompt_with_rating
-        assert "letter grade" in prompt_with_rating.lower()
+        assert "no letter grades" in prompt_with_rating.lower()
     finally:
         local_cache.fallback_filings_by_id.pop(filing_id, None)
         local_cache.fallback_companies.pop(company_id, None)

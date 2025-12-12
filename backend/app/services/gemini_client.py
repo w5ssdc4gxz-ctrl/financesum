@@ -752,11 +752,10 @@ MANDATORY 7-SECTION STRUCTURE (OUTPUT IN EXACT ORDER - CRITICAL):
 You MUST output these 7 sections in EXACTLY this order. Do not skip, reorder, combine, or add extra sections.
 
 ## 1. Financial Health Rating
-[ONE LINE ONLY: "X/100 (Letter) - Descriptor" where:
+[ONE LINE ONLY: "X/100 - Descriptor" where:
 - X = score 0-100
-- Letter = (S)trong, (G)ood, (W)atch, or (C)autious
 - Descriptor = brief summary
-Example: "66/100 (W) - Watch. Strong margins but elevated leverage."]
+Example: "66/100 - Watch. Strong margins but elevated leverage."]
 
 ## 2. Executive Summary  
 [2-3 paragraphs covering:

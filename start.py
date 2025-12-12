@@ -347,7 +347,7 @@ def main():
         # Bypass Next.js rewrite proxy to avoid dev-server timeouts on long summary requests
         frontend_env["NEXT_PUBLIC_API_PROXY_BASE"] = ""
         frontend_proc = subprocess.Popen(
-            ["npm", "run", "dev"],
+            ["npm", "run", "dev:clean"],
             cwd=FRONTEND_DIR,
             env=frontend_env,
         )
@@ -398,7 +398,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 

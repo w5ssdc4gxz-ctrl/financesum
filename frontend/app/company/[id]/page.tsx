@@ -97,6 +97,7 @@ type HealthComponentDescriptions = Partial<Record<keyof HealthComponentScores, s
 type FilingSummary = {
   content: string
   metadata: SummaryPreferenceSnapshot
+  generatedAt: string
   healthRating?: number
   healthComponents?: HealthComponentScores
   healthComponentWeights?: Partial<Record<keyof HealthComponentScores, number>>  // Dynamic weights from user settings
@@ -168,7 +169,7 @@ const healthAnalysisDepthOptions: Array<{ value: HealthAnalysisDepth; label: str
 
 const healthDisplayOptions: Array<{ value: HealthDisplayStyle; label: string; description: string }> = [
   { value: 'score_only', label: '0–100 Score Only', description: 'Single score headline' },
-  { value: 'score_plus_grade', label: 'Score + Letter Grade', description: 'Pair score with an A–F ranking' },
+  { value: 'score_plus_grade', label: 'Score + Rating Label', description: 'Pair score with a Very Healthy/Healthy/Watch/At Risk label' },
   { value: 'score_plus_traffic_light', label: 'Score + Traffic Light', description: 'Color-coded risk signal' },
   { value: 'score_plus_pillars', label: 'Score + 4 Pillars', description: 'Profitability | Risk | Liquidity | Growth' },
   { value: 'score_with_narrative', label: 'Score + Narrative', description: 'Add a short justification paragraph' },
@@ -577,11 +578,13 @@ export default function CompanyPage() {
       const healthComponentMetrics = response.data.health_component_metrics;
 
       if (isMountedRef.current) {
+        const generatedAt = new Date().toISOString()
         setFilingSummaries(prev => ({
           ...prev,
           [filingId]: {
             content: response.data.summary,
             metadata: metadata ?? { mode: 'default' },
+            generatedAt,
             healthRating,
             healthComponents,
             healthComponentWeights,
@@ -901,19 +904,39 @@ export default function CompanyPage() {
 
   // Get the most recent health display data - prefer from filing summaries (has user preferences) over base analysis
   const currentHealthDisplay = useMemo(() => {
-    // Find the most recently generated filing summary with health data
-    const summaryEntries = Object.entries(filingSummaries)
-    for (const [, summary] of summaryEntries) {
-      if (summary.healthComponents || summary.healthRating != null) {
-        return {
-          score: summary.healthRating ?? latestAnalysis?.health_score,
-          components: summary.healthComponents ?? latestAnalysis?.health_components,
-          weights: summary.healthComponentWeights,
-          descriptions: summary.healthComponentDescriptions,
-          metrics: summary.healthComponentMetrics,
-        }
+    const hasHealthData = (summary: FilingSummary | undefined) =>
+      !!summary && (summary.healthComponents || summary.healthRating != null)
+
+    // 1) Prefer the currently selected filing (if it already has a generated summary)
+    const selectedSummary = selectedFilingForSummary
+      ? filingSummaries[selectedFilingForSummary]
+      : undefined
+    if (hasHealthData(selectedSummary)) {
+      return {
+        score: selectedSummary!.healthRating ?? latestAnalysis?.health_score,
+        components: selectedSummary!.healthComponents ?? latestAnalysis?.health_components,
+        weights: selectedSummary!.healthComponentWeights,
+        descriptions: selectedSummary!.healthComponentDescriptions,
+        metrics: selectedSummary!.healthComponentMetrics,
       }
     }
+
+    // 2) Otherwise, use the most recently generated summary (by timestamp)
+    let newest: FilingSummary | null = null
+    for (const [, summary] of Object.entries(filingSummaries)) {
+      if (!hasHealthData(summary)) continue
+      if (!newest || summary.generatedAt > newest.generatedAt) newest = summary
+    }
+    if (newest) {
+      return {
+        score: newest.healthRating ?? latestAnalysis?.health_score,
+        components: newest.healthComponents ?? latestAnalysis?.health_components,
+        weights: newest.healthComponentWeights,
+        descriptions: newest.healthComponentDescriptions,
+        metrics: newest.healthComponentMetrics,
+      }
+    }
+
     // Fall back to latestAnalysis data
     return {
       score: latestAnalysis?.health_score,
@@ -922,7 +945,7 @@ export default function CompanyPage() {
       descriptions: undefined,
       metrics: undefined,
     }
-  }, [filingSummaries, latestAnalysis])
+  }, [filingSummaries, latestAnalysis, selectedFilingForSummary])
 
   const summaryMarkdownComponents = useMemo(
     () => ({

@@ -126,7 +126,7 @@ const healthAnalysisDepthOptions = [
 
 const healthDisplayOptions = [
     { value: 'score_only', label: '0–100 Score Only' },
-    { value: 'score_plus_grade', label: 'Score + Letter Grade' },
+    { value: 'score_plus_grade', label: 'Score + Rating Label' },
     { value: 'score_plus_traffic_light', label: 'Score + Traffic Light' },
     { value: 'score_plus_pillars', label: 'Score + 4 Pillars' },
     { value: 'score_with_narrative', label: 'Score + Narrative' },

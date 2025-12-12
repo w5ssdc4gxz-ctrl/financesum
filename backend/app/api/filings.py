@@ -127,7 +127,7 @@ HEALTH_ANALYSIS_DEPTH_PROMPTS: Dict[str, str] = {
 
 HEALTH_DISPLAY_PROMPTS: Dict[str, str] = {
     "score_only": "Present only the 0–100 score.",
-    "score_plus_grade": "Present the 0–100 score plus a letter grade (A–F).",
+    "score_plus_grade": "Present the 0–100 score plus the band label (Very Healthy/Healthy/Watch/At Risk).",
     "score_plus_traffic_light": "Present the 0–100 score plus a traffic light (Green/Yellow/Red) indicator.",
     "score_plus_pillars": "Present the 0–100 score plus a four-pillar breakdown (Profitability | Risk | Liquidity | Growth).",
     "score_with_narrative": "Present the 0–100 score alongside a short narrative paragraph explaining the result.",
@@ -830,23 +830,22 @@ def _fix_health_score_in_summary(
         r'(##\s*Financial Health Rating\s*\n+'  # Section header
         r'[^#]*?)'  # Any content before the score
         r'(\d{1,3}(?:\.\d+)?/100\s*'  # The score (e.g., "1/100" or "62/100" or "51.1/100")
-        r'(?:\([A-Z]\)\s*)?'  # Optional letter grade in parens
+        r'(?:\([A-Z]{1,3}\)\s*)?'  # Optional grade/abbrev in parens
         r'-?\s*(?:Very Healthy|Healthy|Watch|At Risk)?)',  # Optional band
         re.IGNORECASE | re.DOTALL
     )
     
-    # Also match arrow-prefixed scores like "→\n1/100 (F) - Watch"
+    # Also match arrow-prefixed scores like "→\n1/100 - Watch"
     arrow_score_pattern = re.compile(
         r'(→\s*\n?\s*)'  # Arrow prefix
         r'(\d{1,3}(?:\.\d+)?/100\s*'  # Score
-        r'(?:\([A-Z]\)\s*)?'  # Optional letter grade
+        r'(?:\([A-Z]{1,3}\)\s*)?'  # Optional grade/abbrev
         r'-?\s*(?:Very Healthy|Healthy|Watch|At Risk)?)',
         re.IGNORECASE
     )
     
-    # Format the correct score - using band first letter only, no full letter grade
-    band_abbrev = pre_calculated_band[0] if pre_calculated_band else 'W'
-    correct_score = f"{pre_calculated_score:.0f}/100 ({band_abbrev}) - {pre_calculated_band}"
+    # Format the correct score - numeric score + band label only (no letter grades/abbreviations).
+    correct_score = f"{pre_calculated_score:.0f}/100 - {pre_calculated_band}"
     
     # Track if we made any fixes
     original_text = summary_text
@@ -2648,11 +2647,11 @@ def _build_health_rating_instructions(
         ])
     elif display_style == "score_plus_grade":
         directives.extend([
-            "USER SELECTED: Score + Letter Grade",
+            "USER SELECTED: Score + Rating Label",
             "",
             "MANDATORY FORMAT (YOU MUST INCLUDE ALL ELEMENTS):",
-            "1. The score (0-100) with letter grade: 90-100=A, 80-89=B, 70-79=C, 60-69=D, <60=F",
-            "2. The rating label (Very Healthy/Healthy/Watch/At Risk)",
+            "1. The score (0-100) with rating label (Very Healthy/Healthy/Watch/At Risk)",
+            "2. NO letter grades or abbreviations in parentheses",
             "3. A MANDATORY explanation of 3-4 sentences (40-75 words)",
             "",
             "YOUR EXPLANATION MUST COVER:",
@@ -2664,13 +2663,13 @@ def _build_health_rating_instructions(
             "DO NOT just write the score and stop. The explanation is REQUIRED.",
             "",
             f"CORRECT FORMAT EXAMPLE:",
-            f"'{company_name} receives a Financial Health Rating of 78/100 (C) - Healthy. The score reflects strong profitability ",
+            f"'{company_name} receives a Financial Health Rating of 78/100 - Healthy. The score reflects strong profitability ",
             f"with a 56% net margin and robust free cash flow generation of $22B. The balance sheet is conservatively managed ",
             f"with minimal debt relative to cash holdings. However, applying the user's value investor framework, I note concerns ",
             f"about customer concentration and cyclical demand patterns that could impact the durability of these margins. ",
             f"The score would be higher but for these risk factors that warrant monitoring.'",
             "",
-            "FORBIDDEN: Just writing '{company_name} receives a Financial Health Rating of 78/100 (C) - Healthy.' and stopping.",
+            "FORBIDDEN: Just writing '{company_name} receives a Financial Health Rating of 78/100 - Healthy.' and stopping.",
         ])
     elif display_style == "score_plus_traffic_light":
         directives.extend([
@@ -2805,7 +2804,7 @@ def _build_health_rating_instructions(
         directives.append(f"- The narrative should feel customized to the user's settings, NOT generic.")
         directives.append("")
         directives.append("EXAMPLE OF GOOD PERSONALIZED NARRATIVE:")
-        directives.append(f"'{company_name} receives a Financial Health Rating of 72/100 (W) - Watch. Applying the {framework_display} framework with {weighting_display} as the primary driver, the company's strong 45% gross margins provide a solid foundation. However, taking a {risk_display} approach to risk, the elevated debt-to-equity ratio of 1.8 and declining free cash flow warrant caution. The score would be higher but for these balance sheet concerns that a prudent investor must monitor.'")
+        directives.append(f"'{company_name} receives a Financial Health Rating of 72/100 - Watch. Applying the {framework_display} framework with {weighting_display} as the primary driver, the company's strong 45% gross margins provide a solid foundation. However, taking a {risk_display} approach to risk, the elevated debt-to-equity ratio of 1.8 and declining free cash flow warrant caution. The score would be higher but for these balance sheet concerns that a prudent investor must monitor.'")
         directives.append("")
         directives.append("BAD (too generic - DO NOT DO THIS):")
         directives.append(f"'{company_name} receives a Financial Health Rating of 72/100 - Watch. Strong margins offset by leverage concerns.'")
@@ -2841,7 +2840,7 @@ def _build_health_rating_instructions(
             directives.append(f"TONE: The assessment should sound like personal advice from {persona_name} to a trusted colleague.")
             directives.append("")
             directives.append(f"EXAMPLE ({persona_name} voice):")
-            directives.append(f"'{company_name} receives a Financial Health Rating of 72/100 (W) - Watch. {persona_intro}, the company's fundamentals present a mixed picture. The strong gross margins suggest pricing power, but I'm concerned about the elevated debt levels. For my own portfolio, I'd want to see improvement in cash conversion before committing significant capital.'")
+            directives.append(f"'{company_name} receives a Financial Health Rating of 72/100 - Watch. {persona_intro}, the company's fundamentals present a mixed picture. The strong gross margins suggest pricing power, but I'm concerned about the elevated debt levels. For my own portfolio, I'd want to see improvement in cash conversion before committing significant capital.'")
 
     directives.append("")
     directives.append("PLACEMENT: The Financial Health Rating section MUST appear FIRST, before the Executive Summary.")
@@ -3548,7 +3547,8 @@ def _ensure_health_rating_section(
             heading_idx = idx
             break
 
-    score_line = f"{company_name} receives a Financial Health Rating of {score:.0f}/100 ({band}) based on profitability, cash conversion, and balance sheet resilience."
+    band_text = f" - {band}" if band else ""
+    score_line = f"{company_name} receives a Financial Health Rating of {score:.0f}/100{band_text} based on profitability, cash conversion, and balance sheet resilience."
 
     if heading_idx is None:
         narrative = _build_health_narrative(calculated_metrics, band)
@@ -4600,12 +4600,12 @@ def generate_filing_summary(
                 health_rating_description = (
                     f"!!! MANDATORY SCORE - DO NOT CHANGE !!!\n"
                     f"THE FINANCIAL HEALTH SCORE IS PRE-CALCULATED: {pre_calculated_score:.1f}/100 - {pre_calculated_band}\n\n"
-                    f"YOU MUST WRITE EXACTLY: '{pre_calculated_score:.0f}/100 ({pre_calculated_band[0] if pre_calculated_band else 'W'}) - {pre_calculated_band}'\n\n"
+                    f"YOU MUST WRITE EXACTLY: '{pre_calculated_score:.0f}/100 - {pre_calculated_band}'\n\n"
                     f"CRITICAL RULES:\n"
                     f"1. The score is {pre_calculated_score:.1f} - DO NOT calculate a different score\n"
                     f"2. DO NOT write 1/100, 62/100, or ANY other score - ONLY {pre_calculated_score:.0f}/100\n"
                     f"3. The band is '{pre_calculated_band}' - use this EXACT label\n"
-                    f"4. Start the section with: '{pre_calculated_score:.0f}/100 ({pre_calculated_band[0] if pre_calculated_band else 'W'}) - {pre_calculated_band}. ...'\n"
+                    f"4. Start the section with: '{pre_calculated_score:.0f}/100 - {pre_calculated_band}. ...'\n"
                     f"5. Then EXPLAIN why this score was assigned based on the metrics.\n\n"
                     f"FORBIDDEN: Calculating your own score. The score {pre_calculated_score:.1f} is mathematically computed from actual financial ratios.\n"
                     f"NO letter grades (A, B, C, D). Use the numeric score and band label only."

@@ -169,7 +169,7 @@ def main() -> None:
         processes.append(("celery", celery_proc))
 
         frontend_proc = start_process(
-            ["npm", "run", "dev"],
+            ["npm", "run", "dev:clean"],
             cwd=FRONTEND_DIR,
             env={"PORT": "3000"},
             name="Next.js frontend",
@@ -207,4 +207,3 @@ if __name__ == "__main__":
     except CommandError as error:
         log(f"❌ {error}")
         raise SystemExit(1) from error
-

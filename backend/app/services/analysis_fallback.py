@@ -322,7 +322,7 @@ def _build_summary(
     band = health_score_data.get("score_band")
 
     tldr_lines = [
-        f"{company_name}: {overall:.1f}/100 ({band}). Local analysis mode." if overall is not None and band else f"{company_name}: Local analysis mode.",
+        f"{company_name}: {overall:.1f}/100 - {band}. Local analysis mode." if overall is not None and band else f"{company_name}: Local analysis mode.",
     ]
 
     highlights_map = [
@@ -545,4 +545,3 @@ def _generate_ai_sections(
         print(f"Persona generation error: {exc}")
 
     return ai_summary, persona_outputs
-
