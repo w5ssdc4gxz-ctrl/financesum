@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo } from 'react'
+import { useState, useMemo, Children, cloneElement, isValidElement, ReactElement, ReactNode } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { TypewriterText } from './TypewriterText'
 
@@ -9,6 +9,48 @@ interface CollapsibleSummaryProps {
   previewLength?: number
   renderMarkdown: (text: string) => React.ReactNode
   className?: string
+}
+
+function appendCursorToLastTextNode(node: ReactNode): ReactNode {
+  const cursor = (
+    <span 
+      key="typing-cursor"
+      className="inline-block w-[3px] h-[1em] bg-blue-500 ml-0.5 align-baseline animate-pulse"
+      style={{ verticalAlign: 'text-bottom' }}
+    />
+  )
+
+  if (typeof node === 'string') {
+    return <>{node}{cursor}</>
+  }
+
+  if (!isValidElement(node)) {
+    return node
+  }
+
+  const element = node as ReactElement<{ children?: ReactNode }>
+  const children = element.props.children
+
+  if (!children) {
+    return node
+  }
+
+  const childArray = Children.toArray(children)
+  if (childArray.length === 0) {
+    return cloneElement(element, {}, cursor)
+  }
+
+  const lastIndex = childArray.length - 1
+  const lastChild = childArray[lastIndex]
+
+  const newChildren = childArray.map((child, index) => {
+    if (index === lastIndex) {
+      return appendCursorToLastTextNode(child)
+    }
+    return child
+  })
+
+  return cloneElement(element, {}, ...newChildren)
 }
 
 export function CollapsibleSummary({
@@ -71,12 +113,20 @@ export function CollapsibleSummary({
           <span className="border-b border-transparent group-hover:border-current">
             Show more
           </span>
-          <motion.span 
+          <motion.svg 
+            width="14" 
+            height="14" 
+            viewBox="0 0 24 24" 
+            fill="none" 
+            stroke="currentColor" 
+            strokeWidth="3"
+            strokeLinecap="round" 
+            strokeLinejoin="round"
             animate={{ y: [0, 3, 0] }}
             transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
           >
-            ↓
-          </motion.span>
+            <path d="M12 5v14M5 12l7 7 7-7" />
+          </motion.svg>
         </motion.button>
       )}
 
@@ -95,14 +145,11 @@ export function CollapsibleSummary({
                 speed={500}
                 onComplete={() => setHasAnimated(true)}
               >
-                {(displayText) => (
-                  <div className="relative">
-                    {renderMarkdown(displayText)}
-                    {displayText.length < remaining.length && (
-                      <span className="inline-block w-[3px] h-[1.2em] bg-blue-500 ml-1 animate-blink align-middle" />
-                    )}
-                  </div>
-                )}
+                {(displayText) => {
+                  const rendered = renderMarkdown(displayText)
+                  const isTyping = displayText.length < remaining.length
+                  return isTyping ? appendCursorToLastTextNode(rendered) : rendered
+                }}
               </TypewriterText>
             ) : (
               renderMarkdown(remaining)
@@ -119,12 +166,20 @@ export function CollapsibleSummary({
                 }}
                 className="mt-6 mb-4 text-sm font-bold text-gray-500 hover:text-gray-400 cursor-pointer transition-colors flex items-center gap-1.5 group"
               >
-                <motion.span 
+                <motion.svg 
+                  width="14" 
+                  height="14" 
+                  viewBox="0 0 24 24" 
+                  fill="none" 
+                  stroke="currentColor" 
+                  strokeWidth="3"
+                  strokeLinecap="round" 
+                  strokeLinejoin="round"
                   animate={{ y: [0, -3, 0] }}
                   transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
                 >
-                  ↑
-                </motion.span>
+                  <path d="M12 19V5M5 12l7-7 7 7" />
+                </motion.svg>
                 <span className="border-b border-transparent group-hover:border-current">
                   Show less
                 </span>
