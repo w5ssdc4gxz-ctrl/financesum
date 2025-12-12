@@ -15,10 +15,53 @@ from app.services.local_cache import (
     fallback_companies,
 )
 from app.utils.supabase_errors import is_supabase_table_missing_error
+from app.services.eodhd_client import EODHDClient
 
 router = APIRouter()
 
 MAX_HISTORY_RESULTS = 50
+
+
+def _clean_country(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def _needs_country_fix(country: Optional[str]) -> bool:
+    cleaned = _clean_country(country)
+    return cleaned is None or cleaned in {"US", "USA", "United States", "United States of America"}
+
+
+def _hydrate_country_from_eodhd(ticker: Optional[str], exchange: Optional[str]) -> Optional[str]:
+    if not ticker:
+        return None
+    try:
+        client = EODHDClient()
+        info = client.get_company_info(ticker, exchange or "US")
+        return _clean_country(
+            info.get("CountryName")
+            or info.get("CountryISO")
+            or (info.get("AddressData") or {}).get("Country")
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Dashboard: unable to hydrate country for {ticker}: {exc}")
+        return None
+
+
+def _apply_country_fixes(company_map: Dict[str, Dict[str, Any]], supabase) -> None:
+    for company in company_map.values():
+        if not _needs_country_fix(company.get("country")):
+            continue
+        hydrated = _hydrate_country_from_eodhd(company.get("ticker"), company.get("exchange"))
+        if not hydrated:
+            continue
+        company["country"] = hydrated
+        try:
+            supabase.table("companies").update({"country": hydrated}).eq("id", company.get("id")).execute()
+        except Exception as exc:  # noqa: BLE001
+            print(f"Dashboard: could not persist hydrated country for {company.get('ticker')}: {exc}")
 
 
 @router.get("/overview")
@@ -61,6 +104,7 @@ def _build_supabase_overview() -> Dict[str, Any]:
     if company_ids:
         companies_response = supabase.table("companies").select("*").in_("id", list(company_ids)).execute()
         company_map = {str(company["id"]): company for company in (companies_response.data or [])}
+        _apply_country_fixes(company_map, supabase)
 
     history = [_build_history_entry(analysis, company_map.get(analysis.get("company_id"))) for analysis in analyses]
     stats = _calculate_stats(history, total_analyses=total_analyses)

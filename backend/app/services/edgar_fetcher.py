@@ -22,7 +22,11 @@ async def _hydrate_country_from_eodhd(ticker: str, exchange: Optional[str]) -> O
     try:
         client = EODHDClient()
         info = await asyncio.to_thread(client.get_company_info, ticker, exchange or "US")
-        return _clean_country(info.get("CountryName") or info.get("CountryISO"))
+        return _clean_country(
+            info.get("CountryName")
+            or info.get("CountryISO")
+            or (info.get("AddressData") or {}).get("Country")
+        )
     except Exception as exc:
         print(f"Could not hydrate country from EODHD for {ticker}: {exc}")
         return None

@@ -150,7 +150,9 @@ class EODHDClient:
             try:
                 info = self.get_company_info(query_upper, exchange)
                 if info:
-                    country = _normalize_country_value(info.get("CountryName")) or _normalize_country_value(info.get("CountryISO"))
+                    country = _normalize_country_value(info.get("CountryName")) \
+                        or _normalize_country_value(info.get("CountryISO")) \
+                        or _normalize_country_value((info.get("AddressData") or {}).get("Country"))
                     return {
                         "ticker": info.get("Code"),
                         "name": info.get("Name"),
