@@ -11,6 +11,43 @@ from app.services.eodhd_client import EODHDClient
 settings = get_settings()
 
 
+def _clean_country(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+async def _hydrate_country_from_eodhd(ticker: str, exchange: Optional[str]) -> Optional[str]:
+    try:
+        client = EODHDClient()
+        info = await asyncio.to_thread(client.get_company_info, ticker, exchange or "US")
+        return _clean_country(info.get("CountryName") or info.get("CountryISO"))
+    except Exception as exc:
+        print(f"Could not hydrate country from EODHD for {ticker}: {exc}")
+        return None
+
+
+async def _ensure_country(company: Dict) -> Dict:
+    ticker = company.get("ticker")
+    if not ticker:
+        return company
+
+    needs_country = not company.get("country") or str(company.get("country")).strip() in {
+        "US",
+        "USA",
+        "United States",
+        "United States of America",
+    }
+    if not needs_country:
+        return company
+
+    hydrated = await _hydrate_country_from_eodhd(ticker, company.get("exchange"))
+    if hydrated:
+        company["country"] = hydrated
+    return company
+
+
 async def _enrich_with_yahoo(company: Dict, client: httpx.AsyncClient) -> Dict:
     """
     Enrich company data with sector/industry from Yahoo Finance.
@@ -49,7 +86,11 @@ async def _enrich_with_yahoo(company: Dict, client: httpx.AsyncClient) -> Dict:
             if not company.get("industry"):
                 company["industry"] = quote.get("industryDisp") or quote.get("industry")
             if not company.get("country"):
-                company["country"] = quote.get("region")
+                yahoo_country = quote.get("country") or quote.get("longCountry")
+                if yahoo_country:
+                    company["country"] = yahoo_country
+                elif quote.get("region"):
+                    company["country"] = quote.get("region")
 
             print(f"✓ Enriched {ticker} with Yahoo Finance data")
 
@@ -125,14 +166,16 @@ async def search_company_by_ticker_or_cik(query: str) -> List[Dict]:
                     # If exact ticker match, enrich and return immediately
                     if query_upper == ticker:
                         enriched = await _enrich_with_yahoo(companies[-1], client)
-                        return [enriched]
+                        hydrated = await _ensure_country(enriched)
+                        return [hydrated]
 
             # Enrich all found companies with Yahoo Finance data in parallel
             # Limit to top 10 to avoid spamming Yahoo
             top_companies = companies[:10]
             if top_companies:
                 enriched_companies = await asyncio.gather(*[_enrich_with_yahoo(c, client) for c in top_companies])
-                return enriched_companies
+                hydrated_companies = await asyncio.gather(*[_ensure_country(c) for c in enriched_companies])
+                return hydrated_companies
             
             return []
 
@@ -177,7 +220,8 @@ async def search_company_by_ticker_or_cik(query: str) -> List[Dict]:
                 })
 
             if companies:
-                return companies[:10]
+                hydrated_companies = await asyncio.gather(*[_ensure_country(c) for c in companies[:10]])
+                return hydrated_companies
 
         except Exception as e:
             print(f"Error searching Yahoo Finance: {e}")

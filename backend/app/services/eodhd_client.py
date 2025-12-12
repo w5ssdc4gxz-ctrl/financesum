@@ -3,6 +3,7 @@ import requests
 from typing import Dict, Optional, Any
 from app.config import get_settings
 
+
 settings = get_settings()
 
 
@@ -149,6 +150,7 @@ class EODHDClient:
             try:
                 info = self.get_company_info(query_upper, exchange)
                 if info:
+                    country = _normalize_country_value(info.get("CountryName")) or _normalize_country_value(info.get("CountryISO"))
                     return {
                         "ticker": info.get("Code"),
                         "name": info.get("Name"),
@@ -156,7 +158,7 @@ class EODHDClient:
                         "cik": info.get("CIK"),
                         "sector": info.get("Sector"),
                         "industry": info.get("Industry"),
-                        "country": info.get("CountryName") or info.get("CountryISO")
+                        "country": country,
                     }
             except:
                 continue
@@ -242,17 +244,9 @@ def get_eodhd_client() -> EODHDClient:
     return EODHDClient()
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+def _normalize_country_value(value: Optional[str]) -> Optional[str]:
+    """Return a trimmed country string or None."""
+    if not value:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
