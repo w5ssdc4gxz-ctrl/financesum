@@ -15,6 +15,7 @@ from app.models.schemas import (
 )
 from app.services.edgar_fetcher import search_company_by_ticker_or_cik
 from app.services.local_cache import fallback_companies, save_fallback_companies
+from app.services.eodhd_client import hydrate_country_with_eodhd, should_hydrate_country
 from app.config import get_settings
 from app.utils.supabase_errors import is_supabase_table_missing_error
 
@@ -28,6 +29,34 @@ def _supabase_configured(settings) -> bool:
     if key.lower().startswith("your_"):
         return False
     return True
+
+
+async def _ensure_company_country(company: dict) -> dict:
+    ticker = company.get("ticker")
+    if not ticker or not should_hydrate_country(company.get("country")):
+        return company
+
+    hydrated = await asyncio.to_thread(hydrate_country_with_eodhd, ticker, company.get("exchange"))
+    if hydrated:
+        company["country"] = hydrated
+    return company
+
+
+async def _fix_and_persist_countries(records: list, supabase=None) -> list:
+    updated: List[tuple[str, str]] = []
+    fixed: List[dict] = []
+    for record in records:
+        company = await _ensure_company_country(dict(record))
+        fixed.append(company)
+        if supabase and company.get("id") and company.get("country") != record.get("country"):
+            updated.append((company.get("id"), company.get("country")))
+    if supabase and updated:
+        for company_id, country in updated:
+            try:
+                supabase.table("companies").update({"country": country}).eq("id", company_id).execute()
+            except Exception as exc:  # noqa: BLE001
+                print(f"Country backfill failed for {company_id}: {exc}")
+    return fixed
 
 
 async def _hydrate_company_from_ticker(company_id: str, ticker: str) -> Company:
@@ -44,7 +73,7 @@ async def _hydrate_company_from_ticker(company_id: str, ticker: str) -> Company:
     if not matches:
         raise HTTPException(status_code=404, detail="Company not found")
 
-    source = matches[0]
+    source = await _ensure_company_country(matches[0])
     now = datetime.utcnow()
     fallback_company = Company(
         id=company_id,
@@ -132,7 +161,9 @@ async def lookup_company(request: CompanyLookupRequest):
             response = await asyncio.to_thread(run_supabase_query)
             
             if response and response.data:
-                companies = [Company(**company) for company in response.data]
+                supabase_client = get_supabase_client() if _supabase_configured(settings) else None
+                hydrated_records = await _fix_and_persist_countries(response.data, supabase_client)
+                companies = [Company(**company) for company in hydrated_records]
                 if companies:
                     print(f"Found {len(companies)} companies in Supabase")
                     return CompanyLookupResponse(companies=companies)
@@ -169,6 +200,19 @@ async def lookup_company(request: CompanyLookupRequest):
                                 return result.data[0]
                         return None
 
+                    hydrated = await _ensure_company_country(company_data)
+
+                    def check_and_save():
+                        existing = supabase.table("companies").select("*").eq("ticker", hydrated["ticker"]).execute()
+
+                        if existing.data:
+                            return existing.data[0]
+                        else:
+                            result = supabase.table("companies").insert(hydrated).execute()
+                            if result.data:
+                                return result.data[0]
+                        return None
+
                     saved_data = await asyncio.to_thread(check_and_save)
                     if saved_data:
                         saved_companies.append(Company(**saved_data))
@@ -185,15 +229,16 @@ async def lookup_company(request: CompanyLookupRequest):
 
                     now = datetime.utcnow()
                     company_id = uuid4()
+                    hydrated = await _ensure_company_country(company_data)
                     fallback_company = Company(
                         id=company_id,
                         ticker=ticker,
-                        name=company_data.get("name", query),
-                        cik=company_data.get("cik"),
-                        exchange=company_data.get("exchange"),
-                        industry=company_data.get("industry"),
-                        sector=company_data.get("sector"),
-                        country=company_data.get("country"),
+                        name=hydrated.get("name", query),
+                        cik=hydrated.get("cik"),
+                        exchange=hydrated.get("exchange"),
+                        industry=hydrated.get("industry"),
+                        sector=hydrated.get("sector"),
+                        country=hydrated.get("country"),
                         created_at=now,
                         updated_at=now,
                     )
@@ -213,15 +258,16 @@ async def lookup_company(request: CompanyLookupRequest):
 
                 now = datetime.utcnow()
                 company_id = uuid4()
+                hydrated = await _ensure_company_country(company_data)
                 fallback_company = Company(
                     id=company_id,
                     ticker=ticker,
-                    name=company_data.get("name", query),
-                    cik=company_data.get("cik"),
-                    exchange=company_data.get("exchange"),
-                    industry=company_data.get("industry"),
-                    sector=company_data.get("sector"),
-                    country=company_data.get("country"),
+                    name=hydrated.get("name", query),
+                    cik=hydrated.get("cik"),
+                    exchange=hydrated.get("exchange"),
+                    industry=hydrated.get("industry"),
+                    sector=hydrated.get("sector"),
+                    country=hydrated.get("country"),
                     created_at=now,
                     updated_at=now,
                 )
@@ -246,7 +292,10 @@ async def get_company(company_id: str, ticker: str | None = None):
     if not _supabase_configured(settings):
         cached = fallback_companies.get(str(company_id))
         if cached:
-            return Company(**cached)
+            hydrated = await _ensure_company_country(dict(cached))
+            fallback_companies[str(company_id)] = hydrated
+            save_fallback_companies()
+            return Company(**hydrated)
         if ticker:
             return await _hydrate_company_from_ticker(str(company_id), ticker)
         raise HTTPException(status_code=404, detail="Company not available without Supabase configuration")
@@ -259,12 +308,21 @@ async def get_company(company_id: str, ticker: str | None = None):
         if not response.data:
             cached = fallback_companies.get(str(company_id))
             if cached:
-                return Company(**cached)
+                hydrated = await _ensure_company_country(dict(cached))
+                fallback_companies[str(company_id)] = hydrated
+                save_fallback_companies()
+                return Company(**hydrated)
             if ticker:
                 return await _hydrate_company_from_ticker(str(company_id), ticker)
             raise HTTPException(status_code=404, detail="Company not found")
 
-        return Company(**response.data[0])
+        hydrated = await _ensure_company_country(dict(response.data[0]))
+        if hydrated.get("country") != response.data[0].get("country"):
+            try:
+                supabase.table("companies").update({"country": hydrated.get("country")}).eq("id", company_id).execute()
+            except Exception as exc:  # noqa: BLE001
+                print(f"Country backfill failed for {company_id}: {exc}")
+        return Company(**hydrated)
 
     except HTTPException:
         raise
@@ -272,7 +330,10 @@ async def get_company(company_id: str, ticker: str | None = None):
         if is_supabase_table_missing_error(e):
             cached = fallback_companies.get(str(company_id))
             if cached:
-                return Company(**cached)
+                hydrated = await _ensure_company_country(dict(cached))
+                fallback_companies[str(company_id)] = hydrated
+                save_fallback_companies()
+                return Company(**hydrated)
             if ticker:
                 return await _hydrate_company_from_ticker(str(company_id), ticker)
             raise HTTPException(status_code=404, detail="Company not found (Supabase tables missing and no cached data).")
@@ -304,7 +365,9 @@ async def list_companies(
 
         response = query.range(offset, offset + limit - 1).execute()
 
-        return [Company(**company) for company in response.data]
+        hydrated_records = await _fix_and_persist_countries(response.data or [], supabase)
+
+        return [Company(**company) for company in hydrated_records]
 
     except Exception as e:
         if is_supabase_table_missing_error(e):

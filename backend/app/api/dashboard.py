@@ -13,48 +13,21 @@ from app.models.database import get_supabase_client
 from app.services.local_cache import (
     fallback_analyses,
     fallback_companies,
+    save_fallback_companies,
 )
 from app.utils.supabase_errors import is_supabase_table_missing_error
-from app.services.eodhd_client import EODHDClient
+from app.services.eodhd_client import hydrate_country_with_eodhd, should_hydrate_country
 
 router = APIRouter()
 
 MAX_HISTORY_RESULTS = 50
 
 
-def _clean_country(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    cleaned = str(value).strip()
-    return cleaned or None
-
-
-def _needs_country_fix(country: Optional[str]) -> bool:
-    cleaned = _clean_country(country)
-    return cleaned is None or cleaned in {"US", "USA", "United States", "United States of America"}
-
-
-def _hydrate_country_from_eodhd(ticker: Optional[str], exchange: Optional[str]) -> Optional[str]:
-    if not ticker:
-        return None
-    try:
-        client = EODHDClient()
-        info = client.get_company_info(ticker, exchange or "US")
-        return _clean_country(
-            info.get("CountryName")
-            or info.get("CountryISO")
-            or (info.get("AddressData") or {}).get("Country")
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"Dashboard: unable to hydrate country for {ticker}: {exc}")
-        return None
-
-
-def _apply_country_fixes(company_map: Dict[str, Dict[str, Any]], supabase) -> None:
+def _hydrate_and_persist_countries(company_map: Dict[str, Dict[str, Any]], supabase) -> None:
     for company in company_map.values():
-        if not _needs_country_fix(company.get("country")):
+        if not should_hydrate_country(company.get("country")):
             continue
-        hydrated = _hydrate_country_from_eodhd(company.get("ticker"), company.get("exchange"))
+        hydrated = hydrate_country_with_eodhd(company.get("ticker"), company.get("exchange"))
         if not hydrated:
             continue
         company["country"] = hydrated
@@ -62,6 +35,21 @@ def _apply_country_fixes(company_map: Dict[str, Dict[str, Any]], supabase) -> No
             supabase.table("companies").update({"country": hydrated}).eq("id", company.get("id")).execute()
         except Exception as exc:  # noqa: BLE001
             print(f"Dashboard: could not persist hydrated country for {company.get('ticker')}: {exc}")
+
+
+def _hydrate_fallback_countries(company_map: Dict[str, Dict[str, Any]]) -> None:
+    updated = False
+    for company in company_map.values():
+        if not should_hydrate_country(company.get("country")):
+            continue
+        hydrated = hydrate_country_with_eodhd(company.get("ticker"), company.get("exchange"))
+        if not hydrated:
+            continue
+        company["country"] = hydrated
+        fallback_companies[str(company.get("id"))] = company
+        updated = True
+    if updated:
+        save_fallback_companies()
 
 
 @router.get("/overview")
@@ -104,7 +92,7 @@ def _build_supabase_overview() -> Dict[str, Any]:
     if company_ids:
         companies_response = supabase.table("companies").select("*").in_("id", list(company_ids)).execute()
         company_map = {str(company["id"]): company for company in (companies_response.data or [])}
-        _apply_country_fixes(company_map, supabase)
+        _hydrate_and_persist_countries(company_map, supabase)
 
     history = [_build_history_entry(analysis, company_map.get(analysis.get("company_id"))) for analysis in analyses]
     stats = _calculate_stats(history, total_analyses=total_analyses)
@@ -119,6 +107,8 @@ def _build_supabase_overview() -> Dict[str, Any]:
 
 
 def _build_fallback_overview() -> Dict[str, Any]:
+    _hydrate_fallback_countries(fallback_companies)
+
     history: List[Dict[str, Any]] = []
     for company_id, analyses in fallback_analyses.items():
         company = fallback_companies.get(str(company_id))

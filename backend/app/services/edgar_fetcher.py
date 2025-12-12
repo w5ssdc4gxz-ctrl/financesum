@@ -6,30 +6,13 @@ import requests  # Used for synchronous SEC calls
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 from app.config import get_settings
-from app.services.eodhd_client import EODHDClient
+from app.services.eodhd_client import (
+    EODHDClient,
+    hydrate_country_with_eodhd,
+    should_hydrate_country,
+)
 
 settings = get_settings()
-
-
-def _clean_country(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    cleaned = str(value).strip()
-    return cleaned or None
-
-
-async def _hydrate_country_from_eodhd(ticker: str, exchange: Optional[str]) -> Optional[str]:
-    try:
-        client = EODHDClient()
-        info = await asyncio.to_thread(client.get_company_info, ticker, exchange or "US")
-        return _clean_country(
-            info.get("CountryName")
-            or info.get("CountryISO")
-            or (info.get("AddressData") or {}).get("Country")
-        )
-    except Exception as exc:
-        print(f"Could not hydrate country from EODHD for {ticker}: {exc}")
-        return None
 
 
 async def _ensure_country(company: Dict) -> Dict:
@@ -37,16 +20,10 @@ async def _ensure_country(company: Dict) -> Dict:
     if not ticker:
         return company
 
-    needs_country = not company.get("country") or str(company.get("country")).strip() in {
-        "US",
-        "USA",
-        "United States",
-        "United States of America",
-    }
-    if not needs_country:
+    if not should_hydrate_country(company.get("country")):
         return company
 
-    hydrated = await _hydrate_country_from_eodhd(ticker, company.get("exchange"))
+    hydrated = await asyncio.to_thread(hydrate_country_with_eodhd, ticker, company.get("exchange"))
     if hydrated:
         company["country"] = hydrated
     return company

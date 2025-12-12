@@ -150,9 +150,7 @@ class EODHDClient:
             try:
                 info = self.get_company_info(query_upper, exchange)
                 if info:
-                    country = _normalize_country_value(info.get("CountryName")) \
-                        or _normalize_country_value(info.get("CountryISO")) \
-                        or _normalize_country_value((info.get("AddressData") or {}).get("Country"))
+                    country = extract_country_from_eodhd(info)
                     return {
                         "ticker": info.get("Code"),
                         "name": info.get("Name"),
@@ -246,9 +244,65 @@ def get_eodhd_client() -> EODHDClient:
     return EODHDClient()
 
 
+US_EQUIVALENTS = {
+    "US",
+    "USA",
+    "UNITED STATES",
+    "UNITED STATES OF AMERICA",
+    "UNITEDSTATES",
+}
+
+
 def _normalize_country_value(value: Optional[str]) -> Optional[str]:
     """Return a trimmed country string or None."""
     if not value:
         return None
     cleaned = str(value).strip()
     return cleaned or None
+
+
+def _is_us_country(value: Optional[str]) -> bool:
+    normalized = (_normalize_country_value(value) or "").replace(".", "").replace(" ", "").upper()
+    return normalized in US_EQUIVALENTS
+
+
+def extract_country_from_eodhd(info: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not info:
+        return None
+
+    country_fields = [
+        "CountryName",
+        "Country",
+        "CountryISO",
+        "CountryISO3",
+        "CountryISOAlpha3",
+    ]
+
+    for field in country_fields:
+        value = _normalize_country_value(info.get(field))
+        if value:
+            return value.upper() if "ISO" in field.upper() else value
+
+    address = info.get("AddressData") or info.get("Address") or {}
+    address_country = _normalize_country_value(address.get("Country"))
+    if address_country:
+        return address_country
+
+    return None
+
+
+def should_hydrate_country(country: Optional[str]) -> bool:
+    """Return True when country is missing or looks like an unresolved US placeholder."""
+    return _normalize_country_value(country) is None or _is_us_country(country)
+
+
+def hydrate_country_with_eodhd(ticker: str, exchange: Optional[str] = None) -> Optional[str]:
+    if not ticker:
+        return None
+    try:
+        client = EODHDClient()
+        info = client.get_company_info(ticker, exchange or "US")
+        return extract_country_from_eodhd(info)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Country hydration failed for {ticker}: {exc}")
+        return None
