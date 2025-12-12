@@ -1,0 +1,138 @@
+'use client'
+
+import { useState, useMemo } from 'react'
+import { motion, AnimatePresence } from 'framer-motion'
+import { TypewriterText } from './TypewriterText'
+
+interface CollapsibleSummaryProps {
+  content: string
+  previewLength?: number
+  renderMarkdown: (text: string) => React.ReactNode
+  className?: string
+}
+
+export function CollapsibleSummary({
+  content,
+  previewLength = 500,
+  renderMarkdown,
+  className
+}: CollapsibleSummaryProps) {
+  const [isExpanded, setIsExpanded] = useState(false)
+  const [hasAnimated, setHasAnimated] = useState(false)
+  
+  const { preview, remaining } = useMemo(() => {
+    if (content.length <= previewLength) {
+      return { preview: content, remaining: '' }
+    }
+    
+    let breakPoint = content.lastIndexOf('\n\n', previewLength)
+    if (breakPoint === -1 || breakPoint < previewLength * 0.5) {
+      breakPoint = content.lastIndexOf('. ', previewLength)
+    }
+    if (breakPoint === -1 || breakPoint < previewLength * 0.5) {
+      breakPoint = content.lastIndexOf(' ', previewLength)
+    }
+    if (breakPoint === -1) {
+      breakPoint = previewLength
+    }
+    
+    return {
+      preview: content.slice(0, breakPoint + 1).trim(),
+      remaining: content.slice(breakPoint + 1).trim()
+    }
+  }, [content, previewLength])
+
+  if (!remaining) {
+    return <div className={className}>{renderMarkdown(content)}</div>
+  }
+
+  return (
+    <div className={className}>
+      <div className="relative">
+        {renderMarkdown(preview)}
+        
+        {!isExpanded && (
+          <div 
+            className="absolute bottom-0 left-0 right-0 h-24 pointer-events-none"
+            style={{
+              background: 'linear-gradient(to bottom, transparent 0%, hsl(var(--card)) 100%)'
+            }}
+          />
+        )}
+      </div>
+      
+      {!isExpanded && (
+        <motion.button
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          onClick={() => setIsExpanded(true)}
+          className="mt-2 text-sm font-bold text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 cursor-pointer transition-colors flex items-center gap-1.5 group"
+        >
+          <span className="border-b border-transparent group-hover:border-current">
+            Show more
+          </span>
+          <motion.span 
+            animate={{ y: [0, 3, 0] }}
+            transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
+          >
+            ↓
+          </motion.span>
+        </motion.button>
+      )}
+
+      <AnimatePresence>
+        {isExpanded && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.3, ease: "easeOut" }}
+            className="overflow-hidden"
+          >
+            {!hasAnimated ? (
+              <TypewriterText
+                text={remaining}
+                speed={150}
+                onComplete={() => setHasAnimated(true)}
+              >
+                {(displayText) => (
+                  <div className="relative">
+                    {renderMarkdown(displayText)}
+                    {displayText.length < remaining.length && (
+                      <span className="inline-block w-[3px] h-[1.2em] bg-blue-500 dark:bg-blue-400 ml-1 animate-blink align-middle" />
+                    )}
+                  </div>
+                )}
+              </TypewriterText>
+            ) : (
+              renderMarkdown(remaining)
+            )}
+            
+            {hasAnimated && (
+              <motion.button
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                transition={{ delay: 0.2 }}
+                onClick={() => {
+                  setIsExpanded(false)
+                  setHasAnimated(false)
+                }}
+                className="mt-6 text-sm font-bold text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 cursor-pointer transition-colors flex items-center gap-1.5 group"
+              >
+                <motion.span 
+                  animate={{ y: [0, -3, 0] }}
+                  transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
+                >
+                  ↑
+                </motion.span>
+                <span className="border-b border-transparent group-hover:border-current">
+                  Show less
+                </span>
+              </motion.button>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+}

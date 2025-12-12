@@ -1,7 +1,8 @@
 'use client'
 
 import ReactMarkdown from 'react-markdown'
-import React, { useMemo } from 'react'
+import React, { useMemo, useCallback } from 'react'
+import { CollapsibleSummary } from './ui/CollapsibleSummary'
 
 interface EnhancedSummaryProps {
   content: string
@@ -306,19 +307,14 @@ function extractKeyDataAppendix(content: string): {
 }
 
 export default function EnhancedSummary({ content, persona }: EnhancedSummaryProps) {
-  // Preprocess content to fix markdown formatting issues
   const normalizedContent = useMemo(() => normalizeCasing(content), [content])
   const processedContent = preprocessContent(normalizedContent)
-
-  // Extract Key Data Appendix for special rendering
   const appendixData = useMemo(() => extractKeyDataAppendix(processedContent), [processedContent])
 
-  const renderMarkdown = (text: string) => (
+  const renderMarkdown = useCallback((text: string) => (
     <ReactMarkdown
       className="normal-case [&_*]:normal-case [text-transform:none]"
-      style={{ textTransform: 'none' }}
       components={{
-        // Custom renderers for better styling
         p: ({ children }) => (
           <p className="normal-case leading-relaxed text-[15px] text-gray-900 dark:text-gray-100">
             {children}
@@ -363,11 +359,28 @@ export default function EnhancedSummary({ content, persona }: EnhancedSummaryPro
     >
       {text}
     </ReactMarkdown>
-  )
+  ), [])
+
+  const renderFullContent = useCallback((text: string) => {
+    const data = extractKeyDataAppendix(text)
+    if (data) {
+      return (
+        <>
+          {renderMarkdown(data.beforeAppendix)}
+          <h2 className="flex items-center gap-3 text-xl font-black uppercase mt-8 mb-4 border-b-2 border-black dark:border-white pb-2">
+            <span className="w-4 h-4 bg-black dark:bg-white"></span>
+            Key Data Appendix
+          </h2>
+          <MetricsGrid metrics={data.metrics} />
+          {data.afterAppendix && renderMarkdown(data.afterAppendix)}
+        </>
+      )
+    }
+    return renderMarkdown(text)
+  }, [renderMarkdown])
 
   return (
     <div className="relative space-y-6">
-      {/* Persona Badge - Top Right */}
       {persona && (
         <div className="md:absolute md:top-0 md:right-0 flex items-center gap-3 p-3 bg-white dark:bg-zinc-900 border-2 border-black dark:border-white shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)] mb-6 md:mb-0 z-10 max-w-[300px]">
           <div className="w-12 h-12 rounded-full overflow-hidden border-2 border-black dark:border-white shrink-0">
@@ -388,31 +401,12 @@ export default function EnhancedSummary({ content, persona }: EnhancedSummaryPro
         </div>
       )}
 
-      {/* Render the full content with premium styling */}
-      <div
-        className={`prose dark:prose-invert max-w-none font-mono normal-case [&_*]:normal-case [&_h2]:uppercase [&_h3]:uppercase ${persona ? 'pt-2 md:pt-16' : ''
-          } [text-transform:none]`}
-        style={{ textTransform: 'none' }}
-      >
-        {appendixData ? (
-          <>
-            {/* Content before Key Data Appendix */}
-            {renderMarkdown(appendixData.beforeAppendix)}
-
-            {/* Beautiful Key Data Appendix Section */}
-            <h2 className="flex items-center gap-3 text-xl font-black uppercase mt-8 mb-4 border-b-2 border-black dark:border-white pb-2">
-              <span className="w-4 h-4 bg-black dark:bg-white"></span>
-              Key Data Appendix
-            </h2>
-            <MetricsGrid metrics={appendixData.metrics} />
-
-            {/* Content after Key Data Appendix */}
-            {appendixData.afterAppendix && renderMarkdown(appendixData.afterAppendix)}
-          </>
-        ) : (
-          renderMarkdown(processedContent)
-        )}
-      </div>
+      <CollapsibleSummary
+        content={processedContent}
+        previewLength={600}
+        renderMarkdown={renderFullContent}
+        className={`prose dark:prose-invert max-w-none font-mono normal-case [&_*]:normal-case [&_h2]:uppercase [&_h3]:uppercase ${persona ? 'pt-2 md:pt-16' : ''} [text-transform:none]`}
+      />
     </div>
   )
 }
