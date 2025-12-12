@@ -29,6 +29,8 @@ from app.services.eodhd_client import (
     get_eodhd_client,
     EODHDAccessError,
     EODHDClientError,
+    hydrate_country_with_eodhd,
+    should_hydrate_country,
 )
 from app.services.edgar_fetcher import (
     download_filing,
@@ -1679,7 +1681,7 @@ def _rewrite_summary_to_length(
                 f"- Management Discussion & Analysis: Add {max(5, int(words_needed * 0.35))} words (strategy, capital allocation, execution risks)\n"
                 f"- Risk Factors: Add {max(5, int(words_needed * 0.20))} words (specific scenarios with probability/impact)\n"
                 f"- Executive Summary: Add {max(3, int(words_needed * 0.10))} words (conviction rationale)\n"
-                f"DO NOT add narrative to Key Metrics; keep it a scannable data block.\n\n"
+                "DO NOT add narrative to Key Metrics; keep it a scannable data block.\n\n"
                 f"DO NOT use generic filler sentences. Add SUBSTANTIVE analysis with specific data points.\n"
                 f"You MUST reach at least {lower} words. Count your words before finishing."
             )
@@ -2800,7 +2802,7 @@ def _build_health_rating_instructions(
         directives.append("=== NARRATIVE PERSONALIZATION (MANDATORY) ===")
         directives.append(f"Your explanation MUST explicitly reference the user's selections in the text:")
         directives.append(f"- Start with a phrase like: 'Applying the {framework_display} framework...' or 'From a {framework_display} perspective...'")
-        directives.append(f"- Reference the weighting: 'With {weighting_display} as the primary factor...' or 'Prioritizing {weighting_display}...'")
+        directives.append(f"- Reference the weighting: 'With {weighting_display} as the primary driver...' or 'Prioritizing {weighting_display}...'")
         directives.append(f"- The narrative should feel customized to the user's settings, NOT generic.")
         directives.append("")
         directives.append("EXAMPLE OF GOOD PERSONALIZED NARRATIVE:")
@@ -2931,7 +2933,7 @@ def _load_document_excerpt(path: Path, limit: Optional[int] = None) -> str:
         # Standalone MD&A header (no Item number)
         (r"MANAGEMENT[''\u2019]?S?\s+DISCUSSION\s+AND\s+ANALYSIS\s+OF\s+FINANCIAL\s+CONDITION", [r"ITEM\s+7A\.?", r"ITEM\s+8\.?", r"QUANTITATIVE\s+AND\s+QUALITATIVE", r"ITEM\s+3\.?"], "MANAGEMENT DISCUSSION & ANALYSIS"),
         # Alternative: Just "MANAGEMENT DISCUSSION" without possessive
-        (r"MANAGEMENT\s+DISCUSSION\s+AND\s+ANALYSIS", [r"ITEM\s+7A\.?", r"ITEM\s+8\.?", r"QUANTITATIVE\s+AND\s+QUALITATIVE", r"ITEM\s+3\.?"], "MANAGEMENT DISCUSSION & ANALYSIS"),
+        (r"MANAGEMENT\s+DISCUSSION\s+AND\s+ANALYSIS", [r"ITEM\s+7A\.?", r"ITEM\s+8\.?", r"QUANTITATIVE", r"ITEM\s+3\.?"], "MANAGEMENT DISCUSSION & ANALYSIS"),
         # NVIDIA-specific patterns (often uses dashes)
         (r"MANAGEMENT[''\u2019]?S?\s+DISCUSSION\s+AND\s+ANALYSIS\s+[-–—]", [r"ITEM\s+7A\.?", r"ITEM\s+8\.?", r"QUANTITATIVE", r"ITEM\s+3\.?"], "MANAGEMENT DISCUSSION & ANALYSIS"),
         # Results of Operations (often part of MD&A)
@@ -3821,6 +3823,29 @@ def _ensure_local_document(context: Dict[str, Any], settings) -> Optional[Path]:
     return None
 
 
+def _ensure_company_country(company: Dict[str, Any], *, supabase=None, company_key: Optional[str] = None) -> Dict[str, Any]:
+    """Hydrate and persist company country when missing or US placeholder."""
+    if not company or not should_hydrate_country(company.get("country")):
+        return company
+
+    hydrated = hydrate_country_with_eodhd(company.get("ticker"), company.get("exchange"))
+    if not hydrated:
+        return company
+
+    company["country"] = hydrated
+
+    if supabase and company.get("id"):
+        try:
+            supabase.table("companies").update({"country": hydrated}).eq("id", company.get("id")).execute()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not persist hydrated country for %s: %s", company.get("ticker"), exc)
+    elif company_key is not None:
+        fallback_companies[company_key] = company
+        save_fallback_companies()
+
+    return company
+
+
 async def _start_fetch_with_fallback_company(
     company_key: str,
     company_data: Any,
@@ -3837,6 +3862,7 @@ async def _start_fetch_with_fallback_company(
     else:
         company = dict(company_data)
 
+    company = _ensure_company_country(company, company_key=company_key)
     fallback_companies[company_key] = company
     save_fallback_companies()
 
@@ -4137,7 +4163,7 @@ async def fetch_filings(request: FilingsFetchRequest):
         if not company_response.data:
             raise HTTPException(status_code=404, detail="Company not found")
         
-        company = company_response.data[0]
+        company = _ensure_company_country(company_response.data[0], supabase=supabase)
     except HTTPException:
         raise
     except Exception as e:
@@ -4734,7 +4760,7 @@ YOU ARE A NEUTRAL, OBJECTIVE FINANCIAL ANALYST.
 ABSOLUTE PROHIBITION - READ THIS FIRST:
 - You have NOT been assigned any investor persona
 - Do NOT adopt ANY famous investor's voice or perspective
-- Do NOT use first-person language ('I', 'my view', 'I would', 'I believe')
+- Do NOT use first-person language ('I', 'my view', 'I would', 'I believe', 'my conviction')
 - Do NOT imitate: Warren Buffett, Charlie Munger, Peter Lynch, Benjamin Graham, Howard Marks, Bill Ackman, Ray Dalio, Cathie Wood, John Bogle, Joel Greenblatt, or ANY other investor
 
 REQUIRED WRITING STYLE:
@@ -4853,7 +4879,6 @@ FORBIDDEN CUT-OFF PATTERNS (YOUR OUTPUT WILL BE REJECTED IF ANY APPEAR):
    - "...I would..." (INCOMPLETE - finish with what you would do)
    - "...which is..." (INCOMPLETE - which is what?)
    - "...because I..." (INCOMPLETE - because you what?)
-   - Any sentence ending with: the, a, an, of, to, for, with, in, and, but, or, while, although, I
 
 REAL EXAMPLES OF CUT-OFFS TO AVOID:
    BAD: "...the cyclical nature of the semiconductor industry and." 
@@ -4884,21 +4909,7 @@ NARRATIVE QUALITY:
 - Avoid starting consecutive sentences with the same word.
 - Vary sentence length and structure for readability.
 - THE LAST SENTENCE OF EACH SECTION MUST BE A COMPLETE THOUGHT ending in a period, question mark, or exclamation point.
-- If you write a subordinate clause (starting with "which", "that", "although", "while", "but"), you MUST complete it.
-- BUDGET YOUR WORDS: If the target is 650 words, plan to write ~550 words for main sections, leaving 100 words for proper conclusions.
-
-FREE CASH FLOW RECONCILIATION:
-- If FCF exceeds Net Income, you MUST explain why (e.g., working capital release, D&A exceeds capex, deferred revenue)
-- If FCF < Net Income, explain the cash consumption (e.g., inventory build, receivables growth, capex expansion)
-- Never present FCF > Net Income as normal without explanation
-
-NEGATIVE CONSTRAINTS:
-{health_constraint_line}- Do NOT repeat the same metrics across multiple sections.
-- Do NOT use generic filler phrases like "management remains focused" or "the company continues to execute".
-- Do NOT include placeholder text like "not extracted", "see above", "not available" - if you lack information, omit it.
-- Do NOT switch between personal opinion and neutral analyst tone mid-document.
-- Do NOT end any section with an incomplete sentence. If unsure, read the last sentence aloud.
-- Do NOT cut off numbers mid-way (e.g., "$1." instead of "$1.2B") - always write complete figures.
+- If you write a subordinate clause (starting with "which", "that", "although", "while", "but", "however"), you MUST complete it.
 
 === FINAL PRE-SUBMISSION CHECKLIST (MANDATORY) ===
 Before you output anything, verify:
@@ -5671,7 +5682,7 @@ def _generate_fallback_closing_takeaway(
             [
                 f"{company_name} has real positives, but {concerns[0]} tempers the upside.",
                 "The risk-reward feels balanced today.",
-                "I’d wait for either better fundamentals or a better price.",
+                "I'd wait for either better fundamentals or a better price.",
             ],
         ]
         sentences = rng.choice(variants)
@@ -6071,7 +6082,7 @@ def _ensure_required_sections(
                     verdict_concerns.append("net losses")
             patched = _ensure_personal_verdict(existing_closing, company_name, strengths=verdict_strengths, concerns=verdict_concerns)
             text = re.sub(
-                r'(##\s*Closing\s+Takeaway\s*\n+)[\s\S]*?(?=\n##\s|\Z)',
+                r'##\s*Closing\s+Takeaway\s*\n+[\s\S]*?(?=\n##\s|\Z)',
                 rf'\1{patched}\n',
                 text,
                 flags=re.IGNORECASE,
