@@ -1,13 +1,23 @@
-UNEXPECTED ERROR: name 'cash' is not defined
-Type: <class 'NameError'>
+UNEXPECTED ERROR: invalid group reference 1 at position 1
+Type: <class 're.error'>
 Traceback (most recent call last):
-  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 4777, in generate_filing_summary
-    summary_text = _inject_health_drivers(summary_text, calculated_metrics, health_score_data or {})
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 3291, in _inject_health_drivers
-    block = _build_health_driver_block(calculated_metrics, health_score_data)
-            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 3234, in _build_health_driver_block
-    cash_reserves = (cash or 0) + (marketable_securities or 0)
-                     ^^^^
-NameError: name 'cash' is not defined
+  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 4954, in generate_filing_summary
+    summary_text = _ensure_required_sections(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 6084, in _ensure_required_sections
+    text = re.sub(
+           ^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.11/3.11.14_1/Frameworks/Python.framework/Versions/3.11/lib/python3.11/re/__init__.py", line 185, in sub
+    return _compile(pattern, flags).sub(repl, string, count)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.11/3.11.14_1/Frameworks/Python.framework/Versions/3.11/lib/python3.11/re/__init__.py", line 317, in _subx
+    template = _compile_repl(template, pattern)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.11/3.11.14_1/Frameworks/Python.framework/Versions/3.11/lib/python3.11/re/__init__.py", line 308, in _compile_repl
+    return _parser.parse_template(repl, pattern)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.11/3.11.14_1/Frameworks/Python.framework/Versions/3.11/lib/python3.11/re/_parser.py", line 1081, in parse_template
+    addgroup(int(this[1:]), len(this) - 1)
+  File "/opt/homebrew/Cellar/python@3.11/3.11.14_1/Frameworks/Python.framework/Versions/3.11/lib/python3.11/re/_parser.py", line 1017, in addgroup
+    raise s.error("invalid group reference %d" % index, pos)
+re.error: invalid group reference 1 at position 1
