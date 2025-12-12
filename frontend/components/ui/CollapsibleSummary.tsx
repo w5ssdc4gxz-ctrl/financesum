@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo, Children, cloneElement, isValidElement, ReactElement, ReactNode } from 'react'
+import { useState, useMemo } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { TypewriterText } from './TypewriterText'
 
@@ -9,48 +9,6 @@ interface CollapsibleSummaryProps {
   previewLength?: number
   renderMarkdown: (text: string) => React.ReactNode
   className?: string
-}
-
-function appendCursorToLastTextNode(node: ReactNode): ReactNode {
-  const cursor = (
-    <span 
-      key="typing-cursor"
-      className="inline-block w-[3px] h-[1em] bg-blue-500 ml-0.5 align-baseline animate-pulse"
-      style={{ verticalAlign: 'text-bottom' }}
-    />
-  )
-
-  if (typeof node === 'string') {
-    return <>{node}{cursor}</>
-  }
-
-  if (!isValidElement(node)) {
-    return node
-  }
-
-  const element = node as ReactElement<{ children?: ReactNode }>
-  const children = element.props.children
-
-  if (!children) {
-    return node
-  }
-
-  const childArray = Children.toArray(children)
-  if (childArray.length === 0) {
-    return cloneElement(element, {}, cursor)
-  }
-
-  const lastIndex = childArray.length - 1
-  const lastChild = childArray[lastIndex]
-
-  const newChildren = childArray.map((child, index) => {
-    if (index === lastIndex) {
-      return appendCursorToLastTextNode(child)
-    }
-    return child
-  })
-
-  return cloneElement(element, {}, ...newChildren)
 }
 
 export function CollapsibleSummary({
@@ -146,9 +104,23 @@ export function CollapsibleSummary({
                 onComplete={() => setHasAnimated(true)}
               >
                 {(displayText) => {
-                  const rendered = renderMarkdown(displayText)
-                  const isTyping = displayText.length < remaining.length
-                  return isTyping ? appendCursorToLastTextNode(rendered) : rendered
+                  const safeText = typeof displayText === 'string' ? displayText : String(displayText || '')
+                  const isTyping = safeText.length < remaining.length
+                  return (
+                    <div className="relative">
+                      {renderMarkdown(safeText)}
+                      {isTyping && (
+                        <span 
+                          className="inline-block w-[3px] h-[1em] bg-blue-500 ml-0.5 align-baseline animate-pulse absolute"
+                          style={{ 
+                            verticalAlign: 'text-bottom',
+                            bottom: '1.5em',
+                            right: 0
+                          }}
+                        />
+                      )}
+                    </div>
+                  )
                 }}
               </TypewriterText>
             ) : (
