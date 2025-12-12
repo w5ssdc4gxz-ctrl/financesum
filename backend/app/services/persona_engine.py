@@ -241,7 +241,7 @@ INCOMPLETE_SENTENCE_PATTERNS = [
     r';\s*which\s+is\s*\.?\s*$',  # "; which is..." trailing
     r'which\s+is\s+(?:essential|critical|important|key|vital)\s*\.?\s*$',  # "which is essential..." incomplete
     r'underscores\s+the\s+company\'?s?\s+commitment\s+to[^.]*which\s+is\s*\.?\s*$',  # specific pattern from user feedback
-    # Score truncation patterns (Liquidity: 6/15 (Current Ratio is 4.)
+    # Score truncation patterns (e.g., "Liquidity: 6/15 (Current Ratio is 4.")
     r':\s*\d+/\d+\s*\([^)]*\s+is\s+\d+\.?\s*$',  # "Liquidity: 6/15 (Current Ratio is 4." - incomplete
     r'\(Current\s+Ratio\s+is\s+\d+\.?\s*$',  # "(Current Ratio is 4." - incomplete
     r'Ratio\s+is\s+\d+\.?\s*$',  # "Ratio is 4." without context
@@ -289,14 +289,10 @@ SECTION_TRUNCATION_PATTERNS = [
     r'essential\s+for\s+sustaining\s+its[^.]*$',
     r'which\s+is\s+essential\s+for[^.]*$',
     # Competitive Landscape trailing off
-    r'existing\s+players\s+have\s+the\s+resources[^.]*$',
-    r'as\s+existing\s+players\s+have[^.]*$',
+    (r'existing\s+players\s+have\s+the\s+resources[^.]*$'),
+    (r'as\s+existing\s+players\s+have[^.]*$'),
     # Strategic Initiatives trailing off
-    r'a\s+sign\s+of\s+management[^.]*$',
-    # Activist/Ackman style incomplete demands
-    r'I\s+need\s+to\s+see\s+evidence[^.]*$',
-    r'proactive\s+mitigation\s+strategies[^.]*$',
-    r'contingency\s+planning\s+to\s+address[^.]*$',
+    (r'a\s+sign\s+of\s+management[^.]*$'),
 ]
 
 # Phrases that indicate uncontextualized numbers
@@ -822,8 +818,8 @@ def extract_company_specific_context(company_name: str, financial_data: Dict, ra
         elif revenue_growth > 0.15:
             context["financial_character"].append("strong growth (15%+ revenue growth)")
         elif revenue_growth < 0:
-            context["financial_character"].append("revenue declining")
             context["sector_risks"].append("market share loss or industry headwinds")
+            context["financial_character"].append("revenue declining")
     
     # =========================================================================
     # STEP 3.5: Additional data-driven risk inference (NEW)
@@ -872,7 +868,7 @@ def extract_company_specific_context(company_name: str, financial_data: Dict, ra
     # Working capital intensity
     if current_ratio is not None and revenue is not None:
         try:
-            if current_ratio > 2.5 and revenue and float(revenue) > 1e9:
+            if current_ratio > 2.5 and float(revenue) > 1e9:
                 context["business_model_signals"].append("capital-light with excess working capital")
         except (ValueError, TypeError):
             pass
@@ -1399,7 +1395,7 @@ def detect_internal_data_inconsistency(output: str) -> List[str]:
                         f"Use ONE consistent figure throughout."
                     )
 
-    # Also check for conflicting fiscal periods
+    # Also check conflicting fiscal periods
     fy_pattern = r'(?:FY|fiscal year)\s*\'?(\d{2,4})'
     fy_matches = list(re.finditer(fy_pattern, output, re.IGNORECASE))
     if len(fy_matches) >= 2:
@@ -1595,7 +1591,7 @@ def fix_incomplete_output(output: str, persona_id: str = "") -> str:
 
     # Fix incomplete percentage comparisons
     output = re.sub(
-        r'(\d+\.?\d*%)\s+(?:threshold|benchmark|average)\s*$',
+        r'(\d+\.?\d*%)\s+(?:threshold|benchmarks|average)\s*$',
         r'\1 threshold).',
         output
     )
@@ -1638,12 +1634,14 @@ def fix_incomplete_output(output: str, persona_id: str = "") -> str:
     output = re.sub(
         r',?\s*but\s+the\s+figure\s+is\s+less\s+than\s+net\s*\.?\.\.\.\s*$',
         ', indicating cash flow lags net income slightly but remains healthy.',
-        output
+        output,
+        flags=re.IGNORECASE
     )
     output = re.sub(
         r',?\s*but\s+the\s+figure\s+is\s+less\s+than\s*\.?\.\.\.\s*$',
         ', though conversion could improve.',
-        output
+        output,
+        flags=re.IGNORECASE
     )
 
     # Fix "although I want to assess if this is sustainable in the face of increasing..."
@@ -1743,21 +1741,21 @@ def fix_incomplete_output(output: str, persona_id: str = "") -> str:
     )
     # More generic version: "...and can..." trailing off at end
     output = re.sub(
-        r'and\s+can\s*\.?\.{0,3}\s*$',
+        r'and\s+can\s*\.?\.{0,}\s*$',
         'and can be mitigated with proper diversification.',
         output,
         flags=re.IGNORECASE
     )
     # "...that I believe is..." trailing
     output = re.sub(
-        r'that\s+I\s+believe\s+is\s*\.?\.{0,3}\s*$',
+        r'that\s+I\s+believe\s+is\s*\.?\.{0,}\s*$',
         'that I believe warrants caution.',
         output,
         flags=re.IGNORECASE
     )
     # "...is unnecessary and..." trailing
     output = re.sub(
-        r'is\s+unnecessary\s+and\s*\.?\.{0,3}\s*$',
+        r'is\s+unnecessary\s+and\s*\.?\.{0,}\s*$',
         'is unnecessary and avoidable.',
         output,
         flags=re.IGNORECASE
@@ -1806,7 +1804,7 @@ def fix_incomplete_output(output: str, persona_id: str = "") -> str:
 
     # Pattern: "concrete steps..." or "specific timelines..." trailing
     output = re.sub(
-        r'(?:concrete\s+steps|specific\s+timelines|detailed\s+plans?|clear\s+plan)\s*\.{2,}\s*$',
+        r'(?:concrete\s+steps|s\u00edmilar\s+timelines|d\u00e9tails\s+plans?|clear\s+plan)\s*\.{2,}\s*$',
         'concrete steps with measurable milestones.',
         output,
         flags=re.IGNORECASE
@@ -1843,7 +1841,6 @@ def fix_incomplete_output(output: str, persona_id: str = "") -> str:
     )
 
     # Pattern: Generic ellipsis at end of any sentence (aggressive cleanup)
-    # This catches any "word word word..." pattern at end
     output = re.sub(
         r'(\w+)\s*\.{3,}\s*$',
         r'\1.',
@@ -1890,24 +1887,21 @@ def fix_incomplete_output(output: str, persona_id: str = "") -> str:
     # Pattern: "but I need to see better..." trailing
     output = re.sub(
         r'but\s+I\s+need\s+to\s+see\s+(?:better|more|clearer)\s+[^.!?]*\.{2,}\s*$',
-        'but I need to see better execution before committing capital.',
+        'but I need to see better execution before risking capital.',
         output,
         flags=re.IGNORECASE
     )
 
     # Check if output ends with proper punctuation
-    if output and not output.rstrip().endswith(('.', '!', '?', '"', "'")):
-        # Find last complete sentence
+    if output and not output[-1] in '.!?"\'':
+        # Find the last sentence
         last_period = output.rfind('.')
         last_exclaim = output.rfind('!')
         last_question = output.rfind('?')
         last_punct = max(last_period, last_exclaim, last_question)
-
-        if last_punct > 0:
-            # Truncate to last complete sentence
+        if last_punct > 0 and last_punct > len(output) - 100:
             output = output[:last_punct + 1]
         else:
-            # No sentence end found - append period
             output += '.'
 
     # Additional cleanup: remove any trailing "I need to determine..." type phrases
@@ -1916,12 +1910,11 @@ def fix_incomplete_output(output: str, persona_id: str = "") -> str:
         r'\.\s*I need to determine[^.!?]*[.!?]?\s*$',
         r'\.\s*I need to assess[^.!?]*[.!?]?\s*$',
         r'\.\s*I need to evaluate[^.!?]*[.!?]?\s*$',
-        r'\.\s*My take is[^.!?]*;\s*I need to[^.!?]*[.!?]?\s*$',
+        r'\.\s*My take is[^.!?]*;\s*I need to\s*.',
     ]
     for pattern in trailing_incomplete:
         match = re.search(pattern, output, re.IGNORECASE)
         if match:
-            # Find a better ending point
             output = output[:match.start()] + '.'
             break
 
@@ -2201,7 +2194,7 @@ def fix_mid_text_ellipsis(output: str) -> str:
 
         # Pattern: "until I..." mid-line
         line = re.sub(
-            r'until\s+I\s*\.{2,}',
+            r'until\s+I\s+\.{2,}',
             'until I see clearer execution.',
             line,
             flags=re.IGNORECASE
@@ -2233,6 +2226,120 @@ def fix_mid_text_ellipsis(output: str) -> str:
     return '\n'.join(fixed_lines)
 
 
+def reorder_persona_sections(output: str) -> str:
+    """
+    Reorder persona output to canonical 7-section structure.
+    Ensures sections appear in the correct order regardless of how the model generated them.
+    Also removes non-canonical sections.
+    """
+    if not output:
+        return output
+
+    # Define canonical section order with detection patterns
+    section_defs = [
+        ("health", r'^##?\s*\d*\.?\s*financial\s+health\s+rating'),
+        ("exec", r'^##?\s*\d*\.?\s*executive\s+summary'),
+        ("perf", r'^##?\s*\d*\.?\s*financial\s+performance'),
+        ("mda", r'^##?\s*\d*\.?\s*management\s+discussion'),
+        ("risks", r'^##?\s*\d*\.?\s*risk\s+factors?'),
+        ("metrics", r'^##?\s*\d*\.?\s*key\s+metrics'),
+        ("closing", r'^##?\s*\d*\.?\s*closing\s+takeaway'),
+    ]
+    
+    # Non-canonical sections to skip/remove
+    non_canonical_patterns = [
+        r'^##?\s*\d*\.?\s*strategic\s+initiatives',
+        r'^##?\s*\d*\.?\s*capital\s+allocation',
+        r'^##?\s*\d*\.?\s*competitive\s+landscape',
+        r'^##?\s*\d*\.?\s*catalysts?',
+        r'^##?\s*\d*\.?\s*investment\s+recommendation',
+        r'^##?\s*\d*\.?\s*investment\s+thesis',
+        r'^##?\s*\d*\.?\s*top\s+\d+\s+risks',
+        r'^##?\s*\d*\.?\s*key\s+kpis',
+        r'^##?\s*\d*\.?\s*cash\s+flow\s+analysis',
+        r'^##?\s*\d*\.?\s*key\s+data\s+appendix',
+        r'^##?\s*\d*\.?\s*health\s+score\s+drivers',
+        r'^##?\s*\d*\.?\s*tl;?dr',
+        r'^##?\s*\d*\.?\s*valuation',
+    ]
+
+    correct_order = ["health", "exec", "perf", "mda", "risks", "metrics", "closing"]
+
+    lines = output.strip().split('\n')
+    sections_found = {}
+    current_section = None
+    current_content = []
+    preamble = []  # Content before first section
+    in_non_canonical = False  # Flag to skip non-canonical section content
+
+    for line in lines:
+        line_lower = line.lower().strip()
+
+        # Check if this line starts a canonical section
+        found_section = None
+        for section_key, pattern in section_defs:
+            if re.match(pattern, line_lower):
+                found_section = section_key
+                break
+        
+        # Check if this is a non-canonical section header
+        is_non_canonical = any(re.match(p, line_lower) for p in non_canonical_patterns)
+
+        if found_section:
+            # Save previous section if any
+            if current_section:
+                sections_found[current_section] = '\n'.join(current_content)
+            elif current_content and not preamble:
+                preamble = current_content
+
+            current_section = found_section
+            current_content = [line]
+            in_non_canonical = False
+        elif is_non_canonical:
+            # Save previous section and mark we're in non-canonical territory
+            if current_section:
+                sections_found[current_section] = '\n'.join(current_content)
+                current_content = []
+            current_section = None
+            in_non_canonical = True  # Skip content until next canonical section
+        elif in_non_canonical:
+            # Skip this content - it belongs to a non-canonical section
+            continue
+        else:
+            current_content.append(line)
+
+    # Save last section
+    if current_section:
+        sections_found[current_section] = '\n'.join(current_content)
+    elif current_content and not preamble:
+        preamble = current_content
+
+    # If no sections were found, return original
+    if not sections_found:
+        return output
+
+    # Rebuild in correct order
+    rebuilt = []
+
+    # Don't add preamble - we want clean section-based output
+    # (Any important content should be in Executive Summary)
+
+    # Add sections in correct order
+    for key in correct_order:
+        if key in sections_found:
+            rebuilt.append(sections_found[key])
+
+    if not rebuilt:
+        return output
+
+    result = '\n\n'.join(rebuilt)
+
+    # Clean up multiple newlines
+    result = re.sub(r'\n{3,}', '\n\n', result)
+
+    return result.strip()
+
+
 def sanitize_persona_output(output: str, company_context: Optional[Dict] = None) -> str:
     """
     Aggressively post-process persona output to remove any leaked generic elements.
@@ -2240,6 +2347,58 @@ def sanitize_persona_output(output: str, company_context: Optional[Dict] = None)
     """
     if not output:
         return output
+    
+    # =========================================================================
+    # PHASE 0: AGGRESSIVE CLEANUP OF HEALTH SCORE / KEY DATA APPENDIX SECTIONS
+    # =========================================================================
+    
+    # Remove "Health Score Drivers:" sections entirely (with all sub-bullets)
+    output = re.sub(
+        r'(?i)(?:^|\n)\s*(?:##?\s*)?Health\s+Score\s+Drivers?\*:?\s*\n(?:[^\n]*\n)*?(?=\n\s*(?:##|\Z|STANCE:|VERDICT:))',
+        '\n',
+        output,
+        flags=re.MULTILINE
+    )
+    
+    # Remove any "Key Data Appendix" section and everything after it until STANCE/VERDICT
+    output = re.sub(
+        r'(?i)(?:^|\n)\s*(?:##?\s*)?Key\s+Data\s+Appendix\s*\n(?:[^\n]*\n)*?(?=\n\s*(?:STANCE:|VERDICT:|\Z))',
+        '\n',
+        output,
+        flags=re.MULTILINE
+    )
+    
+    # Remove ALL lines that start with → (arrow notation) - COMPREHENSIVE
+    output = re.sub(r'(?m)^[→\->]\s*[^\n]*\n?', '', output)
+    output = re.sub(r'(?m)^→[^\n]*\n?', '', output)
+    
+    # Remove lines that contain ONLY metrics in arrow format
+    output = re.sub(r'(?m)^.*(?:Revenue|Operating|Net\s+Income|Capital|Assets|Margin|Cash\s+Flow)\s*:\s*\$?[\d.,]+[BMK]?\s*\|.*$\n?', '', output)
+    
+    # Remove "Financial Health Rating: X, Health Score: X, Overall Rating: X"
+    output = re.sub(r'(?i)Financial\s+Health\s+Rating[^\n]*(?:\n|$)', '', output)
+    
+    # =========================================================================
+    # PHASE 0.5: REMOVE ALL REPETITIVE MONITORING SUGGESTIONS
+    # =========================================================================
+    
+    # Pattern: Lines that are just "Monitor X.", "Track Y.", "Watch Z.", "Additionally, evaluate..."
+    monitoring_patterns = [
+        r'(?m)^(?:Monitor|Track|Watch|Evaluate|Assess|Review|Consider|Additionally,?\s*(?:monitor|track|watch|evaluate|assess|review))[^\n]*\.?\s*\n?',
+        r'(?m)^Additionally,?\s+(?:monitor|track|watch|evaluate|assess|review|compare|test|benchmark)[^\n]*\.?\s*\n?',
+        r'(?m)^(?:Test\s+sensitivity|Benchmark|Compare\s+cash)[^\n]*\.?\s*\n?',
+    ]
+    
+    for pattern in monitoring_patterns:
+        # Only remove if it's near the end of the document (last 500 chars)
+        if len(output) > 500:
+            end_section = output[-500:]
+            cleaned_end = re.sub(pattern, '', end_section, flags=re.IGNORECASE)
+            if cleaned_end != end_section:
+                output = output[:-500] + cleaned_end
+    
+    # Also remove trailing monitoring lines regardless of position if they're standalone
+    output = re.sub(r'\n(?:Monitor|Track|Watch)\s+[^\n]{10,80}\.?\s*$', '', output, flags=re.IGNORECASE | re.MULTILINE)
     
     # =========================================================================
     # PHASE 1: Remove ALL rating patterns (very aggressive)
@@ -2260,7 +2419,6 @@ def sanitize_persona_output(output: str, company_context: Optional[Dict] = None)
     output = re.sub(r'(?i)investment\s+(?:rating|grade)[^.]*\.?', '', output)
 
     # Remove entire "Financial Health Rating" sections with category breakdowns
-    # Pattern: "Financial Health Rating: X/100" followed by category scores
     output = re.sub(
         r'(?i)(?:financial\s+)?health\s+(?:rating|score)[^.]*(?:\n[^\n]*(?:profitability|leverage|liquidity|cash\s*flow)[^.]*)+',
         '',
@@ -2268,7 +2426,6 @@ def sanitize_persona_output(output: str, company_context: Optional[Dict] = None)
     )
 
     # Remove standalone "Financial Health Rating" sections entirely
-    # This handles the format: "Financial Health Rating\nProfitability: 30/30 (...)"
     output = re.sub(
         r'(?i)(?:^|\n)(?:##?\s*)?Financial\s+Health\s+Rating\s*\n(?:[^\n]*(?:Profitability|Cash\s*Flow\s*Quality|Leverage|Liquidity)[^\n]*\n?)+',
         '\n',
@@ -2276,45 +2433,98 @@ def sanitize_persona_output(output: str, company_context: Optional[Dict] = None)
     )
 
     # Remove category scoring lines like "Profitability: 25/30" or "Cash Flow Quality: 18/25"
-    # More aggressive - captures full lines with explanations
     output = re.sub(
-        r'(?i)(?:^|\n)(?:Profitability|Cash\s*Flow\s*Quality|Leverage|Liquidity|Solvency):\s*\d+\s*/\s*\d+[^\n]*',
+        r'(?i)(?:^|\n)(?:Profitability|Cash\s*Flow\s*Quality|Leverage|Liquidity):\s*\d+\s*/\s*\d+[^\n]*',
         '',
         output
     )
 
-    # Remove category scoring lines like "Profitability: 25/30" or "Cash Flow Quality: 18/25"
-    output = re.sub(r'(?i)\n[^\n]*(?:profitability|leverage|liquidity|cash\s*flow\s*quality)[^:]*:\s*\d+\s*/\s*\d+[^\n]*', '', output)
+    # Remove category scoring lines with explanations
+    output = re.sub(r'(?i)\n[^\n]*(?:profitability|leverage|liquidity|cash\s*flow\s*quality)[^:]*:\s*\d+\s*/\d+[^\n]*', '', output)
 
     # Remove "Total: X/100" lines
     output = re.sub(r'(?i)\n[^\n]*total[^:]*:\s*\d+\s*/\s*100[^\n]*', '', output)
 
-    # Parenthetical ratings: (72/100), (8/10), (B+)
+    # Parenthetical ratings
     output = re.sub(r'\(\s*\d+\s*(?:out of|/)\s*\d+\s*\)', '', output)
     output = re.sub(r'\(\s*[A-F][+-]?\s*\)', '', output)
     
+    # Remove "(W) - Watch" type annotations
+    output = re.sub(r'\([A-Z]\)\s*-\s*\w+', '', output)
+    
     # =========================================================================
-    # PHASE 2: Remove ALL markdown headers (not just generic ones)
+    # PHASE 1.5: FIX CAPITALIZATION - Convert all-caps sentences to sentence case
     # =========================================================================
     
+    # Find sentences that are ALL CAPS (excluding headers which start with ##)
+    def fix_all_caps_sentence(match):
+        text = match.group(0)
+        # Don't touch markdown headers
+        if text.strip().startswith('#'):
+            return text
+        # Don't touch STANCE: or VERDICT: lines
+        if text.strip().startswith(('STANCE:', 'VERDICT:')):
+            return text
+        # Convert to sentence case
+        return text.capitalize()
+    
+    # Fix all-caps words in the middle of sentences (more than 3 consecutive caps words)
+    def fix_caps_run(match):
+        text = match.group(0)
+        words = text.split()
+        # Convert to title case for runs of caps words
+        return ' '.join(word.capitalize() for word in words)
+    
+    # Pattern: 3+ consecutive ALL-CAPS words (not at start of line)
+    output = re.sub(r'(?<![#\n])\b([A-Z]{2,}\s+){2,}[A-Z]{2,}\b', fix_caps_run, output)
+    
+    # =========================================================================
+    # PHASE 2: Preserve canonical section headers, remove others
+    # =========================================================================
+
+    # Canonical 7-section headers to preserve
+    canonical_headers = [
+        'financial health rating', 'executive summary', 'financial performance',
+        'management discussion', 'risk factors', 'key metrics', 'closing takeaway'
+    ]
+
+    # Headers to explicitly remove
+    banned_headers = [
+        'health score drivers', 'key data appendix', 'strategic initiatives',
+        'capital allocation', 'key data'
+    ]
+
     lines = output.split('\n')
     cleaned_lines = []
-    
+
     for i, line in enumerate(lines):
         stripped = line.strip()
-        
-        # Remove ALL markdown headers (## anything)
+
+        # Handle markdown headers
         if stripped.startswith('#'):
-            # Skip headers entirely - personas should write prose
+            header_text = stripped.lstrip('#').strip().lower()
+            # Remove number prefixes like "1. " or "2. "
+            header_text = re.sub(r'^\d+\.\s*', '', header_text)
+
+            # Check if it's a banned header - skip entirely
+            if any(banned in header_text for banned in banned_headers):
+                continue
+
+            # Check if it's a canonical header - keep it
+            if any(ch in header_text for ch in canonical_headers):
+                cleaned_lines.append(line)
+                continue
+
+            # Other headers - skip them (e.g., random headers not in our structure)
             continue
-        
-        # Remove standalone "Key Risks:", "Investment Thesis:", etc.
+
+        # Remove standalone "Key Risks:", "Investment Thesis:", etc. without ## prefix
         generic_labels = [
-            'key risks:', 'investment thesis:', 'executive summary:',
-            'risk factors:', 'financial health:', 'key data:', 'catalysts:',
+            'key risks:', 'investment thesis:',
+            'financial health:', 'key data:', 'catalysts:',
             'conclusion:', 'summary:', 'overview:', 'analysis:',
             'key points:', 'recommendations:', 'verdict:',
-            'key data appendix', 'financial health rating'
+            'key data appendix', 'health score drivers'
         ]
         if any(stripped.lower().startswith(label) for label in generic_labels):
             # Keep the content after the colon if any, otherwise skip
@@ -2323,9 +2533,9 @@ def sanitize_persona_output(output: str, company_context: Optional[Dict] = None)
                 if content_after:
                     cleaned_lines.append(content_after)
             continue
-        
+
         cleaned_lines.append(line)
-    
+
     output = '\n'.join(cleaned_lines)
     
     # =========================================================================
@@ -2333,7 +2543,7 @@ def sanitize_persona_output(output: str, company_context: Optional[Dict] = None)
     # =========================================================================
     
     # Count bullet points - if too many, we have a structural problem
-    bullet_count = output.count('\n- ') + output.count('\n• ') + output.count('\n* ')
+    bullet_count = output.count('\n- ') + output.count('• ') + output.count('* ')
     
     # If more than 3 bullet points, try to convert to prose
     if bullet_count > 3:
@@ -2519,7 +2729,7 @@ def sanitize_persona_output(output: str, company_context: Optional[Dict] = None)
     output = re.sub(r'\n{3,}', '\n\n', output)
 
     # Clean up lines that are just whitespace
-    lines = [line for line in output.split('\n') if line.strip() or not line]
+    lines = [line for line in output.split('\n') if line.strip()]
     output = '\n'.join(lines)
 
     # Normalize quotation marks (curly to straight)
@@ -2549,6 +2759,11 @@ def sanitize_persona_output(output: str, company_context: Optional[Dict] = None)
     # PHASE 8: Fix mid-text ellipsis patterns
     # =========================================================================
     output = fix_mid_text_ellipsis(output)
+
+    # =========================================================================
+    # PHASE 9: Reorder sections to canonical order
+    # =========================================================================
+    output = reorder_persona_sections(output)
 
     return output.strip()
 
@@ -2604,7 +2819,6 @@ PERSONA_VOICE_ANCHORS = {
             "INNING: What inning of growth is this company in?",
         ],
         "anti_rating_guidance": "NEVER use factor-based scoring (72/100). Lynch uses intuition, stories, and simple math (PEG). No health ratings.",
-        "story_requirement": "You MUST explain what the company does in plain English that a 12-year-old could understand.",
     },
     "dalio": {
         "must_use_phrases": ["cycle", "machine", "paradigm"],
@@ -2613,7 +2827,7 @@ PERSONA_VOICE_ANCHORS = {
         "emotional_register": "systematic, mechanical, dispassionate",
         "structural_pattern": "macro-first analysis connecting company to economic cycles",
         "never_says": ["exciting", "love", "hate", "feel"],
-        "forbidden_concepts": ["tenbagger", "PEG ratio", "Magic Formula", "moat", "owner earnings", "S-curve", "index fund"],
+        "forbidden_concepts": ["tenbagger", "PEG ratio", "Magic Formula", "moat", "owner earnings", "S-curve", "index fund", "activist catalyst", "forward guidance"],
         "required_macro_factors": [
             "Where we are in the debt cycle (short-term and long-term)",
             "Interest rate environment and cost of capital implications",
@@ -2674,1394 +2888,9 @@ GREENBLATT'S MAGIC FORMULA:
         "never_says": ["buy this stock", "outperform", "beat the market", "alpha", "upside potential", "price target", "I'm bullish"],
         "forbidden_concepts": ["tenbagger", "catalyst", "target price", "Magic Formula", "TAM", "disruption", "activist", "debt cycle", "guidance", "next quarter"],
         # Bogle-specific requirements
-        "required_bogle_elements": [
-            "Cost impact analysis (fees, trading costs, taxes)",
-            "Valuation sanity check (P/E vs historical averages)",
-            "Concentration warning (single stock risk vs index)",
-            "Shareholder return analysis (dividends/buybacks vs dilution)",
-            "Comparison to index alternative (why not just buy the index?)",
-            "Long-term compounding perspective (10-20 year horizon)",
-            "Skepticism toward individual stock picking",
-            "Clear conclusion: index vs this stock",
-        ],
-        "anti_rating_guidance": "NEVER give this stock a rating or score. Bogle would find that absurd. Instead, assess whether owning this single stock makes sense vs. owning the entire market.",
         "valuation_requirement": "You MUST discuss valuation - P/E ratio, earnings yield, or price-to-sales. Bogle believed in buying at reasonable prices, not at any price.",
+        "anti_rating_guidance": "NEVER give this stock a rating or score. Bogle would find that absurd. Instead, assess whether owning this single stock makes sense vs. owning the entire market.",
     },
-    "marks": {
-        "must_use_phrases": ["pendulum", "second-level", "cycle"],
-        "encouraged_phrases": ["asymmetry", "priced for perfection", "permanent loss", "when everyone believes"],
-        "opening_patterns": ["Where is the pendulum", "The question I keep asking", "Second-level thinking requires"],
-        "emotional_register": "reflective, philosophical, contrarian",
-        "structural_pattern": "essay-form memo discussing market psychology and risk",
-        "never_says": ["I demand", "concerning", "raises questions", "problematic"],
-        "forbidden_concepts": ["tenbagger", "PEG ratio", "Magic Formula", "TAM", "S-curve", "index fund", "stay the course"],
-    },
-    "ackman": {
-        "must_use_phrases": ["catalyst", "simple, predictable"],
-        "encouraged_phrases": ["the fix", "free cash flow", "target price", "building a position"],
-        "opening_patterns": ["This is a great business", "Let me be specific", "The catalyst is"],
-        "emotional_register": "confident, specific, activist-minded",
-        "structural_pattern": "clear thesis with specific numbers and timeline",
-        "never_says": ["wait and see", "unclear", "uncertain", "maybe"],
-        "forbidden_concepts": ["tenbagger", "PEG ratio", "TAM", "S-curve", "index fund", "stay the course", "margin of safety", "debt cycle"],
-    },
-}
-
-
-# =============================================================================
-# RADICALLY DISTINCTIVE FEW-SHOT EXAMPLES
-# Each persona must sound COMPLETELY DIFFERENT from all others
-# =============================================================================
-
-FEW_SHOT_EXAMPLES = {
-    "buffett": '''
-EXAMPLE 1 - ASML (Semiconductor Equipment):
-"I'll be honest with you - I don't fully understand what ASML does. Charlie tells me they make machines that make chips, and that there's only one company in the world that can make these particular machines. That sounds like a toll bridge to me.
-
-Here's what I do understand: $28 billion in revenue, $7 billion in free cash flow, and customers who have no choice but to buy from them. TSMC, Samsung, Intel - they all need these machines. There's no substitute. That's what I call a moat.
-
-The business reminds me of what we found in See's Candies, but at planetary scale. See's had the best chocolate in California - people would drive past other candy stores to get to See's. ASML has the best lithography machines on Earth - chipmakers will wait years to get one.
-
-Now, is it cheap? At 35 times earnings, Mr. Market is asking a fair price for an extraordinary business. I've learned that wonderful businesses at fair prices beat fair businesses at wonderful prices. If this machine keeps collecting its toll for the next twenty years - and I see no reason it won't - today's price will look like a bargain.
-
-This is a business I'd be comfortable owning if the stock market closed for a decade."
-
-EXAMPLE 2 - Passing on a Loss-Making Tech Company:
-"The young fellow presenting this company was very enthusiastic. He used words like 'disruption' and 'addressable market' quite a lot. I nodded politely.
-
-What I didn't hear was how this company makes money. They lost $400 million last year. They'll lose more this year. The plan, apparently, is to lose money until they don't.
-
-In Omaha, we call this 'burning the furniture to heat the house.' You can do it for a while, but eventually you run out of furniture.
-
-Maybe this will be the next great American company. I don't know. What I know is that I've done best when I've stuck to businesses I understand - businesses that make money today, not businesses that promise to make money someday. 
-
-I'll pass on this one and sleep well."
-''',
-    
-    "munger": '''
-EXAMPLE 1 - Costco:
-"Costco? That's easy. One of the best businesses in the world.
-
-They pay their employees well, charge customers low prices, and still make a fortune. How? Volume. Efficiency. No bullshit. They don't have seventeen varieties of ketchup. They have one, and it's the best one at the best price.
-
-The incentives are beautiful. Management owns stock. Employees get real wages. Customers get real value. Everyone wins. That's rare. Most businesses are zero-sum games where management enriches itself at everyone else's expense.
-
-What kills it? I've been trying to figure that out for twenty years. Amazon? People still like going to Costco. My wife drags me there. Some things you can't get from a screen.
-
-I have nothing to add. It's a no-brainer."
-
-EXAMPLE 2 - A Leveraged Roll-Up:
-"This is the dumbest thing I've seen in months.
-
-Let me explain what they've done. They borrowed money at 6% to buy businesses earning 10% returns on capital. Sounds smart, right? It's not. It's financial engineering masquerading as business building.
-
-What happens when rates go to 8%? Or when the businesses they bought start declining? They can't cut their interest payments. The leverage that made them look smart on the way up will destroy them on the way down.
-
-I've seen this movie before. It was called the 1980s. A lot of smart people ended up looking very stupid.
-
-The management team has MBAs from fine schools. That's part of the problem. They learned how to optimize spreadsheets, not how to run businesses. Show me the incentives and I'll show you the outcome - and their incentives are to grow, not to create value.
-
-Obviously stupid. Pass."
-''',
-
-    "graham": '''
-EXAMPLE 1 - An Undervalued Industrial:
-"We begin, as we must, with the balance sheet.
-
-Current assets: $847 million, comprising cash of $312 million, receivables of $298 million, and inventory of $237 million. Current liabilities: $423 million. Net current assets, therefore, stand at $424 million.
-
-Total liabilities, including long-term debt of $180 million: $603 million. Net current asset value (current assets minus total liabilities): $244 million.
-
-The present market capitalization is $215 million.
-
-The investor is being offered this business for 88 cents per dollar of liquidating value - and this before ascribing any value to the operating business, which earned an average of $31 million annually over the past decade.
-
-Ten-year earnings record: positive in nine years, with one loss during the 2009 recession. Such consistency merits confidence. At present prices, the normalized price-to-earnings ratio stands at 6.9.
-
-The margin of safety is substantial. The intelligent investor may proceed."
-
-EXAMPLE 2 - Rejecting a Growth Stock:
-"The security trades at 52 times trailing earnings and 11 times book value. These figures admit of no margin of safety.
-
-The promoter will speak of growth rates and market opportunity. The intelligent investor recalls that growth is a projection, while price is a fact. One pays for certainty; one hopes for growth.
-
-At present valuations, even modest disappointment in growth expectations will prove costly. The security offers substantial risk of permanent capital loss.
-
-This is speculation, not investment. The distinction matters."
-''',
-
-    "lynch": '''
-EXAMPLE 1 - NVIDIA (Semiconductor):
-"Let me tell you about NVIDIA. This is one of my favorite kinds of stories.
-
-THE STORY: NVIDIA makes the brains for video games and artificial intelligence. Think of them as the company that makes the engines for race cars - except these race cars are computers. Every gamer needs their graphics cards. Every AI company needs their chips. It's like being the only gas station on a highway where everyone has to stop.
-
-MY CLASSIFICATION: This is a Fast Grower, and I mean FAST. Earnings are growing 50%+ a year. These are the stocks that made Magellan famous. When I see growth like this in a company with real products that real people use, I get excited.
-
-THE PEG MATH: Let's say the P/E is around 60. Sounds expensive, right? But earnings are growing at 100%. So PEG = 60 ÷ 100 = 0.6. Under 1.0 means you're getting this growth at a discount. Wall Street is so busy worrying about whether AI is a bubble that they're missing the obvious - this company is printing money.
-
-THE CUSTOMERS: Microsoft, Google, Amazon, Tesla - they're all lining up to buy these chips. When you see the biggest companies in the world waiting in line for your product, that's what I call a business. My nephew's gaming computer has an NVIDIA chip. His company's AI servers have NVIDIA chips. It's everywhere.
-
-WHAT INNING? I'd say 4th or 5th inning. AI is real, it's happening, but we're not at peak adoption yet. The game is far from over.
-
-THE VERDICT: I'd be a buyer here. Yes, it looks expensive on a P/E basis, but the PEG tells the real story. This is exactly the kind of Fast Grower I'd want in my portfolio."
-
-EXAMPLE 2 - Passing on a Hyped Stock:
-"Everyone keeps asking me about this cloud software company. Let me tell you why I'm passing.
-
-THE STORY: They make... software that helps other software work better? Something about APIs and cloud infrastructure. I've read the 10-K twice and I still can't explain it to my wife. If I can't explain what a company does in two sentences, I don't buy it. Rule number one.
-
-MY CLASSIFICATION: I honestly can't classify this. It's not a Fast Grower because there's no earnings - they lost $500 million last year. It's not a Turnaround because it was never profitable to begin with. It's not a Stalwart because it's not stable. I call this a No Category, and I don't buy No Categories.
-
-THE PEG PROBLEM: Here's where it gets ugly. P/E? Can't calculate it - no E. They're losing money. The revenue is growing 40%, which sounds great, but you can grow revenue by selling dollar bills for 80 cents. Show me the profits.
-
-WHAT INNING? Who knows. The whole game might get rained out if they run out of cash.
-
-THE VERDICT: I'll pass. There are 10,000 other stocks out there. I'll wait until this company actually makes money. Then we can talk."
-
-EXAMPLE 3 - A Boring Winner:
-"Here's a company that will put you to sleep. And that's exactly why I love it.
-
-THE STORY: They make auto parts. Not the exciting kind - brake pads, oil filters, windshield wipers. Every car on the road eventually needs these. Americans are keeping their cars longer now, average age is 12 years. Older cars need more parts. This company sells to the mechanics who fix those cars.
-
-MY CLASSIFICATION: Fast Grower in a boring industry - my absolute favorite. Earnings up 22% last year. Nobody on Wall Street wants to cover auto parts. No analyst is getting a bonus for recommending the brake pad company. That's exactly why the stock is undervalued.
-
-THE PEG: P/E of 14, earnings growth of 22%. PEG = 14 ÷ 22 = 0.64. Under 1.0 by a mile. The market is giving you this growth for practically free.
-
-WHAT INNING? Maybe the 5th. They're expanding into new regions, adding stores. Plenty of runway.
-
-THE VERDICT: I'd buy it. No debt, management owns 15% of the stock, and nobody's paying attention. Could be a double or more if the story plays out."
-''',
-
-    "dalio": '''
-EXAMPLE 1 - Understanding Through Cycles (Semiconductor Company):
-"To understand this investment, we must first understand where we are in the machine.
-
-We are late in the short-term debt cycle. The Fed has raised rates from 0% to 5% in eighteen months. This is a paradigm shift. The free-money environment that enabled capital-intensive growth companies to flourish has ended.
-
-MACRO POSITION: The semiconductor industry is cyclical within the broader tech capex cycle. We are seeing the classic pattern: overinvestment during boom, inventory correction, then recovery. Current inventory levels suggest we are 6-9 months into the correction phase.
-
-GEOPOLITICAL RISK: NVIDIA depends on TSMC for 100% of advanced chip manufacturing. Taiwan concentration risk is not theoretical - it is the defining risk of this investment. A Taiwan disruption would halt 90% of the world's advanced chip production. This is not priced into the stock.
-
-CREDIT & COST OF CAPITAL: With rates at 5%, the cost of capital for AI infrastructure buildout has tripled versus 2021. Hyperscalers (Microsoft, Amazon, Google) are 70% of Data Center revenue. Their capex decisions are now rate-sensitive.
-
-CORRELATION PROFILE: NVDA is positively correlated to tech spending (+0.8), negatively correlated to rates (-0.4), and highly correlated to AI narrative momentum. In a risk parity framework, this is a high-beta position that amplifies portfolio volatility.
-
-The machine tells us: excellent business, but cyclically exposed and geopolitically concentrated. Position sizing should reflect cycle position and concentration risk."
-
-EXAMPLE 2 - Macro Headwinds:
-"The company is fine. The macro is not.
-
-We are in a deleveraging environment. Credit is contracting. The debt service ratio for corporate America has risen from 8% to 14% of cash flows. Companies that thrived with free money must now compete for expensive capital.
-
-INTEREST RATE SENSITIVITY: This company has $4 billion in debt coming due in 2025. They will refinance at rates 400 basis points higher than their current cost. That's $160 million in additional interest expense - money that used to be profit.
-
-SUPPLY CHAIN PARADIGM: Global supply chains are bifurcating. The China-US decoupling creates dual inventory builds, dual manufacturing bases. For a hardware company, this doubles working capital requirements and compresses margins.
-
-LIQUIDITY CONDITIONS: Central bank balance sheets are shrinking. Credit spreads are widening. The liquidity that supported multiple expansion is reversing.
-
-The business is not broken. The machine has shifted. What worked in the previous paradigm does not work in this one. Reduce position until the cycle turns."
-''',
-
-    "wood": '''
-EXAMPLE 1 - Exponential Opportunity (AI Company):
-"Traditional analysts are looking at this company's losses and seeing failure. We see investment.
-
-Let me explain Wright's Law: for every cumulative doubling of production, costs fall by a consistent percentage. In AI training compute, we're seeing 70% cost declines per doubling. This company is riding that curve.
-
-Where are we on the S-curve? Early majority. The technology works. The early adopters have proven it. Now we're seeing enterprise adoption accelerate. This is the inflection point - the moment where exponential growth becomes visible to everyone.
-
-By 2030, our models suggest AI will be a $15 trillion market. This company's platform is becoming the infrastructure layer. Think of it as AWS in 2010 - losses today, dominance tomorrow.
-
-Current valuation metrics are meaningless. You cannot apply P/E ratios to a company investing in exponential growth. Amazon had no earnings for a decade. The market eventually understood.
-
-We are high conviction buyers. The next five years will prove transformational."
-
-EXAMPLE 2 - Disruption Thesis:
-"The incumbents think they're safe. They have the relationships, the installed base, the regulatory moats.
-
-They're wrong.
-
-Disruption doesn't ask permission. This company is building technology that makes the incumbents' business model obsolete. Every year the technology gets cheaper (Wright's Law). Every year adoption grows (S-curve). By the time the incumbents react, it will be too late.
-
-The convergence is beautiful: AI enables automation, automation enables cost reduction, cost reduction enables adoption, adoption generates data, data improves AI. It's a flywheel. Once it starts spinning, it's very hard to stop.
-
-We don't invest in what is. We invest in what will be. This is the future."
-''',
-
-    "greenblatt": '''
-EXAMPLE 1 - Good AND Cheap (Buy):
-"Return on Capital: 34%
-EBIT of $8.5B ÷ Invested Capital of $25B = 34%. More than double the S&P 500 average of 15%. Good company.
-
-Earnings Yield: 11%
-EBIT of $8.5B ÷ Enterprise Value of $77B = 11%. More than 2x the Treasury rate of 4.5%. Cheap stock.
-
-VERDICT: Good AND Cheap. Buy.
-High ROC means quality. High yield means value. Both metrics pass. Own it."
-
-EXAMPLE 2 - Good but Expensive (Pass):
-"Return on Capital: 62%
-EBIT of $30B ÷ Invested Capital of $48B = 62%. Exceptional. Top 5%.
-
-Earnings Yield: 2.8%
-EBIT of $30B ÷ Enterprise Value of $1.1T = 2.8%. Below the 4.5% risk-free rate.
-
-VERDICT: Good but Expensive. Pass.
-Great business, wrong price. At 2.8% yield, you're paying for a decade of perfect execution."
-
-EXAMPLE 3 - Not Good (Pass):
-"Return on Capital: 8%
-EBIT of $2B ÷ Invested Capital of $25B = 8%. Below cost of capital.
-
-Earnings Yield: 12%
-EBIT of $2B ÷ Enterprise Value of $17B = 12%. Looks cheap.
-
-VERDICT: Not Good. Pass.
-Cheap garbage is still garbage. Low ROC means no competitive advantage. Price doesn't save quality."
-''',
-
-    "bogle": '''
-EXAMPLE 1 - The Index Argument (Strong Company):
-"I've spent sixty years in this business, and I've learned one thing above all else: costs matter.
-
-This company - let's look at it honestly. Revenue of $130 billion, growing at 12% annually. Operating margins north of 60%. By any measure, this is an exceptional business. The management team has executed brilliantly.
-
-And that's exactly the problem.
-
-At 35 times earnings, you're paying a premium for excellence that everyone already recognizes. The stock has appreciated 200% in five years. You're not discovering hidden value - you're paying full price for what the market already knows.
-
-Now consider the alternative. A total market index fund costs you 0.03% per year. This analysis cost you time and attention. If you trade this stock, you'll pay spreads, commissions, and eventually capital gains taxes. Over 20 years, those costs compound devastatingly.
-
-Here's the math that Wall Street won't tell you: 90% of professional stock pickers fail to beat the index over 15 years. Not amateurs - professionals with research teams and Bloomberg terminals. What edge do you have that they don't?
-
-Even if this company continues to excel - and it might - you're making a single bet against the entire market. The haystack contains thousands of needles. Why gamble on finding just one?
-
-My conclusion: This is a fine business. But the prudent course is to own the entire market, keep your costs near zero, stay the course for decades, and let compounding work for you. The index fund is not exciting. Neither is getting wealthy slowly."
-
-EXAMPLE 2 - The Valuation Argument (Overpriced Company):
-"Let me tell you a secret that Wall Street desperately doesn't want you to know.
-
-This company trades at 85 times earnings. Eighty-five. To justify that price, they'd need to grow earnings at 25% annually for the next decade. That's happened exactly twice in the last century among large companies.
-
-I've seen this before. In 1999, brilliant companies with real businesses traded at 100 times earnings. They were still brilliant in 2002 - but the stocks had fallen 80%.
-
-The business is real. The valuation is speculation.
-
-Here's what I know with certainty: An index fund trading at 20 times earnings has better odds of delivering reasonable returns than a single stock at 85 times earnings. Not because the index is exciting, but because starting valuation matters enormously for long-term returns.
-
-At 0.03% in annual fees, you keep 99.97% of what the market gives you. That fraction compounds over forty years into hundreds of thousands of dollars.
-
-Don't speculate. Diversify. Stay the course."
-
-EXAMPLE 3 - Honest Assessment of a Value Stock:
-"The math is simple, and it rarely favors individual stock selection.
-
-This company trades at 12 times earnings, well below the market average of 22. Free cash flow yield of 8%. By value metrics, it appears cheap.
-
-I'll grant you this: if you must own individual stocks, owning them at reasonable valuations improves your odds. Benjamin Graham taught us that. A margin of safety matters.
-
-But here's what Graham also knew: you need to be right about dozens of stocks, monitor them constantly, and avoid the emotional mistakes that come with watching individual positions rise and fall. Most people fail at this.
-
-The alternative remains the same: a total market index fund owns this value stock, plus 3,000 others, at a cost of 0.03%. No analysis required. No monitoring. No panic selling.
-
-If you're absolutely determined to own this stock, I won't talk you out of it - the valuation is reasonable. But keep it to 5% of your portfolio. The other 95% should be in a diversified index, held for decades.
-
-Stay the course."
-''',
-
-    "marks": '''
-EXAMPLE 1 - Oaktree Memo Style (Overvalued Market):
-"Where is the pendulum?
-
-This is the question I keep asking as I look at this company. Not whether it's a good business - it clearly is. But whether today's price adequately compensates for the risks, or whether it reflects optimism that leaves no room for error.
-
-At 35 times earnings, the market is pricing in 20% growth for the next decade. That's not impossible. It's also not assured. And here's what concerns me: I don't see anyone worried about this. The analyst reports are uniformly bullish. The word 'risk' appears as a formality, not a warning.
-
-Second-level thinking requires us to ask: What does everyone else believe, and why might they be wrong?
-
-Everyone believes tech spending will continue growing. Everyone believes AI will drive adoption. Everyone believes this company's moat is impenetrable.
-
-When everyone believes something, it's usually in the price. And when it's in the price, the risk-reward is no longer attractive.
-
-I remember the late 1990s. Every tech company was going to change the world. Many did! But the stocks still lost 80% because the expectations were even higher than the results.
-
-The asymmetry here troubles me. If everything goes perfectly, the stock might double in five years. If expectations merely normalize, it could fall 40%. That's not a bet I want to make.
-
-This is a time for caution, not aggression."
-
-EXAMPLE 2 - Oaktree Memo Style (Opportunity in Fear):
-"The market hates this stock. Good.
-
-Let me explain what I'm seeing. The company is down 55% from its highs. Analyst coverage has dried up. The word 'uninvestable' appears in reports. Fund managers tell me they 'can't own it' because their clients would ask questions.
-
-This is exactly when I get interested.
-
-The business hasn't declined 55%. Revenue is down 12%. The delta between business reality and stock price is where opportunity lives.
-
-Second-level thinking: Everyone knows the problems. The recession hurt demand. The new product launch was delayed. Management communication has been poor. But everyone knowing these things means they're priced in - and then some.
-
-At 7 times earnings with 15% free cash flow yield, I'm being paid to take the risk that things normalize. If they don't, I lose some money on a small position. If they do, I make multiples.
-
-The pendulum has swung too far toward fear. Not because fear is wrong - the problems are real - but because price reflects disaster while reality suggests difficulty.
-
-This is when we move from defense to offense. Not recklessly - position size matters - but with conviction that asymmetry has turned favorable."
-''',
-
-    "ackman": '''
-EXAMPLE 1 - Activist Thesis:
-"This is a great business being run at 60% of its potential. Let me be specific.
-
-The business: Quick-service restaurants. Simple, predictable, generates free cash flow in all environments. People eat fast food in recessions. They eat it in booms. This is a royalty on American hunger.
-
-The problem: Operating margins are 14%. Peer average is 22%. That's 800 basis points of value destruction. Where does it go? Bloated corporate overhead. Underperforming locations. A menu that's too complicated.
-
-The fix: Close 200 underperforming stores - $15 million annual savings. Reduce corporate headcount by 30% - $50 million. Simplify the menu to 15 core items - improves throughput, reduces waste, another $30 million.
-
-Total: $95 million to the bottom line. At the current 12x EBITDA multiple, that's $1.1 billion in value creation.
-
-The catalyst: The CEO announced retirement last month. We've had conversations with the board about what kind of operator they need. We have a candidate - someone who did exactly this at another restaurant chain.
-
-Target price: $85 in 24 months versus $52 today. That's 63% upside with a simple, executable plan.
-
-We're building a position."
-
-EXAMPLE 2 - Simple, Predictable, Free-Cash-Flow Generative:
-"I look for three things: Simple. Predictable. Free-cash-flow generative.
-
-This company has all three. They provide a service people need every month. Recession-resistant demand. Pricing power - they've raised prices 4% annually for a decade and no one switches.
-
-The stock is cheap because of a failed acquisition. Management overpaid in 2021, wrote off $3 billion, and the stock collapsed. The market is punishing them for a mistake that's now in the past.
-
-Here's what the market is missing: The core business is unchanged. Same customers, same margins, same cash flow. The acquisition is gone but the punishment remains.
-
-The catalyst: The CEO who made the bad deal is retiring. The new CEO is a cost-cutter. Guidance for next year will reset expectations.
-
-At 9 times free cash flow, I'm being offered a royalty stream at a panic price. The math is simple. The risk is low. The upside is substantial.
-
-We're buying."
-'''
-}
-
-
-# =============================================================================
-# RADICALLY DISTINCTIVE PROMPT TEMPLATES
-# 80% OBJECTIVE ANALYSIS, 20% PERSONA FLAVOR - NOT OPINION OVERRIDE
-# =============================================================================
-
-PERSONA_PROMPT_TEMPLATES = {
-    "buffett": '''Analyze {company_name} with a focus on durable competitive advantages and long-term economics.
-
-FINANCIAL DATA:
-{metrics_block}
-
-FOCUS AREAS:
-- Durability of competitive position (moat strength)
-- Owner earnings and cash generation quality
-- Business understandability and predictability
-- Management capital allocation track record
-
-FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
-When discussing financial performance, you MUST address:
-- Revenue trends: YoY growth with segment breakdown if available
-- Margin analysis: Gross, operating, net margins with trend direction
-- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
-- Working capital: Inventory trends, AR/AP dynamics if material
-- Capital efficiency: ROIC, ROE if calculable
-
-MD&A CRITICAL ASSESSMENT REQUIREMENTS:
-When referencing management commentary, you MUST:
-- State what management CLAIMS (with attribution: "management stated...")
-- Assess if claims MATCH actual results (flag disconnects)
-- Apply skepticism: Are they deflecting? Being overly optimistic?
-- Identify what management ISN'T discussing (the silent issues)
-
-Do NOT simply report what management says—CRITIQUE IT.
-
-BALANCE: 80% objective financial analysis, 20% persona perspective.
-The analysis should be grounded in data - persona flavor adds color, not conclusions.
-If the data shows weakness, acknowledge it even if the persona would be enthusiastic.
-
-COMPLETION REQUIREMENTS:
-- COMPLETE ALL SENTENCES - never trail off mid-thought
-- COMPLETE ALL SECTIONS - every point must have full explanation
-- END with a clear, complete conclusion that provides closure
-- If discussing capital allocation (dividends, buybacks), complete the numbers (e.g., "$14.2B in share repurchases")
-- If discussing financial health scores, complete the interpretation
-
-EXECUTIVE SUMMARY REQUIREMENTS:
-If you write an executive summary, it MUST end with a complete directional view.
-Example: "...strategic alignment with secular AI trends positions the company for continued long-term growth. However, valuation risk, supply-chain concentration, and geopolitical exposure introduce meaningful uncertainty."
-
-FORBIDDEN GENERIC FILLER PHRASES (INSTANT FAILURE):
-- "Additional detail covers..."
-- "Capital allocation remarks..."
-- "Further notes address..."
-- "Risk coverage includes..."
-- "The analysis also outlines..."
-- Any placeholder or summary-of-summary text
-
-WRITE SUBSTANTIVE ANALYSIS, NOT PLACEHOLDERS.
-
-CLOSING TAKEAWAY: Your final sentence MUST connect back to the Buffett philosophy.
-Example: "As I've always said, it's far better to buy a wonderful company at a fair price than a fair company at a wonderful price - and this analysis illustrates why."
-
-Write exactly 325 words (±10 acceptable: 315-335 range) as flowing prose. No headers, no bullet points. End with a complete conclusion.''',
-
-    "munger": '''Analyze {company_name} using inversion and incentive analysis.
-
-FINANCIAL DATA:
-{metrics_block}
-
-FOCUS AREAS:
-- What could cause this investment to fail? (inversion)
-- How are management incentives aligned with shareholders?
-- Are there multiple factors reinforcing each other (positive or negative)?
-- Is there anything obviously problematic?
-
-FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
-When discussing financial performance, you MUST address:
-- Revenue trends: YoY growth with segment breakdown if available
-- Margin analysis: Gross, operating, net margins with trend direction
-- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
-- Working capital: Inventory trends, AR/AP dynamics if material
-- Capital efficiency: ROIC, ROE if calculable
-
-MD&A CRITICAL ASSESSMENT REQUIREMENTS:
-When referencing management commentary, you MUST:
-- State what management CLAIMS (with attribution: "management stated...")
-- Assess if claims MATCH actual results (flag disconnects)
-- Apply skepticism: Are they deflecting? Being overly optimistic?
-- Identify what management ISN'T discussing (the silent issues)
-
-Do NOT simply report what management says—CRITIQUE IT.
-
-BALANCE: 80% objective financial analysis, 20% persona perspective.
-The inversion should identify real risks from the data, not hypothetical ones.
-
-COMPLETION REQUIREMENTS:
-- COMPLETE ALL SENTENCES - never trail off mid-thought
-- END with a clear, complete verdict
-
-FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
-- "Additional detail covers..." - "Further notes..." - "Risk coverage includes..."
-- Any placeholder text
-
-CLOSING TAKEAWAY: Your final sentence MUST connect back to the Munger philosophy.
-Example: "Invert, always invert - and when I invert here, I see more ways to lose than to win."
-
-Write exactly 225 words (±10 acceptable: 215-235 range). Be direct and concise.''',
-
-    "graham": '''Analyze {company_name} with emphasis on quantitative measures and margin of safety.
-
-FINANCIAL DATA:
-{metrics_block}
-
-FOCUS AREAS:
-- Balance sheet strength: assets, liabilities, net current asset value
-- Margin of safety based on quantifiable metrics
-- Historical earnings consistency
-- Current price vs. intrinsic value estimate
-
-FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
-When discussing financial performance, you MUST address:
-- Revenue trends: YoY growth with segment breakdown if available
-- Margin analysis: Gross, operating, net margins with trend direction
-- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
-- Working capital: Inventory trends, AR/AP dynamics if material
-- Capital efficiency: ROIC, ROE if calculable
-
-MD&A CRITICAL ASSESSMENT REQUIREMENTS:
-When referencing management commentary, you MUST:
-- State what management CLAIMS (with attribution: "management stated...")
-- Assess if claims MATCH actual results (flag disconnects)
-- Apply skepticism: Are they deflecting? Being overly optimistic?
-- Identify what management ISN'T discussing (the silent issues)
-
-Do NOT simply report what management says—CRITIQUE IT.
-
-STRUCTURE:
-- Balance Sheet Position
-- Margin of Safety Calculation
-- Investment or Speculation?
-
-BALANCE: 90% quantitative analysis, 10% Graham's academic framing.
-Every claim must be backed by a specific number from the data.
-
-FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
-- "Additional detail covers..." - "Capital allocation remarks..." - Any placeholder text
-
-CLOSING TAKEAWAY: Your final sentence MUST connect back to the Graham philosophy.
-Example: "The margin of safety principle demands that we refuse to pay more than intrinsic value - and at current prices, that margin simply does not exist."
-
-Write exactly 250 words (±10 acceptable: 240-260 range). Be specific with numbers.''',
-
-    "lynch": '''You ARE Peter Lynch. Write this analysis as Lynch himself would write it.
-
-COMPANY: {company_name}
-
-FINANCIAL DATA:
-{metrics_block}
-
-=============================================================================
-PETER LYNCH'S MANDATORY STRUCTURE (FOLLOW EXACTLY)
-=============================================================================
-
-START WITH "THE STORY" (2-3 sentences):
-Explain what this company actually DOES in plain English. A 12-year-old should understand.
-Example: "NVIDIA makes chips that power video games and AI. Every gamer and every AI company needs their products. It's like selling picks and shovels during a gold rush."
-
-THEN CLASSIFY THE STOCK (pick ONE):
-- FAST GROWER: Earnings growing 20%+ annually. These are my favorites. Small/mid companies expanding aggressively.
-- STALWART: Big company, 10-15% growth. Coca-Cola, Microsoft. Solid but won't make you 10x.
-- SLOW GROWER: Under 5% growth. Utilities. For dividends, not appreciation.
-- CYCLICAL: Tied to economic cycles. Autos, airlines, steel. Buy at the bottom.
-- TURNAROUND: In trouble but may recover. High risk, high reward.
-- ASSET PLAY: Hidden assets worth more than the stock price.
-
-CALCULATE THE PEG RATIO (SHOW YOUR MATH):
-PEG = P/E Ratio ÷ Earnings Growth Rate (as whole number)
-Example: "P/E of 30 ÷ earnings growing 40% = PEG of 0.75"
-- PEG under 1.0 = CHEAP (stock is undervalued relative to growth)
-- PEG 1.0 to 2.0 = FAIR
-- PEG over 2.0 = EXPENSIVE (you're overpaying for growth)
-
-If you don't have P/E data, estimate from net margin and market cap, or say:
-"I can't calculate a clean PEG here because [reason], but based on [X]..."
-
-WHAT INNING ARE WE IN?
-- 1st-3rd inning: Early, tons of runway
-- 4th-6th inning: Middle, still growing strong
-- 7th-9th inning: Late, growth slowing
-
-YOUR VERDICT (one clear sentence):
-"I'd buy this one" OR "I'd pass" OR "I'd wait for a better price"
-
-=============================================================================
-PETER LYNCH'S RULES (ABSOLUTE)
-=============================================================================
-
-NEVER:
-- Use numeric ratings (NO "72/100", NO "8/10", NO "health score")
-- Discuss Fed policy, interest rates, or macro economics
-- Use Wall Street jargon ("margin trajectory", "operating leverage", "TAM")
-- Sound like a hedge fund analyst or research report
-- Leave sentences incomplete or numbers without context
-
-ALWAYS:
-- Write like you're explaining to a friend over coffee
-- Use "I" - first person, conversational
-- Show enthusiasm when warranted ("I love this company!")
-- Explain the business in simple terms
-- Calculate the PEG (or explain why you can't)
-- Pick a stock classification
-- Say what inning we're in
-- Give a clear verdict at the end
-
-FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
-When discussing financial performance, you MUST address:
-- Revenue trends: YoY growth with segment breakdown if available
-- Margin analysis: Gross, operating, net margins with trend direction
-- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
-- Working capital: Inventory trends, AR/AP dynamics if material
-- Capital efficiency: ROIC, ROE if calculable
-
-MD&A CRITICAL ASSESSMENT REQUIREMENTS:
-When referencing management commentary, you MUST:
-- State what management CLAIMS (with attribution: "management stated...")
-- Assess if claims MATCH actual results (flag disconnects)
-- Apply skepticism: Are they deflecting? Being overly optimistic?
-- Identify what management ISN'T discussing (the silent issues)
-
-Do NOT simply report what management says—CRITIQUE IT.
-
-TONE: Enthusiastic, practical, accessible. Like explaining a stock pick to your neighbor.
-
-FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
-- "Additional detail covers..." - "Risk coverage includes..." - "The analysis outlines..."
-- Any placeholder or summary-of-summary text
-
-CLOSING TAKEAWAY: Your final sentence MUST connect back to the Lynch philosophy.
-Example: "Know what you own, and know why you own it - and if you can't explain this stock in two sentences, you probably shouldn't own it."
-
-Write exactly 375 words (±10 acceptable: 365-385 range). COMPLETE ALL SENTENCES. End with your clear verdict.''',
-
-    "dalio": '''You ARE Ray Dalio. Write this analysis as Dalio himself would write it.
-
-COMPANY: {company_name}
-
-FINANCIAL DATA:
-{metrics_block}
-
-=============================================================================
-RAY DALIO'S PRINCIPLES (YOU MUST EMBODY THESE)
-=============================================================================
-1. UNDERSTAND THE MACHINE - Every outcome has causes. Trace the cause-effect chain.
-2. ECONOMIC CYCLES ARE INEVITABLE - Debt cycles, business cycles, they all turn.
-3. RADICAL TRANSPARENCY - State what you see, even if uncomfortable.
-4. DIVERSIFICATION IS EVERYTHING - Uncorrelated bets reduce risk.
-5. PAIN + REFLECTION = PROGRESS - Mistakes are learning opportunities.
-6. WHAT'S PRICED IN? - Markets discount future. What does price ASSUME?
-
-=============================================================================
-REQUIRED STRUCTURE (FOLLOW EXACTLY)
-=============================================================================
-
-**1. THE ECONOMIC MACHINE (Cycle Position)**
-- Where is this company in its business cycle? (Early, mid, late?)
-- Where is the broader economy in the debt/credit cycle?
-- How do macro conditions (rates, liquidity, growth) affect this specific business?
-- Example: "We're in the late stages of a tech capex cycle, where AI spending has peaked optimism."
-
-**2. THE CAUSE-EFFECT CHAIN**
-- What DRIVES this company's earnings? Trace the mechanism.
-- How do external factors (rates, commodity prices, consumer spending) flow through to results?
-- Example: "Higher rates → lower consumer spending → weaker gaming demand → revenue pressure."
-
-**3. RISK PARITY PERSPECTIVE (REQUIRED)**
-- What's the risk/reward asymmetry at current prices?
-- What does the current valuation ASSUME about the future?
-- Is the market pricing in too much optimism or pessimism?
-- Example: "At 45x earnings, the market assumes sustained 30% growth. That's a lot of optimism already priced in."
-
-**4. RISKS & VULNERABILITIES (4-6 SPECIFIC RISKS)**
-YOU MUST LIST 4-6 DISTINCT RISKS. This is mandatory for Dalio's risk-focused approach.
-For each risk:
-- State the risk clearly
-- Explain the mechanism (how would it hurt the business?)
-- Assess probability (High/Medium/Low)
-
-Example risks:
-- Supply chain concentration (TSMC dependency)
-- Geopolitical risk (US-China tech war, Taiwan exposure)
-- Cyclical demand (data center spending may slow)
-- Competition (AMD, custom hyperscaler chips)
-- Valuation risk (high multiples vulnerable to sentiment shift)
-- Customer concentration
-
-**5. PORTFOLIO CONSTRUCTION VIEW**
-- How does this fit in a diversified portfolio?
-- What's the correlation to other holdings?
-- Example: "This adds tech/AI exposure but correlates highly with growth stocks. In a risk-off environment, it moves with the market."
-
-**6. VERDICT (CLEAR AND ACTIONABLE)**
-You MUST end with a clear investment stance:
-- "The cycle is [early/mid/late]. The risk/reward at current prices is [favorable/unfavorable]."
-- "I would [buy/hold/avoid] with [conviction level]."
-- "The key metric to watch is [specific catalyst or indicator]."
-
-FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
-When discussing financial performance, you MUST address:
-- Revenue trends: YoY growth with segment breakdown if available
-- Margin analysis: Gross, operating, net margins with trend direction
-- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
-- Working capital: Inventory trends, AR/AP dynamics if material
-- Capital efficiency: ROIC, ROE if calculable
-
-MD&A CRITICAL ASSESSMENT REQUIREMENTS:
-When referencing management commentary, you MUST:
-- State what management CLAIMS (with attribution: "management stated...")
-- Assess if claims MATCH actual results (flag disconnects)
-- Apply skepticism: Are they deflecting? Being overly optimistic?
-- Identify what management ISN'T discussing (the silent issues)
-
-Do NOT simply report what management says—CRITIQUE IT.
-
-=============================================================================
-DALIO VOICE REQUIREMENTS (ABSOLUTE)
-=============================================================================
-
-USE DALIO'S LANGUAGE:
-- "The machine works like this..."
-- "What's priced in is..."
-- "The debt cycle is..."
-- "Looking at the cause-effect chain..."
-- "Risk parity means..."
-- "From a portfolio construction standpoint..."
-
-NEVER:
-- Sound like a generic analyst or research report
-- Use ratings or scores (NO "72/100", NO "8/10")
-- Write passively or without conviction
-- End without a clear verdict
-- List fewer than 4 risks
-- Drift into generic Wall Street tone ("attractive opportunity", "solid fundamentals")
-- Mix in terminology from other investors (no "moat" from Buffett, no "PEG" from Lynch)
-
-=============================================================================
-FORBIDDEN GENERIC FILLER PHRASES (INSTANT FAILURE)
-=============================================================================
-If you write ANY of these phrases, the output FAILS validation immediately:
-- "Additional detail covers..."
-- "Capital allocation remarks highlight..."
-- "Further notes address..."
-- "Risk coverage includes..."
-- "The analysis also outlines..."
-- "Valuation context compares..."
-- Any placeholder or summary-of-summary text
-- "Management discussion covers..."
-- "Strategic initiatives include..."
-
-WRITE SUBSTANTIVE ANALYSIS, NOT PLACEHOLDERS. If you mention something, ANALYZE it fully.
-
-MAINTAIN DALIO'S SYSTEMATIC, PRINCIPLES-BASED VOICE THROUGHOUT.
-If you start sounding like a neutral analyst mid-way, you have failed.
-
-CLOSING TAKEAWAY: Your final sentence MUST connect back to the Dalio philosophy.
-Example: "The economic machine works in cycles, and understanding where we are in this cycle is what separates successful investors from those who get crushed by it."
-
-Write exactly 425 words (±10 acceptable: 415-435 range). Systematic. Risk-focused. Cycle-aware. Complete all sentences. End with clear verdict.''',
-
-    "wood": '''Analyze {company_name} through the lens of technological disruption and exponential growth.
-
-FINANCIAL DATA:
-{metrics_block}
-
-FOCUS AREAS:
-- Position on technology adoption S-curve
-- Cost curve trajectory (Wright's Law effects)
-- Technology convergence opportunities
-- Total addressable market expansion
-- 5-10 year growth potential
-
-FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
-When discussing financial performance, you MUST address:
-- Revenue trends: YoY growth with segment breakdown if available
-- Margin analysis: Gross, operating, net margins with trend direction
-- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
-- Working capital: Inventory trends, AR/AP dynamics if material
-- Capital efficiency: ROIC, ROE if calculable
-
-MD&A CRITICAL ASSESSMENT REQUIREMENTS:
-When referencing management commentary, you MUST:
-- State what management CLAIMS (with attribution: "management stated...")
-- Assess if claims MATCH actual results (flag disconnects)
-- Apply skepticism: Are they deflecting? Being overly optimistic?
-- Identify what management ISN'T discussing (the silent issues)
-
-Do NOT simply report what management says—CRITIQUE IT.
-
-STRUCTURE:
-- Disruption Thesis
-- S-Curve & Cost Trajectory
-- Long-Term Vision
-
-BALANCE: 80% objective analysis of growth metrics and trends, 20% innovation framing.
-If growth is decelerating or margins weak, acknowledge the data.
-
-FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
-- "Additional detail covers..." - "Further notes..." - Any placeholder text
-
-CLOSING TAKEAWAY: Your final sentence MUST connect back to the Wood philosophy.
-Example: "Wright's Law tells us that costs decline predictably with production volume - and for this company, that curve is just getting started."
-
-Write exactly 300 words (±10 acceptable: 290-310 range). Focus on exponential trends.''',
-
-    "greenblatt": '''You are Joel Greenblatt. Magic Formula investing. Pure quantitative analysis.
-
-COMPANY: {company_name}
-
-DATA:
-{metrics_block}
-
-=============================================================================
-MAGIC FORMULA OUTPUT (EXACTLY THIS FORMAT)
-=============================================================================
-
-**1. Return on Capital (ROIC): [X]%**
-EBIT $[X]B ÷ (Net Working Capital + Net Fixed Assets) $[X]B = [X]%.
-Benchmark: S&P 500 average is ~12-15%. This company is [above/below] average.
-
-**2. Earnings Yield (EBIT/EV): [X]%**
-EBIT $[X]B ÷ Enterprise Value $[X]B = [X]%.
-Benchmark: 10-Year Treasury yields ~4.5%. This company yields [X]% more/less than risk-free.
-
-**3. Valuation Context:**
-- Forward P/E: [X]x (if available)
-- EV/EBIT: [X]x (inverse of earnings yield)
-- FCF Yield: [X]% (FCF ÷ Market Cap)
-If data unavailable, state: "Cannot calculate [metric] - missing [specific data]."
-
-**4. Magic Formula Classification:**
-Based on ROC and Earnings Yield, this company is:
-- "GOOD AND CHEAP" - High ROC (>15%) AND high Earnings Yield (>8%). BUY.
-- "GOOD BUT EXPENSIVE" - High ROC (>15%) but low Earnings Yield (<8%). PASS at this price.
-- "CHEAP BUT NOT GOOD" - Low ROC (<15%) but high Earnings Yield. Value trap risk.
-- "NEITHER" - Low ROC AND low Earnings Yield. PASS.
-
-[State which category and why in ONE sentence.]
-
-**5. Risk Summary (2-3 items max):**
-For each risk, state: [Risk] - [Probability: High/Medium/Low] - [Severity: High/Medium/Low].
-Example: "Customer concentration (NVDA >10% from top customer) - Probability: Medium - Severity: High."
-Do NOT leave any risk statement incomplete. Every risk MUST have probability and severity.
-
-**6. VERDICT:**
-[ONE clear sentence: "Buy", "Watch", or "Pass" with specific reason tied to valuation.]
-Example: "PASS. At 45x earnings, we are paying for 5+ years of perfect execution. I need a 30x entry."
-
-=============================================================================
-GREENBLATT RULES (ABSOLUTE)
-=============================================================================
-
-MAXIMUM LENGTH: 200-300 words. Concise but complete.
-
-NEVER:
-- Use ratings or scores (NO "72/100", NO "8/10", NO "health score")
-- Write narrative, story, or "the thesis"
-- Discuss management quality, moat, or competitive position narratively
-- Request disclosures (NO "management should provide")
-- Use phrases like "I worry", "I remain cautious", "excessive optimism"
-- Leave ANY sentence incomplete (NO "operating in a high…", NO trailing "...")
-- End a risk statement without probability/severity
-- Use conversational phrases ("and this earnings power is precisely what I seek")
-
-ALWAYS:
-- Show the actual division math (EBIT ÷ Capital = X%)
-- Calculate BOTH ROC and Earnings Yield (EBIT/EV)
-- Include at least one valuation metric (Forward P/E, EV/EBIT, or FCF Yield)
-- Classify using Magic Formula thresholds explicitly
-- Complete EVERY sentence - if you start a thought, finish it
-- For risks: state probability AND severity
-- End with clear investment stance (Buy/Watch/Pass) with price anchor
-
-FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
-When discussing financial performance, you MUST address:
-- Revenue trends: YoY growth with segment breakdown if available
-- Margin analysis: Gross, operating, net margins with trend direction
-- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
-- Working capital: Inventory trends, AR/AP dynamics if material
-- Capital efficiency: ROIC, ROE if calculable
-
-MD&A CRITICAL ASSESSMENT REQUIREMENTS:
-When referencing management commentary, you MUST:
-- State what management CLAIMS (with attribution: "management stated...")
-- Assess if claims MATCH actual results (flag disconnects)
-- Apply skepticism: Are they deflecting? Being overly optimistic?
-- Identify what management ISN'T discussing (the silent issues)
-
-Do NOT simply report what management says—CRITIQUE IT.
-
-SENTENCE QUALITY:
-- Maximum 35 words per sentence
-- No hedging ("could potentially", "might be")
-- No filler ("It should be noted that", "One thing to consider")
-
-TONE: Clinical, mathematical, no-nonsense. Formula-driven. Complete.
-
-FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
-- "Additional detail covers..." - "Further notes..." - Any placeholder text
-
-CLOSING TAKEAWAY: Your final sentence MUST connect back to the Greenblatt philosophy.
-Example: "The Magic Formula is simple: buy good companies at cheap prices - and the numbers here tell us clearly whether this qualifies."
-
-Write exactly 150 words (±10 acceptable: 140-160 range). Complete all sentences. End with clear verdict.''',
-
-    "bogle": '''Analyze {company_name} through the lens of John Bogle's indexing philosophy.
-
-FINANCIAL DATA:
-{metrics_block}
-
-=============================================================================
-BOGLE'S CORE BELIEFS (you MUST embody these)
-=============================================================================
-1. COSTS DESTROY RETURNS - Fees, trading costs, and taxes compound against investors
-2. STOCK PICKING IS A LOSER'S GAME - 90% of professionals fail to beat the index over 15 years
-3. VALUATION MATTERS - Pay reasonable prices; avoid speculation disguised as investing
-4. DIVERSIFICATION IS FREE INSURANCE - Why own one needle when you can own the haystack?
-5. TIME IN MARKET > TIMING THE MARKET - Stay the course through all conditions
-6. SIMPLICITY BEATS COMPLEXITY - The elegant solution is the index fund
-7. SHAREHOLDER YIELD MATTERS - Dividends and buybacks are real returns; speculation is not
-
-=============================================================================
-REQUIRED ANALYSIS STRUCTURE (FOLLOW EXACTLY)
-=============================================================================
-
-**1. FINANCIAL HEALTH ASSESSMENT**
-- Revenue: State the figure with YoY context if available, or note "YoY growth data unavailable"
-- Margins: Gross margin, operating margin, net margin
-- Cash Flow: FCF and FCF/Net Income ratio
-- If comparing values, ALWAYS complete the comparison: "$15.55B compared to $22.34B last year" NOT "$15.55B compared to $22."
-
-**2. VALUATION REALITY CHECK**
-- P/E ratio vs S&P 500 historical average (~16x)
-- Earnings Yield vs Treasury rates
-- Is this price speculative or reasonable?
-- Example: "At 45x earnings vs the market's historical 16x, this is a speculative premium."
-
-**3. RISK FACTORS (REQUIRED - 4-6 items)**
-You MUST include a dedicated risk section with specific risks:
-- TSMC/supply chain dependency
-- Geopolitical risks (US-China export restrictions)
-- Customer concentration (top customers % of revenue)
-- Cyclical demand risk
-- Competitive threats
-For each risk: state the risk, its significance, and ONE implication.
-Example: "Customer concentration - top 5 customers represent ~50% of revenue, creating revenue volatility risk."
-
-**4. THE CONCENTRATION WARNING**
-- Explicitly warn: owning one stock = maximum unsystematic risk
-- Compare: one company vs 4,000+ companies in a total market index
-- The math: "This stock could fall 50% on company-specific news; an index rarely moves more than 20%."
-
-**5. THE INDEX ALTERNATIVE**
-- Total market index cost: 0.03% expense ratio
-- Over 30 years, 1% fees cost ~25% of returns
-- State clearly: "At 0.03%, a total market index gives you the entire economy's earnings at virtually zero cost."
-
-**6. CONCLUDING PERSPECTIVE (REQUIRED)**
-You MUST end with a clear investment stance. Pick ONE:
-- "Given [reasons], I would not initiate a position in this single stock."
-- "The fundamentals are strong, but concentration risk dominates. Own the index instead."
-- "For most investors, a total market index remains the superior choice."
-- "The risk-adjusted return profile does not justify the concentration risk."
-
-**CLOSING TAKEAWAY**: Your final sentence MUST connect back to the Bogle philosophy.
-End with a sentence like: "As I have always maintained, diversification is the only free lunch in investing - and this analysis reinforces that conviction."
-
-FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
-When discussing financial performance, you MUST address:
-- Revenue trends: YoY growth with segment breakdown if available
-- Margin analysis: Gross, operating, net margins with trend direction
-- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
-- Working capital: Inventory trends, AR/AP dynamics if material
-- Capital efficiency: ROIC, ROE if calculable
-
-MD&A CRITICAL ASSESSMENT REQUIREMENTS:
-When referencing management commentary, you MUST:
-- State what management CLAIMS (with attribution: "management stated...")
-- Assess if claims MATCH actual results (flag disconnects)
-- Apply skepticism: Are they deflecting? Being overly optimistic?
-- Identify what management ISN'T discussing (the silent issues)
-
-Do NOT simply report what management says—CRITIQUE IT.
-
-=============================================================================
-CRITICAL CONSTRAINTS (ABSOLUTE)
-=============================================================================
-
-NEVER:
-- Use ratings or scores (NO "72/100", NO "8/10")
-- Use forward guidance or price targets
-- Say "I'm bullish" or "I'm bearish"
-- Use corporate analyst jargon
-- Leave ANY sentence incomplete
-- Leave ANY comparison incomplete ("$X compared to $Y." MUST have units/context)
-- End sections with questions without conclusions
-- End the memo without a final investment stance
-
-WHEN DATA IS MISSING:
-- If YoY growth is unavailable, state: "Year-over-year growth data is not available in this filing, limiting trend analysis."
-- Then provide industry context if possible: "Industry peers are growing at approximately X%."
-- DO NOT simply list questions about missing data - provide a CONCLUSION about what the absence means for investment confidence.
-
-MD&A HANDLING:
-If MD&A is limited or unavailable:
-- Briefly note the absence (1-2 sentences)
-- State ONE implication: "Without forward guidance, we cannot assess management's growth expectations, which increases uncertainty."
-- DO NOT list multiple questions - conclude what it means.
-
-BOGLE VOICE ANCHORS (use at least 3):
-- "Why own one needle when you can own the haystack?"
-- "Costs matter. Over decades, they compound dramatically against you."
-- "90% of active managers fail to beat the index over 15 years."
-- "Diversification is the only free lunch in investing."
-- "Stay the course."
-- "The stock market is a giant distraction from the business of investing."
-
-FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
-- "Additional detail covers..." - "Capital allocation remarks..." - "Risk coverage includes..."
-- Any placeholder or summary-of-summary text
-
-Write exactly 425 words (±10 acceptable: 415-435 range). Complete EVERY sentence. End with clear investment stance.''',
-
-    "marks": '''You ARE Howard Marks. Write this analysis as Marks himself would write it in an Oaktree memo.
-
-COMPANY: {company_name}
-
-FINANCIAL DATA:
-{metrics_block}
-
-=============================================================================
-HOWARD MARKS' SECOND-LEVEL THINKING (EMBODY THIS)
-=============================================================================
-- You think about what EVERYONE ELSE thinks, not just what YOU think
-- You ask: "What's priced in? What is consensus missing?"
-- You focus on RISK/REWARD ASYMMETRY, not just upside
-- You're skeptical of the crowd, but not contrarian for its own sake
-- You think in CYCLES - where are we in the cycle?
-- You TAKE A STANCE - you're not a fence-sitter
-
-=============================================================================
-REQUIRED STRUCTURE (FOLLOW EXACTLY)
-=============================================================================
-
-**1. CYCLE POSITIONING (MANDATORY)**
-- Where are we in the business/market cycle for this company/sector?
-- Is this early cycle (optimism building), mid-cycle, or late cycle (peak optimism)?
-- What does history tell us about similar cycle positions?
-- Example: "We appear to be in the late stages of the AI capex cycle, where expectations have become elevated and caution is warranted."
-
-**2. WHAT'S PRICED IN (MANDATORY)**
-- What does the current valuation ASSUME about future performance?
-- How much optimism is already embedded in the price?
-- What would have to go right for this stock to outperform from here?
-- Example: "At 45x forward earnings, the market is pricing in sustained 30%+ growth for years. That's a lot of good news already reflected."
-
-**3. REVENUE SEGMENTATION (REQUIRED)**
-- Break down revenue by segment: Data Center, Gaming, Automotive, Professional Visualization (for NVIDIA)
-- Identify which segments are growing/declining
-- Distinguish: hardware vs. software, recurring vs. non-recurring
-- Example: "Data Center represents 80%+ of revenue and is the growth engine. Gaming, once the core, is now secondary."
-
-**4. RISK ANALYSIS (4-6 SPECIFIC RISKS - MANDATORY)**
-You MUST include a substantive risk section with these categories:
-- **Cycle Risk**: AI spending cycle may peak; data center capex is lumpy
-- **Competition Risk**: AMD catching up, custom hyperscaler chips (Google TPU, Amazon, Microsoft)
-- **Geopolitical Risk**: Taiwan/China exposure, US export controls
-- **Supply Chain Risk**: TSMC concentration (100% of leading-edge production)
-- **Valuation Risk**: High multiples leave no margin for disappointment
-- **Demand Volatility**: AI inference vs training, enterprise adoption pace
-
-For EACH risk, explain the MECHANISM and PROBABILITY (High/Medium/Low).
-
-**5. RISK/REWARD ASYMMETRY (MANDATORY)**
-- Don't just list risks - quantify the asymmetry
-- What's the upside if things go right? (+X%)
-- What's the downside if cycle turns? (-Y%)
-- Is the asymmetry favorable or unfavorable?
-- Example: "The asymmetry concerns me: upside is perhaps 20% if AI accelerates further, but downside could be 40%+ if the cycle turns. That's unfavorable."
-
-**6. VERDICT (CLEAR AND ACTIONABLE - MANDATORY)**
-You MUST end with a decisive stance:
-- "WATCH" - Interesting but cycle risk high, wait for better entry
-- "BUY" - Risk/reward favorable at current levels
-- "AVOID" - Asymmetry unfavorable, too much priced in
-- "SELL" - Cycle turning, time to take profits
-
-Include:
-- Your stance in ONE WORD (Buy/Watch/Avoid/Sell)
-- The key trigger that would change your view
-- What the market is missing OR why consensus is right
-
-Example verdict: "WATCH. The business is exceptional, but at current valuations, we're paying for perfection with limited margin of safety. I'd wait for a pullback to 35x forward earnings, where the risk/reward asymmetry improves."
-
-FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
-When discussing financial performance, you MUST address:
-- Revenue trends: YoY growth with segment breakdown if available
-- Margin analysis: Gross, operating, net margins with trend direction
-- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
-- Working capital: Inventory trends, AR/AP dynamics if material
-- Capital efficiency: ROIC, ROE if calculable
-
-MD&A CRITICAL ASSESSMENT REQUIREMENTS:
-When referencing management commentary, you MUST:
-- State what management CLAIMS (with attribution: "management stated...")
-- Assess if claims MATCH actual results (flag disconnects)
-- Apply skepticism: Are they deflecting? Being overly optimistic?
-- Identify what management ISN'T discussing (the silent issues)
-
-Do NOT simply report what management says—CRITIQUE IT.
-
-=============================================================================
-MARKS VOICE REQUIREMENTS (ABSOLUTE)
-=============================================================================
-
-USE MARKS' LANGUAGE:
-- "What's priced in..."
-- "The cycle suggests..."
-- "Second-level thinking requires..."
-- "The asymmetry is..."
-- "Consensus believes X, but..."
-- "In my experience..."
-
-NEVER:
-- Sound like a generic analyst or research report
-- Use ratings or scores (NO "72/100")
-- Sit on the fence - take a clear stance
-- Skip the risk section - this is your strength
-- Use placeholder text like "data not available"
-- End without a verdict
-
-ARGUE FOR YOUR POSITION:
-If you say "Watch," explain WHY watching is the right move.
-If you say "Buy," explain WHY the risk/reward is attractive.
-Support every opinion with evidence and logic.
-
-FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
-- "Additional detail covers..." - "Further notes address..." - "The analysis outlines..."
-- Any placeholder or summary-of-summary text
-
-CLOSING TAKEAWAY: Your final sentence MUST connect back to the Marks philosophy.
-Example: "Second-level thinking demands we ask not just whether this is a good company, but whether the price already reflects that - and here, the pendulum has swung too far toward optimism."
-
-Write exactly 475 words (±10 acceptable: 465-485 range). Risk-focused. Cycle-aware. Take a stance. Complete all sentences. End with clear verdict.
-
-Output format: Flowing prose (no markdown headers or bullet points in final output).''',
-
-    "ackman": '''Analyze {company_name} as an activist investor looking for value creation.
-
-FINANCIAL DATA:
-{metrics_block}
-
-=============================================================================
-BILL ACKMAN'S ACTIVIST VOICE (EMBODY THIS)
-=============================================================================
-- "Simple, Predictable, Free-Cash-Flow Generative." - Your mantra.
-- You don't buy stocks; you buy businesses and FIX them.
-- If management is inefficient, you DEMAND change.
-- If capital allocation is poor, you PRESCRIBE the solution.
-- Valuation is the anchor. You buy at a discount to intrinsic value.
-- You are confrontational when needed. You push for change.
-- You always know what the CATALYST is - what will unlock value.
-
-TONE REQUIREMENTS:
-- ACTIVIST: Push for change. "Management MUST allocate..."
-- PRAGMATIC: Numbers-driven. "$X in FCF means Y."
-- CATALYST-FOCUSED: Every analysis ends with "the catalyst is..."
-- FORWARD-LOOKING: "Over the next 3 years..."
-- CONFRONTATIONAL when needed: "This is unacceptable. We demand..."
-
-ANTI-PATTERNS (NEVER DO):
-- Generic sell-side research tone ("A detailed breakdown of the cost structure...")
-- Passive observations without prescriptions
-- Describing problems without solutions
-- Ending without stating what must change
-
-=============================================================================
-REQUIRED STRUCTURE (Follow EXACTLY)
-=============================================================================
-
-0. FISCAL PERIOD CONTEXT (MANDATORY FIRST LINE)
-   - State the period clearly: "For [Q1/Q2/Full Year] [Fiscal Year], ending [Date]..."
-   - Example: "For Q2 FY25, ending July 31, 2025..."
-
-1. THE BUSINESS (Simple & Predictable?)
-   - Is this a high-quality business? (Moat, pricing power, recurring revenue)
-   - Is it simple and predictable? (Or complex and opaque?)
-   - Growth Outlook: What drives revenue over the next 3-5 years? (Pricing, volume, new units?)
-
-2. VALUATION REALITY (The Anchor)
-   - Mandatory Metrics: P/E, FCF Yield, EV/EBITDA (if calculable)
-   - Optimism Check: Does the current price embed too much success?
-   - "At [X]x earnings, we are paying for..."
-   - If valuation metrics unavailable: state what IS available and conclude from it
-
-3. THE ACTIVIST THESIS & CATALYST (The Fix)
-   - What is the SPECIFIC catalyst? (Operational improvement, spin-off, capital return, management change?)
-   - Capital Allocation Prescription (BE SPECIFIC):
-     - Buybacks: "Management MUST allocate [X]% of FCF ($[X]B) to retire shares."
-     - Dividends: "Initiate dividend at $[X]/share" or "Cut dividend to fund growth."
-     - Leverage: "Optimize balance sheet by [specific action]."
-   - WHAT MUST CHANGE: State explicitly what you would push for as an activist.
-
-4. COMPETITIVE MOAT & THREATS (INTEGRATION REQUIRED)
-   - Name specific competitors
-   - Connect to earlier points (e.g., if you mentioned AR growth, connect it to competitive pressure)
-   - End with moat conclusion: "The moat is [durable/eroding/threatened because...]"
-
-5. CASH FLOW DECOMPOSITION (INTERNAL CONSISTENCY)
-   - Break it down: CFO, Capex, Working Capital
-   - SBC Impact: "Stock-based compensation of $[X]M represents [X]% dilution."
-   - FCF/Net Income Analysis:
-     - If FCF/NI < 0.7: "Below the 0.7-1.0 healthy range. Cash conversion needs improvement."
-     - If FCF/NI 0.7-1.0: "Within the healthy range."
-     - If FCF/NI > 1.0: "Above typical range - investigate working capital release or accounting."
-   - CONNECT to earlier sections: If you mentioned AR/inventory concerns, explain their FCF impact HERE.
-
-6. RISKS & ASYMMETRY (4-6 Items with Integration)
-   - List 4-6 specific risks
-   - Each risk should connect to something discussed earlier
-   - Focus on asymmetry: "Heads we win big, tails we lose a little." OR "Asymmetry unfavorable."
-
-7. CONCLUSION & VERDICT (ACTIONABLE)
-   - Summarize the thesis in 2-3 sentences.
-   - STATE THE CATALYST: "The catalyst is [specific event/action]."
-   - WHAT THE MARKET IS MISSING: Why is this opportunity available?
-   - WHAT WE WOULD PUSH FOR: As an activist, our agenda would be [X, Y, Z].
-   - Final Stance: Buy (High Conviction), Watch (Interested but price/fix needed), or Pass (Too hard/expensive).
-
-FINANCIAL PERFORMANCE DEPTH REQUIREMENTS:
-When discussing financial performance, you MUST address:
-- Revenue trends: YoY growth with segment breakdown if available
-- Margin analysis: Gross, operating, net margins with trend direction
-- Cash flow quality: OCF/Net Income ratio (>0.7 is healthy, <0.5 is concerning)
-- Working capital: Inventory trends, AR/AP dynamics if material
-- Capital efficiency: ROIC, ROE if calculable
-
-MD&A CRITICAL ASSESSMENT REQUIREMENTS:
-When referencing management commentary, you MUST:
-- State what management CLAIMS (with attribution: "management stated...")
-- Assess if claims MATCH actual results (flag disconnects)
-- Apply skepticism: Are they deflecting? Being overly optimistic?
-- Identify what management ISN'T discussing (the silent issues)
-
-Do NOT simply report what management says—CRITIQUE IT.
-
-=============================================================================
-CRITICAL CONSTRAINTS
-=============================================================================
-- COMPLETE ALL SENTENCES. Never trail off.
-- USE "I" and "WE". "We believe...", "I demand...".
-- BE PRESCRIPTIVE. Don't say "management could". Say "management MUST".
-- NO PASSIVE VOICE. Not "A breakdown should be provided." Say "We need to see..."
-- SPECIFIC NUMBERS. Don't say "significant buybacks". Say "$2B in buybacks."
-- CONSISTENT FINANCIALS. Use ONE set of data. Never mix fiscal years.
-- INTEGRATE SECTIONS. If you mention working capital in Section 1, reference it in Section 5.
-- NO GENERIC ANALYST TONE. Sound like an activist, not a research analyst.
-
-FORBIDDEN FILLER PHRASES (INSTANT FAILURE):
-- "Additional detail covers..." - "Capital allocation remarks..." - "Risk coverage includes..."
-- Any placeholder or summary-of-summary text
-
-CLOSING TAKEAWAY: Your final sentence MUST connect back to the Ackman philosophy.
-Example: "Simple, predictable, free-cash-flow generative - that's what I look for, and this company either has it or it doesn't."
-
-Write exactly 475 words (±10 acceptable: 465-485 range). High conviction. Prescriptive. Integrated. Complete.''',
-}
-
-
-# =============================================================================
-# PERSONA-SPECIFIC OUTPUT STRUCTURES
-# =============================================================================
-# Maps persona ID to their expected output format:
-# - None = Pure flowing prose (no sections, no headers, no bullet points)
-# - List = Specific section headers allowed
-#
-# This replaces the generic 10-K style: Executive Summary, Key Risks, etc.
-
-PERSONA_STRUCTURES = {
-    # PURE PROSE - These personas write like letters/memos/speeches
-    # No markdown headers. No bullet points. Just flowing narrative.
-    "buffett": None,  # Shareholder letter narrative
-    "munger": None,   # Pithy shareholder meeting response
-    "marks": None,    # Oaktree memo essay
-    "bogle": None,    # Gentle indexing argument essay
-
-    # MINIMAL STRUCTURE - Just the formula output
-    "greenblatt": ["Return on Capital:", "Earnings Yield:", "Magic Formula Verdict:"],
-
-    # LIGHT STRUCTURE - 2-3 persona-specific sections
-    "graham": [
-        "Balance Sheet Position",
-        "Margin of Safety Calculation",
-        "Investment or Speculation?"
-    ],
-    "ackman": [
-        "The Business (Simple & Predictable)",
-        "Valuation Reality",
-        "The Activist Thesis (The Fix)",
-        "Competitive Moat & Threats",
-        "Cash Flow Decomposition",
-        "Risks & Asymmetry",
-        "Conclusion & Verdict"
-    ],
-
-    # HYBRID - Some structure within narrative flow
-    "lynch": [
-        "The Story",
-        "Stock Classification",
-        "The Numbers (PEG)"
-    ],
-    "dalio": [
-        "Where We Are in the Cycle",
-        "The Economic Machine View",
-        "Risk Parity Consideration"
-    ],
-    "wood": [
-        "The Disruption Thesis",
-        "Wright's Law & S-Curve Position",
-        "2030 Vision"
-    ],
-}
-
-
-# =============================================================================
-# STREAMLINED PERSONA DEFINITIONS
-# =============================================================================
-
-INVESTOR_PERSONAS = {
-    "buffett": {
-        "name": "Warren Buffett",
-        "philosophy": "Buy wonderful companies at fair prices. Moats, durability, simplicity.",
-        "signature_concepts": ["moat", "owner earnings", "circle of competence", "Mr. Market", "toll bridge"],
-        "required_vocabulary": ["moat", "wonderful", "owner earnings", "circle of competence", "Mr. Market"],
-        "forbidden_elements": ["ratings", "scores", "EBITDA", "executive summary", "key risks"],
-        "style": "Folksy shareholder letter narrative with analogies"
-    },
-    "munger": {
-        "name": "Charlie Munger", 
-        "philosophy": "Inversion, incentives, mental models. Avoid stupidity.",
-        "signature_concepts": ["invert", "incentives", "lollapalooza", "obviously stupid", "mental models"],
-        "required_vocabulary": ["invert", "incentives", "stupid", "mental models", "nothing to add"],
-        "forbidden_elements": ["ratings", "I believe", "in my opinion", "bullet points"],
-        "style": "Pithy shareholder meeting response"
-    },
-    "graham": {
-        "name": "Benjamin Graham",
-        "philosophy": "Margin of safety. Intrinsic value vs price. Balance sheet first.",
-        "signature_concepts": ["margin of safety", "intrinsic value", "net current asset value", "speculation vs investment"],
-        "required_vocabulary": ["margin of safety", "intrinsic value", "NCAV", "speculator", "intelligent investor"],
-        "forbidden_elements": ["ratings", "projections", "management vision", "exciting adjectives"],
-        "style": "Academic security analysis with specific numbers"
-    },
-    "lynch": {
-        "name": "Peter Lynch",
-        "philosophy": "Invest in what you know. Find tenbaggers. PEG ratio.",
-        "signature_concepts": ["tenbagger", "PEG ratio", "Fast Grower/Stalwart/Turnaround", "boring is beautiful"],
-        "required_vocabulary": ["tenbagger", "PEG ratio", "story", "Fast Grower", "Stalwart"],
-        "forbidden_elements": ["ratings", "macro analysis", "formal jargon"],
-        "style": "Enthusiastic stock story for individual investors"
-    },
-    "dalio": {
-        "name": "Ray Dalio",
-        "philosophy": "The economic machine. Debt cycles. Paradigm shifts. Correlation.",
-        "signature_concepts": ["economic machine", "debt cycle", "paradigm shift", "risk parity", "correlation"],
-        "required_vocabulary": ["machine", "cycle", "paradigm", "correlation", "deleveraging"],
-        "forbidden_elements": ["ratings", "company-only analysis", "emotional language"],
-        "style": "Systematic macro analysis connecting company to cycles"
-    },
-    "wood": {
-        "name": "Cathie Wood",
-        "philosophy": "Disruptive innovation. Wright's Law. S-curves. Exponential thinking.",
-        "signature_concepts": ["Wright's Law", "S-curve", "TAM", "disruption", "convergence"],
-        "required_vocabulary": ["Wright's Law", "S-curve", "disruption", "exponential", "2030"],
-        "forbidden_elements": ["ratings", "P/E ratio", "current profitability focus", "skepticism"],
-        "style": "Visionary technology thesis with 5-10 year horizon"
-    },
-    "greenblatt": {
-        "name": "Joel Greenblatt",
-        "philosophy": "Magic Formula. Return on capital + earnings yield. Simple.",
-        "signature_concepts": ["return on capital", "earnings yield", "Magic Formula", "good + cheap"],
-        "required_vocabulary": ["return on capital", "earnings yield", "Magic Formula"],
-        "forbidden_elements": ["ratings", "long narratives", "macro analysis"],
-        "style": "Minimal formula-driven analysis"
-    },
-    "bogle": {
-        "name": "John Bogle",
-        "philosophy": "Index investing. Costs matter. Stay the course. Buy the haystack. Valuation sanity.",
-        "signature_concepts": ["index fund", "costs matter", "stay the course", "haystack vs needle", "90% failure rate", "compounding", "simplicity"],
-        "required_vocabulary": ["index", "costs", "haystack", "stay the course", "diversif"],
-        "forbidden_elements": ["ratings", "scores", "stock recommendations", "market timing", "price targets", "forward guidance", "bullish/bearish"],
-        "style": "Wise grandfatherly case for indexing, with honest company assessment and valuation discussion",
-        "anti_rating_policy": "NEVER give ratings. Assess fundamentals honestly, but conclude with index vs. stock recommendation."
-    },
-    "marks": {
-        "name": "Howard Marks",
-        "philosophy": "Cycles. Pendulum. Second-level thinking. Asymmetry. Risk.",
-        "signature_concepts": ["pendulum", "second-level thinking", "asymmetry", "cycles", "permanent loss"],
-        "required_vocabulary": ["pendulum", "second-level", "asymmetry", "cycle", "risk"],
-        "forbidden_elements": ["ratings", "bullet points", "demanding language", "structured sections"],
-        "style": "Reflective essay-style memo about cycles and psychology"
-    },
-    "ackman": {
-        "name": "Bill Ackman",
-        "philosophy": "Activist value. Find the fix. Name the catalyst. Simple predictable FCF.",
-        "signature_concepts": ["catalyst", "the fix", "simple predictable", "free cash flow", "target price"],
-        "required_vocabulary": ["catalyst", "fix", "simple", "predictable", "free cash flow"],
-        "forbidden_elements": ["ratings", "vague theses", "passive acceptance"],
-        "style": "Confident activist thesis with specific numbers"
-    }
 }
 
 
@@ -4213,7 +3042,7 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
 
         # For ROC: Invested Capital = Net Working Capital + Net Fixed Assets
         # Simplified: (Current Assets - Current Liabilities) + (Total Assets - Current Assets)
-        # Or use Total Assets - Current Liabilities if available
+        # Or use Total Assets - Current Assets if available
         # Approximation: Total Equity + Total Debt (or Total Assets - Cash for simplicity)
 
         # Get additional balance sheet items
@@ -4246,7 +3075,7 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
             # Fallback: use Total Equity + Total Debt
             try:
                 equity_val = float(total_equity)
-                debt_val = float(total_debt) if total_debt else (float(long_term_debt) if long_term_debt else 0)
+                debt_val = float(total_debt) if total_debt else (float(total_liabilities) * 0.4 if total_liabilities else 0)
                 invested_capital = equity_val + debt_val
             except (ValueError, TypeError):
                 pass
@@ -4280,7 +3109,7 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
             except (ValueError, TypeError):
                 pass
 
-        # Build Greenblatt-specific metrics block
+        # Build Greenblatt-specific ratios block
         greenblatt_lines.append("\n--- MAGIC FORMULA INPUTS ---")
 
         if ebit_fmt:
@@ -4312,24 +3141,17 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
         else:
             greenblatt_lines.append("Earnings Yield: Cannot be calculated - requires Enterprise Value (market cap + debt - cash)")
 
-        # Add note about valuation metrics
         if market_cap is None:
             greenblatt_lines.append("\nNOTE: P/E and FCF Yield cannot be calculated without current market price data, which is outside SEC filing scope.")
 
-        # Add Greenblatt lines to main output
         lines.extend(greenblatt_lines)
 
-    # Add valuation note for other personas if P/E not available
     pe_ratio = ratios.get("pe_ratio")
     if pe_ratio is None and persona_id != "greenblatt":
         lines.append("\nValuation Note: P/E ratio and market-based metrics require current share price data, which is not included in SEC filings. To calculate: obtain current market cap, then divide by net income.")
 
     return "\n".join(lines) if lines else "Limited financial data available."
 
-
-# =============================================================================
-# OUTPUT VALIDATION - ENFORCE PERSONA DISTINCTIVENESS (STRICT MODE)
-# =============================================================================
 
 def calculate_authenticity_score(persona_id: str, output: str, persona: Dict) -> Tuple[int, List[str]]:
     """
@@ -4338,7 +3160,7 @@ def calculate_authenticity_score(persona_id: str, output: str, persona: Dict) ->
     Returns:
         Tuple of (score, list of issues/feedback)
     """
-    score = 100  # Start at 100, deduct for problems
+    score = 100
     feedback = []
     output_lower = output.lower()
 
@@ -4348,2800 +3170,337 @@ def calculate_authenticity_score(persona_id: str, output: str, persona: Dict) ->
     never_says = voice_anchors.get("never_says", [])
     forbidden_concepts = voice_anchors.get("forbidden_concepts", [])
 
-    # =========================================================================
-    # PERSONA VOICE CONSISTENCY CHECK - Detect mixed personas
-    # =========================================================================
-
-    # Define persona-specific markers that shouldn't appear in other personas
     persona_markers = {
-        "buffett": ["moat", "owner earnings", "wonderful company", "circle of competence", "mr. market", "economic moat", "durable competitive advantage"],
-        "munger": ["invert", "lollapalooza", "mental models", "incentives matter", "obviously stupid", "worldly wisdom"],
-        "graham": ["margin of safety", "intrinsic value", "net current asset", "intelligent investor", "mr. market"],
-        "lynch": ["tenbagger", "peg ratio", "fast grower", "stalwart", "know the company", "what inning"],
-        "dalio": ["debt cycle", "economic machine", "paradigm", "deleveraging", "risk parity", "cause-effect chain", "the machine", "what's priced in"],
-        "wood": ["wright's law", "s-curve", "disruption", "exponential", "2030", "innovation platform"],
-        "greenblatt": ["magic formula", "return on capital", "earnings yield", "good and cheap", "roic"],
-        "bogle": ["index fund", "stay the course", "haystack", "costs matter", "90% of managers", "stay the course"],
-        "marks": ["second-level thinking", "risk asymmetry", "cycle", "what's priced in", "oaktree", "contrarian"],
-        "ackman": ["activist", "catalyst", "capital allocation", "management must", "the fix", "we demand", "prescription"],
+        "buffett": ["moat", "owner earnings", "wonderful company", "circle of competence", "durable competitive advantage", "margin of safety", "long-term value", "Mr. Market", "economic moat"],
+        "munger": ["invert", "lollapalooza", "mental models", "incentives", "stupid", "obviously", "asinine", "worldly wisdom"],
+        "graham": ["margin of safety", "intrinsic value", "net current asset", "intelligent investor", "speculator", "Mr. Market", "financial metrics"],
+        "lynch": ["tenbagger", "peg ratio", "fast grower", "stalwart", "story", "boring", "Wall Street is missing", "know the company", "kick the tires", "what inning"],
+        "dalio": ["debt cycle", "economic machine", "paradigm", "deleveraging", "correlation", "debt cycle", "mechanism", "risk parity", "credit", "liquidity"],
+        "wood": ["disruption", "exponential", "wright's law", "s-curve", "2030", "TAM", "convergence", "market potential"],
+        "greenblatt": ["return on capital", "earnings yield", "magic formula", "good company", "cheap price", "mean reversion", "ROIC", "EV/EBIT"],
+        "bogle": ["index", "costs", "haystack", "stay the course", "90%", "speculation", "compounding", "simplicity", "diversification", "fees", "long-term"],
+        "marks": ["second-level thinking", "cycle", "risk control", "durable competitive advantage", "long-term value", "competitive landscape"],
+        "ackman": ["activist", "catalyst", "simple business", "durable competitive advantage", "long-term value", "competitive landscape"],
     }
 
-    # Generic analyst phrases that break ALL persona immersion
-    generic_analyst_markers = [
-        "solid fundamentals", "attractive opportunity", "well-positioned",
-        "robust growth", "strong performance", "demonstrates resilience",
-        "compelling valuation", "favorable outlook", "remains optimistic",
-        "in summary", "in conclusion", "going forward", "moving forward",
-        "it is worth noting", "it should be noted", "importantly",
-    ]
+    for phrase in must_use:
+        if phrase.lower() not in output_lower:
+            score -= 10
+            feedback.append(f"Missing required phrase: '{phrase}'")
 
-    # Count generic analyst language - this breaks persona immersion
-    generic_count = sum(1 for phrase in generic_analyst_markers if phrase in output_lower)
-    if generic_count >= 3:
-        score -= 15
-        feedback.append(
-            f"GENERIC ANALYST TONE: Found {generic_count} generic phrases that break persona immersion. "
-            f"Write like {persona_id.upper()}, not like a bank research report. - deducted 15 points"
-        )
+    encouraged_count = sum(1 for phrase in encouraged if phrase.lower() in output_lower)
+    if encouraged_count == 0:
+        score -= 5
+        feedback.append("No encouraged vocabulary used")
 
-    # Check if markers from OTHER personas appear in the output
-    current_markers = persona_markers.get(persona_id, [])
-    contaminating_personas = []
+    for phrase in never_says:
+        if phrase.lower() in output_lower:
+            score -= 15
+            feedback.append(f"Used forbidden phrase: '{phrase}'")
+
+    for concept in forbidden_concepts:
+        if concept.lower() in output_lower:
+            score -= 10
+            feedback.append(f"Used forbidden concept: '{concept}'")
 
     for other_persona, markers in persona_markers.items():
-        if other_persona == persona_id:
-            continue
-        # Check if this persona's markers appear
-        markers_found = sum(1 for m in markers if m in output_lower)
-        own_markers_found = sum(1 for m in current_markers if m in output_lower)
-
-        # If other persona's markers appear more than own persona's markers, flag it
-        if markers_found >= 2 and markers_found > own_markers_found:
-            contaminating_personas.append((other_persona, markers_found))
-
-    if contaminating_personas:
-        # Sort by marker count
-        contaminating_personas.sort(key=lambda x: -x[1])
-        worst_contamination = contaminating_personas[0]
-        score -= 25
-        feedback.append(
-            f"VOICE INCONSISTENCY: Output sounds more like {worst_contamination[0].upper()} "
-            f"({worst_contamination[1]} markers) than {persona_id.upper()}. "
-            f"Pick one consistent persona voice. - deducted 25 points"
-        )
-
-    # Check for explicit persona mixing (mentioning other investor names)
-    other_investor_names = {
-        "buffett": ["warren", "buffett", "berkshire"],
-        "munger": ["charlie", "munger"],
-        "graham": ["benjamin graham", "ben graham"],
-        "lynch": ["peter lynch"],
-        "dalio": ["ray dalio", "bridgewater"],
-        "wood": ["cathie", "ark invest"],
-        "greenblatt": ["joel greenblatt", "gotham"],
-        "bogle": ["john bogle", "vanguard founder"],
-        "marks": ["howard marks", "oaktree"],
-        "ackman": ["bill ackman", "pershing square"],
-    }
-
-    for other_persona, names in other_investor_names.items():
-        if other_persona == persona_id:
-            continue
-        if any(name in output_lower for name in names):
-            score -= 15
-            feedback.append(
-                f"PERSONA MIXING: Mentions {other_persona.upper()} while writing as {persona_id.upper()}. "
-                f"Each report should be ONE voice. - deducted 15 points"
-            )
-            break
-
-    # =========================================================================
-    # CRITICAL VIOLATIONS (-30 points each) - Instant failures
-    # =========================================================================
-
-    # Ratings/scores
-    rating_patterns = [
-        r'\d{1,3}\s*/\s*100',  # 72/100
-        r'\d{1,2}\s*/\s*10',   # 8/10
-        r'\d+\s*out of\s*\d+', # 8 out of 10
-        r'(?:rating|score|grade)\s*:?\s*\d+',  # rating: 72
-        r'health rating',
-        r'financial health rating',
-        r'\(\s*[A-F][+-]?\s*\)',  # (A+), (B-)
-    ]
-    for pattern in rating_patterns:
-        if re.search(pattern, output_lower):
-            score -= 30
-            feedback.append("CRITICAL: Contains ratings/scores - deducted 30 points")
-            break
-
-    # Generic section headers
-    generic_headers = [
-        "executive summary", "key risks:", "investment thesis:", "risk factors:",
-        "## key", "## risk", "## investment", "## executive", "## conclusion"
-    ]
-    for header in generic_headers:
-        if header in output_lower:
-            score -= 30
-            feedback.append(f"CRITICAL: Generic section header '{header}' - deducted 30 points")
-            break
-
-    # =========================================================================
-    # UNIVERSAL FILLER PHRASE DETECTION (-30 points) - All personas
-    # =========================================================================
-    filler_phrases = [
-        "additional detail covers",
-        "capital allocation remarks",
-        "further notes address",
-        "risk coverage includes",
-        "the analysis also outlines",
-        "the analysis outlines",
-        "valuation context compares",
-        "management discussion covers",
-        "strategic initiatives include",
-    ]
-
-    filler_count = sum(1 for phrase in filler_phrases if phrase in output_lower)
-    if filler_count > 0:
-        score -= 30
-        feedback.append(
-            f"GENERIC FILLER DETECTED: Found {filler_count} placeholder phrase(s). "
-            f"Write complete analysis, not summary bullets. - deducted 30 points"
-        )
-
-    # =========================================================================
-    # CROSS-CONTAMINATION CHECK (-20 points) - Persona using wrong concepts
-    # =========================================================================
-    contamination_found = [c for c in forbidden_concepts if c.lower() in output_lower]
-    if contamination_found:
-        score -= 20
-        feedback.append(f"CROSS-CONTAMINATION: Persona using concepts from other frameworks: {contamination_found[:2]} - deducted 20 points")
-
-    # =========================================================================
-    # MAJOR VIOLATIONS (-15 points each)
-    # =========================================================================
-
-    # Banned generic phrases
-    banned_found = [p for p in BANNED_GENERIC_PHRASES if p.lower() in output_lower]
-    if banned_found:
-        score -= 15
-        feedback.append(f"Generic phrases found: {banned_found[:2]} - deducted 15 points")
-
-    # Corporate analyst phrases - instant disqualifier for all personas
-    corporate_found = [p for p in CORPORATE_ANALYST_PHRASES if p.lower() in output_lower]
-    if corporate_found:
-        score -= 20
-        feedback.append(f"CORPORATE ANALYST PHRASES FOUND: {corporate_found[:2]} - deducted 20 points. These break persona immersion.")
-
-    # Generic risk phrases that apply to any company
-    generic_risk_found = [p for p in GENERIC_RISK_PHRASES if p.lower() in output_lower]
-    if generic_risk_found:
-        score -= 15
-        feedback.append(f"GENERIC RISKS: {generic_risk_found[:2]} - these apply to any company, use specific risks - deducted 15 points")
-
-    # =========================================================================
-    # DALIO-SPECIFIC CONCEPT VALIDATION (-20 points)
-    # =========================================================================
-    if persona_id == "dalio":
-        required_dalio_concepts = ["cycle", "machine", "cause-effect"]
-        # Allow variations: "cause and effect", "cause/effect", "causal"
-        concepts_found = 0
-        if "cycle" in output_lower:
-            concepts_found += 1
-        if "machine" in output_lower:
-            concepts_found += 1
-        if any(term in output_lower for term in ["cause-effect", "cause and effect", "cause/effect", "causal chain"]):
-            concepts_found += 1
-
-        if concepts_found < 3:
-            score -= 20
-            feedback.append(
-                f"MISSING DALIO CONCEPTS: Only {concepts_found}/3 required concepts found. "
-                f"Must discuss cycle, machine, and cause-effect chain. - deducted 20 points"
-            )
-
-    # Forbidden persona-specific phrases
-    forbidden_found = [p for p in never_says if p.lower() in output_lower]
-    if forbidden_found:
-        score -= 15
-        # Add persona-specific context for the forbidden phrases
-        if persona_id == "marks":
-            feedback.append(f"Marks is reflective, not confrontational - forbidden phrases found: {forbidden_found}")
-        elif persona_id == "munger":
-            feedback.append(f"Munger doesn't hedge - forbidden phrases found: {forbidden_found}")
-        else:
-            feedback.append(f"Forbidden phrases for this persona: {forbidden_found} - deducted 15 points")
-
-    # Too many bullet points (breaks narrative)
-    bullet_count = output.count('- ') + output.count('• ') + output.count('* ')
-    if bullet_count > 5:
-        score -= 15
-        feedback.append(f"Too many bullet points ({bullet_count}) breaks narrative - deducted 15 points")
-
-    # =========================================================================
-    # REPETITION CHECK (-10 points) - Same phrase repeated multiple times
-    # =========================================================================
-    # Check for repeated significant phrases (4+ words)
-    words = output_lower.split()
-    four_grams = [' '.join(words[i:i+4]) for i in range(len(words)-3)]
-    from collections import Counter
-    gram_counts = Counter(four_grams)
-    repeated_phrases = [phrase for phrase, count in gram_counts.items() if count >= 3]
-    if repeated_phrases:
-        score -= 10
-        feedback.append(f"REPETITION: Same phrase repeated 3+ times - deducted 10 points")
-
-    # Check for repeated key metrics being cited multiple times
-    # Look for patterns like "$X billion" appearing more than twice
-    dollar_amounts = re.findall(r'\$[\d.,]+\s*(?:billion|million|B|M)?', output, re.IGNORECASE)
-    amount_counts = Counter(dollar_amounts)
-    repeated_amounts = [amt for amt, count in amount_counts.items() if count >= 3]
-    if repeated_amounts:
-        score -= 5
-        feedback.append(f"METRIC REPETITION: Same dollar amounts cited {len(repeated_amounts)} times unnecessarily")
-
-    # =========================================================================
-    # MODERATE VIOLATIONS (-15 points each) - Critical for persona identity
-    # =========================================================================
-
-    # Missing signature concepts - THIS IS CRITICAL for persona distinctiveness
-    signature_concepts = persona.get("signature_concepts", [])
-    concepts_found = sum(1 for c in signature_concepts if c.lower() in output_lower)
-    min_required = 2 if persona_id == "greenblatt" else 3
-    if concepts_found < min_required:
-        score -= 15
-        feedback.append(f"Missing signature concepts (found {concepts_found}/{min_required}) - deducted 15 points")
-
-    # Missing must-use phrases - Also critical for voice authenticity
-    must_use_found = sum(1 for p in must_use if p.lower() in output_lower)
-    if must_use_found < 1:
-        score -= 15
-        feedback.append(f"Missing mandatory phrases (need 1 of: {must_use[:3]}) - deducted 15 points")
-
-    # =========================================================================
-    # PERSONA-SPECIFIC VOICE DRIFT CHECK
-    # Detect when output starts in persona voice but drifts to neutral analyst
-    # =========================================================================
-
-    # Split output into thirds and check if persona markers decline
-    output_thirds = [output_lower[:len(output_lower)//3],
-                     output_lower[len(output_lower)//3:2*len(output_lower)//3],
-                     output_lower[2*len(output_lower)//3:]]
-
-    markers_by_third = []
-    for third in output_thirds:
-        persona_marker_count = sum(1 for m in current_markers if m in third)
-        generic_marker_count = sum(1 for p in generic_analyst_markers if p in third)
-        markers_by_third.append((persona_marker_count, generic_marker_count))
-
-    # Check for voice drift: persona markers in first third, generic in last third
-    if len(markers_by_third) == 3:
-        first_persona, first_generic = markers_by_third[0]
-        last_persona, last_generic = markers_by_third[2]
-
-        # If persona markers decrease and generic markers increase, that's drift
-        if first_persona > 0 and last_persona == 0 and last_generic >= 2:
-            score -= 20
-            feedback.append(
-                f"VOICE DRIFT: Output starts as {persona_id.upper()} but drifts to neutral analyst. "
-                f"Maintain consistent persona voice throughout. - deducted 20 points"
-            )
-
-    # =========================================================================
-    # MINOR ISSUES (-5 points each)
-    # =========================================================================
-
-    # Too short
-    word_count = len(output.split())
-    min_words = 100 if persona_id == "greenblatt" else 200
-    if word_count < min_words:
-        score -= 5
-        feedback.append(f"Too short ({word_count} words, need {min_words}+) - deducted 5 points")
-
-    # =========================================================================
-    # GREENBLATT-SPECIFIC VALIDATION (in authenticity scoring)
-    # =========================================================================
-    if persona_id == "greenblatt":
-        # Greenblatt should be CONCISE - max 175 words (allowing slight buffer over 150)
-        if word_count > 175:
-            score -= 30
-            feedback.append(f"Greenblatt output too verbose ({word_count} words). Must be under 150 words. Two ratios. One verdict. Done.")
-        elif word_count > 150:
-            score -= 10
-            feedback.append(f"Greenblatt output slightly long ({word_count} words). Target is 100-150 words.")
-
-        # MUST have ROC and Earnings Yield calculations
-        has_roc = bool(re.search(r'return on capital[:\s]+\d+', output_lower) or
-                      re.search(r'roc[:\s]+\d+', output_lower) or
-                      re.search(r'ebit.*÷.*invested capital', output_lower) or
-                      re.search(r'ebit.*\/.*invested capital', output_lower))
-        has_ey = bool(re.search(r'earnings yield[:\s]+\d+', output_lower) or
-                     re.search(r'ebit.*÷.*enterprise value', output_lower) or
-                     re.search(r'ebit.*\/.*enterprise value', output_lower))
-
-        if not has_roc:
-            score -= 25
-            feedback.append("MISSING: Return on Capital calculation (EBIT ÷ Invested Capital)")
-        if not has_ey:
-            score -= 25
-            feedback.append("MISSING: Earnings Yield calculation (EBIT ÷ Enterprise Value)")
-
-        # MUST have a verdict
-        has_verdict = bool(re.search(r'verdict[:\s]*(good\s+and\s+cheap|good\s+but\s+expensive|not\s+good)', output_lower) or
-                         re.search(r'(buy|pass)', output_lower))
-        if not has_verdict:
-            score -= 20
-            feedback.append("MISSING: Clear verdict (Good AND Cheap, Good but Expensive, or Not Good)")
-
-        # Greenblatt should NOT use narrative/emotional language
-        narrative_phrases = [
-            "i worry", "i am always", "i remain cautious", "i would prefer",
-            "excessive optimism", "potential weaknesses", "searching for",
-            "i am concerned", "my concern", "remains to be seen",
-            "time will tell", "only time", "careful observation",
-            "the thesis", "the story", "narrative", "moat", "competitive advantage"
-        ]
-        narrative_found = [p for p in narrative_phrases if p in output_lower]
-        if narrative_found:
-            score -= 20
-            feedback.append(f"Greenblatt is neutral and analytical, not emotional/narrative: remove {narrative_found}")
-
-        # Greenblatt should NOT ask for unrealistic management disclosures
-        unrealistic_requests = [
-            "management should provide", "management should disclose",
-            "provide roi on", "offer margin guidance", "detailed timelines",
-            "projected revenue contribution", "sensitivity analysis",
-            "scenario analysis", "provide projected", "offer guidance",
-            "should offer transparency", "would prefer more transparency",
-            # SMART goal related
-            "smart goal", "kpi target", "kpi milestone", "quarterly target",
-            "monthly target", "detailed breakdown", "segment-level projection",
-            "unit economics breakdown", "ltv/cac", "roi on each",
-            "specific margin guidance", "headcount target", "market share target",
-            # Unrealistic disclosure language
-            "we need management to", "investors require", "lack of disclosure",
-            "more transparency on", "should clarify", "needs to address",
-        ]
-        unrealistic_found = [p for p in unrealistic_requests if p in output_lower]
-        if unrealistic_found:
-            score -= 25  # Stronger penalty
-            feedback.append(f"Greenblatt doesn't request unrealistic management disclosures: {unrealistic_found}")
-
-        # Greenblatt should NOT use Lynch-style storytelling
-        lynch_contamination = [
-            "the story", "what inning", "tenbagger", "wall street is missing",
-            "i'd buy this", "i'd pass", "explaining to a friend", "peg ratio"
-        ]
-        lynch_found = [p for p in lynch_contamination if p in output_lower]
-        if lynch_found:
-            score -= 20
-            feedback.append(f"Cross-contamination with Lynch style: {lynch_found}")
-
-        # Greenblatt should NOT use sell-side analyst jargon
-        analyst_jargon = [
-            "margin trajectory", "capital allocation framework",
-            "operational excellence", "secular growth", "multiple expansion",
-            "valuation is pricing in", "headwinds", "tailwinds"
-        ]
-        jargon_found = [p for p in analyst_jargon if p in output_lower]
-        if jargon_found:
-            score -= 15
-            feedback.append(f"Greenblatt avoids sell-side jargon: {jargon_found}")
-
-    # Not enough encouraged vocabulary
-    encouraged_found = sum(1 for p in encouraged if p.lower() in output_lower)
-    if encouraged_found < 2:
-        score -= 5
-        feedback.append("Low vocabulary diversity - deducted 5 points")
-    
-    # =========================================================================
-    # BONUSES (+5 points each, max +15)
-    # =========================================================================
-    
-    bonus = 0
-    
-    # Extra signature concepts
-    if concepts_found >= min_required + 2:
-        bonus += 5
-        feedback.append("Bonus: Excellent use of signature concepts")
-    
-    # Good vocabulary diversity
-    if encouraged_found >= 4:
-        bonus += 5
-        feedback.append("Bonus: Strong vocabulary diversity")
-    
-    # First-person narrative - only small bonus, not required for 80% objective approach
-    if output_lower.count(" i ") >= 3 or output_lower.startswith("i "):
-        bonus += 3
-        feedback.append("Bonus: First-person voice present (+3)")
-    
-    score = min(100, score + min(bonus, 15))
-    score = max(0, score)
-
-    return score, feedback
-
-
-def check_conclusion_consistency(output: str) -> Tuple[bool, List[str]]:
-    """
-    Check if the conclusion/verdict matches the analysis tone.
-    Returns (is_consistent, list of issues).
-    """
-    issues = []
-    output_lower = output.lower()
-
-    # Detect positive signals in the analysis
-    positive_signals = [
-        "strong margin", "high margin", "excellent", "impressive growth",
-        "fortress balance sheet", "cash generative", "dominant", "moat",
-        "undervalued", "cheap", "attractive valuation", "wonderful",
-        "high returns", "exceptional", "great business", "durable",
-        "pricing power", "market leader", "competitive advantage"
-    ]
-    positive_count = sum(1 for s in positive_signals if s in output_lower)
-
-    # Detect negative signals in the analysis
-    negative_signals = [
-        "weak", "declining", "cash burning", "loss", "negative margin",
-        "overvalued", "expensive", "high risk", "poor", "concerning",
-        "debt-heavy", "leveraged", "distressed", "competitive pressure",
-        "margin compression", "deteriorating", "struggling", "failed"
-    ]
-    negative_count = sum(1 for s in negative_signals if s in output_lower)
-
-    # Detect conclusion stance - look for clear signals
-    buy_words = ["buy", "bullish", "attractive entry", "undervalued", "recommend buying"]
-    sell_words = ["sell", "pass", "avoid", "bearish", "would not invest"]
-
-    has_buy_conclusion = any(w in output_lower for w in buy_words)
-    has_sell_conclusion = any(w in output_lower for w in sell_words)
-
-    # Check for contradictions - require strong signal imbalance
-    if positive_count >= 5 and has_sell_conclusion and negative_count <= 1:
-        issues.append("CONTRADICTION: Analysis is overwhelmingly positive but conclusion is negative")
-
-    if negative_count >= 5 and has_buy_conclusion and positive_count <= 1:
-        issues.append("CONTRADICTION: Analysis is overwhelmingly negative but conclusion is positive")
-
-    # NEW: Check for C-rating on strong company or A-rating on weak company
-    # This catches rating-content mismatches like "C (78/100)" for a healthy company
-    strong_company_signals = ["fortress balance sheet", "cash generative", "high returns", "exceptional", "market leader"]
-    strong_count = sum(1 for s in strong_company_signals if s in output_lower)
-
-    weak_company_signals = ["cash burning", "negative margin", "distressed", "struggling", "high debt"]
-    weak_count = sum(1 for s in weak_company_signals if s in output_lower)
-
-    # Look for rating letter grades in parentheses: (C), (C+), etc.
-    grade_match = re.search(r'\(([ABCDF][+-]?)\)', output, re.IGNORECASE)
-    if grade_match:
-        grade = grade_match.group(1).upper()
-        if grade.startswith('C') or grade.startswith('D'):
-            if strong_count >= 3 and weak_count == 0:
-                issues.append(f"RATING MISMATCH: Gave {grade} rating but analysis shows strong company fundamentals")
-        elif grade.startswith('A'):
-            if weak_count >= 3 and strong_count == 0:
-                issues.append(f"RATING MISMATCH: Gave {grade} rating but analysis shows weak company fundamentals")
-
-    return len(issues) == 0, issues
-
-
-def check_section_integration(output: str, persona_id: str) -> List[str]:
-    """
-    Check that sections of the analysis are properly integrated.
-    For example: if AR growth is mentioned in one section, it should connect
-    to cash flow discussion in another.
-
-    Returns list of integration issues.
-    """
-    issues = []
-    output_lower = output.lower()
-
-    # Define concepts that should be integrated across sections
-    integration_requirements = [
-        # (trigger concept, expected follow-up concepts, context description)
-        (
-            ["accounts receivable", "ar growth", "receivables increased", "ar balance"],
-            ["cash flow", "fcf", "working capital", "cash conversion"],
-            "AR/receivables mentioned but not connected to cash flow impact"
-        ),
-        (
-            ["inventory build", "inventory increased", "inventory growth"],
-            ["working capital", "cash flow", "fcf impact", "cash conversion"],
-            "Inventory concerns mentioned but not connected to cash flow"
-        ),
-        (
-            ["high margins", "strong margin", "operating margin"],
-            ["competitive", "moat", "pricing power", "sustainable"],
-            "High margins cited without discussing sustainability or competitive threats"
-        ),
-        (
-            ["customer concentration", "top customer", "major customer"],
-            ["risk", "concentration risk", "dependency"],
-            "Customer concentration mentioned but not addressed in risk section"
-        ),
-        (
-            ["stock-based compensation", "sbc", "share-based"],
-            ["dilution", "cash flow", "real cost"],
-            "SBC mentioned but not connected to dilution or cash flow quality"
-        ),
-    ]
-
-    for triggers, followups, description in integration_requirements:
-        # Check if any trigger concept is present
-        has_trigger = any(t in output_lower for t in triggers)
-        if has_trigger:
-            # Check if any follow-up concept is also present
-            has_followup = any(f in output_lower for f in followups)
-            if not has_followup:
-                issues.append(f"INTEGRATION GAP: {description}")
-
-    # Check for promised but undelivered analysis
-    promise_patterns = [
-        (r"we will (?:discuss|examine|analyze|explore) .{10,50} later", "later analysis promised but may not be delivered"),
-        (r"this will be (?:addressed|discussed|covered) in", "deferred analysis that may not appear"),
-    ]
-
-    for pattern, description in promise_patterns:
-        if re.search(pattern, output_lower):
-            issues.append(f"DEFERRED CONTENT: {description}")
-
-    return issues
-
-
-def check_minimum_risk_coverage(output: str, persona_id: str) -> List[str]:
-    """
-    Check that the analysis covers a minimum number of distinct risks.
-    Production-grade analysis requires 3-5 core risks.
-    This check is MANDATORY - risk section must ALWAYS be present.
-
-    Returns list of issues.
-    """
-    issues = []
-    output_lower = output.lower()
-
-    # Core risk categories that should be covered
-    risk_categories = {
-        "supply_chain": ["tsmc", "supply chain", "manufacturing", "fab", "foundry", "supplier"],
-        "geopolitical": ["china", "export control", "tariff", "geopolitical", "taiwan", "sanction", "trade war"],
-        "competition": ["amd", "intel", "competitor", "competitive", "custom asic", "hyperscaler", "google tpu", "amazon", "microsoft"],
-        "customer_concentration": ["customer concentration", "top customer", "major customer", "large customer", "hyperscaler"],
-        "valuation": ["valuation", "multiple", "expensive", "overvalued", "price risk", "high p/e", "priced in"],
-        "regulatory": ["regulatory", "regulation", "antitrust", "doj", "ftc", "eu", "compliance"],
-        "cyclical": ["cyclical", "cycle", "demand", "slowdown", "recession", "correction", "downturn"],
-        "technology": ["technology risk", "obsolescence", "disruption", "new entrant", "innovation"],
-    }
-
-    # Count how many distinct risk categories are mentioned
-    risks_covered = []
-    for category, keywords in risk_categories.items():
-        if any(kw in output_lower for kw in keywords):
-            risks_covered.append(category)
-
-    num_risks = len(risks_covered)
-
-    # Minimum requirements by persona
-    min_risks = 3  # Default minimum
-    if persona_id in ["ackman", "marks", "dalio"]:
-        min_risks = 4  # These personas should cover more risks
-    elif persona_id in ["greenblatt", "munger"]:
-        min_risks = 2  # These are more focused
-
-    if num_risks < min_risks:
-        missing_suggestions = []
-        if "supply_chain" not in risks_covered:
-            missing_suggestions.append("supply chain/TSMC dependency")
-        if "geopolitical" not in risks_covered:
-            missing_suggestions.append("China/export controls/Taiwan")
-        if "competition" not in risks_covered:
-            missing_suggestions.append("competitive threats (AMD, custom ASICs)")
-        if "valuation" not in risks_covered:
-            missing_suggestions.append("valuation risk/what's priced in")
-        if "cyclical" not in risks_covered:
-            missing_suggestions.append("cycle risk/demand volatility")
-
-        issues.append(
-            f"INSUFFICIENT RISK COVERAGE: Only {num_risks} risk categories covered, minimum {min_risks} required. "
-            f"YOU MUST INCLUDE AN EXPLICIT RISK SECTION. "
-            f"Add these risks: {', '.join(missing_suggestions[:4])}"
-        )
-
-    # Check if there's an explicit risk section/discussion
-    risk_section_keywords = [
-        "risk", "concern", "threat", "vulnerability", "downside",
-        "danger", "exposure", "headwind", "caution", "worry"
-    ]
-    risk_mention_count = sum(1 for kw in risk_section_keywords if kw in output_lower)
-
-    # For Marks especially, risk must be prominent
-    if persona_id == "marks" and risk_mention_count < 5:
-        issues.append(
-            f"RISK SECTION MISSING: Howard Marks is synonymous with risk awareness. "
-            f"Only {risk_mention_count} risk-related terms found. Include an explicit risk section with 3-5 specific risks."
-        )
-
-    return issues
-
-
-def check_mda_quality(output: str, persona_id: str) -> List[str]:
-    """
-    Check that MD&A section (if present) is substantive, not generic.
-    Production-grade MD&A should include specific themes from management.
-    Also checks for placeholder text that should be replaced with real analysis.
-
-    Returns list of issues.
-    """
-    issues = []
-    output_lower = output.lower()
-
-    # Check for placeholder/cop-out phrases that indicate lazy analysis
-    placeholder_phrases = [
-        "explicit management commentary is limited",
-        "management commentary is limited",
-        "no explicit guidance",
-        "limited disclosure",
-        "data not available",
-        "not disclosed in the filing",
-        "management did not provide",
-        "no specific commentary",
-        "information is not available",
-        "cannot be determined from",
-        "the filing does not include",
-    ]
-
-    for phrase in placeholder_phrases:
-        if phrase in output_lower:
-            issues.append(
-                f"PLACEHOLDER TEXT DETECTED: '{phrase}' - Replace with substantive analysis. "
-                f"If data is limited, infer from available metrics and state your interpretation."
-            )
-
-    # Check if there's an MD&A-like section
-    has_mda = any(pattern in output_lower for pattern in [
-        "management discussion", "md&a", "management's discussion",
-        "management commentary", "management outlook"
-    ])
-
-    if not has_mda:
-        # Not all personas need explicit MD&A
-        return issues
-
-    # MD&A quality indicators - specific themes that should be extracted
-    quality_indicators = [
-        # Segment-level detail
-        (["segment", "data center", "gaming", "automotive", "professional visualization"], "segment-level commentary"),
-        # Margin/profitability commentary
-        (["gross margin", "operating margin", "margin expansion", "margin pressure"], "margin discussion"),
-        # Growth drivers
-        (["growth driver", "revenue driver", "demand driver", "ai demand", "datacenter demand"], "growth drivers"),
-        # Capex/investment
-        (["capex", "capital expenditure", "investment", "r&d spending", "research and development"], "investment priorities"),
-        # Supply chain detail
-        (["supply chain", "capacity", "manufacturing", "inventory"], "supply chain commentary"),
-        # Guidance/Outlook
-        (["guidance", "outlook", "expect", "forecast", "anticipate", "project"], "guidance/outlook"),
-        # Inventory trends
-        (["inventory", "channel inventory", "stockpile", "buildup"], "inventory trends"),
-    ]
-
-    themes_found = 0
-    missing_themes = []
-
-    for keywords, theme_name in quality_indicators:
-        if any(kw in output_lower for kw in keywords):
-            themes_found += 1
-        else:
-            missing_themes.append(theme_name)
-
-    # Require at least 3 themes for substantive MD&A
-    if themes_found < 3:
-        issues.append(
-            f"MD&A TOO GENERIC: Only {themes_found} specific themes found. "
-            f"Include at least 3 of: segment commentary, margin discussion, growth drivers, capex, supply chain, guidance/outlook, inventory trends. "
-            f"Missing: {', '.join(missing_themes[:4])}"
-        )
-
-    # Additional requirement: if MD&A exists, it should have at least one insight about management behavior
-    management_insight_keywords = [
-        "management is", "management has", "ceo", "cfo", "executive",
-        "they are", "the company is", "leadership", "prioritizing",
-        "focused on", "investing in", "pulling back", "accelerating"
-    ]
-    has_management_insight = any(kw in output_lower for kw in management_insight_keywords)
-    if not has_management_insight:
-        issues.append(
-            "MD&A LACKS INSIGHT: Include what management is DOING, not just what they're NOT saying. "
-            "Infer management priorities from capex, R&D, hiring, or segment emphasis."
-        )
-
-    # Check for generic filler phrases that indicate shallow MD&A
-    generic_mda_patterns = [
-        r"management (?:did not|didn't) provide (?:specific|detailed)",
-        r"no specific guidance",
-        r"limited disclosure",
-        r"management's outlook remains",
-        r"going forward",
-    ]
-
-    for pattern in generic_mda_patterns:
-        if re.search(pattern, output_lower):
-            issues.append("MD&A FILLER: Contains generic filler instead of specific management themes")
-            break
-
-    return issues
-
-
-def check_executive_summary_quality(output: str, persona_id: str) -> List[str]:
-    """
-    Check that opening/executive summary section is substantive.
-    A production-grade executive summary should include:
-    - What is priced in (valuation context)
-    - Cycle position
-    - Key risks mentioned
-    - Investment stance/verdict
-
-    Returns list of issues found.
-    """
-    issues = []
-    output_lower = output.lower()
-
-    # Get the first 600 characters as the "executive summary zone"
-    exec_zone = output_lower[:600] if len(output_lower) > 600 else output_lower
-
-    # Required elements for a strong executive summary (for personas that need it)
-    exec_summary_personas = ["marks", "dalio", "buffett", "ackman"]
-
-    if persona_id not in exec_summary_personas:
-        return issues
-
-    # Check for cycle/valuation context in opening
-    cycle_keywords = ["cycle", "priced in", "valuation", "multiple", "expectations", "embedded"]
-    has_cycle_context = any(kw in exec_zone for kw in cycle_keywords)
-
-    if not has_cycle_context and persona_id in ["marks", "dalio"]:
-        issues.append(
-            "WEAK OPENING: Executive summary lacks cycle/valuation context. "
-            "Include what's priced in and where we are in the cycle."
-        )
-
-    # Check for risk mention in opening
-    risk_keywords = ["risk", "concern", "threat", "downside", "caution"]
-    has_risk_in_opening = any(kw in exec_zone for kw in risk_keywords)
-
-    if not has_risk_in_opening and persona_id in ["marks"]:
-        issues.append(
-            "WEAK OPENING: Executive summary lacks risk awareness. "
-            "Marks always mentions key risks early."
-        )
-
-    # Check for verdict signal in opening (preview of conclusion)
-    verdict_signals = ["watch", "buy", "avoid", "pass", "hold", "attractive", "unattractive", "caution warranted", "favorable", "unfavorable"]
-    has_verdict_signal = any(kw in exec_zone for kw in verdict_signals)
-
-    if not has_verdict_signal:
-        issues.append(
-            "WEAK OPENING: Executive summary lacks investment stance preview. "
-            "Give readers a sense of direction upfront."
-        )
-
-    return issues
-
-
-def check_actionable_conclusion(output: str, persona_id: str) -> List[str]:
-    """
-    Check that conclusions are actionable and specific, not vague.
-    ALL personas must have a clear verdict. This is mandatory for premium output.
-
-    Returns list of issues with conclusion quality.
-    """
-    issues = []
-    output_lower = output.lower()
-
-    # Get the last 600 characters as the "conclusion zone"
-    conclusion_zone = output_lower[-600:] if len(output_lower) > 600 else output_lower
-
-    # UNIVERSAL required elements - ALL personas need these
-    verdict_keywords = [
-        "buy", "sell", "pass", "hold", "watch", "avoid", "skip",
-        "high conviction", "wait for pullback", "attractive", "unattractive",
-        "i would", "i'd buy", "i'd pass", "i'd hold", "i'd avoid",
-        "my verdict", "my stance", "my position", "bottom line",
-        "the answer is", "therefore", "in conclusion", "ultimately"
-    ]
-
-    # Risk-related keywords that should appear somewhere in the output
-    risk_keywords = [
-        "risk", "threat", "concern", "challenge", "vulnerability",
-        "downside", "danger", "exposure", "headwind"
-    ]
-
-    # Valuation-related keywords
-    valuation_keywords = [
-        "valuation", "p/e", "multiple", "price", "expensive", "cheap",
-        "fair value", "overvalued", "undervalued", "priced in", "discount", "premium"
-    ]
-
-    # Forward-looking keywords
-    forward_keywords = [
-        "going forward", "outlook", "expect", "anticipate", "forecast",
-        "will", "should", "catalyst", "driver", "over the next"
-    ]
-
-    # Check for verdict - MANDATORY for all personas
-    has_verdict = any(kw in conclusion_zone for kw in verdict_keywords)
-    if not has_verdict:
-        issues.append("MISSING VERDICT: Every analysis MUST end with a clear investment stance (Buy/Hold/Watch/Pass/Avoid)")
-
-    # Check for valuation perspective somewhere in the output
-    has_valuation = any(kw in output_lower for kw in valuation_keywords)
-    if not has_valuation:
-        issues.append("MISSING VALUATION: Must include valuation perspective (expensive/cheap/fair value)")
-
-    # Check for risk discussion somewhere in the output
-    has_risks = any(kw in output_lower for kw in risk_keywords)
-    if not has_risks:
-        issues.append("MISSING RISKS: Must include risk discussion - every investment has risks")
-
-    # Check for forward-looking statement
-    has_forward = any(kw in output_lower for kw in forward_keywords)
-    if not has_forward:
-        issues.append("MISSING FORWARD VIEW: Must include forward-looking perspective or catalyst")
-
-    # Additional requirements for specific personas
-    activist_personas = ["ackman"]
-    risk_focused_personas = ["marks", "dalio", "bogle"]
-
-    if persona_id in activist_personas:
-        # Check for catalyst
-        catalyst_keywords = ["catalyst", "what will unlock", "the trigger", "near-term driver", "key event", "the fix"]
-        has_catalyst = any(kw in output_lower for kw in catalyst_keywords)
-        if not has_catalyst:
-            issues.append("MISSING CATALYST: Activist analysis must identify specific catalyst for value unlock")
-
-        # Check for specific action/prescription
-        action_keywords = ["must", "should", "demand", "push for", "agenda", "we would"]
-        has_action = any(kw in conclusion_zone for kw in action_keywords)
-        if not has_action:
-            issues.append("NOT PRESCRIPTIVE: Activist should state what management MUST do")
-
-    if persona_id in risk_focused_personas:
-        # These personas MUST have substantial risk discussion
-        risk_count = sum(1 for kw in risk_keywords if kw in output_lower)
-        if risk_count < 3:
-            issues.append(f"INSUFFICIENT RISK FOCUS: {persona_id.upper()} must emphasize risks (found {risk_count} risk mentions)")
-
-    # Check for vague/non-committal conclusions
-    vague_conclusion_patterns = [
-        r"requires? (?:further|more|additional) (?:analysis|research|study)",
-        r"(?:remains|continue) to (?:monitor|watch|track)",
-        r"time will tell",
-        r"only time will show",
-        r"depends on (?:future|upcoming) (?:developments|events)",
-        r"it remains to be seen",
-        r"we shall see",
-    ]
-
-    for pattern in vague_conclusion_patterns:
-        if re.search(pattern, conclusion_zone):
-            issues.append("VAGUE CONCLUSION: Conclusion defers judgment instead of taking a stance. Be decisive.")
-            break
-
-    # Check for hedging language that weakens conviction
-    hedging_patterns = [
-        r"\bI am (?:somewhat|slightly|fairly) (?:concerned|optimistic|cautious)\b",
-        r"\bthe situation is (?:mixed|unclear|uncertain)\b",
-        r"\bit could go either way\b",
-        r"\bthere are pros and cons\b",
-        r"\bon balance\b",
-        r"\bon the one hand.*on the other hand\b",
-        r"\bI'm torn\b",
-        r"\bit's hard to say\b",
-    ]
-
-    for pattern in hedging_patterns:
-        if re.search(pattern, output_lower):
-            issues.append("WEAK CONVICTION: Opinion is hedged. Take a clear stance and argue for it.")
-            break
-
-    return issues
-
-
-def check_opinion_conviction(output: str, persona_id: str) -> List[str]:
-    """
-    Check that the analysis argues for its opinion with conviction.
-    Every opinion should be supported with evidence.
-
-    Returns list of issues with conviction.
-    """
-    issues = []
-    output_lower = output.lower()
-
-    # Check for unsupported opinions (opinion word without nearby evidence)
-    opinion_words = ["should", "must", "need to", "will", "believe", "think", "expect", "anticipate"]
-    evidence_words = ["because", "given", "since", "due to", "as", "based on", "demonstrated by", "shown by", "%", "$", "billion", "million"]
-
-    # Split into sentences
-    sentences = re.split(r'[.!?]', output)
-
-    unsupported_opinions = 0
-    for sentence in sentences:
-        sentence_lower = sentence.lower()
-        has_opinion = any(word in sentence_lower for word in opinion_words)
-        has_evidence = any(word in sentence_lower for word in evidence_words)
-
-        if has_opinion and not has_evidence and len(sentence) > 30:
-            unsupported_opinions += 1
-
-    if unsupported_opinions >= 3:
-        issues.append(f"UNSUPPORTED OPINIONS: Found {unsupported_opinions} opinion statements without supporting evidence. Back up claims with data.")
-
-    # Check for passive voice which weakens conviction
-    passive_patterns = [
-        r"\bit is (?:believed|thought|expected|considered)\b",
-        r"\bit may be (?:argued|said|noted)\b",
-        r"\bcan be seen as\b",
-        r"\bcould be interpreted as\b",
-    ]
-
-    passive_count = sum(1 for pattern in passive_patterns if re.search(pattern, output_lower))
-    if passive_count >= 2:
-        issues.append("PASSIVE VOICE: Use active voice to express conviction. 'I believe X because Y' not 'It is believed that X'")
-
-    return issues
-
-
-def validate_persona_output(persona_id: str, output: str, persona: Dict) -> Tuple[bool, List[str]]:
-    """
-    Validate that output meets quality standards.
-    Uses authenticity scoring with minimum threshold of 70.
-    (Lowered from 80 to accommodate 80% objective / 20% persona approach)
-    """
-    output_lower = output.lower()
-    feedback = []
-
-    # =========================================================================
-    # INSTANT FAIL PATTERNS - These immediately reject output
-    # =========================================================================
-    INSTANT_FAIL_PATTERNS = [
-        (r'\d{1,3}\s*/\s*100', "Contains X/100 rating"),
-        (r'\d{1,2}\s*/\s*10', "Contains X/10 rating"),
-        (r'(?i)financial health rating', "Contains 'financial health rating'"),
-        (r'(?i)health rating\s*:?\s*\d+', "Contains health rating score"),
-        (r'(?i)^##\s*executive summary', "Contains '## Executive Summary' header"),
-        (r'(?i)^##\s*key risks', "Contains '## Key Risks' header"),
-        (r'(?i)^##\s*investment thesis', "Contains '## Investment Thesis' header"),
-        (r'(?i)\b(?:score|rating|grade)\s*:?\s*\d+', "Contains numeric score/rating/grade"),
-        (r'(?i)data\s+(?:is\s+)?unavailable', "Contains 'data unavailable' placeholder"),
-        (r'(?i)not\s+disclosed', "Contains 'not disclosed' placeholder"),
-        # Financial Health Rating with category breakdown that doesn't add up
-        (r'(?i)(?:profitability|leverage|liquidity|cash\s*flow)[^:]*:\s*\d+\s*/\s*\d+', "Contains sub-category scoring (X/Y)"),
-        # Total scores with breakdowns
-        (r'(?i)total[^:]*:\s*\d+\s*/\s*100', "Contains total score with 100-point scale"),
-    ]
-
-    for pattern, reason in INSTANT_FAIL_PATTERNS:
-        if re.search(pattern, output, re.MULTILINE):
-            feedback.append(f"INSTANT FAIL: {reason}")
-            return False, feedback
-
-    # =========================================================================
-    # CORPORATE ANALYST INSTANT FAIL - These phrases break ALL persona immersion
-    # =========================================================================
-    for phrase in CORPORATE_ANALYST_PHRASES:
-        if phrase.lower() in output_lower:
-            feedback.append(f"INSTANT FAIL: Corporate analyst phrase '{phrase}' - this sounds like institutional research, not {persona.get('name', 'the persona')}")
-            return False, feedback
-
-    # =========================================================================
-    # MD&A SPECULATION CHECK - Don't claim management said things they didn't
-    # =========================================================================
-    for phrase in MDA_SPECULATION_PHRASES:
-        if phrase.lower() in output_lower:
-            feedback.append(f"QUALITY ISSUE: MD&A speculation '{phrase}' - don't assume management disclosed things they didn't")
-            # Don't instant fail, but this is a quality issue
-
-    # =========================================================================
-    # INCOMPLETE SENTENCE CHECK - Detect truncated output
-    # =========================================================================
-    incomplete_issues = detect_incomplete_sentences(output, persona_id)
-    if incomplete_issues:
-        # For truncated/incomplete output, this is a serious issue
-        has_truncation = any("TRUNCATION" in issue or "INCOMPLETE" in issue for issue in incomplete_issues)
-        if has_truncation:
-            feedback.append("INSTANT FAIL: Output is incomplete or truncated")
-            for issue in incomplete_issues:
-                feedback.append(f"  - {issue}")
-            return False, feedback
-        # Other issues like missing verdict are quality issues
-        for issue in incomplete_issues:
-            feedback.append(f"QUALITY ISSUE: {issue}")
-
-    # =========================================================================
-    # UNSUPPORTED VALUATION CLAIMS - Require metrics to back claims
-    # =========================================================================
-    valuation_issues = detect_unsupported_valuation_claims(output)
-    if valuation_issues:
-        for issue in valuation_issues:
-            feedback.append(f"QUALITY ISSUE: {issue}")
-        # Don't instant fail, but deduct from score
-
-    # =========================================================================
-    # FINANCIAL FIGURE CONTEXTUALIZATION CHECK
-    # Every dollar figure should have context within 50 characters
-    # =========================================================================
-    contextualization_issues = check_financial_contextualization(output)
-    if contextualization_issues:
-        for issue in contextualization_issues:
-            feedback.append(f"QUALITY ISSUE: {issue}")
-        # Don't instant fail, but flag for awareness
-
-    # =========================================================================
-    # NUMERICAL CONTRADICTION CHECK - Catch math errors like "0.51 in 0.7-1.0 range"
-    # =========================================================================
-    contradiction_issues = detect_numerical_contradictions(output)
-    if contradiction_issues:
-        for issue in contradiction_issues:
-            feedback.append(f"CRITICAL: {issue}")
-        # This is a serious issue - deduct significantly
-        score = score if 'score' in dir() else 100  # Initialize if not yet set
-        score -= 20 * len(contradiction_issues)
-
-    # =========================================================================
-    # INTERNAL DATA INCONSISTENCY CHECK - Same metric with different values
-    # =========================================================================
-    data_inconsistency_issues = detect_internal_data_inconsistency(output)
-    has_data_inconsistency = False
-    if data_inconsistency_issues:
-        for issue in data_inconsistency_issues:
-            feedback.append(f"CRITICAL: {issue}")
-        has_data_inconsistency = True
-
-    # =========================================================================
-    # SECTION INTEGRATION CHECK - Ensure concepts are connected across sections
-    # =========================================================================
-    integration_issues = check_section_integration(output, persona_id)
-    if integration_issues:
-        for issue in integration_issues:
-            feedback.append(f"QUALITY ISSUE: {issue}")
-
-    # =========================================================================
-    # ACTIONABLE CONCLUSION CHECK - Especially for activist personas
-    # =========================================================================
-    conclusion_issues = check_actionable_conclusion(output, persona_id)
-    if conclusion_issues:
-        for issue in conclusion_issues:
-            feedback.append(f"QUALITY ISSUE: {issue}")
-
-    # =========================================================================
-    # EXECUTIVE SUMMARY QUALITY CHECK - For Marks/Dalio especially
-    # =========================================================================
-    exec_summary_issues = check_executive_summary_quality(output, persona_id)
-    if exec_summary_issues:
-        for issue in exec_summary_issues:
-            feedback.append(f"QUALITY ISSUE: {issue}")
-
-    # =========================================================================
-    # MINIMUM RISK COVERAGE CHECK - Require 3-5 distinct risks
-    # This is CRITICAL for production quality - deduct 20 points if insufficient
-    # =========================================================================
-    risk_issues = check_minimum_risk_coverage(output, persona_id)
-    has_risk_coverage_failure = False
-    if risk_issues:
-        for issue in risk_issues:
-            feedback.append(f"CRITICAL: {issue}")
-        has_risk_coverage_failure = True
-
-    # =========================================================================
-    # MD&A QUALITY CHECK - Ensure substantive management discussion
-    # Deduct 10 points for generic MD&A
-    # =========================================================================
-    mda_issues = check_mda_quality(output, persona_id)
-    if mda_issues:
-        for issue in mda_issues:
-            feedback.append(f"QUALITY ISSUE: {issue}")
-
-    # =========================================================================
-    # OPINION CONVICTION CHECK - Ensure opinions are argued with evidence
-    # =========================================================================
-    conviction_issues = check_opinion_conviction(output, persona_id)
-    if conviction_issues:
-        for issue in conviction_issues:
-            feedback.append(f"QUALITY ISSUE: {issue}")
-
-    # =========================================================================
-    # Check for voice authenticity
-    # =========================================================================
-    score, score_feedback = calculate_authenticity_score(persona_id, output, persona)
-    feedback.extend(score_feedback)
-
-    # =========================================================================
-    # DEDUCTIONS FROM SCORE - These issues reduce the authenticity score
-    # =========================================================================
-
-    # Deduct for incomplete sentences
-    if incomplete_issues:
-        score -= 10 * len(incomplete_issues)
-
-    # Deduct for unsupported valuation claims
-    if valuation_issues:
-        score -= 5 * len(valuation_issues)
-
-    # Deduct for insufficient risk coverage (20 points per issue)
-    if risk_issues:
-        score -= 20 * len(risk_issues)
-
-    # Deduct for generic MD&A (10 points per issue)
-    if mda_issues:
-        score -= 10 * len(mda_issues)
-
-    # Deduct for missing actionable conclusion (15 points per issue)
-    if conclusion_issues:
-        score -= 15 * len(conclusion_issues)
-
-    # Deduct for integration issues (5 points per issue)
-    if integration_issues:
-        score -= 5 * len(integration_issues)
-
-    # Deduct for data inconsistencies (25 points - this is critical)
-    if data_inconsistency_issues:
-        score -= 25 * len(data_inconsistency_issues)
-
-    # Deduct for weak conviction (10 points per issue)
-    if conviction_issues:
-        score -= 10 * len(conviction_issues)
-
-    # Deduct for weak executive summary (10 points per issue)
-    if exec_summary_issues:
-        score -= 10 * len(exec_summary_issues)
-
-    # =========================================================================
-    # Check conclusion consistency
-    # =========================================================================
-    is_consistent, consistency_issues = check_conclusion_consistency(output)
-    if not is_consistent:
-        feedback.extend(consistency_issues)
-        score -= 10  # Penalty for inconsistent conclusion
-
-    # =========================================================================
-    # HARD FAILURE CONDITIONS - These ALWAYS fail validation
-    # =========================================================================
-    has_hard_failure = False
-
-    # Insufficient risk coverage is a hard failure for production quality
-    if has_risk_coverage_failure:
-        has_hard_failure = True
-        feedback.insert(0, "HARD FAILURE: Insufficient risk coverage - premium analysis requires 3-5 distinct risks")
-
-    # Missing actionable conclusion is a hard failure for activist personas
-    if conclusion_issues and persona_id in ["ackman", "marks", "dalio", "greenblatt"]:
-        has_hard_failure = True
-        feedback.insert(0, f"HARD FAILURE: Missing actionable conclusion - {persona_id.upper()} analysis requires clear verdict")
-
-    # Data inconsistency is a hard failure - premium analysis cannot have conflicting figures
-    if has_data_inconsistency:
-        has_hard_failure = True
-        feedback.insert(0, "HARD FAILURE: Data inconsistency detected - same metric cited with different values")
-
-    # Require minimum score of 70 to pass (accommodates 80% objective / 20% persona)
-    # Also fail on hard failures regardless of score
-    is_valid = score >= 70 and is_consistent and not has_hard_failure
-
-    if not is_valid:
-        feedback.insert(0, f"Authenticity score: {score}/100 (minimum: 70)")
-
-    # =========================================================================
-    # Additional voice check: first-person vs third-person
-    # Note: With 80% objective / 20% persona, we don't require first-person
-    # =========================================================================
-    # Removed first-person requirement - analysis should be primarily objective
-
-    return is_valid, feedback
-
-
-def validate_persona_output_strict(persona_id: str, output: str, persona: Dict) -> Tuple[bool, List[str]]:
-    """
-    Original strict validation for backward compatibility.
-    """
-    issues = []
-    output_lower = output.lower()
-    
-    # =======================================================================
-    # CRITICAL: No ratings or scores for ANY persona (expanded patterns)
-    # =======================================================================
-    rating_patterns = [
-        r'\d{1,3}\s*/\s*100',  # 72/100
-        r'\d{1,2}\s*/\s*10',   # 8/10
-        r'\d+\s*out of\s*\d+', # 8 out of 10
-        r'(?:rating|score|grade)\s*:?\s*\d+',  # rating: 72
-        r'health rating',
-        r'financial health rating',
-        r'\(\s*[A-F][+-]?\s*\)',  # (A+), (B-)
-    ]
-    for pattern in rating_patterns:
-        if re.search(pattern, output_lower):
-            issues.append("CRITICAL: Contains ratings/scores - real investors don't give numeric ratings")
-            break
-    
-    # =======================================================================
-    # No generic section headers (breaks narrative flow)
-    # =======================================================================
-    generic_sections = [
-        "executive summary", "key risks:", "investment thesis:", "risk factors:",
-        "key data appendix", "financial health", "## key", "## risk", "## investment",
-        "## executive", "## conclusion", "## summary", "## analysis"
-    ]
-    # Note: "## Final Recommendation Summary" is allowed and required now
-    # Remove it from the check text so it doesn't trigger "## summary" or "## recommendation" bans
-    check_text = output_lower.replace("## final recommendation summary", "")
-    
-    for section in generic_sections:
-        if section in check_text:
-            issues.append(f"Generic section header breaks narrative: '{section}'")
-    
-    # =======================================================================
-    # Check for banned generic phrases (corporate fluff)
-    # =======================================================================
-    banned_found = []
-    for phrase in BANNED_GENERIC_PHRASES:
-        if phrase.lower() in output_lower:
-            banned_found.append(phrase)
-    if banned_found:
-        issues.append(f"Contains banned generic phrases: {banned_found[:3]}")
-    
-    # =======================================================================
-    # Must use at least 3 signature concepts (increased from 2)
-    # =======================================================================
-    signature_concepts = persona.get("signature_concepts", [])
-    concepts_found = sum(1 for concept in signature_concepts if concept.lower() in output_lower)
-    min_required = 3 if persona_id != "greenblatt" else 2  # Greenblatt is intentionally minimal
-    if concepts_found < min_required:
-        issues.append(f"Missing signature concepts - only found {concepts_found}/{min_required} ({signature_concepts[:4]})")
-    
-    # =======================================================================
-    # Check for voice anchor usage (new requirement)
-    # =======================================================================
-    if persona_id in PERSONA_VOICE_ANCHORS:
-        anchors = PERSONA_VOICE_ANCHORS[persona_id]
-        must_use = anchors.get("must_use_phrases", [])
-        must_use_found = sum(1 for phrase in must_use if phrase.lower() in output_lower)
-        if must_use_found < 1:
-            issues.append(f"Missing mandatory voice anchors - need at least 1 of: {must_use}")
-        
-        # Check for forbidden phrases
-        never_says = anchors.get("never_says", [])
-        forbidden_found = [phrase for phrase in never_says if phrase.lower() in output_lower]
-        if forbidden_found:
-            issues.append(f"Uses forbidden phrases for this persona: {forbidden_found}")
-    
-    # =======================================================================
-    # Persona-specific validation (stricter)
-    # =======================================================================
-    if persona_id == "marks":
-        # Marks must discuss cycles/pendulum, cannot be confrontational
-        marks_concepts = ["pendulum", "cycle", "second-level", "asymmetry"]
-        if sum(1 for w in marks_concepts if w in output_lower) < 2:
-            issues.append("Marks must discuss at least 2 of: pendulum, cycles, second-level thinking, asymmetry")
-        confrontational = ["i demand", "this raises serious questions", "demands investigation", "concerning", "problematic"]
-        for phrase in confrontational:
-            if phrase in output_lower:
-                issues.append(f"Marks is reflective, not confrontational: remove '{phrase}'")
-        # Marks writes essays, not bullet points
-        if output.count('- ') > 5 or output.count('• ') > 3:
-            issues.append("Marks writes flowing essays, not bullet-point lists")
-
-        # MARKS SIGNATURE: Must address cycle positioning
-        cycle_positioning_terms = ["early cycle", "mid cycle", "late cycle", "peak", "trough",
-                                   "where we are in the cycle", "stage of the cycle", "cycle position"]
-        has_cycle_positioning = any(term in output_lower for term in cycle_positioning_terms)
-        if not has_cycle_positioning:
-            issues.append("MARKS SIGNATURE MISSING: Must articulate where we are in the cycle (early/mid/late, peak optimism, etc.)")
-
-        # MARKS SIGNATURE: Must address priced-in expectations
-        priced_in_terms = ["priced in", "priced-in", "already reflected", "embedded in", "market is pricing",
-                          "expectations are", "assumes", "pricing in", "discounting"]
-        has_priced_in = any(term in output_lower for term in priced_in_terms)
-        if not has_priced_in:
-            issues.append("MARKS SIGNATURE MISSING: Must articulate what expectations are already priced in")
-
-        # MARKS SIGNATURE: Risk/reward asymmetry must be quantified
-        asymmetry_terms = ["upside", "downside", "asymmetry", "risk/reward", "risk-reward", "skewed"]
-        has_asymmetry = any(term in output_lower for term in asymmetry_terms)
-        if not has_asymmetry:
-            issues.append("MARKS SIGNATURE MISSING: Must articulate risk/reward asymmetry (upside vs downside)")
-
-    if persona_id == "buffett":
-        buffett_concepts = ["moat", "owner earnings", "wonderful", "mr. market", "circle of competence", "toll"]
-        if sum(1 for w in buffett_concepts if w in output_lower) < 2:
-            issues.append("Buffett must mention at least 2 of: moat, owner earnings, wonderful company, circle of competence")
-        # Buffett doesn't use Wall Street jargon
-        jargon = ["ebitda", "comps", "dcf", "multiple expansion"]
-        jargon_found = [j for j in jargon if j in output_lower]
-        if jargon_found:
-            issues.append(f"Buffett avoids Wall Street jargon: {jargon_found}")
-    
-    if persona_id == "munger":
-        if "i believe" in output_lower or "in my opinion" in output_lower or "potentially" in output_lower:
-            issues.append("Munger doesn't hedge - remove hedging language")
-        # Munger is pithy - check sentence length
-        sentences = output.split('.')
-        avg_words = sum(len(s.split()) for s in sentences) / max(len(sentences), 1)
-        if avg_words > 25:
-            issues.append("Munger is pithy - sentences should be shorter and punchier")
-    
-    if persona_id == "graham":
-        # Graham needs specific numbers - at least 3
-        numbers_found = len(re.findall(r'\$[\d,]+|\d+\.?\d*%', output))
-        if numbers_found < 3:
-            issues.append(f"Graham analysis needs more specific numbers (found {numbers_found}, need 3+)")
-        # Graham is academic - check for superlatives
-        superlatives = ["exciting", "impressive", "amazing", "incredible", "fantastic"]
-        if any(s in output_lower for s in superlatives):
-            issues.append("Graham doesn't use superlatives - keep it measured and academic")
-    
-    if persona_id == "lynch":
-        # Lynch MUST have PEG ratio
-        if "peg" not in output_lower:
-            issues.append("Lynch analysis MUST include PEG ratio calculation")
-
-        # Lynch must classify the stock
-        classifications = ["fast grower", "stalwart", "slow grower", "cyclical", "turnaround", "asset play"]
-        if not any(c in output_lower for c in classifications):
-            issues.append("Lynch analysis MUST classify the stock (Fast Grower, Stalwart, Slow Grower, Cyclical, Turnaround, Asset Play)")
-
-        # Lynch must explain what the company does
-        story_indicators = ["they make", "they sell", "they provide", "the business", "customers", "the story"]
-        if not any(s in output_lower for s in story_indicators):
-            issues.append("Lynch analysis MUST include 'the story' - what the company does in plain English")
-
-        # Lynch should NOT have factor-based ratings
-        rating_patterns = [r'\d+/100', r'\d+\s*/\s*10', r'health rating', r'scoring', r'factor.*score']
-        if any(re.search(p, output, re.IGNORECASE) for p in rating_patterns):
-            issues.append("Lynch does NOT use factor-based scoring or health ratings - remove them")
-
-        # Banned corporate analyst phrases
-        lynch_banned = ["margin trajectory", "capital allocation", "operational excellence",
-                        "valuation is pricing in", "macro headwinds", "regulatory uncertainty",
-                        "operating leverage", "multiple expansion", "secular growth"]
-        lynch_banned_found = [p for p in lynch_banned if p in output_lower]
-        if lynch_banned_found:
-            issues.append(f"Lynch uses plain English, avoid jargon: {lynch_banned_found}")
-    
-    if persona_id == "dalio":
-        dalio_concepts = ["cycle", "mechanism", "paradigm", "correlation", "debt", "deleveraging", "macro"]
-        if sum(1 for w in dalio_concepts if w in output_lower) < 1:
-            issues.append("Cycle-aware analysis should reference cycles, mechanisms, or macro factors")
-    
-    if persona_id == "wood":
-        wood_concepts = ["wright", "s-curve", "disruption", "exponential", "2030", "tam", "innovation", "adoption"]
-        if sum(1 for w in wood_concepts if w in output_lower) < 1:
-            issues.append("Innovation analysis should reference disruption, S-curves, or exponential growth")
-    
-    if persona_id == "greenblatt":
-        # Greenblatt MUST have both ROC and Earnings Yield with actual math
-        has_roc = bool(re.search(r'return on capital', output_lower) or
-                      re.search(r'roc[:\s]+\d+', output_lower) or
-                      re.search(r'roic', output_lower) or
-                      re.search(r'ebit.*÷.*invested capital', output_lower) or
-                      re.search(r'ebit.*\/.*invested capital', output_lower) or
-                      re.search(r'ebit.*÷.*net working capital', output_lower))
-        if not has_roc:
-            issues.append("Magic Formula MUST include Return on Capital (ROC/ROIC) with EBIT ÷ Invested Capital")
-
-        has_earnings_yield = bool(re.search(r'earnings yield', output_lower) or
-                                 re.search(r'ebit.*÷.*enterprise value', output_lower) or
-                                 re.search(r'ebit.*\/.*enterprise value', output_lower) or
-                                 re.search(r'ebit/ev', output_lower) or
-                                 re.search(r'ebit / ev', output_lower))
-        if not has_earnings_yield:
-            issues.append("Magic Formula MUST include Earnings Yield (EBIT/EV) with actual calculation")
-
-        # Greenblatt MUST have valuation context (at least one metric)
-        valuation_metrics = ["forward p/e", "ev/ebit", "fcf yield", "ev/fcf", "p/e", "pe ratio", "times earnings"]
-        has_valuation = any(v in output_lower for v in valuation_metrics)
-        if not has_valuation:
-            issues.append("Magic Formula MUST include valuation context (Forward P/E, EV/EBIT, or FCF Yield)")
-
-        # Greenblatt MUST classify using Magic Formula thresholds
-        classification_patterns = ["good and cheap", "good but expensive", "cheap but not good", "neither",
-                                   "high roc", "low roc", ">15%", "<15%", ">8%", "<8%", "buy", "pass", "watch"]
-        has_classification = any(c in output_lower for c in classification_patterns)
-        if not has_classification:
-            issues.append("Magic Formula MUST explicitly classify: 'Good AND Cheap', 'Good but Expensive', etc.")
-
-        # Greenblatt MUST have a verdict with clear stance
-        verdict_patterns = ["verdict", "buy", "pass", "watch", "good and cheap", "good but expensive", "not good"]
-        if not any(v in output_lower for v in verdict_patterns):
-            issues.append("Magic Formula MUST include verdict: Buy, Watch, or Pass with valuation anchor")
-
-        # Greenblatt risk statements must be complete with probability/severity
-        risk_incomplete_patterns = [
-            r'presents?\s+a\s+major\s+risk\s*\.\s*$',  # ends with "major risk." no explanation
-            r'this\s+reliance\s+.*risk\s*\.\s*$',  # "this reliance...risk." incomplete
-            r'operating\s+in\s+a\s+high[^.]*$',  # "operating in a high..." trails off
-        ]
-        for pattern in risk_incomplete_patterns:
-            if re.search(pattern, output, re.IGNORECASE):
-                issues.append("Risk statements MUST include probability and severity - do not leave incomplete")
-
-        # Greenblatt should NOT have ratings
-        rating_patterns = [r'\d+/100', r'\d+\s*/\s*10', r'[ABCDF][+-]?\s+rating', r'rating:\s*\d+', r'score:\s*\d+', r'health.*rating', r'\d+/15']
-        if any(re.search(p, output, re.IGNORECASE) for p in rating_patterns):
-            issues.append("Greenblatt does NOT use numeric ratings - only ROC and Earnings Yield")
-
-        # Greenblatt word count - updated for new template
-        word_count = len(output.split())
-        if word_count > 350:
-            issues.append(f"Greenblatt output too verbose ({word_count} words). Target is 200-300 words.")
-        elif word_count < 150:
-            issues.append(f"Greenblatt output too brief ({word_count} words). Must include ROC, Earnings Yield, valuation, risks, and verdict.")
-
-        # Greenblatt should NOT use narrative/emotional language
-        narrative_phrases = [
-            "i worry", "i am always", "i remain cautious", "i would prefer",
-            "excessive optimism", "potential weaknesses", "searching for",
-            "i am concerned", "my concern", "remains to be seen",
-            "time will tell", "only time", "careful observation",
-            "precisely what i seek", "this earnings power is precisely",
-            "the thesis", "the story", "narrative"
-        ]
-        narrative_found = [p for p in narrative_phrases if p in output_lower]
-        if narrative_found:
-            issues.append(f"Greenblatt is clinical, not conversational: remove {narrative_found}")
-
-        # Greenblatt sentences should be concise (max 35 words)
-        sentences = re.split(r'[.!?]+', output)
-        long_sentences = [s for s in sentences if len(s.split()) > 35]
-        if long_sentences:
-            issues.append(f"Greenblatt sentences must be ≤35 words. Found {len(long_sentences)} long sentence(s).")
-
-        # Greenblatt should NOT ask for unrealistic management disclosures
-        unrealistic_requests = [
-            "management should provide", "management should disclose",
-            "provide roi on", "offer margin guidance", "detailed timelines",
-            "projected revenue contribution", "sensitivity analysis",
-            "scenario analysis", "provide projected", "offer guidance",
-            "should offer transparency", "would prefer more transparency",
-            "smart goal", "kpi target", "kpi milestone", "quarterly target",
-            "monthly target", "detailed breakdown", "segment-level projection",
-            "we need management to", "investors require", "lack of disclosure"
-        ]
-        unrealistic_found = [p for p in unrealistic_requests if p in output_lower]
-        if unrealistic_found:
-            issues.append(f"Greenblatt doesn't request unrealistic management disclosures: {unrealistic_found}")
-
-        # Greenblatt should NOT use Lynch-style storytelling
-        lynch_contamination = [
-            "the story", "what inning", "tenbagger", "wall street is missing",
-            "i'd buy this", "i'd pass", "explaining to a friend", "peg ratio"
-        ]
-        lynch_found = [p for p in lynch_contamination if p in output_lower]
-        if lynch_found:
-            issues.append(f"Cross-contamination with Lynch style: {lynch_found}")
-
-        # Greenblatt should NOT use sell-side analyst jargon
-        analyst_jargon = [
-            "margin trajectory", "capital allocation framework",
-            "operational excellence", "secular growth", "multiple expansion",
-            "valuation is pricing in", "headwinds", "tailwinds"
-        ]
-        jargon_found = [p for p in analyst_jargon if p in output_lower]
-        if jargon_found:
-            issues.append(f"Greenblatt avoids sell-side jargon: {jargon_found}")
-
-    # =======================================================================
-    # COMPETITIVE LANDSCAPE VALIDATION (all personas)
-    # =======================================================================
-    # If output discusses competition, it must conclude with moat implications
-    competitive_keywords = ["compet", "rival", "market share", "pricing power", "switching cost", "barrier"]
-    discusses_competition = any(kw in output_lower for kw in competitive_keywords)
-
-    if discusses_competition:
-        # Check for moat/implication conclusion
-        moat_conclusion_terms = [
-            "moat", "pricing power", "barrier to entry", "switching cost",
-            "competitive advantage", "durable", "sustainable", "threatens",
-            "structural risk", "margin pressure", "commodit", "differentiation"
-        ]
-        has_moat_conclusion = any(term in output_lower for term in moat_conclusion_terms)
-        if not has_moat_conclusion:
-            issues.append("COMPETITIVE LANDSCAPE: When discussing competition, must conclude with moat/pricing power implications")
-
-    if persona_id == "bogle":
-        bogle_concepts = ["index", "haystack", "stay the course", "cost", "90%", "diversif", "market", "fees", "compounding", "concentration"]
-        if sum(1 for w in bogle_concepts if w in output_lower) < 3:
-            issues.append("Bogle analysis should reference indexing, costs, fees, diversification, or concentration (need at least 3)")
-
-        # Bogle MUST discuss valuation
-        valuation_terms = ["p/e", "pe ratio", "earnings yield", "times earnings", "valuation", "price-to-earnings", "multiple", "16x", "speculative"]
-        if not any(v in output_lower for v in valuation_terms):
-            issues.append("Bogle analysis MUST discuss valuation (P/E vs historical 16x average)")
-
-        # Bogle MUST include risk factors
-        risk_terms = ["risk", "tsmc", "dependency", "geopolitical", "concentration", "cyclical", "competitive", "china", "export"]
-        risk_count = sum(1 for r in risk_terms if r in output_lower)
-        if risk_count < 2:
-            issues.append("Bogle analysis MUST include specific risk factors (TSMC dependency, geopolitical, customer concentration, cyclical demand)")
-
-        # Bogle MUST include concentration warning
-        concentration_terms = ["concentration", "single stock", "one stock", "one company", "unsystematic", "haystack", "4,000", "diversif"]
-        if not any(c in output_lower for c in concentration_terms):
-            issues.append("Bogle analysis MUST include concentration warning (single stock risk vs diversified index)")
-
-        # Bogle MUST include index alternative discussion
-        index_terms = ["0.03%", "expense ratio", "total market", "index fund", "vanguard", "low cost", "low-cost"]
-        if not any(i in output_lower for i in index_terms):
-            issues.append("Bogle analysis MUST discuss the index alternative (0.03% expense ratio, total market fund)")
-
-        # Bogle MUST have concluding investment stance
-        conclusion_terms = ["would not", "own the index", "superior choice", "risk-adjusted", "for most investors",
-                          "concentration risk dominates", "remains the superior", "do not recommend", "recommend against"]
-        if not any(c in output_lower for c in conclusion_terms):
-            issues.append("Bogle analysis MUST end with clear investment stance (index vs single stock recommendation)")
-
-        # Bogle should NOT have ratings
-        rating_patterns = [r'\d+/100', r'\d+\s*/\s*10', r'[ABCDF][+-]?\s+rating', r'rating:\s*\d+', r'score:\s*\d+']
-        if any(re.search(p, output, re.IGNORECASE) for p in rating_patterns):
-            issues.append("Bogle analysis should NOT include ratings or scores")
-
-        # Check for incomplete comparisons
-        incomplete_comparison = re.search(r'compared\s+to\s+\$\d+\.(?:\s*$|\s*[A-Z])', output)
-        if incomplete_comparison:
-            issues.append("Bogle analysis has incomplete comparison - must complete: 'compared to $X.XX [units] [context]'")
-
-        # Check for questions without conclusions (MD&A issue)
-        question_count = output.count('?')
-        if question_count > 3:
-            issues.append(f"Bogle analysis has {question_count} questions - reduce questions, provide conclusions instead")
-    
-    if persona_id == "ackman":
-        ackman_concepts = ["catalyst", "fix", "target", "simple", "predictable", "free cash flow", "value", "improvement"]
-        if sum(1 for w in ackman_concepts if w in output_lower) < 1:
-            issues.append("Activist analysis should identify catalysts, fixes, or targets")
-        # Ackman is specific - should have numbers
-        if not re.search(r'\$\d+|\d+%', output):
-            issues.append("Activist analysis benefits from concrete numbers or targets")
-
-        # ACKMAN SIGNATURE: Must have valuation section
-        valuation_terms = ["p/e", "pe ratio", "fcf yield", "ev/ebitda", "ev/fcf", "multiple", "times earnings", "valuation"]
-        if not any(v in output_lower for v in valuation_terms):
-            issues.append("ACKMAN SIGNATURE MISSING: Must include valuation (P/E, FCF Yield, EV/EBITDA)")
-
-        # ACKMAN SIGNATURE: Must have capital allocation prescription
-        capital_terms = ["buyback", "repurchase", "dividend", "leverage", "debt", "balance sheet", "capital return", "capital allocation"]
-        if not any(c in output_lower for c in capital_terms):
-            issues.append("ACKMAN SIGNATURE MISSING: Must include capital allocation prescription (buybacks, dividends, leverage)")
-
-        # ACKMAN SIGNATURE: Must have investment stance/conclusion
-        stance_terms = ["buy", "sell", "pass", "watch", "high conviction", "overvalued", "undervalued", "attractive", "verdict", "conclusion"]
-        if not any(s in output_lower for s in stance_terms):
-            issues.append("ACKMAN SIGNATURE MISSING: Must include investment stance (Buy/Watch/Pass)")
-
-        # ACKMAN SIGNATURE: Must discuss growth outlook
-        growth_terms = ["growth", "trajectory", "revenue growth", "margin", "outlook", "forward", "next year", "2025", "2026"]
-        if not any(g in output_lower for g in growth_terms):
-            issues.append("ACKMAN SIGNATURE MISSING: Must include growth outlook (forward revenue, margin trajectory)")
-
-        # ACKMAN: Uses first person and prescriptive language
-        if "we " not in output_lower and "i " not in output_lower:
-            issues.append("Ackman uses first person ('We believe...', 'I demand...')")
-
-        # ACKMAN: Should name specific competitors
-        if "amd" not in output_lower and "intel" not in output_lower and "hyperscaler" not in output_lower:
-            issues.append("Ackman names specific competitors (AMD, Intel, hyperscalers, etc.)")
-
-    # Minimum length (except Greenblatt who should be brief)
-    word_count = len(output.split())
-    min_words = 80 if persona_id == "greenblatt" else 120
-    if word_count < min_words:
-        issues.append(f"Too short ({word_count} words, need {min_words}+)")
-    
-    return len(issues) == 0, issues
+        if other_persona != persona_id:
+            for marker in markers:
+                if marker.lower() in output_lower and marker.lower() not in [p.lower() for p in must_use + encouraged]:
+                    score -= 5
+                    feedback.append(f"Voice contamination: '{marker}' belongs to {other_persona}")
+
+    return max(0, score), feedback
 
 
 # =============================================================================
-# PERSONA ENGINE
+# PERSONAS - Mapping of persona ID to persona information
 # =============================================================================
+
+PERSONAS = {
+    "buffett": {
+        "name": "Warren Buffett",
+        "philosophy": "Invest in businesses with durable competitive advantages and long-term value creation. Focus on companies with strong moats, predictable earnings, and shareholder-friendly management. Buy when the market is irrational and sell when it's overvalued. The key is patience and understanding the business model.",
+        "voice_style": "Folksy, patient, humble, conversational. Uses analogies like 'Mr. Market' and 'toll bridge'. Speaks in simple terms about business fundamentals and long-term value.",
+        "framework": "Circle of Competence: Invest only in businesses you understand deeply. Focus on companies with durable competitive advantages (moats) that protect profits from competition. Value is in the business, not the stock price.",
+        "key_metrics": ["moat", "owner earnings", "circle of competence", "durable competitive advantage", "margin of safety", "long-term value"],
+    },
+    "munger": {
+        "name": "Charlie Munger",
+        "philosophy": "Invest in businesses that solve real problems and create lasting value. Focus on companies with powerful mental models and simple business models. The key is understanding the business and avoiding complex financial engineering.",
+        "voice_style": "Blunt, pithy, sardonic. Uses mental models like 'lollapalooza' and 'incentives matter'. Speaks in short, declarative sentences with minimal hedging.",
+        "framework": "Mental Models: Use a diverse set of mental models (e.g., psychology, business, physics) to understand companies. Focus on businesses that solve real problems and create lasting value.",
+        "key_metrics": ["mental models", "lollapalooza", "incentives", "stupid", "obviously", "asinine", "simple business"],
+    },
+    "graham": {
+        "name": "Benjamin Graham",
+        "philosophy": "Invest in companies with strong intrinsic value and a margin of safety. Focus on companies with predictable earnings, strong balance sheets, and low debt. The key is buying at a significant discount to intrinsic value.",
+        "voice_style": "Academic, measured, quantitative. Uses formal prose with specific numbers and avoids adjectives. Focuses on financial metrics and risk management.",
+        "framework": "Intrinsic Value: The true value of a company based on its financials. Margin of Safety: The buffer between intrinsic value and market price. Focus on companies with strong balance sheets and predictable earnings.",
+        "key_metrics": ["margin of safety", "intrinsic value", "net current asset", "intelligent investor", "speculator", "Mr. Market", "financial metrics"],
+    },
+    "lynch": {
+        "name": "Peter Lynch",
+        "philosophy": "Invest in companies with strong growth potential and simple business models. Focus on companies with clear stories and real products. The key is understanding the business and its customers.",
+        "voice_style": "Enthusiastic, practical, accessible. Uses stories about real products and customers. Focuses on growth, valuation, and business classification.",
+        "framework": "Story-Based Analysis: Understand the business story, customers, and growth potential. Focus on companies with clear stories and real products.",
+        "key_metrics": ["PEG ratio", "tenbagger", "fast grower", "stalwart", "story", "boring", "Wall Street is missing", "know the company", "kick the tires"],
+    },
+    "dalio": {
+        "name": "Ray Dalio",
+        "philosophy": "Invest in businesses that align with macroeconomic cycles. Focus on companies that benefit from economic expansion and are resilient during downturns. The key is understanding the economic cycle and timing.",
+        "voice_style": "Systematic, mechanical, dispassionate. Uses macroeconomic analysis and economic cycles. Focuses on the broader economic environment.",
+        "framework": "Macro-Cycle Investing: Understand the current phase of the economic cycle (expansion, peak, contraction, trough). Invest in businesses that benefit from expansion and are resilient during downturns.",
+        "key_metrics": ["debt cycle", "economic machine", "paradigm", "deleveraging", "correlation", "debt cycle", "mechanism", "risk parity", "credit", "liquidity"],
+    },
+    "wood": {
+        "name": "Cathie Wood",
+        "philosophy": "Invest in companies with disruptive technologies and exponential growth potential. Focus on companies that are creating new markets and solving real problems. The key is understanding the technology and market potential.",
+        "voice_style": "Visionary, optimistic, long-horizon. Uses future-focused analysis and exponential thinking. Focuses on disruptive technologies and market potential.",
+        "framework": "Exponential Growth: Focus on companies with disruptive technologies and exponential growth potential. The key is understanding the technology and market potential.",
+        "key_metrics": ["disruption", "exponential", "Wright's Law", "S-curve", "TAM", "convergence", "2030", "market potential"],
+    },
+    "greenblatt": {
+        "name": "Joel Greenblatt",
+        "philosophy": "Invest in companies with high return on capital and high earnings yield. Focus on companies with strong financials and low valuation. The key is using the Magic Formula to identify good companies.",
+        "voice_style": "Minimal, formula-driven, matter-of-fact. Uses the Magic Formula to identify good companies. Focuses on financial metrics and simple calculations.",
+        "framework": "Magic Formula: Use the Magic Formula to identify good companies. The key is high return on capital and high earnings yield.",
+        "key_metrics": ["return on capital", "earnings yield", "Magic Formula", "good company", "cheap price", "mean reversion", "ROIC", "EV/EBIT"],
+    },
+    "bogle": {
+        "name": "John Bogle",
+        "philosophy": "Invest in index funds and diversified portfolios. Focus on low-cost, diversified investments. The key is long-term compounding and avoiding active management.",
+        "voice_style": "Wise, humble, grandfatherly. Uses long-term perspective and diversified portfolios. Focuses on low-cost, diversified investments.",
+        "framework": "Index Investing: Invest in low-cost index funds and diversified portfolios. The key is long-term compounding and avoiding active management.",
+        "key_metrics": ["costs", "index", "haystack", "stay the course", "90%", "speculation", "compounding", "simplicity", "diversification", "fees", "long-term"],
+    },
+    "marks": {
+        "name": "Howard Marks",
+        "philosophy": "Invest in businesses with strong competitive advantages and long-term value. Focus on companies with durable competitive advantages and strong balance sheets. The key is understanding the business and its competitive landscape.",
+        "voice_style": "Thoughtful, cyclical, risk-focused. Uses second-level thinking and cycle awareness. Focuses on risk control and contrarian positioning.",
+        "framework": "Second-Level Thinking: Understand the business and its competitive landscape. Focus on companies with strong competitive advantages and long-term value.",
+        "key_metrics": ["second-level thinking", "cycle", "risk control", "durable competitive advantage", "long-term value", "competitive landscape"],
+    },
+    "ackman": {
+        "name": "Bill Ackman",
+        "philosophy": "Invest in companies with strong competitive advantages and long-term value. Focus on companies with durable competitive advantages and strong balance sheets. The key is understanding the business and its competitive landscape.",
+        "voice_style": "Bold, activist, conviction-driven. Uses activist lens and catalyst focus. Focuses on simple businesses with clear improvement paths.",
+        "framework": "Activist Value: Understand the business and its competitive landscape. Focus on companies with strong competitive advantages and long-term value.",
+        "key_metrics": ["activist", "catalyst", "simple business", "durable competitive advantage", "long-term value", "competitive landscape"],
+    },
+}
+
 
 class PersonaEngine:
-    """Generate investment analyses through different analytical lenses."""
-
-    def __init__(self, gemini_client: GeminiClient):
-        self.gemini_client = gemini_client
-        self.personas = INVESTOR_PERSONAS
-        self.few_shot_examples = FEW_SHOT_EXAMPLES
-        self.prompt_templates = PERSONA_PROMPT_TEMPLATES
+    """Engine for generating persona-specific investment analyses."""
+    
+    def __init__(self):
+        self.gemini_client = GeminiClient()
     
     def generate_persona_analysis(
         self,
         persona_id: str,
         company_name: str,
         general_summary: str,
-        ratios: Dict[str, float],
-        financial_data: Optional[Dict[str, Any]] = None,
+        ratios: Dict,
+        financial_data: Dict,
         target_length: Optional[int] = None
     ) -> Dict[str, Any]:
         """
-        Generate an investment analysis through the specified analytical lens.
-
+        Generate a persona-specific analysis for a company.
+        
         Args:
-            persona_id: ID of the investor persona (e.g., "dalio", "buffett")
+            persona_id: ID of the persona (e.g., 'buffett', 'bogle')
             company_name: Name of the company being analyzed
-            general_summary: General company summary or minimal context
+            general_summary: Brief context about the company
             ratios: Financial ratios dictionary
-            financial_data: Optional raw financial data
-            target_length: Optional target word count (uses persona default if not provided)
-
+            financial_data: Raw financial data dictionary
+            target_length: Optional target word count
+        
         Returns:
-            Dictionary with persona analysis results
+            Dictionary with persona analysis including summary, stance, reasoning, key_points
         """
-
-        # Normalize persona ID (handle frontend IDs like warren_buffett)
+        # Normalize persona ID
         normalized_id = normalize_persona_id(persona_id)
         
-        if normalized_id not in self.personas:
-            raise ValueError(f"Persona {persona_id} (normalized: {normalized_id}) not found")
+        # Get persona info
+        persona_info = PERSONAS.get(normalized_id)
+        if not persona_info:
+            return {
+                "persona_name": persona_id,
+                "summary": f"Unknown persona: {persona_id}",
+                "stance": "Hold",
+                "reasoning": "Persona not found",
+                "key_points": []
+            }
         
-        persona = self.personas[normalized_id]
-        # Per-request variation token to reduce repetitive phrasing across runs
-        variation_token = uuid4().hex[:8].upper()
+        # Extract company-specific context
+        company_context = extract_company_specific_context(company_name, financial_data, ratios)
         
-        # Extract company-specific context for relevant risks
-        company_context = extract_company_specific_context(
-            company_name, financial_data or {}, ratios
+        # Get persona-relevant metrics
+        metrics_context = extract_persona_relevant_metrics(
+            persona_id=normalized_id,
+            ratios=ratios,
+            financial_data=financial_data,
+            company_name=company_name
         )
         
-        # Get metrics
-        metrics_block = extract_persona_relevant_metrics(
-            normalized_id, ratios, financial_data or {}, company_name
-        )
-        
-        # Build prompt with company context
-        prompt = self._build_prompt(
-            normalized_id, company_name, metrics_block, general_summary, company_context, variation_token=variation_token
-        )
-        
-        # Generate with validation retry
-        max_retries = 3
-        last_output = ""
-        last_issues = []
-        
-        for attempt in range(max_retries):
-            try:
-                # On retry, rebuild prompt with stronger constraints
-                if attempt > 0 and last_issues:
-                    prompt = self._build_retry_prompt(
-                        normalized_id, company_name, metrics_block, 
-                        company_context, last_issues, attempt, variation_token=variation_token
-                    )
-                
-                result = self.gemini_client.generate_premium_persona_view(
-                    prompt=prompt,
-                    persona_name=persona["name"]
-                )
-                
-                summary_text = result.get("summary", "")
-
-                # Apply post-generation sanitization with company context for industry-aware filtering
-                summary_text = sanitize_persona_output(summary_text, company_context)
-                # Also apply mid-text ellipsis fix
-                summary_text = fix_mid_text_ellipsis(summary_text)
-                result["summary"] = summary_text
-                last_output = summary_text
-                
-                # Validate
-                is_valid, issues = validate_persona_output(normalized_id, summary_text, persona)
-                last_issues = issues
-
-                if is_valid:
-                    # Generate and append closing persona message
-                    closing_message = generate_closing_persona_message(
-                        normalized_id, company_name, ratios, financial_data
-                    )
-                    if closing_message:
-                        summary_text = summary_text.rstrip()
-                        # Add closing message with persona header
-                        summary_text += f"\n\n---\n\n**{persona['name']}'s Final Verdict:**\n{closing_message}"
-                        result["summary"] = summary_text
-
-                    result["persona_id"] = normalized_id
-                    result["persona_name"] = persona["name"]
-                    result["closing_message"] = closing_message  # Also store separately
-                    result["disclaimer"] = (
-                        "This is an educational simulation based on publicly available writings. "
-                        "It does not represent the actual investor's current views."
-                    )
-                    return result
-
-                print(f"Persona {normalized_id} attempt {attempt + 1} failed validation: {issues[:2]}")
-
-            except Exception as e:
-                print(f"Error generating {normalized_id} (attempt {attempt + 1}): {e}")
-
-        # Apply sanitization to last output as well with company context
-        if last_output:
-            last_output = sanitize_persona_output(last_output, company_context)
-            # Also apply mid-text ellipsis fix
-            last_output = fix_mid_text_ellipsis(last_output)
-
-        # Even if validation failed, still append the closing message for user experience
-        closing_message = generate_closing_persona_message(
-            normalized_id, company_name, ratios, financial_data
-        )
-        if closing_message and last_output:
-            last_output = last_output.rstrip()
-            last_output += f"\n\n---\n\n**{persona['name']}'s Final Verdict:**\n{closing_message}"
-
-        return {
-            "persona_id": normalized_id,
-            "persona_name": persona["name"],
-            "summary": last_output or f"Unable to generate {persona['name']} analysis.",
-            "stance": "Hold",
-            "reasoning": "Generation incomplete",
-            "key_points": [],
-            "closing_message": closing_message,
-            "disclaimer": "Analysis may be incomplete."
-        }
-    
-    def _build_retry_prompt(
-        self,
-        persona_id: str,
-        company_name: str,
-        metrics_block: str,
-        company_context: Dict[str, Any],
-        previous_issues: List[str],
-        attempt: int,
-        variation_token: Optional[str] = None
-    ) -> str:
-        """
-        Build a cleaner retry prompt when previous attempt failed validation.
-        Uses persona-specific retry prompts for better results.
-        """
-        template = self.prompt_templates.get(persona_id, "")
-        context_str = format_company_context_for_prompt(company_context)
-
-        # Get industry-specific risks
-        industry_risks = company_context.get("sector_risks", [])
-        risk_str = "\n".join(f"- {r}" for r in industry_risks[:4]) if industry_risks else "- Business-specific execution risks"
-
-        # Format issues
-        issues_str = "\n".join(f"  - {issue}" for issue in previous_issues[:3])
-        if variation_token:
-            issues_str += f"\nSTYLE VARIATION TOKEN: {variation_token}\n  - Use distinct wording from prior attempts, especially in the verdict."
-
-        # Build the prompt with the template
-        formatted_template = template.format(
+        # Build the persona prompt
+        prompt = self._build_persona_prompt(
+            persona_id=normalized_id,
+            persona_info=persona_info,
             company_name=company_name,
-            metrics_block=metrics_block
+            general_summary=general_summary,
+            metrics_context=metrics_context,
+            company_context=company_context,
+            target_length=target_length
         )
-
-        variation_clause = ""
-        if variation_token:
-            variation_clause = (
-                f"\nSTYLE VARIATION TOKEN: {variation_token}\n"
-                "- Use distinct wording from previous attempts, especially in the verdict.\n"
-            )
-
-        # Dalio-specific retry instructions
-        if persona_id == "dalio":
-            return f'''RETRY ATTEMPT {attempt + 1} - YOUR OUTPUT FAILED VALIDATION.
-
-ISSUES:
-{issues_str}
-
-YOU ARE RAY DALIO. Your previous output was rejected because it didn't embody your systematic approach.
-
-COMPANY: {company_name}
-
-DATA:
-{metrics_block}
-
-CONTEXT:
-{context_str}
-
-CRITICAL FAILURES TO FIX:
-- NO placeholder text like "Additional detail covers..." - write the actual detail
-- NO summary bullets - write flowing analytical prose
-- MUST discuss: The Economic Machine, Cause-Effect Chain, Risk Parity, Correlation
-- MUST include 4-6 SPECIFIC risks with mechanisms explained
-- MUST end with clear verdict connecting cycle position to action
-
-RAY DALIO'S VOICE ANCHORS (use at least 4):
-- "To understand this, we must first understand the machine..."
-- "The cause-effect relationship here is..."
-- "What's priced in at current valuations is..."
-- "From a risk parity perspective..."
-- "The correlation profile suggests..."
-- "This is where we are in the cycle..."
-
-STRUCTURE YOUR ANALYSIS:
-1. Cycle Position - Where is this company/sector in its cycle? Early/mid/late?
-2. The Machine - What drives this business? Trace the cause-effect chain.
-3. What's Priced In - What assumptions are embedded in current valuation?
-4. Risks (4-6 items) - SPECIFIC risks with probability and mechanism
-5. Portfolio View - How does this fit? What's the correlation?
-6. Verdict - Clear stance tied to cycle position
-
-Write exactly 425 words (±10 acceptable: 415-435 range). Complete sentences. Clear verdict. NO FILLER.'''
-
-        # Lynch-specific retry instructions
-        if persona_id == "lynch":
-            return f'''RETRY ATTEMPT {attempt + 1} - YOUR PREVIOUS OUTPUT FAILED.
-
-ISSUES:
-{issues_str}
-
-YOU ARE PETER LYNCH. Your previous output was rejected because it didn't follow my style.
-
-COMPANY: {company_name}
-
-FINANCIAL DATA:
-{metrics_block}
-
-BUSINESS CONTEXT:
-{context_str}
-
-FOLLOW THIS EXACT STRUCTURE:
-
-1. START with "THE STORY" - What does {company_name} actually do? Explain it simply.
-
-2. CLASSIFY the stock - Pick ONE: Fast Grower, Stalwart, Slow Grower, Cyclical, Turnaround, or Asset Play.
-
-3. CALCULATE THE PEG - Show the math: P/E ÷ Growth Rate = PEG
-   - If you can't calculate it, explain why honestly.
-
-4. WHAT INNING - Early (1-3), Middle (4-6), or Late (7-9)?
-
-5. END WITH YOUR VERDICT - "I'd buy this" OR "I'd pass" OR "I'd wait for a better price"
-
-ABSOLUTE RULES:
-- NO ratings or scores (no 72/100, no 8/10)
-- NO macro/Fed/rates discussion
-- NO Wall Street jargon
-- COMPLETE your sentences - don't end with "I need to determine..."
-- END with a clear verdict
-
-Write 300-400 words. Sound like you're explaining this to a friend.'''
-
-        # Greenblatt-specific retry - extremely focused on the formula
-        if persona_id == "greenblatt":
-            return f'''RETRY ATTEMPT {attempt + 1} - YOUR OUTPUT FAILED VALIDATION.
-
-ISSUES:
-{issues_str}
-
-YOU ARE JOEL GREENBLATT. Magic Formula ONLY. No narrative, no story, no management commentary.
-
-COMPANY: {company_name}
-
-DATA:
-{metrics_block}
-
-=============================================================================
-REQUIRED OUTPUT (EXACTLY THIS - NOTHING ELSE):
-=============================================================================
-
-**Return on Capital: [X]%**
-EBIT $[X] ÷ Invested Capital $[X] = [X]%. [Compare to 15% S&P average.]
-
-**Earnings Yield: [X]%**
-EBIT $[X] ÷ Enterprise Value $[X] = [X]%. [Compare to 4.5% Treasury.]
-
-**VERDICT: [Good AND Cheap | Good but Expensive | Not Good]**
-[ONE sentence: Buy or Pass.]
-
-=============================================================================
-ABSOLUTE RULES:
-=============================================================================
-- 100-150 words MAXIMUM. You were too verbose before.
-- NO ratings (no 72/100, no scores)
-- NO narrative, story, moat, or management discussion
-- NO forward guidance or MD&A
-- NO unrealistic disclosure requests (no "management should provide")
-- SHOW the math: EBIT ÷ Capital = X%
-- If data missing: "Cannot calculate - missing [X]"
-
-Two ratios. One verdict. Done.'''
-
-        # Default retry prompt for other personas
-        # Check for specific failure types to provide targeted fixes
-        has_risk_failure = any("risk coverage" in issue.lower() for issue in previous_issues)
-        has_conclusion_failure = any("conclusion" in issue.lower() or "verdict" in issue.lower() for issue in previous_issues)
-        has_data_failure = any("data" in issue.lower() or "inconsisten" in issue.lower() for issue in previous_issues)
-        has_tone_failure = any("voice" in issue.lower() or "persona" in issue.lower() or "tone" in issue.lower() for issue in previous_issues)
-
-        # Build specific correction instructions based on failure types
-        correction_instructions = []
-
-        if has_risk_failure:
-            correction_instructions.append(f"""
-RISK COVERAGE FIX (YOUR PREVIOUS OUTPUT FAILED THIS):
-You MUST include at least 4 distinct risk categories from this list:
-- Supply chain/manufacturing dependency (TSMC, foundries)
-- Geopolitical risks (China, Taiwan, export controls, tariffs)
-- Competition (AMD, Intel, custom ASICs, hyperscaler chips)
-- Customer concentration (major customers, hyperscaler dependency)
-- Valuation risk (high P/E, expensive multiples)
-- Regulatory concerns (antitrust, compliance)
-- Cyclical/demand risks (PC cycle, data center spending)
-- Technology obsolescence (new entrants, disruption)
-
-Write 2-3 sentences for EACH risk you cover. Don't just mention TSMC once.""")
-
-        if has_conclusion_failure:
-            correction_instructions.append(f"""
-CONCLUSION FIX (YOUR PREVIOUS OUTPUT FAILED THIS):
-You MUST end with a clear, actionable verdict paragraph that includes:
-1. Your stance: "Buy", "Sell", "Hold", or "Wait for better price"
-2. The key catalyst or event to watch
-3. What the market is missing or getting wrong
-4. What price/valuation would change your mind
-
-Example: "My verdict: Buy on any pullback below 35x forward earnings. The catalyst is the
-next data center spending cycle in Q2. The market underappreciates the AI inference
-opportunity. I'd reconsider if gross margins drop below 70%." """)
-
-        if has_data_failure:
-            correction_instructions.append("""
-DATA CONSISTENCY FIX (YOUR PREVIOUS OUTPUT FAILED THIS):
-- Use ONLY one set of financial figures throughout. Don't mix quarterly and annual data.
-- State the fiscal period ONCE at the start ("For FY2024..." or "For Q3 FY2025...")
-- If you cite revenue of $X.XB, use that SAME number every time you mention revenue
-- Check your math: if you say FCF/NI = 0.7, make sure FCF and NI actually produce that ratio
-- Don't fabricate numbers - if you don't have data, say "based on reported figures" """)
-
-        if has_tone_failure:
-            correction_instructions.append(f"""
-PERSONA VOICE FIX (YOUR PREVIOUS OUTPUT FAILED THIS):
-- You are {persona_id.upper()}, not a generic analyst
-- Use first person occasionally ("I would...", "My concern is...")
-- Reference this investor's actual framework and terminology
-- Don't sound like a bank research report
-- Don't mix terminology from other investors (no "moat" for Dalio, no "debt cycle" for Buffett)
-- Maintain consistent tone throughout - don't start as {persona_id.upper()} and drift into neutral analyst voice """)
-
-        correction_block = "\n".join(correction_instructions) if correction_instructions else ""
-
-        return f'''RETRY ATTEMPT {attempt + 1} - Previous output had issues:
-{issues_str}
-
-{correction_block}
-
-{formatted_template}
-
-BUSINESS CONTEXT:
-{context_str}
-
-COMPANY-SPECIFIC RISK FACTORS (use these, not generic risks):
-{risk_str}
-
-CRITICAL REQUIREMENTS FOR THIS RETRY:
-1. COMPLETE SENTENCES - never truncate mid-sentence or mid-number
-2. NO placeholder text - skip metrics you don't have data for
-3. NO ratings/scores - use words like "attractive", "concerning", "pass"
-4. NO markdown headers (##) - write flowing prose
-5. NO generic risks - use the company-specific risks above
-6. Write 200-400 words minimum
-7. End with a clear stance
-8. CONTEXTUALIZE NUMBERS - explain what metrics mean, don't just cite them
-9. NO REPETITION - each point should appear only once
-10. VALUATION NEEDS SUPPORT - if saying cheap/expensive, cite the metric
-
-Begin your analysis:'''
+        
+        # Generate using Gemini
+        result = self.gemini_client.generate_premium_persona_view(
+            prompt=prompt,
+            persona_name=persona_info.get("name", persona_id)
+        )
+        
+        # Post-process: sanitize output
+        if result.get("summary"):
+            result["summary"] = sanitize_persona_output(result["summary"], company_context)
+        
+        return result
     
-    def _get_anti_patterns(self, persona_id: str) -> str:
-        """
-        Return concrete anti-patterns showing what NOT to do.
-        These are examples of generic analyst writing that must be avoided.
-        """
-        
-        # Universal anti-patterns for all personas
-        universal = '''
-UNIVERSAL ANTI-PATTERNS (NEVER DO THESE):
-
-❌ WRONG - Rating agency style:
-   "Financial Health Rating: 72/100"
-   "Overall Score: 8/10"
-   "Investment Grade: B+"
-   
-❌ WRONG - Generic section headers:
-   "## Executive Summary"
-   "## Key Risks"
-   "## Investment Thesis"
-   
-❌ WRONG - Corporate PR language:
-   "The company showcases its dominance in the market"
-   "Management is driving shareholder value"
-   "The outlook remains incredibly encouraging"
-   "This is a testament to their operational excellence"
-   
-❌ WRONG - Template risk factors:
-   "Macroeconomic volatility could impact performance"
-   "Regulatory scrutiny poses risks"
-   "Competitive pressures may affect margins"
-   "Data privacy concerns remain" (unless the company actually handles data)
-   
-❌ WRONG - Bullet-point lists:
-   "Key strengths:
-   - Strong revenue growth
-   - Solid margins
-   - Good management"
-'''
-        
-        # Persona-specific anti-patterns
-        persona_specific = {
-            "buffett": '''
-❌ WRONG for Buffett:
-   "The DCF analysis suggests..." (Buffett doesn't do DCFs)
-   "EBITDA multiple of 15x..." (Buffett hates EBITDA)
-   "Target price of $X" (Buffett doesn't set targets)
-   "Short-term catalysts include..." (Buffett thinks long-term)
-
-✓ RIGHT for Buffett:
-   "I'll be honest with you - I understand this business."
-   "This reminds me of See's Candies..."
-   "The moat here is the customer switching cost..."
-''',
-            "munger": '''
-❌ WRONG for Munger:
-   "I believe this could potentially..." (Munger doesn't hedge)
-   "In my humble opinion..." (Munger is blunt)
-   "The situation is nuanced..." (Munger cuts through complexity)
-   Long paragraphs (Munger is pithy)
-
-✓ RIGHT for Munger:
-   "That's easy. One of the best businesses I've seen."
-   "Obviously stupid. The incentives are all wrong."
-   "Invert the question. What would make this fail?"
-''',
-            "graham": '''
-❌ WRONG for Graham:
-   "Exciting growth prospects" (Graham doesn't use exciting)
-   "Management's vision" (Graham focuses on numbers)
-   "The stock could double" (Graham is conservative)
-   Emotional adjectives
-
-✓ RIGHT for Graham:
-   "We begin, as we must, with the balance sheet."
-   "Net current asset value: $X million."
-   "The margin of safety is 32%."
-''',
-            "lynch": '''
-❌ WRONG for Lynch:
-   "Fed policy implications" (Lynch ignores macro)
-   "Geopolitical risk factors" (Lynch focuses on products)
-   "Financial Health Rating: 72/100" (Lynch doesn't use scoring systems)
-   "Margin trajectory" (Too much jargon)
-   "Operating leverage dynamics" (Lynch uses simple language)
-   Formal financial jargon
-   Being boring
-
-✓ RIGHT for Lynch:
-   "I love this company. Let me tell you the story..."
-   "The PEG ratio is 0.6 - you're getting growth for free!"
-   "I classify this as a Fast Grower - earnings up 25% a year."
-   "They make chips for computers. Everyone needs computers."
-   "My wife uses their products. That's always a good sign."
-   "What inning are we in? I'd say the 4th or 5th."
-
-LYNCH CHECKLIST:
-✓ Stock classification (Fast Grower, Stalwart, etc.)
-✓ PEG ratio calculated with math shown
-✓ The Story (what do they actually do?)
-✓ Customer perspective (who buys from them?)
-✓ Simple language a 12-year-old would understand
-✓ Clear verdict: buy, hold, or pass
-✗ NO health ratings or factor scores
-✗ NO macro analysis (Fed, rates, geopolitics)
-✗ NO Wall Street jargon
-''',
-            "dalio": '''
-❌ WRONG for Dalio:
-   "I love this stock" (Dalio is unemotional)
-   "Great management" (Dalio focuses on the machine)
-   Company analysis without macro context
-   Ignoring where we are in the cycle
-
-✓ RIGHT for Dalio:
-   "To understand this, we must first understand the cycle."
-   "The correlation profile is interesting."
-   "The machine has shifted paradigms."
-''',
-            "marks": '''
-❌ WRONG for Marks:
-   "I demand greater transparency" (Marks is not confrontational)
-   "This raises serious questions" (Marks is reflective)
-   Bullet-point lists (Marks writes flowing essays)
-   "Concerning" or "problematic" (too judgmental)
-
-✓ RIGHT for Marks:
-   "Where is the pendulum?"
-   "Second-level thinking requires us to ask..."
-   "The asymmetry here troubles me."
-''',
-            "ackman": '''
-❌ WRONG for Ackman:
-   "Wait and see" (Ackman is decisive)
-   "Unclear outlook" (Ackman is specific)
-   Vague thesis without numbers
-   Passive acceptance of status quo
-
-✓ RIGHT for Ackman:
-   "The catalyst is clear: new CEO in Q2."
-   "Target price: $85 in 24 months."
-   "The fix: cut 200 stores, $95M to the bottom line."
-''',
-            "wood": '''
-❌ WRONG for Wood:
-   "The P/E ratio looks attractive" (Wood dismisses P/E)
-   "Near-term profitability" (Wood thinks 5-10 years)
-   Skepticism about technology
-   Linear thinking
-
-✓ RIGHT for Wood:
-   "By 2030, our models suggest..."
-   "Wright's Law implies 70% cost decline per doubling."
-   "Traditional analysts are missing the S-curve."
-''',
-            "greenblatt": '''
-❌ WRONG for Greenblatt:
-   Long narrative analysis (Greenblatt is minimal)
-   "Management quality" (formula doesn't care)
-   "The story is compelling" (just the numbers)
-
-✓ RIGHT for Greenblatt:
-   "Return on Capital: 34%. Earnings Yield: 11%."
-   "Good company, cheap price. Buy."
-''',
-            "bogle": '''
-❌ WRONG for Bogle:
-   "Buy this stock" (Bogle recommends indexing over stock picking)
-   "This will outperform" (Bogle is skeptical of any outperformance claims)
-   "Alpha generation" (Bogle doesn't believe in sustainable alpha)
-   "Financial Health Rating: 72/100" (Bogle would NEVER rate stocks)
-   "Based on forward guidance" (Bogle rejects forecasts)
-   "I'm bullish on this name" (Not Bogle's vocabulary)
-   "Price target of $X" (Speculation, not investing)
-
-✓ RIGHT for Bogle:
-   "I've spent sixty years in this business..."
-   "Costs matter. At 0.03% per year for an index fund..."
-   "90% of professionals fail to beat the index over 15 years."
-   "At 35 times earnings, you're paying for excellence everyone already recognizes."
-   "Buy the haystack, not the needle."
-   "Stay the course."
-   "The prudent course is to own the entire market."
-
-BOGLE VOICE CHECKLIST:
-✓ Discusses actual valuation (P/E, earnings yield)
-✓ Mentions cost advantage of index funds
-✓ References the failure rate of active managers
-✓ Grandfatherly, wise tone (not condescending)
-✓ Clear conclusion: index vs. this stock
-✓ NO ratings, scores, or price targets
-✓ NO forward guidance or forecasts
-'''
-        }
-        
-        # Add concrete failure example that shows what generic output looks like
-        failure_example = '''
-===============================================================================
-CONCRETE FAILURE EXAMPLE - THIS IS WHAT GENERIC AI OUTPUT LOOKS LIKE
-===============================================================================
-
-❌ THIS OUTPUT WOULD INSTANTLY FAIL:
-"Company X demonstrates a Financial Health Rating of 72/100, reflecting solid 
-fundamentals. Key risks include macroeconomic volatility, regulatory uncertainty, 
-and competitive pressures. The investment thesis is supported by strong revenue 
-growth and operational excellence. Management continues to drive shareholder value 
-through strategic initiatives. Overall, the company is well-positioned for future 
-growth, though investors should monitor key developments."
-
-WHY IT FAILS:
-- Uses ratings (72/100) - real investors don't give scores
-- Generic risks that could apply to ANY company
-- Corporate PR language ("drive shareholder value", "well-positioned")
-- No personality, no distinctive voice
-- Reads like a template, not a human investor
-
-YOUR OUTPUT MUST BE THE OPPOSITE OF THIS.
-'''
-        
-        return universal + persona_specific.get(persona_id, "") + failure_example
-    
-    def _build_prompt(
+    def _build_persona_prompt(
         self,
         persona_id: str,
+        persona_info: Dict,
         company_name: str,
-        metrics_block: str,
         general_summary: str,
-        company_context: Dict[str, Any],
-        variation_token: Optional[str] = None
+        metrics_context: str,
+        company_context: Dict,
+        target_length: Optional[int] = None
     ) -> str:
-        """
-        Build an objective analysis prompt with persona-flavored analytical lens.
-
-        Structure:
-        1. ANALYTICAL FRAMEWORK (the lens to use)
-        2. COMPANY DATA (raw facts)
-        3. OUTPUT REQUIREMENTS (format and constraints)
-        """
-
-        persona = self.personas[persona_id]
-        template = self.prompt_templates.get(persona_id, "")
-
+        """Build the complete persona prompt."""
+        
+        persona_name = persona_info.get("name", persona_id.title())
+        philosophy = persona_info.get("philosophy", "")
+        voice_style = persona_info.get("voice_style", "")
+        framework = persona_info.get("framework", "")
+        key_metrics = persona_info.get("key_metrics", [])
+        
+        # Get voice anchors for authenticity
+        voice_anchors = PERSONA_VOICE_ANCHORS.get(persona_id, {})
+        must_use_phrases = voice_anchors.get("must_use_phrases", [])
+        encouraged_phrases = voice_anchors.get("encouraged_phrases", [])
+        never_says = voice_anchors.get("never_says", [])
+        
+        # Default target length
+        word_target = target_length if target_length else 750
+        
         # Format company context
-        context_str = format_company_context_for_prompt(company_context)
+        company_context_str = format_company_context_for_prompt(company_context) if company_context else ""
+        
+        prompt = f"""You ARE {persona_name}. Write EXACTLY as {persona_name} would speak - with their exact vocabulary, cadence, and philosophical lens.
 
-        # Get industry-specific risks for grounding
-        industry_risks = company_context.get("sector_risks", [])
-        risk_str = "\n".join(f"- {r}" for r in industry_risks[:4]) if industry_risks else "- Business-specific execution risks"
+PERSONA PHILOSOPHY:
+{philosophy}
 
-        # Build the prompt with the template
-        formatted_template = template.format(
-            company_name=company_name,
-            metrics_block=metrics_block
-        )
+VOICE STYLE:
+{voice_style}
 
-        variation_clause = ""
-        if variation_token:
-            variation_clause = (
-                f"\nSTYLE VARIATION TOKEN: {variation_token}\n"
-                "- Vary phrasing and sentence openings compared to prior runs.\n"
-                "- Avoid reusing identical closing verdict wording.\n"
-            )
+ANALYTICAL FRAMEWORK:
+{framework}
 
-        return f'''{formatted_template}
-{variation_clause}
+KEY METRICS TO ANALYZE:
+{', '.join(key_metrics)}
 
-BUSINESS CONTEXT:
-{context_str}
+AUTHENTICITY REQUIREMENTS:
+- You MUST naturally use these phrases: {', '.join(must_use_phrases[:3])}
+- You are encouraged to use: {', '.join(encouraged_phrases[:5])}
+- You MUST NEVER say: {', '.join(never_says[:5])}
 
-COMPANY-SPECIFIC RISK FACTORS (use these, not generic risks):
-{risk_str}
+COMPANY: {company_name}
 
-OUTPUT QUALITY REQUIREMENTS:
-1. COMPLETE SENTENCES ONLY - never truncate mid-sentence or mid-number
-2. NO placeholder text like "data unavailable" or "N/A" - skip metrics you don't have
-3. NO ratings, scores, or letter grades (no "7/10", no "B+")
-4. NO markdown headers (##) - write as flowing prose
-5. NO generic risk factors like "regulatory uncertainty" or "macro headwinds" - use the specific risks above
-6. Use actual numbers from the financial data - don't invent figures
-7. Write 200-400 words of substantive analysis
-8. Every paragraph must conclude completely - no abrupt endings
-9. End with a clear stance (Buy/Hold/Sell) and one-sentence verdict
-10. CONTEXTUALIZE ALL NUMBERS - don't just cite "$X revenue", explain what it means (growing/declining, margin implications, vs peers)
-11. AVOID REPETITION - don't repeat the same point or metric in different sections
-12. VALUATION CLAIMS NEED SUPPORT - if you say "undervalued" or "cheap", cite P/E, earnings yield, or another metric
-13. MANDATORY FINAL SECTION: You MUST end with a section titled "## Final Recommendation Summary".
-    - This section must appear at the very end, before the STANCE/VERDICT lines.
-    - Content: A 2-3 sentence summary of your final recommendation (Buy/Hold/Sell) and the core reasoning, written in the persona's voice.
-    - Example: "## Final Recommendation Summary\nAs Howard Marks, I recommend a HOLD. While the company is high quality, the current valuation leaves no margin of safety, and I prefer to wait for a better entry point when the pendulum swings back."
-14. SENTENCE CASE: Keep paragraphs in normal sentence case. Do NOT use all caps.
-15. VARIETY: Vary wording and sentence openings across runs and sections; avoid repeating identical phrases or verdict language.
+COMPANY CONTEXT:
+{general_summary}
 
-Begin your analysis:'''
-    
-    def generate_multiple_personas(
-        self,
-        persona_ids: List[str],
-        company_name: str,
-        general_summary: str,
-        ratios: Dict[str, float],
-        financial_data: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Dict]:
-        """Generate analyses for multiple personas."""
-        results = {}
-        for persona_id in persona_ids:
-            try:
-                results[persona_id] = self.generate_persona_analysis(
-                    persona_id, company_name, general_summary, ratios, financial_data
-                )
-            except Exception as e:
-                results[persona_id] = {
-                    "persona_id": persona_id,
-                    "persona_name": self.personas.get(persona_id, {}).get("name", "Unknown"),
-                    "summary": f"Error: {e}",
-                    "stance": "Hold",
-                    "reasoning": str(e),
-                    "key_points": []
-                }
-        return results
-    
-    def get_all_persona_ids(self) -> List[str]:
-        return list(self.personas.keys())
-    
-    def get_persona_info(self, persona_id: str) -> Dict:
-        if persona_id not in self.personas:
-            raise ValueError(f"Unknown persona: {persona_id}")
-        return self.personas[persona_id]
+{company_context_str}
+
+FINANCIAL METRICS:
+{metrics_context}
+
+LENGTH REQUIREMENT: Write approximately {word_target} words. This is a HARD requirement.
+
+MANDATORY 7-SECTION STRUCTURE (OUTPUT IN EXACT ORDER - CRITICAL):
+You MUST output these 7 sections in EXACTLY this order. Do not skip, reorder, combine, or add extra sections.
+
+## 1. Financial Health Rating
+[ONE LINE ONLY in YOUR voice: State your overall assessment with stance (bullish/bearish/neutral) and conviction (high/medium/low).
+Example: "From my perspective, this is a HOLD with medium conviction - strong business but rich valuation."]
+
+## 2. Executive Summary
+[2-3 paragraphs in YOUR unique voice:
+- Your conviction and why
+- Core investment thesis through YOUR analytical lens
+- What matters most to YOU as {persona_name}
+Write in flowing prose. NO bullet lists of "Monitor X".]
+
+## 3. Financial Performance
+[Analyze through YOUR lens - what metrics matter to {persona_name}?
+- Cite specific figures with $ and %
+- Explain what the numbers MEAN, not just what they ARE
+- If operating margin and net margin diverge significantly, explain WHY (one-time items, non-operating income, etc.)
+Every metric must have interpretation, not just data.]
+
+## 4. Management Discussion & Analysis
+[Evaluate through YOUR framework:
+- Capital allocation - does it align with {persona_name}'s principles?
+- Earnings quality concerns
+- What would YOU want management to do differently?
+Do NOT speculate about "management commentary" not in filings.]
+
+## 5. Risk Factors
+[3-5 SPECIFIC risks that concern YOU as {persona_name}:
+- Each risk must have a clear name and 2-3 sentence explanation
+- Be company-specific, not generic
+- Quantify impact where possible
+Format: "**Risk Name**: Explanation."
+Do NOT use generic risks without specific context.]
+
+## 6. Key Metrics
+[Write 5 specific metrics YOU would track, explained in PROSE:
+"I would watch [metric] because [reason]..."
+Do NOT use bullet points or "Monitor X" format.
+Write complete sentences explaining WHY each metric matters to your investment thesis.]
+
+## 7. Closing Takeaway
+[Your final verdict in YOUR authentic voice:
+- 2-3 sentences synthesizing your view
+- Clear stance and what would change it
+End with these exact lines:
+
+STANCE: [Buy/Hold/Sell/Pass/Watch]
+CONVICTION: [High/Medium/Low]
+
+This MUST be the FINAL section - NO content after CONVICTION.]
+
+CRITICAL RULES (VIOLATIONS WILL BE REJECTED):
+1. OUTPUT SECTIONS 1-7 IN EXACT ORDER SHOWN - Financial Health Rating FIRST, Closing Takeaway LAST
+2. NO numerical ratings or scores (no X/100, no letter grades) - express quality in YOUR words
+3. NO generic analyst language - you are {persona_name}, not a Wall Street analyst
+4. NO bullet points of "Monitor X" / "Track Y" / "Watch Z" / "Additionally, track..." ANYWHERE
+5. NO "Health Score Drivers:" sections outside Key Metrics
+6. NO "Key Data Appendix" sections
+7. NO arrow notation (→) for metrics
+8. NO "Strategic Initiatives & Capital Allocation" as a separate section - fold into MD&A
+9. NO "Competitive Landscape" as a separate section - integrate into Risk Factors or Executive Summary
+10. Write in flowing prose with natural transitions
+11. EVERY section must have substantive content - no filler
+12. Each section must be COMPLETE - no trailing "but...", "although...", or unfinished thoughts
+13. The FINAL output must end with "CONVICTION: [level]" - nothing after that
+"""
+        
+        return prompt
 
 
 def get_persona_engine() -> PersonaEngine:
-    """Get persona engine instance."""
-    from app.services.gemini_client import get_gemini_client
-    return PersonaEngine(get_gemini_client())
-
-
-# =============================================================================
-# CLOSING PERSONA MESSAGE - Brief opinion based on financial data
-# =============================================================================
-
-PERSONA_CLOSING_TEMPLATES = {
-    "buffett": [
-        "At current valuations, {company_name} {quality_assessment}. {valuation_view}",
-        "Looking at {company_name}, {quality_assessment}. {valuation_view}",
-    ],
-    "munger": [
-        "{company_name}: {quality_assessment}. {valuation_view}",
-        "The economics of {company_name} {quality_assessment}. {valuation_view}",
-    ],
-    "graham": [
-        "Based on the numbers, {company_name} {quality_assessment}. {valuation_view}",
-        "From a margin of safety perspective, {company_name} {quality_assessment}. {valuation_view}",
-    ],
-    "lynch": [
-        "Here's the story on {company_name}: {quality_assessment}. {valuation_view}",
-        "{company_name} {quality_assessment}. {valuation_view}",
-    ],
-    "dalio": [
-        "Given where we are in the cycle, {company_name} {quality_assessment}. {valuation_view}",
-        "The machine view on {company_name}: {quality_assessment}. {valuation_view}",
-    ],
-    "wood": [
-        "From a disruption perspective, {company_name} {quality_assessment}. {valuation_view}",
-        "Looking at the S-curve, {company_name} {quality_assessment}. {valuation_view}",
-    ],
-    "greenblatt": [
-        "Magic Formula verdict on {company_name}: {quality_assessment}. {valuation_view}",
-        "By the numbers, {company_name} {quality_assessment}. {valuation_view}",
-    ],
-    "bogle": [
-        "While {company_name} {quality_assessment}, {valuation_view}",
-        "The fundamentals of {company_name} {quality_assessment}. {valuation_view}",
-    ],
-    "marks": [
-        "At current market valuations, {company_name} {quality_assessment}. {valuation_view}",
-        "Second-level thinking on {company_name}: {quality_assessment}. {valuation_view}",
-    ],
-    "ackman": [
-        "The activist view on {company_name}: {quality_assessment}. {valuation_view}",
-        "From a value creation standpoint, {company_name} {quality_assessment}. {valuation_view}",
-    ],
-}
-
-
-def generate_closing_persona_message(
-    persona_id: str,
-    company_name: str,
-    ratios: Dict[str, Any],
-    financial_data: Optional[Dict[str, Any]] = None
-) -> str:
-    """
-    Generate a brief closing message from the investor persona based on financial data.
-
-    Example output:
-    "At current market valuations, NVDA is an exceptionally high-quality business,
-    though the market may have already priced in much of its future growth,
-    warranting cautious consideration for new investments."
-    """
-    if not company_name:
-        return ""
-
-    # Extract key metrics
-    gross_margin = ratios.get("gross_margin")
-    operating_margin = ratios.get("operating_margin")
-    net_margin = ratios.get("net_margin")
-    roe = ratios.get("roe")
-    roa = ratios.get("roa")
-    fcf = ratios.get("fcf")
-    current_ratio = ratios.get("current_ratio")
-    debt_to_equity = ratios.get("debt_to_equity")
-    revenue_growth = ratios.get("revenue_growth_yoy")
-
-    # Determine business quality assessment
-    quality_signals = 0
-    quality_concerns = 0
-
-    # Profitability signals
-    if gross_margin is not None and gross_margin > 0.5:
-        quality_signals += 2  # Excellent gross margin
-    elif gross_margin is not None and gross_margin > 0.3:
-        quality_signals += 1
-    elif gross_margin is not None and gross_margin < 0.2:
-        quality_concerns += 1
-
-    if operating_margin is not None and operating_margin > 0.2:
-        quality_signals += 2  # Excellent operating margin
-    elif operating_margin is not None and operating_margin > 0.1:
-        quality_signals += 1
-    elif operating_margin is not None and operating_margin < 0.05:
-        quality_concerns += 1
-
-    if net_margin is not None and net_margin > 0.15:
-        quality_signals += 1
-    elif net_margin is not None and net_margin < 0.03:
-        quality_concerns += 1
-
-    # Return metrics
-    if roe is not None and roe > 0.2:
-        quality_signals += 1
-    elif roe is not None and roe < 0.08:
-        quality_concerns += 1
-
-    # Growth signals
-    if revenue_growth is not None and revenue_growth > 0.2:
-        quality_signals += 1
-    elif revenue_growth is not None and revenue_growth < 0:
-        quality_concerns += 1
-
-    # Cash flow signals
-    if fcf is not None and fcf > 0:
-        quality_signals += 1
-    elif fcf is not None and fcf < 0:
-        quality_concerns += 1
-
-    # Balance sheet signals
-    if current_ratio is not None and current_ratio > 1.5:
-        quality_signals += 1
-    elif current_ratio is not None and current_ratio < 1.0:
-        quality_concerns += 1
-
-    if debt_to_equity is not None and debt_to_equity < 0.5:
-        quality_signals += 1
-    elif debt_to_equity is not None and debt_to_equity > 2.0:
-        quality_concerns += 1
-
-    # Generate quality assessment text based on persona
-    if quality_signals >= 6:
-        quality_level = "exceptional"
-    elif quality_signals >= 4:
-        quality_level = "high"
-    elif quality_signals >= 2:
-        quality_level = "moderate"
-    elif quality_concerns >= 3:
-        quality_level = "concerning"
-    else:
-        quality_level = "mixed"
-
-    # Persona-specific quality descriptions
-    quality_descriptions = {
-        "buffett": {
-            "exceptional": "is an exceptionally high-quality business with durable economics",
-            "high": "shows the hallmarks of a quality business with strong moat characteristics",
-            "moderate": "has decent fundamentals but may lack the wide moat I prefer",
-            "concerning": "raises concerns about the durability of its competitive position",
-            "mixed": "presents a mixed picture that requires careful evaluation",
-        },
-        "munger": {
-            "exceptional": "has the quality economics that make it worth owning",
-            "high": "demonstrates the kind of returns on capital that attract my attention",
-            "moderate": "is a decent business, nothing obviously stupid about it",
-            "concerning": "shows warning signs that a smart investor would notice",
-            "mixed": "requires more thought to understand its true economics",
-        },
-        "graham": {
-            "exceptional": "exhibits the quantitative strength an intelligent investor seeks",
-            "high": "shows solid balance sheet characteristics and earnings power",
-            "moderate": "meets some criteria for investment but falls short on others",
-            "concerning": "fails to provide adequate margin of safety at these metrics",
-            "mixed": "presents both attractive and concerning fundamental factors",
-        },
-        "lynch": {
-            "exceptional": "is the kind of business I get excited about",
-            "high": "has the growth story and fundamentals I like to see",
-            "moderate": "is a decent company but not a tenbagger candidate",
-            "concerning": "shows some warning signs in the numbers",
-            "mixed": "has an interesting story but the numbers are mixed",
-        },
-        "dalio": {
-            "exceptional": "demonstrates strong fundamentals across the cycle",
-            "high": "shows resilience that should weather economic transitions",
-            "moderate": "has acceptable fundamentals but is cycle-dependent",
-            "concerning": "appears vulnerable to cycle turns and deleveraging",
-            "mixed": "presents factors that could go either way depending on the cycle",
-        },
-        "wood": {
-            "exceptional": "is positioned on the right side of the disruption curve",
-            "high": "shows the growth trajectory of a disruptive innovator",
-            "moderate": "has some innovation potential but may face traditional competition",
-            "concerning": "may be disrupted rather than disruptor",
-            "mixed": "is at an inflection point in its technology adoption curve",
-        },
-        "greenblatt": {
-            "exceptional": "scores well on both return on capital and earnings yield",
-            "high": "is a good business at a reasonable price",
-            "moderate": "is either good but expensive, or cheap but not great",
-            "concerning": "fails the Magic Formula criteria",
-            "mixed": "requires further calculation to determine value",
-        },
-        "bogle": {
-            "exceptional": "is a fundamentally strong company",
-            "high": "shows solid fundamentals that justify inclusion in broad indices",
-            "moderate": "has acceptable fundamentals for a diversified portfolio",
-            "concerning": "reminds us why diversification matters",
-            "mixed": "illustrates both the promise and peril of individual stock selection",
-        },
-        "marks": {
-            "exceptional": "is an exceptionally high-quality business",
-            "high": "demonstrates the quality that justifies serious consideration",
-            "moderate": "has acceptable fundamentals but risk/reward matters more",
-            "concerning": "shows concerning signs that the consensus may be missing",
-            "mixed": "presents an asymmetric situation that requires careful analysis",
-        },
-        "ackman": {
-            "exceptional": "is a simple, predictable, free-cash-flow generative business",
-            "high": "has the quality fundamentals I look for in a core position",
-            "moderate": "has potential but may need operational improvements",
-            "concerning": "requires significant changes to unlock value",
-            "mixed": "needs a clear catalyst to realize its potential",
-        },
-    }
-
-    quality_assessment = quality_descriptions.get(persona_id, quality_descriptions["marks"]).get(quality_level, "presents a mixed picture")
-
-    # Generate valuation view
-    # Determine if valuation seems stretched based on available metrics
-    high_valuation_signals = 0
-    low_valuation_signals = 0
-
-    # Check P/E if available
-    pe_ratio = ratios.get("pe_ratio")
-    if pe_ratio is not None:
-        if pe_ratio > 40:
-            high_valuation_signals += 2
-        elif pe_ratio > 25:
-            high_valuation_signals += 1
-        elif pe_ratio < 12:
-            low_valuation_signals += 1
-
-    # Check margins relative to quality (high margins + high quality = likely priced in)
-    if quality_signals >= 5 and gross_margin is not None and gross_margin > 0.6:
-        high_valuation_signals += 1
-
-    # Growth premium
-    if revenue_growth is not None and revenue_growth > 0.3:
-        high_valuation_signals += 1  # Fast growth often means high valuation
-
-    # Persona-specific valuation views
-    if high_valuation_signals >= 2:
-        valuation_views = {
-            "buffett": "though at current prices, the market may have already recognized much of this quality, warranting patience for a better entry",
-            "munger": "The price, however, seems to embed considerable optimism already",
-            "graham": "Current prices appear to offer limited margin of safety for new investors",
-            "lynch": "At this price, you're paying up for the story - I'd wait for a pullback",
-            "dalio": "The risk/reward asymmetry at current valuations suggests caution for new positions",
-            "wood": "though the long-term opportunity remains compelling for patient capital",
-            "greenblatt": "At current prices, the earnings yield suggests waiting for a better entry",
-            "bogle": "remember that high-quality stocks can still disappoint when expectations are elevated - the index remains the prudent choice",
-            "marks": "though the market may have already priced in much of its future growth, warranting cautious consideration for new investments",
-            "ackman": "though the current valuation requires perfect execution to justify - I'd want a catalyst or pullback",
-        }
-    elif low_valuation_signals >= 1:
-        valuation_views = {
-            "buffett": "and current prices appear to offer a reasonable opportunity for patient investors",
-            "munger": "The price seems reasonable for what you're getting",
-            "graham": "Current prices may offer adequate margin of safety for the intelligent investor",
-            "lynch": "At this price, you're not overpaying for the growth story",
-            "dalio": "The risk/reward at current levels appears more balanced",
-            "wood": "and current valuations don't fully reflect the disruption potential",
-            "greenblatt": "Current prices offer an attractive earnings yield relative to quality",
-            "bogle": "that said, individual stock selection carries risks that diversification avoids",
-            "marks": "and current valuations appear to offer reasonable risk/reward for the patient investor",
-            "ackman": "and current prices don't require heroic assumptions to justify",
-        }
-    else:
-        valuation_views = {
-            "buffett": "The key question is whether current prices fully reflect this quality",
-            "munger": "Whether the price is right depends on the durability of these economics",
-            "graham": "Current prices require careful analysis of intrinsic value before committing",
-            "lynch": "At this price, make sure you understand the story before buying",
-            "dalio": "Position sizing should reflect where we are in the cycle",
-            "wood": "The 5-year view matters more than the current quarter",
-            "greenblatt": "The Magic Formula verdict depends on precise calculation of earnings yield",
-            "bogle": "as always, the surest path to building wealth remains the low-cost index fund",
-            "marks": "The key is understanding what's already priced in before taking a position",
-            "ackman": "Success here depends on identifying and acting on the right catalyst",
-        }
-
-    valuation_view = valuation_views.get(persona_id, valuation_views["marks"])
-
-    # Select template and format
-    import random
-    templates = PERSONA_CLOSING_TEMPLATES.get(persona_id, PERSONA_CLOSING_TEMPLATES["marks"])
-    template = random.choice(templates)
-
-    closing_message = template.format(
-        company_name=company_name,
-        quality_assessment=quality_assessment,
-        valuation_view=valuation_view
-    )
-
-    # Add a definitive concluding sentence based on quality and valuation
-    concluding_sentences = {
-        "buffett": {
-            ("exceptional", "high_val"): "For patient investors, this is a business worth watching for a better entry point.",
-            ("exceptional", "low_val"): "At these prices, this is exactly the kind of opportunity I look for.",
-            ("exceptional", "neutral"): "The quality is there - the question is whether the price will come to us.",
-            ("high", "high_val"): "I'd keep this on the watchlist and wait for Mr. Market to offer a better price.",
-            ("high", "low_val"): "The economics are good enough, and the price is right - that's a combination I like.",
-            ("high", "neutral"): "A solid business at a fair price beats a great business at a wrong price.",
-            ("moderate", "high_val"): "Without a wider moat, the premium valuation gives me pause.",
-            ("moderate", "low_val"): "The price is attractive, but I'd want to understand the economics better first.",
-            ("moderate", "neutral"): "This one requires more conviction about the moat before I'd commit.",
-            ("concerning", "high_val"): "The numbers don't support the valuation - I'd look elsewhere.",
-            ("concerning", "low_val"): "Cheap for a reason - the business quality concerns me.",
-            ("concerning", "neutral"): "I'd pass until the business fundamentals improve.",
-            ("mixed", "high_val"): "Too many questions at this valuation - patience is warranted.",
-            ("mixed", "low_val"): "Interesting value, but the risks need clarification first.",
-            ("mixed", "neutral"): "More work needed before I'd be comfortable owning this.",
-        },
-        "munger": {
-            ("exceptional", "high_val"): "Great business, but don't overpay - even for quality.",
-            ("exceptional", "low_val"): "This is the rare combination: wonderful business at a sensible price.",
-            ("exceptional", "neutral"): "Quality is evident - patience on price is the remaining variable.",
-            ("high", "high_val"): "Good business, but the price reflects that already.",
-            ("high", "low_val"): "The opportunity here is obvious to those who look.",
-            ("high", "neutral"): "Worth serious study - the economics suggest durability.",
-            ("moderate", "high_val"): "Average business at above-average price. No thank you.",
-            ("moderate", "low_val"): "Cheap, but I'd rather own something better.",
-            ("moderate", "neutral"): "Nothing obviously stupid, but nothing compelling either.",
-            ("concerning", "high_val"): "This is the kind of mistake that costs you money.",
-            ("concerning", "low_val"): "Low price doesn't fix bad economics.",
-            ("concerning", "neutral"): "Move on - plenty of better opportunities exist.",
-            ("mixed", "high_val"): "Confusion at a premium price is not attractive.",
-            ("mixed", "low_val"): "If you can figure out the economics, maybe - but I can't.",
-            ("mixed", "neutral"): "Life is too short for businesses I don't understand.",
-        },
-        "graham": {
-            ("exceptional", "high_val"): "Quality is present, but the margin of safety is insufficient at current prices.",
-            ("exceptional", "low_val"): "Rare combination of quality and value - the intelligent investor takes note.",
-            ("exceptional", "neutral"): "Sound fundamentals warrant further analysis of intrinsic value.",
-            ("high", "high_val"): "Sound business, but the speculative element in the price is too high.",
-            ("high", "low_val"): "The numbers support a position - this passes my quantitative screens.",
-            ("high", "neutral"): "Further calculation of intrinsic value is warranted.",
-            ("moderate", "high_val"): "Speculation, not investment, at these prices.",
-            ("moderate", "low_val"): "Potentially adequate margin of safety - deeper analysis required.",
-            ("moderate", "neutral"): "Neither fish nor fowl - I'd wait for better clarity.",
-            ("concerning", "high_val"): "This fails my criteria on multiple dimensions.",
-            ("concerning", "low_val"): "Cheap, but the fundamentals do not support even this price.",
-            ("concerning", "neutral"): "The quantitative case is weak - I would pass.",
-            ("mixed", "high_val"): "Insufficient margin of safety for the uncertainty present.",
-            ("mixed", "low_val"): "Requires conviction I cannot derive from these numbers.",
-            ("mixed", "neutral"): "The prudent investor looks elsewhere.",
-        },
-        "lynch": {
-            ("exceptional", "high_val"): "Love the company, but the stock has gotten ahead of the story.",
-            ("exceptional", "low_val"): "This is the kind of find that gets me excited - buy it!",
-            ("exceptional", "neutral"): "Great story - just need to make sure the price is right.",
-            ("high", "high_val"): "Good company, but I'd wait for a pullback to buy.",
-            ("high", "low_val"): "The story checks out and the price is fair - I'd own it.",
-            ("high", "neutral"): "Do your homework, but this one has potential.",
-            ("moderate", "high_val"): "Not enough growth story to justify this price.",
-            ("moderate", "low_val"): "Could work, but it's not a tenbagger candidate.",
-            ("moderate", "neutral"): "Keep it on the radar, but don't rush in.",
-            ("concerning", "high_val"): "The story has holes and the price is too high - pass.",
-            ("concerning", "low_val"): "Cheap for a reason - the story isn't working.",
-            ("concerning", "neutral"): "Something's wrong here - trust your gut and move on.",
-            ("mixed", "high_val"): "Too confusing at this price - plenty of clearer stories out there.",
-            ("mixed", "low_val"): "Interesting, but I need to understand the story better first.",
-            ("mixed", "neutral"): "When in doubt, stay out - wait for clarity.",
-        },
-        "dalio": {
-            ("exceptional", "high_val"): "Strong fundamentals, but cycle positioning suggests caution on new entries.",
-            ("exceptional", "low_val"): "Quality asset at reasonable price - appropriate for balanced portfolios.",
-            ("exceptional", "neutral"): "Fundamentals are sound; size the position for where we are in the cycle.",
-            ("high", "high_val"): "Resilient business, but valuations leave little room for cycle turns.",
-            ("high", "low_val"): "Risk/reward is favorable given current cycle conditions.",
-            ("high", "neutral"): "Position sizing should reflect cycle awareness.",
-            ("moderate", "high_val"): "Cyclically vulnerable at premium prices - reduce exposure.",
-            ("moderate", "low_val"): "Acceptable risk/reward if position is appropriately sized.",
-            ("moderate", "neutral"): "Proceed with diversification in mind.",
-            ("concerning", "high_val"): "Vulnerable to cycle turns and overpriced - avoid.",
-            ("concerning", "low_val"): "The price reflects the risks - no edge here.",
-            ("concerning", "neutral"): "Better opportunities exist in this cycle phase.",
-            ("mixed", "high_val"): "Uncertainty at peak valuation is not a good combination.",
-            ("mixed", "low_val"): "Could work, but the correlation profile needs consideration.",
-            ("mixed", "neutral"): "Diversify away from concentrated bets like this.",
-        },
-        "wood": {
-            ("exceptional", "high_val"): "The disruption thesis is intact - volatility creates opportunity for long-term holders.",
-            ("exceptional", "low_val"): "Innovation at value prices - the market is missing the S-curve potential.",
-            ("exceptional", "neutral"): "The 5-year picture is compelling for those with conviction.",
-            ("high", "high_val"): "Growth trajectory supports the premium for patient investors.",
-            ("high", "low_val"): "Underappreciated innovation potential - worth building a position.",
-            ("high", "neutral"): "The disruption thesis warrants serious consideration.",
-            ("moderate", "high_val"): "Not enough innovation edge to justify the valuation.",
-            ("moderate", "low_val"): "Some technology potential, but not a high-conviction position.",
-            ("moderate", "neutral"): "More traditional than disruptive - not our focus.",
-            ("concerning", "high_val"): "At risk of being disrupted, not the disruptor.",
-            ("concerning", "low_val"): "Innovation laggard even at low prices - pass.",
-            ("concerning", "neutral"): "The technology adoption curve doesn't favor this business.",
-            ("mixed", "high_val"): "Innovation potential unclear at premium valuation - wait for clarity.",
-            ("mixed", "low_val"): "If the technology thesis crystallizes, there's upside here.",
-            ("mixed", "neutral"): "Monitor the technology evolution before committing.",
-        },
-        "greenblatt": {
-            ("exceptional", "high_val"): "Good business, but the earnings yield doesn't compensate for the price.",
-            ("exceptional", "low_val"): "High ROC + high earnings yield = Magic Formula buy.",
-            ("exceptional", "neutral"): "Quality is there - wait for the price to come in.",
-            ("high", "high_val"): "Decent ROC doesn't justify a low earnings yield.",
-            ("high", "low_val"): "The numbers work - add to the portfolio.",
-            ("high", "neutral"): "Run the formula again when the price moves.",
-            ("moderate", "high_val"): "Neither good nor cheap - this doesn't rank.",
-            ("moderate", "low_val"): "Cheap but not good enough - borderline pass.",
-            ("moderate", "neutral"): "The formula doesn't select this one.",
-            ("concerning", "high_val"): "Fails both criteria - clear pass.",
-            ("concerning", "low_val"): "Cheap because it's not a good business - pass.",
-            ("concerning", "neutral"): "The numbers speak for themselves - move on.",
-            ("mixed", "high_val"): "Can't rank what I can't calculate clearly - pass.",
-            ("mixed", "low_val"): "Need cleaner numbers before the formula applies.",
-            ("mixed", "neutral"): "Insufficient data for Magic Formula ranking.",
-        },
-        "bogle": {
-            ("exceptional", "high_val"): "Fine company, but why pay premium prices when the index costs 0.03%?",
-            ("exceptional", "low_val"): "Even quality at value prices can't beat the index over time - own the market.",
-            ("exceptional", "neutral"): "Strong fundamentals, but diversification remains the prudent choice.",
-            ("high", "high_val"): "The odds favor the index over any individual stock pick.",
-            ("high", "low_val"): "Perhaps reasonable, but why take single-stock risk?",
-            ("high", "neutral"): "Stay the course with broad market exposure instead.",
-            ("moderate", "high_val"): "Premium price for average business - the index is clearly better.",
-            ("moderate", "low_val"): "Cheap or not, concentration risk is unnecessary.",
-            ("moderate", "neutral"): "Own the haystack, not the needle.",
-            ("concerning", "high_val"): "This illustrates why stock picking is a loser's game.",
-            ("concerning", "low_val"): "Even cheap stocks can disappoint - diversify.",
-            ("concerning", "neutral"): "The index protects you from mistakes like this.",
-            ("mixed", "high_val"): "Uncertainty plus premium price equals poor odds - own the index.",
-            ("mixed", "low_val"): "Why speculate when you can own everything at virtually no cost?",
-            ("mixed", "neutral"): "The total market index remains the wise choice.",
-        },
-        "marks": {
-            ("exceptional", "high_val"): "Quality is priced in - patience for better risk/reward is warranted.",
-            ("exceptional", "low_val"): "Asymmetry favors the investor here - this is second-level opportunity.",
-            ("exceptional", "neutral"): "Strong fundamentals; watch for the pendulum to swing your way.",
-            ("high", "high_val"): "The consensus is already reflected - look for contrarian entries.",
-            ("high", "low_val"): "Risk/reward is skewed favorably - worthy of consideration.",
-            ("high", "neutral"): "Neither contrarian nor consensus - wait for better asymmetry.",
-            ("moderate", "high_val"): "Insufficient quality to justify the optimism in the price.",
-            ("moderate", "low_val"): "Cheap, but understand why before acting.",
-            ("moderate", "neutral"): "Average opportunity in an average situation.",
-            ("concerning", "high_val"): "This is where losses come from - the pendulum has swung too far.",
-            ("concerning", "low_val"): "Low price may reflect reality, not opportunity.",
-            ("concerning", "neutral"): "When fundamentals are poor, patience is not a virtue.",
-            ("mixed", "high_val"): "Uncertainty at high prices is asymmetric against you.",
-            ("mixed", "low_val"): "Potential opportunity if you can assess what others are missing.",
-            ("mixed", "neutral"): "Second-level thinking required before committing.",
-        },
-        "ackman": {
-            ("exceptional", "high_val"): "Great business, but I need a catalyst or pullback to act.",
-            ("exceptional", "low_val"): "Simple, predictable, free-cash-flow generative at a fair price - I'm interested.",
-            ("exceptional", "neutral"): "The quality is there - now find the catalyst.",
-            ("high", "high_val"): "Solid business, but the activist playbook needs a cheaper entry.",
-            ("high", "low_val"): "Good fundamentals at reasonable price - building conviction.",
-            ("high", "neutral"): "Worth the work to find the value creation opportunity.",
-            ("moderate", "high_val"): "Not enough quality to justify premium for operational improvement.",
-            ("moderate", "low_val"): "There may be value to unlock, but it requires heavy lifting.",
-            ("moderate", "neutral"): "Average business with average prospects - not my focus.",
-            ("concerning", "high_val"): "No amount of activism can fix these fundamentals at this price.",
-            ("concerning", "low_val"): "Cheap, but the business needs a turnaround story I don't see.",
-            ("concerning", "neutral"): "Pass - there are better uses of activist capital.",
-            ("mixed", "high_val"): "Too many unknowns at this valuation - clarity before capital.",
-            ("mixed", "low_val"): "Potential turnaround, but need to see the path to value creation.",
-            ("mixed", "neutral"): "More work needed to identify the catalyst.",
-        },
-    }
-
-    # Determine valuation bucket
-    if high_valuation_signals >= 2:
-        val_bucket = "high_val"
-    elif low_valuation_signals >= 1:
-        val_bucket = "low_val"
-    else:
-        val_bucket = "neutral"
-
-    # Get the concluding sentence
-    persona_conclusions = concluding_sentences.get(persona_id, concluding_sentences["marks"])
-    conclusion_key = (quality_level, val_bucket)
-    concluding_line = persona_conclusions.get(conclusion_key, "")
-
-    if concluding_line:
-        closing_message = f"{closing_message} {concluding_line}"
-
-    return closing_message
+    """Factory function to get a PersonaEngine instance."""
+    return PersonaEngine()

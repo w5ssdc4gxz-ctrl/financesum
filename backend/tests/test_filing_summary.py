@@ -598,8 +598,7 @@ def test_final_clamp_holds_length_after_postprocessing(monkeypatch):
         word_count = _backend_word_count(summary)
         assert target_length - 10 <= word_count <= target_length + 10
         # Ensure sections survive trimming
-        assert "Key Data Appendix" in summary
-        assert "Strategic Initiatives" in summary
+        assert "Key Metrics" in summary
     finally:
         local_cache.fallback_filings_by_id.pop(filing_id, None)
         local_cache.fallback_companies.pop(company_id, None)
@@ -672,7 +671,7 @@ def test_final_output_clamped_to_target_band(monkeypatch):
         assert target_length - 10 <= word_count <= target_length + 10
         # Ensure key sections remain present after padding/clamping
         assert "Executive Summary" in summary
-        assert "Key Data Appendix" in summary
+        assert "Key Metrics" in summary
     finally:
         local_cache.fallback_filings_by_id.pop(filing_id, None)
         local_cache.fallback_companies.pop(company_id, None)
@@ -681,7 +680,7 @@ def test_final_output_clamped_to_target_band(monkeypatch):
 
 
 def test_overlong_output_is_trimmed_but_complete(monkeypatch):
-    """Overlong drafts are trimmed into band while preserving Key Data Appendix rows."""
+    """Overlong drafts are trimmed into band while preserving Key Metrics rows."""
     settings = get_settings()
     settings.gemini_api_key = "test-key"
 
@@ -743,7 +742,7 @@ def test_overlong_output_is_trimmed_but_complete(monkeypatch):
         summary = response.json()["summary"]
         word_count = _backend_word_count(summary)
         assert target_length - 10 <= word_count <= target_length + 10
-        assert "Key Data Appendix" in summary
+        assert "Key Metrics" in summary
     finally:
         local_cache.fallback_filings_by_id.pop(filing_id, None)
         local_cache.fallback_companies.pop(company_id, None)

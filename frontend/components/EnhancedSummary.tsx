@@ -254,15 +254,17 @@ function normalizeCasing(text: string): string {
 }
 
 /**
- * Extract Key Data Appendix section and parse metrics
+ * Extract Key Metrics / Key Data Appendix section and parse metrics
  */
 function extractKeyDataAppendix(content: string): {
   beforeAppendix: string
   metrics: { label: string; value: string }[]
   afterAppendix: string
 } | null {
-  // Find the Key Data Appendix section
-  const appendixMatch = content.match(/##\s*Key\s+Data\s+Appendix\s*\n([\s\S]*?)(?=\n##\s|\n\n##\s|$)/i)
+  // Find the Key Metrics (preferred) or Key Data Appendix section
+  const appendixMatch = content.match(
+    /##\s*(?:Key\s+Metrics|Key\s+Data\s+Appendix)\s*\n([\s\S]*?)(?=\n##\s|\n\n##\s|$)/i
+  )
 
   if (!appendixMatch) return null
 

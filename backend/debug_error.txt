@@ -1,0 +1,13 @@
+UNEXPECTED ERROR: name 'cash' is not defined
+Type: <class 'NameError'>
+Traceback (most recent call last):
+  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 4777, in generate_filing_summary
+    summary_text = _inject_health_drivers(summary_text, calculated_metrics, health_score_data or {})
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 3291, in _inject_health_drivers
+    block = _build_health_driver_block(calculated_metrics, health_score_data)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 3234, in _build_health_driver_block
+    cash_reserves = (cash or 0) + (marketable_securities or 0)
+                     ^^^^
+NameError: name 'cash' is not defined

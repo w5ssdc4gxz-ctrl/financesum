@@ -391,6 +391,170 @@ class GeminiClient:
             self.force_http_fallback = True
             return SimpleNamespace(text=fallback_text)
 
+    def _post_process_summary(self, response_text: str) -> str:
+        """
+        Post-process the summary to fix common issues:
+        1. ALWAYS reorder sections to canonical order (1-7)
+        2. Remove banned phrases and "Additionally" spam
+        3. Remove extra sections not in canonical 7
+        4. Clean up formatting
+        """
+        import re
+        
+        # Banned phrase patterns to remove
+        banned_patterns = [
+            r"Additionally,?\s*monitor[^.]*\.",
+            r"Additionally,?\s*track[^.]*\.",
+            r"Additionally,?\s*watch[^.]*\.",
+            r"Additionally,?\s*assess[^.]*\.",
+            r"Additionally,?\s*review[^.]*\.",
+            r"Additionally,?\s*compare[^.]*\.",
+            r"Additionally,?\s*consider[^.]*\.",
+            r"Additionally,?\s*evaluate[^.]*\.",
+            r"Additionally,?\s*the balance sheet[^.]*\.",
+            r"Additionally,?\s*cash generation[^.]*\.",
+            r"Additionally,?\s*profitability[^.]*\.",
+            r"Additionally,?\s*working capital[^.]*\.",
+            r"Additionally,?\s*the capital[^.]*\.",
+            r"Additionally,?\s*operating leverage[^.]*\.",
+            r"Monitor revenue trajectory[^.]*\.",
+            r"Track operating margin[^.]*\.",
+            r"Watch free cash flow[^.]*\.",
+            r"Assess leverage and liquidity[^.]*\.",
+            r"Review capital allocation between[^.]*\.",
+            r"Consider guidance credibility[^.]*\.",
+            r"Evaluate unit economics[^.]*\.",
+            r"Compare cash balance to[^.]*\.",
+            r"Test sensitivity of margins[^.]*\.",
+            r"Benchmark take rate[^.]*\.",
+            r"The debt profile aligns[^.]*\.",
+            r"Cash generation metrics suggest[^.]*\.",
+            r"Profitability trends deserve[^.]*\.",
+            r"Working capital efficiency reflects[^.]*\.",
+            r"The capital structure positions[^.]*\.",
+            r"Revenue diversification reduces[^.]*\.",
+            r"Margin stability indicates[^.]*\.",
+            r"Operating leverage could amplify[^.]*\.",
+            r"The balance sheet strength provides[^.]*\.",
+            r"Cash conversion supports[^.]*\.",
+            r"second-level thinking",
+            r"pendulum",
+            r"where are we in the cycle",
+        ]
+        
+        cleaned_text = response_text
+        for pattern in banned_patterns:
+            cleaned_text = re.sub(pattern, "", cleaned_text, flags=re.IGNORECASE)
+        
+        # Remove stray monitoring directives at end of document (outside sections)
+        monitoring_patterns = [
+            r"\n\s*Monitor revenue trajectory[^\n]*",
+            r"\n\s*Track operating margin[^\n]*",
+            r"\n\s*Watch free cash flow[^\n]*",
+            r"\n\s*Assess leverage and liquidity[^\n]*",
+            r"\n\s*Monitor [^\n]*$",
+            r"\n\s*Track [^\n]*$",
+            r"\n\s*Watch [^\n]*$",
+        ]
+        for pattern in monitoring_patterns:
+            cleaned_text = re.sub(pattern, "", cleaned_text, flags=re.IGNORECASE)
+        
+        # ALWAYS reorder sections to canonical 7-section order
+        lines = cleaned_text.strip().split('\n')
+        
+        # Section detection patterns - map to canonical keys
+        section_patterns = [
+            ("health", r'^##?\s*\d*\.?\s*financial\s+health\s+rating'),
+            ("exec", r'^##?\s*\d*\.?\s*executive\s+summary'),
+            ("perf", r'^##?\s*\d*\.?\s*financial\s+performance'),
+            ("mda", r'^##?\s*\d*\.?\s*management\s+discussion'),
+            ("risks", r'^##?\s*\d*\.?\s*risk\s+factors?'),
+            ("metrics", r'^##?\s*\d*\.?\s*key\s+metrics'),
+            ("closing", r'^##?\s*\d*\.?\s*closing\s+takeaway'),
+        ]
+        
+        # Non-canonical sections to fold or remove
+        non_canonical_patterns = [
+            r'^##?\s*\d*\.?\s*strategic\s+initiatives',
+            r'^##?\s*\d*\.?\s*capital\s+allocation',
+            r'^##?\s*\d*\.?\s*competitive\s+landscape',
+            r'^##?\s*\d*\.?\s*catalysts?',
+            r'^##?\s*\d*\.?\s*investment\s+recommendation',
+            r'^##?\s*\d*\.?\s*investment\s+thesis',
+            r'^##?\s*\d*\.?\s*top\s+\d+\s+risks',
+            r'^##?\s*\d*\.?\s*key\s+kpis',
+            r'^##?\s*\d*\.?\s*cash\s+flow\s+analysis',
+            r'^##?\s*\d*\.?\s*key\s+data\s+appendix',
+            r'^##?\s*\d*\.?\s*health\s+score\s+drivers',
+            r'^##?\s*\d*\.?\s*tl;?dr',
+        ]
+        
+        sections_found = {}
+        current_section = None
+        current_content = []
+        preamble = []  # Content before first section
+        
+        for line in lines:
+            line_lower = line.lower().strip()
+            
+            # Check if this line starts a canonical section
+            found_section = None
+            for section_key, pattern in section_patterns:
+                if re.match(pattern, line_lower):
+                    found_section = section_key
+                    break
+            
+            # Check if this is a non-canonical section (to skip/fold)
+            is_non_canonical = any(re.match(p, line_lower) for p in non_canonical_patterns)
+            
+            if found_section:
+                # Save previous section
+                if current_section:
+                    sections_found[current_section] = '\n'.join(current_content)
+                elif current_content and not preamble:
+                    preamble = current_content
+                
+                current_section = found_section
+                current_content = [line]
+            elif is_non_canonical:
+                # Save previous section and start collecting non-canonical content
+                if current_section:
+                    sections_found[current_section] = '\n'.join(current_content)
+                    current_content = []
+                # We'll skip the header of non-canonical sections
+                current_section = None  # Mark as non-canonical content
+            else:
+                current_content.append(line)
+        
+        # Save last section
+        if current_section:
+            sections_found[current_section] = '\n'.join(current_content)
+        
+        # If no sections found, return original cleaned text
+        if not sections_found:
+            cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
+            return cleaned_text.strip()
+        
+        # Rebuild in canonical order: health, exec, perf, mda, risks, metrics, closing
+        canonical_order = ["health", "exec", "perf", "mda", "risks", "metrics", "closing"]
+        rebuilt = []
+        
+        for key in canonical_order:
+            if key in sections_found:
+                rebuilt.append(sections_found[key])
+        
+        if rebuilt:
+            cleaned_text = '\n\n'.join(rebuilt)
+        
+        # Clean up multiple newlines
+        cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
+        
+        # Clean up empty sentences from removed phrases
+        cleaned_text = re.sub(r'\.\s*\.', '.', cleaned_text)
+        cleaned_text = re.sub(r'\s{2,}', ' ', cleaned_text)
+        
+        return cleaned_text.strip()
+
     def generate_company_summary(
         self,
         company_name: str,
@@ -462,6 +626,8 @@ class GeminiClient:
                         continue
                 
                 # Parse the response into structured sections
+                # First, apply post-processing to fix section order and remove banned phrases
+                summary_text = self._post_process_summary(summary_text)
                 sections = self._parse_summary_response(summary_text)
                 sections["tldr"] = self._clamp_tldr_length(sections.get("tldr", ""))
                 return sections
@@ -514,27 +680,19 @@ class GeminiClient:
 CRITICAL LENGTH CONSTRAINT (STRICT ±10 WORDS - ABSOLUTE REQUIREMENT):
 Target: EXACTLY {target_length} words (acceptable range: {min_words}-{max_words} words).
 
-WORD COUNTING PROTOCOL (MANDATORY):
-1. BEFORE writing: Plan section word allocations to total {target_length} words.
-2. WHILE writing: Track cumulative word count after each major section.
-3. AFTER writing: COUNT EVERY WORD. If outside {min_words}-{max_words}, REWRITE immediately.
-4. FINAL CHECK: Your output MUST be between {min_words} and {max_words} words. No exceptions.
-
-SECTION WORD ALLOCATION GUIDE (adjust proportionally for target):
-- TL;DR: EXACTLY 10 words (strict max - count them!)
-- Investment Thesis: ~{int(target_length * 0.15)} words
-- Top 5 Risks: ~{int(target_length * 0.18)} words
-- Strategic Initiatives: ~{int(target_length * 0.14)} words
-- Competitive Landscape: ~{int(target_length * 0.12)} words
-- Cash Flow Analysis: ~{int(target_length * 0.10)} words
-- Catalysts: ~{int(target_length * 0.08)} words
-- KPIs to Monitor: ~{int(target_length * 0.07)} words
-- Investment Recommendation: ~{int(target_length * 0.06)} words
+SECTION WORD ALLOCATION (7 sections):
+- Financial Health Rating: ~{int(target_length * 0.03)} words (1 line)
+- Executive Summary: ~{int(target_length * 0.25)} words
+- Financial Performance: ~{int(target_length * 0.20)} words
+- Management Discussion & Analysis: ~{int(target_length * 0.15)} words
+- Risk Factors: ~{int(target_length * 0.18)} words
+- Key Metrics: ~{int(target_length * 0.09)} words
+- Closing Takeaway: ~{int(target_length * 0.10)} words
 
 LENGTH ADJUSTMENT RULES:
-- If running SHORT: Add specific data points, quantified impacts, and analytical depth.
-- If running LONG: Remove adjectives, merge sentences, eliminate redundancy.
-- NEVER cut off mid-sentence to hit word count. Complete thoughts, then adjust.
+- If running SHORT: Add specific data points and analytical depth to Executive Summary or Financial Performance.
+- If running LONG: Remove redundancy and generic phrases.
+- NEVER cut off mid-sentence to hit word count.
 """
 
         variation_clause = ""
@@ -590,73 +748,85 @@ FINAL LENGTH VERIFICATION (MANDATORY):
             length_reminder = ""
         
         prompt += f"""
-Please provide the following analysis in a structured format:
+MANDATORY 7-SECTION STRUCTURE (OUTPUT IN EXACT ORDER - CRITICAL):
+You MUST output these 7 sections in EXACTLY this order. Do not skip, reorder, combine, or add extra sections.
 
-## TL;DR (STRICT: 10 words max)
-[Write ONE powerful sentence. MAXIMUM 10 words. Count them. Include stance (bullish/bearish/neutral). Examples: "AI chip monopoly, 75% margins. Bullish." (7 words) | "Overvalued growth stock burning cash. Bearish." (6 words)]
+## 1. Financial Health Rating
+[ONE LINE ONLY: "X/100 (Letter) - Descriptor" where:
+- X = score 0-100
+- Letter = (S)trong, (G)ood, (W)atch, or (C)autious
+- Descriptor = brief summary
+Example: "66/100 (W) - Watch. Strong margins but elevated leverage."]
 
-## Investment Thesis (5 bullet points)
-[List 5 key reasons why this company could be an attractive investment, with brief explanations]
+## 2. Executive Summary  
+[2-3 paragraphs covering:
+- Your conviction (bullish/bearish/neutral) with confidence level (high/medium/low)
+- Core investment thesis in 2-3 clear sentences
+- Key narrative driving the stock
+- What matters most for investors to watch
+Write in flowing prose. NO bullet lists of "Monitor X" or "Track Y".]
 
-## Top 5 Risks
-[List EXACTLY 5 major company-specific risks. Each risk MUST be:
-1. Specific to THIS company's business model (not generic "regulatory risk" or "macro headwinds")
-2. Named clearly (e.g., "Customer Concentration Risk", "Patent Cliff", "China Revenue Exposure")
-3. Explained in 2-3 sentences with concrete detail and quantified impact where possible
-Example: "Customer concentration: Top 3 hyperscalers (Microsoft, Amazon, Google) represent ~45% of Data Center revenue, creating dependency risk."]
+## 3. Financial Performance
+[Analyze the numbers with insight, not just data dumps:
+- Revenue with context (growth, market position)
+- Operating margin - what it reveals about core business profitability
+- Net margin - if it diverges significantly from operating margin, explain WHY (e.g., non-operating income, one-time items)
+- Cash flow quality - FCF, cash conversion
+Every metric must be explained, not just stated. Use $ figures and %.]
 
-## Strategic Initiatives & Capital Allocation
-[Analyze how the company deploys capital:
-- R&D intensity (as % of revenue) and what it funds
-- Capital expenditure priorities (distinguish from shareholder returns)
-- Buybacks and dividends (as % of free cash flow) - these fund shareholder returns, NOT growth
-- M&A history and strategic rationale
-- Management's stated priorities for capital deployment]
+## 4. Management Discussion & Analysis
+[Evaluate through an investor lens:
+- Capital allocation priorities (R&D, capex, buybacks, dividends)
+- Earnings quality concerns (one-time items, non-operating income)
+- Strategic execution evidence from financials
+Do NOT speculate about "management commentary" not in the filings.
+Do NOT say "Management discusses..." - just state the facts.]
 
-## Competitive Landscape
-[Dedicated section analyzing the competitive environment:
-- Identify key competitors (e.g., AMD, Intel, Hyperscalers for NVDA)
-- Discuss competitive threats (e.g., custom silicon, pricing pressure)
-- Analyze moat sustainability]
+## 5. Risk Factors  
+[3-5 SPECIFIC company risks. Each MUST:
+1. Have a clear name (e.g., "Customer Concentration", "Margin Compression Risk")
+2. Be 2-3 sentences with quantified impact where possible
+3. Be specific to THIS company - NOT generic risks
+Format: "**Risk Name**: Explanation with specifics."
+Do NOT use generic risks like "macroeconomic volatility" or "regulatory uncertainty" without company-specific context.]
 
-## Cash Flow Analysis
-[Decompose the cash flow:
-- Operating Cash Flow (CFO) trends
-- Capex requirements
-- Working capital impact
-- Free Cash Flow (FCF) sustainability comment]
+## 6. Key Metrics
+[Concise data summary in this EXACT format:
+→ Revenue: $X | Operating Income: $X | Net Income: $X
+→ Capital Expenditures: $X | Total Assets: $X
 
-## Catalysts (3-5 items)
-[List 3-5 potential catalysts with expected time horizons]
+Health Score Drivers:
+→ Profitability: operating margin X%, net margin X%.
+→ Cash conversion: operating cash flow $X, FCF $X, FCF margin X%.
+→ Balance sheet: cash + securities $X, liabilities $X, leverage X.Xx, interest coverage X.Xx.
+→ Liquidity: current ratio X.Xx.
 
-## Key KPIs to Monitor (5 items)
-[List 5 key performance indicators investors should track]
+THEN 1-2 sentences on which metrics matter most for this company.]
 
-## Investment Recommendation
-[Provide a clear, actionable investment recommendation. This section MUST include:
-1. **Rating**: State explicitly: BUY, HOLD, or SELL
-2. **Conviction Level**: High, Medium, or Low
-3. **Summary Rationale**: 2-3 sentences synthesizing the key findings from the entire analysis
-4. **Key Conditions**: What would change your recommendation (upside triggers for HOLD/SELL, downside risks for BUY)
+## 7. Closing Takeaway
+[Your final verdict in 2-3 complete sentences:
+- Clear stance: BUY, HOLD, or SELL
+- Primary reasoning
+- What would change your view
+This MUST be the FINAL section. NO content after this. NO trailing "Monitor X" suggestions.]
 
-Format example:
-"**Rating: HOLD (Medium Conviction)**
-NVDA demonstrates exceptional profitability and market leadership in AI/accelerated computing, but the premium valuation leaves limited margin of safety. The recommendation shifts to BUY if margins remain above 40% for two consecutive quarters while revenue growth exceeds 20%, or to SELL if customer concentration risk materializes with hyperscaler order reductions exceeding 15%."]
+CRITICAL RULES (VIOLATIONS WILL BE REJECTED):
+1. OUTPUT SECTIONS 1-7 IN EXACT ORDER SHOWN - Financial Health Rating FIRST, Closing Takeaway LAST
+2. NO "Strategic Initiatives & Capital Allocation" as a separate section - fold into MD&A (section 4)
+3. NO "Competitive Landscape" as a separate section - integrate into Executive Summary or Risk Factors
+4. NO "Catalysts" as a separate section
+5. NO "Investment Recommendation" as a separate section - it's part of Closing Takeaway (section 7)
+6. NO "Health Score Drivers" outside of section 6 (Key Metrics)
+7. NO content after Closing Takeaway - it is the FINAL section
+8. NO repetitive "Additionally, monitor X" or "Track Y" phrases anywhere
+9. Use billions as "$X.XB", millions as "$X.XM"
+10. Specify fiscal period (FY24, Q3 FY25, TTM) with figures
 
-CRITICAL FORMATTING RULES:
-- Use consistent number formatting: billions as "X.XB" (e.g., $26.2B), millions as "X.XM"
-- ALWAYS specify time period: (FY24), (Q3 FY25), (TTM) after each figure
-- DISTINGUISH: Capex funds growth. Buybacks/dividends fund shareholder returns. Never conflate them.
-
-ABSOLUTE SENTENCE COMPLETION REQUIREMENTS (CRITICAL - DO NOT VIOLATE):
-- EVERY sentence MUST be complete. Never end a sentence mid-thought.
-- FORBIDDEN: Ending with "but...", "although...", "however...", "while...", "which is...", "driven by the..."
-- FORBIDDEN: Cutting off numbers like "FCF/Net Income of 0.51 demonstrates solid cash generation, but the figure is less than net..."
-- FORBIDDEN: Executive summaries or conclusions that trail off mid-sentence
-- If you write "but", "although", "however", or "while", you MUST complete the contrasting thought
-- If you mention a ratio or metric, ALWAYS explain what it means, don't just state the number
-- VERIFY: Before finishing, re-read your output and ensure EVERY sentence ends with a period, exclamation, or question mark AFTER a complete thought
-- The final sentence of EVERY section must be a complete, standalone thought
+SENTENCE COMPLETION (CRITICAL):
+- EVERY sentence MUST end with a complete thought
+- FORBIDDEN: trailing "but...", "although...", "which is...", "driven by the..."
+- FORBIDDEN: numbers cut off mid-figure
+- If you start a contrast ("but", "however"), you MUST complete it
 {length_reminder}
 """
         
@@ -995,7 +1165,7 @@ CRITICAL INSTRUCTIONS FOR PREMIUM QUALITY:
 10. **CUSTOM INSTRUCTIONS**: {custom_instructions}
 11. **PERSONA PERSISTENCE**: Every section must sound like {persona_name}. Open with "As {persona_name}, ..." and restate your lens in at least one sentence per section.
 12. **VALUATION VERDICT**: State explicitly whether the company is good/cheap vs great/expensive, why, and what must be true for upside/downside. Tie this to persona-specific metrics.
-13. **RISK/IMPACT**: Rank the single most important risk and describe its impact on margins, cash flow, and valuation in the persona’s language.
+13. **RISK/IMPACT**: Rank the single most important risk and describe its impact on margins, cash flow, and valuation in the persona's language.
 14. **TENSION & HINGE ASSUMPTION**: Call out the hinge assumption that could break the thesis (e.g., ROC compression, growth deceleration, leverage) and how the persona would monitor it.
 15. **DATA GAPS**: If data is missing, NEVER say "Data unavailable". Instead, infer from context, use a proxy, or explain why the absence is a risk factor itself.
 
@@ -1033,18 +1203,55 @@ If you are writing as John Bogle, you MUST:
 3. CITE THE BASE RATE: "90% of professional stock pickers fail to beat the index over 15 years."
 4. COMPARE TO INDEX: Would the reader be better off owning a total market index fund instead?
 5. AVOID SPECULATION: No forward guidance analysis, no price targets, no "upside potential."
-6. NO RATINGS OR SCORES: Bogle would never rate a stock "72/100" - that's absurd to him.
+6. NO RATINGS OR SCORES: Bogle would never rate a stock "72/100" - that's absurd to him. NO "Financial Health Rating" sections.
 7. GRANDFATHERLY TONE: Wise, patient, humble. Not condescending, but firm in your convictions.
 8. CLEAR CONCLUSION: Should the reader own this stock, or the index? Be direct and complete your thought.
+
+FORMATTING AND FLOW RULES (CRITICAL FOR QUALITY):
+- Write in FLOWING PROSE with natural transitions between ideas
+- Each paragraph should connect logically to the next - do not write choppy, disconnected sections
+- Use sentence case for all body text - NEVER write entire sentences in CAPITAL LETTERS
+- Only section headlines may use title case (e.g., "Executive Summary")
+- NO arrow notation (→) anywhere in the output
+- NO metric dumps or data appendices at the end
+- NO "Health Score Drivers" or "Key Data Appendix" sections - these are NOT Bogle's style
+- NO repetitive lists like "Monitor revenue", "Track margins", "Watch cash flow" at the end
+- NO bullet point lists of things to watch - Bogle speaks in prose, not checklists
+
+CLOSING TAKEAWAY QUALITY (MANDATORY):
+- Your closing paragraph must be SUBSTANTIVE, not filler
+- Do NOT pad the ending with generic monitoring suggestions
+- Do NOT repeat information already covered
+- The closing should synthesize your analysis into a coherent investment perspective
+- End with a genuine personal recommendation that flows naturally from your analysis
+- The closing should feel like wisdom from a trusted advisor, not a corporate disclaimer
+
+ANTI-CHEATING RULES:
+- Every sentence must add genuine analytical value - no padding
+- Do not artificially inflate word count with repetitive phrases
+- Do not list the same risks or metrics multiple times in different sections
+- If you find yourself writing "Additionally, monitor X" or "Also track Y" - STOP and write something substantive instead
+- Quality over quantity: a shorter, tighter analysis is better than a padded one
+
 Do NOT sound like a corporate analyst. Sound like a wise grandfather warning about Wall Street's self-serving advice.
 Do NOT use "bullish" or "bearish" language. Do NOT give price targets. Do NOT analyze forward guidance.
-END with a clear, complete conclusion - never leave a thought unfinished.
+END with a clear, complete conclusion - never leave a thought unfinished or add filler content after.
 
-STORYTELLING MODE (MANDATORY FOR BUFFETT/MUNGER/LYNCH):
-- Use METAPHORS and ANALOGIES. (e.g., "This business is a castle," "The CEO is the jockey.")
-- AVOID JARGON. Do not say "operating margin expansion." Say "they are keeping more pennies from every dollar."
-- NO BULLET POINTS FOR RISKS. Tell a story about what could go wrong.
-- NO NUMERIC RATINGS. (e.g., "9/10"). Use words like "Wonderful," "Fair," or "Terrible."
+STRICT LOGIC GATES (DO NOT VIOLATE):
+- IF Net Income < 0 OR Free Cash Flow < 0: YOU ARE FORBIDDEN from suggesting buybacks or dividends as viable options. Discuss cash burn, dilution risk, and runway instead.
+- IF Revenue Growth is negative: DO NOT call it "stable". Call it "declining" or "contracting".
+- IF the company is hardware/manufacturing (like Lidar): DO NOT discuss "advertising budgets" or "software churn" unless explicitly relevant.
+
+CONTEXT-AWARE RISKS:
+- RISKS MUST BE SPECIFIC TO THE BUSINESS MODEL.
+- Do NOT list generic risks like "regulatory changes" or "general economic downturn" unless you explain EXACTLY how they impact THIS company.
+- Example: For a Lidar company, discuss "automotive OEM adoption cycles" or "sensor pricing pressure", NOT "data privacy".
+
+MANDATORY METRICS TO ANALYZE:
+- Cash Runway (if loss-making)
+- Unit Economics (if available)
+- Operating Leverage (are margins improving with scale?)
+- Liquidity & Solvency
 
 FINAL OUTPUT STRUCTURE:
 Do NOT use generic section headers like "## Executive Summary", "## Key Risks", "## Investment Thesis".

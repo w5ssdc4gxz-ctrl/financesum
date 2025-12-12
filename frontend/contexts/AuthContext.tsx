@@ -37,6 +37,36 @@ const DEMO_ACTIVE_KEY = 'financesum.demo.active'
 const SUPABASE_URL = (process.env.NEXT_PUBLIC_SUPABASE_URL ?? '').replace(/\/$/, '')
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? ''
 
+const decodeSupabaseProjectRef = (key: string): string | null => {
+  try {
+    const payload = key.split('.')[1]
+    if (!payload || typeof atob !== 'function') return null
+    const normalized = payload.replace(/-/g, '+').replace(/_/g, '/')
+    const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), '=')
+    const decoded = atob(padded)
+    const parsed = JSON.parse(decoded)
+    return typeof parsed?.ref === 'string' ? parsed.ref : null
+  } catch {
+    return null
+  }
+}
+
+const extractProjectRefFromUrl = (url: string): string | null => {
+  try {
+    const hostname = new URL(url).hostname
+    const [projectRef] = hostname.split('.')
+    return projectRef || null
+  } catch {
+    return null
+  }
+}
+
+const SUPABASE_URL_PROJECT_REF = extractProjectRefFromUrl(SUPABASE_URL)
+const SUPABASE_ANON_KEY_REF = decodeSupabaseProjectRef(SUPABASE_ANON_KEY)
+const SUPABASE_CONFIG_MISMATCH =
+  Boolean(SUPABASE_URL_PROJECT_REF && SUPABASE_ANON_KEY_REF) &&
+  SUPABASE_URL_PROJECT_REF !== SUPABASE_ANON_KEY_REF
+
 const createDemoUser = (): User => {
   const timestamp = new Date().toISOString()
   return {
@@ -64,12 +94,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [session, setSession] = useState<Session | null>(null)
   const [loading, setLoading] = useState(true)
-  const [demoMode, setDemoMode] = useState<boolean>(AUTH_MODE === 'demo')
+  const [demoMode, setDemoMode] = useState<boolean>(
+    AUTH_MODE === 'demo' || (SUPABASE_CONFIG_MISMATCH && ALLOW_DEMO_FALLBACK)
+  )
   const [providerStatus, setProviderStatus] = useState<{ checked: boolean; enabled: boolean | null }>({
     checked: false,
     enabled: null,
   })
-  const resolvedDemoMode = useMemo(() => demoMode, [demoMode])
+  const resolvedDemoMode = useMemo(
+    () => demoMode || (SUPABASE_CONFIG_MISMATCH && ALLOW_DEMO_FALLBACK),
+    [demoMode]
+  )
+
+  useEffect(() => {
+    if (SUPABASE_CONFIG_MISMATCH) {
+      console.warn(
+        'Supabase URL and anon key point to different projects. Update NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY to use the same project.',
+        { urlRef: SUPABASE_URL_PROJECT_REF, keyRef: SUPABASE_ANON_KEY_REF }
+      )
+    }
+  }, [])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -81,6 +125,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [])
   const fetchProviderStatus = useCallback(async () => {
     if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+      setProviderStatus({ checked: true, enabled: null })
+      return null
+    }
+
+    if (SUPABASE_CONFIG_MISMATCH) {
       setProviderStatus({ checked: true, enabled: null })
       return null
     }
@@ -153,6 +202,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return
     }
 
+    if (SUPABASE_CONFIG_MISMATCH) {
+      setLoading(false)
+      return
+    }
+
     // Supabase auth flow
     let isMounted = true
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -195,12 +249,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return
     }
 
+    if (SUPABASE_CONFIG_MISMATCH) {
+      const message = `Supabase project mismatch: URL (${SUPABASE_URL_PROJECT_REF ?? 'unknown'}) vs anon key (${SUPABASE_ANON_KEY_REF ?? 'unknown'}). Update your environment variables so they reference the same project.`
+      if (ALLOW_DEMO_FALLBACK) {
+        startDemoSession()
+        throw new Error(`${message} Started a local demo session instead.`)
+      }
+      throw new Error(message)
+    }
+
     let isProviderEnabled = providerStatus.enabled
     if (!providerStatus.checked) {
       isProviderEnabled = await fetchProviderStatus()
     }
 
-    const supabaseConfigured = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY)
+    const supabaseConfigured = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY && !SUPABASE_CONFIG_MISMATCH)
     const providerDisabled = isProviderEnabled === false
 
     if (!supabaseConfigured || providerDisabled) {
@@ -276,8 +339,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
-
-
 
 
 
