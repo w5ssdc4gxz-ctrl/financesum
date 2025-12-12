@@ -3,11 +3,13 @@
 
 def is_supabase_table_missing_error(error: Exception) -> bool:
     """
-    Return True when Supabase reports that a referenced table is missing.
+    Return True when Supabase is unusable and callers should fall back.
 
     This typically surfaces as PostgREST error code PGRST205 with a message like
     "Could not find the table 'public.xyz' in the schema cache".
     We also guard against common phrasing like "relation ... does not exist".
+    Additionally, treat obvious authentication/configuration failures (invalid API key,
+    expired JWT, permission denied) as fallback-worthy so the app can run in local mode.
     """
     try:
         message = str(error)
@@ -22,4 +24,9 @@ def is_supabase_table_missing_error(error: Exception) -> bool:
         "could not find the table" in lowered
         or "pgrst205" in lowered
         or "does not exist" in lowered
+        or "invalid api key" in lowered
+        or "jwt expired" in lowered
+        or "permission denied" in lowered
+        or "not authorized" in lowered
+        or "unauthorized" in lowered
     )

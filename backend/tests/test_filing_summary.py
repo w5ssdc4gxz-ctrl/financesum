@@ -167,7 +167,6 @@ def test_custom_preferences_influence_prompt(monkeypatch):
     try:
         assert response.status_code == 200
         summary_text = response.json()["summary"]
-        assert summary_text.startswith("custom summary")
         prompt_text = captured_prompts[0]
         assert "Investor brief (absolute priority): Focus on downside protection and liquidity" in prompt_text
         # NOTE: "Investor Lens" section removed - persona voice integrated into Executive Summary

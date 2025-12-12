@@ -801,7 +801,7 @@ Health Score Drivers:
 → Balance sheet: cash + securities $X, liabilities $X, leverage X.Xx, interest coverage X.Xx.
 → Liquidity: current ratio X.Xx.
 
-THEN 1-2 sentences on which metrics matter most for this company.]
+Do NOT explain or interpret these metrics here. Do NOT show formulas/equations (no '=' signs). If a metric is missing, omit the line rather than writing N/A or not calculable. This section is a pure, scannable data block.]
 
 ## 7. Closing Takeaway
 [Your final verdict in 2-3 complete sentences:
