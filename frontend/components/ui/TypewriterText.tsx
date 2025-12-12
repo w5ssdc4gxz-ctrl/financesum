@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useRef } from 'react'
+import { useEffect, useState, useRef, useCallback } from 'react'
 
 interface TypewriterTextProps {
   text: string
@@ -20,22 +20,29 @@ export function TypewriterText({
   const [displayText, setDisplayText] = useState('')
   const indexRef = useRef(0)
   const animationRef = useRef<number>()
+  const onCompleteRef = useRef(onComplete)
+  
+  useEffect(() => {
+    onCompleteRef.current = onComplete
+  }, [onComplete])
 
   useEffect(() => {
     indexRef.current = 0
     setDisplayText('')
     
-    const interval = 1000 / speed
+    const charsPerFrame = Math.max(1, Math.floor(speed / 60))
+    const interval = 1000 / 60
+
     let lastTime = 0
 
     const animate = (currentTime: number) => {
       if (currentTime - lastTime >= interval) {
         if (indexRef.current < text.length) {
-          indexRef.current++
+          indexRef.current = Math.min(indexRef.current + charsPerFrame, text.length)
           setDisplayText(text.slice(0, indexRef.current))
           lastTime = currentTime
         } else {
-          onComplete?.()
+          onCompleteRef.current?.()
           return
         }
       }
@@ -49,7 +56,7 @@ export function TypewriterText({
         cancelAnimationFrame(animationRef.current)
       }
     }
-  }, [text, speed, onComplete])
+  }, [text, speed])
 
   if (children) {
     return <>{children(displayText)}</>

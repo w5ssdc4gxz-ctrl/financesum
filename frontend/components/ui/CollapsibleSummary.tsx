@@ -53,9 +53,9 @@ export function CollapsibleSummary({
         
         {!isExpanded && (
           <div 
-            className="absolute bottom-0 left-0 right-0 h-24 pointer-events-none"
+            className="absolute bottom-0 left-0 right-0 h-16 pointer-events-none"
             style={{
-              background: 'linear-gradient(to bottom, transparent 0%, hsl(var(--card)) 100%)'
+              background: 'linear-gradient(to bottom, transparent 0%, rgb(24 24 27 / 0.95) 70%, rgb(24 24 27) 100%)'
             }}
           />
         )}
@@ -66,7 +66,7 @@ export function CollapsibleSummary({
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           onClick={() => setIsExpanded(true)}
-          className="mt-2 text-sm font-bold text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 cursor-pointer transition-colors flex items-center gap-1.5 group"
+          className="mt-4 text-sm font-bold text-blue-500 hover:text-blue-400 cursor-pointer transition-colors flex items-center gap-1.5 group"
         >
           <span className="border-b border-transparent group-hover:border-current">
             Show more
@@ -86,20 +86,20 @@ export function CollapsibleSummary({
             initial={{ opacity: 0, height: 0 }}
             animate={{ opacity: 1, height: 'auto' }}
             exit={{ opacity: 0, height: 0 }}
-            transition={{ duration: 0.3, ease: "easeOut" }}
+            transition={{ duration: 0.2, ease: "easeOut" }}
             className="overflow-hidden"
           >
             {!hasAnimated ? (
               <TypewriterText
                 text={remaining}
-                speed={150}
+                speed={500}
                 onComplete={() => setHasAnimated(true)}
               >
                 {(displayText) => (
                   <div className="relative">
                     {renderMarkdown(displayText)}
                     {displayText.length < remaining.length && (
-                      <span className="inline-block w-[3px] h-[1.2em] bg-blue-500 dark:bg-blue-400 ml-1 animate-blink align-middle" />
+                      <span className="inline-block w-[3px] h-[1.2em] bg-blue-500 ml-1 animate-blink align-middle" />
                     )}
                   </div>
                 )}
@@ -117,7 +117,7 @@ export function CollapsibleSummary({
                   setIsExpanded(false)
                   setHasAnimated(false)
                 }}
-                className="mt-6 text-sm font-bold text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300 cursor-pointer transition-colors flex items-center gap-1.5 group"
+                className="mt-6 mb-8 text-sm font-bold text-gray-500 hover:text-gray-400 cursor-pointer transition-colors flex items-center gap-1.5 group"
               >
                 <motion.span 
                   animate={{ y: [0, -3, 0] }}
@@ -133,6 +133,9 @@ export function CollapsibleSummary({
           </motion.div>
         )}
       </AnimatePresence>
+      
+      {/* Bottom padding for scroll breathing room */}
+      <div className="h-12" />
     </div>
   )
 }
