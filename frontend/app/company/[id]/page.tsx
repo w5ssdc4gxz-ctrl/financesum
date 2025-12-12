@@ -1198,7 +1198,7 @@ export default function CompanyPage() {
                             key={fid}
                             initial={{ opacity: 0, y: 20 }}
                             animate={{ opacity: 1, y: 0 }}
-                            className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 shadow-[6px_6px_0px_0px_rgba(0,0,0,1)] dark:shadow-[6px_6px_0px_0px_rgba(255,255,255,1)] max-h-[calc(100vh-200px)] overflow-hidden flex flex-col"
+                            className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 shadow-[6px_6px_0px_0px_rgba(0,0,0,1)] dark:shadow-[6px_6px_0px_0px_rgba(255,255,255,1)]"
                           >
                             <div className="flex justify-between items-start mb-4 border-b-2 border-gray-100 dark:border-gray-800 pb-4">
                               <div>
@@ -1240,12 +1240,12 @@ export default function CompanyPage() {
                                 </BrutalButton>
                               </div>
                             </div>
-                            <div className="prose dark:prose-invert max-w-none font-mono text-sm overflow-y-auto pr-2 custom-scrollbar flex-1">
-                              <EnhancedSummary
-                                content={summary.content}
-                                persona={summary.metadata?.selectedPersona ? INVESTOR_PERSONAS.find(p => p.id === summary.metadata.selectedPersona) : null}
-                              />
-                            </div>
+                            <div className="prose dark:prose-invert max-w-none font-mono text-sm">
+                                <EnhancedSummary
+                                  content={summary.content}
+                                  persona={summary.metadata?.selectedPersona ? INVESTOR_PERSONAS.find(p => p.id === summary.metadata.selectedPersona) : null}
+                                />
+                              </div>
                           </motion.div>
                         ))}
                       </div>
