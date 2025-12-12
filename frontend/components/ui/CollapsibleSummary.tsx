@@ -48,14 +48,14 @@ export function CollapsibleSummary({
 
   return (
     <div className={className}>
-      <div className="relative">
+      <div className={`relative ${!isExpanded ? 'max-h-[280px] overflow-hidden' : ''}`}>
         {renderMarkdown(preview)}
         
         {!isExpanded && (
           <div 
-            className="absolute bottom-0 left-0 right-0 h-16 pointer-events-none"
+            className="absolute bottom-0 left-0 right-0 h-24 pointer-events-none"
             style={{
-              background: 'linear-gradient(to bottom, transparent 0%, rgb(24 24 27 / 0.95) 70%, rgb(24 24 27) 100%)'
+              background: 'linear-gradient(to bottom, transparent 0%, rgb(24 24 27 / 0.8) 50%, rgb(24 24 27) 100%)'
             }}
           />
         )}
@@ -66,7 +66,7 @@ export function CollapsibleSummary({
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           onClick={() => setIsExpanded(true)}
-          className="mt-4 text-sm font-bold text-blue-500 hover:text-blue-400 cursor-pointer transition-colors flex items-center gap-1.5 group"
+          className="mt-2 text-sm font-bold text-blue-500 hover:text-blue-400 cursor-pointer transition-colors flex items-center gap-1.5 group"
         >
           <span className="border-b border-transparent group-hover:border-current">
             Show more
@@ -117,7 +117,7 @@ export function CollapsibleSummary({
                   setIsExpanded(false)
                   setHasAnimated(false)
                 }}
-                className="mt-6 mb-8 text-sm font-bold text-gray-500 hover:text-gray-400 cursor-pointer transition-colors flex items-center gap-1.5 group"
+                className="mt-6 mb-4 text-sm font-bold text-gray-500 hover:text-gray-400 cursor-pointer transition-colors flex items-center gap-1.5 group"
               >
                 <motion.span 
                   animate={{ y: [0, -3, 0] }}
@@ -133,9 +133,6 @@ export function CollapsibleSummary({
           </motion.div>
         )}
       </AnimatePresence>
-      
-      {/* Bottom padding for scroll breathing room */}
-      <div className="h-12" />
     </div>
   )
 }

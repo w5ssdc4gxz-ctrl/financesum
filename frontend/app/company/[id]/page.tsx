@@ -1240,7 +1240,7 @@ export default function CompanyPage() {
                                 </BrutalButton>
                               </div>
                             </div>
-                            <div className="prose dark:prose-invert max-w-none font-mono text-sm max-h-[600px] overflow-y-auto pr-2 custom-scrollbar">
+                            <div className="prose dark:prose-invert max-w-none font-mono text-sm overflow-y-auto pr-2 custom-scrollbar">
                               <EnhancedSummary
                                 content={summary.content}
                                 persona={summary.metadata?.selectedPersona ? INVESTOR_PERSONAS.find(p => p.id === summary.metadata.selectedPersona) : null}
