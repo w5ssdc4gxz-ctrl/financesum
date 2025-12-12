@@ -49,7 +49,7 @@ async def _enrich_with_yahoo(company: Dict, client: httpx.AsyncClient) -> Dict:
             if not company.get("industry"):
                 company["industry"] = quote.get("industryDisp") or quote.get("industry")
             if not company.get("country"):
-                company["country"] = quote.get("region") or "US"
+                company["country"] = quote.get("region")
 
             print(f"✓ Enriched {ticker} with Yahoo Finance data")
 
@@ -81,7 +81,7 @@ async def search_company_by_ticker_or_cik(query: str) -> List[Dict]:
                     "exchange": company_info["exchange"],
                     "sector": company_info.get("sector"),
                     "industry": company_info.get("industry"),
-                    "country": company_info.get("country", "USA")
+                    "country": company_info.get("country")
                 }]
     except Exception as e:
         print(f"EODHD search error (falling back to EDGAR): {e}")
@@ -119,7 +119,7 @@ async def search_company_by_ticker_or_cik(query: str) -> List[Dict]:
                         "exchange": "US",
                         "sector": None,
                         "industry": None,
-                        "country": "US"
+                        "country": None
                     })
 
                     # If exact ticker match, enrich and return immediately
@@ -173,7 +173,7 @@ async def search_company_by_ticker_or_cik(query: str) -> List[Dict]:
                     "exchange": quote.get("exchDisp") or quote.get("exchange") or "US",
                     "sector": quote.get("sectorDisp") or quote.get("sector"),
                     "industry": quote.get("industryDisp") or quote.get("industry"),
-                    "country": quote.get("region") or "US",
+                    "country": quote.get("region"),
                 })
 
             if companies:

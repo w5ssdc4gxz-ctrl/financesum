@@ -15,7 +15,7 @@ class CompanyBase(BaseModel):
     exchange: Optional[str] = None
     industry: Optional[str] = None
     sector: Optional[str] = None
-    country: str = "US"
+    country: Optional[str] = None
 
 
 class CompanyCreate(CompanyBase):

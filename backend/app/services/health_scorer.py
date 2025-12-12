@@ -546,14 +546,21 @@ class HealthScorer:
                 if fcf > 0:
                     # Score positive FCF based on margin if available
                     if fcf_margin is not None:
-                        if fcf_margin >= 0.15:  # 15%+ FCF margin = excellent
-                            cash_flow_scores.append(90)
-                        elif fcf_margin >= 0.10:  # 10-15%
-                            cash_flow_scores.append(80)
-                        elif fcf_margin >= 0.05:  # 5-10%
-                            cash_flow_scores.append(70)
-                        else:  # <5%
-                            cash_flow_scores.append(60)
+                        # Piecewise-linear scoring to avoid early saturation at high margins.
+                        # Anchors: 0%→60, 5%→70, 10%→80, 15%→90, 30%+→95 (cap).
+                        margin = fcf_margin / 100 if fcf_margin > 1 else fcf_margin  # tolerate % inputs
+                        if margin >= 0.30:
+                            cash_flow_scores.append(95)
+                        elif margin >= 0.15:
+                            cash_flow_scores.append(90 + (5 * (margin - 0.15) / 0.15))
+                        elif margin >= 0.10:
+                            cash_flow_scores.append(80 + (10 * (margin - 0.10) / 0.05))
+                        elif margin >= 0.05:
+                            cash_flow_scores.append(70 + (10 * (margin - 0.05) / 0.05))
+                        elif margin >= 0:
+                            cash_flow_scores.append(60 + (10 * margin / 0.05))
+                        else:
+                            cash_flow_scores.append(25)
                         self.data_sources["cash_flow"] = "primary_fcf_margin"
                     else:
                         cash_flow_scores.append(72)  # Positive FCF without margin data
@@ -1049,7 +1056,6 @@ def calculate_health_score(
     """
     scorer = HealthScorer(ratios, peer_data, custom_weights=weighting_preset, ai_growth_assessment=ai_growth_assessment)
     return scorer.calculate_health_score()
-
 
 
 

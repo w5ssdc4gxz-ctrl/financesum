@@ -19,6 +19,7 @@ import { Button as StatefulButton } from '@/components/ui/stateful-button'
 import { useAuth } from '@/contexts/AuthContext'
 import { BrutalButton } from '@/components/ui/BrutalButton'
 import SummaryWizard, { INVESTOR_PERSONAS } from '@/components/SummaryWizard'
+import { Modal } from '@/components/ui/modal'
 import { cn } from '@/lib/utils'
 import { MultiStepLoader } from '@/components/ui/multi-step-loader'
 
@@ -428,6 +429,7 @@ export default function CompanyPage() {
   const [showCustomLengthInput, setShowCustomLengthInput] = useState(false)
   const [customLengthInput, setCustomLengthInput] = useState(() => String(createDefaultSummaryPreferences().targetLength))
   const [dashboardSavedSummaries, setDashboardSavedSummaries] = useState<Record<string, boolean>>({})
+  const [showSavedPopup, setShowSavedPopup] = useState(false)
   const summaryCardRef = useRef<HTMLDivElement | null>(null)
   const preferencesHydratedRef = useRef(false)
   const isSummaryGenerating = selectedFilingForSummary ? !!loadingSummaries[selectedFilingForSummary] : false
@@ -651,6 +653,7 @@ export default function CompanyPage() {
     } as any)
     setDashboardSavedSummaries(prev => ({ ...prev, [filingId]: true }))
     emitDashboardSync()
+    setShowSavedPopup(true)
   }
 
   const scrollToSummaryCard = () => {
@@ -1468,6 +1471,35 @@ export default function CompanyPage() {
           </div>
         </main>
       </div>
+
+      {/* Saved to Dashboard Success Popup */}
+      <Modal isOpen={showSavedPopup} onClose={() => setShowSavedPopup(false)} className="max-w-md">
+        <div className="text-center py-4">
+          <div className="w-16 h-16 bg-green-400 mx-auto mb-6 flex items-center justify-center border-2 border-black dark:border-white shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)]">
+            <svg className="w-8 h-8 text-black" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+            </svg>
+          </div>
+          <h3 className="text-xl font-black uppercase mb-2">Saved to Dashboard!</h3>
+          <p className="text-gray-600 dark:text-gray-400 font-mono text-sm mb-8">
+            Your summary has been saved and is ready to view.
+          </p>
+          <div className="flex flex-col gap-3">
+            <BrutalButton
+              onClick={() => router.push('/dashboard')}
+              className="w-full px-6 py-3 text-sm font-bold uppercase border-2 border-black dark:border-white bg-blue-500 text-white shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-2px] hover:shadow-[6px_6px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[6px_6px_0px_0px_rgba(255,255,255,1)] transition-all"
+            >
+              Go to Dashboard
+            </BrutalButton>
+            <button
+              onClick={() => setShowSavedPopup(false)}
+              className="w-full px-6 py-3 text-sm font-bold uppercase text-gray-600 dark:text-gray-400 hover:text-black dark:hover:text-white transition-colors"
+            >
+              Stay Here
+            </button>
+          </div>
+        </div>
+      </Modal>
     </div>
   )
 }

@@ -54,7 +54,7 @@ async def _hydrate_company_from_ticker(company_id: str, ticker: str) -> Company:
         exchange=source.get("exchange"),
         industry=source.get("industry"),
         sector=source.get("sector"),
-        country=source.get("country", "US"),
+        country=source.get("country"),
         created_at=now,
         updated_at=now,
     )
@@ -193,7 +193,7 @@ async def lookup_company(request: CompanyLookupRequest):
                         exchange=company_data.get("exchange"),
                         industry=company_data.get("industry"),
                         sector=company_data.get("sector"),
-                        country=company_data.get("country", "US"),
+                        country=company_data.get("country"),
                         created_at=now,
                         updated_at=now,
                     )
@@ -221,7 +221,7 @@ async def lookup_company(request: CompanyLookupRequest):
                     exchange=company_data.get("exchange"),
                     industry=company_data.get("industry"),
                     sector=company_data.get("sector"),
-                    country=company_data.get("country", "US"),
+                    country=company_data.get("country"),
                     created_at=now,
                     updated_at=now,
                 )

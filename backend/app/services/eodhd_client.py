@@ -156,7 +156,7 @@ class EODHDClient:
                         "cik": info.get("CIK"),
                         "sector": info.get("Sector"),
                         "industry": info.get("Industry"),
-                        "country": info.get("CountryName", "USA")
+                        "country": info.get("CountryName") or info.get("CountryISO")
                     }
             except:
                 continue
