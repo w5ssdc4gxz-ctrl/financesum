@@ -11,7 +11,8 @@ celery_app = Celery(
     include=[
         "app.tasks.fetch",
         "app.tasks.parse",
-        "app.tasks.analyze"
+        "app.tasks.analyze",
+        "app.tasks.country_hydration"
     ]
 )
 

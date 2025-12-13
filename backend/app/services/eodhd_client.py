@@ -1,5 +1,6 @@
 """EODHD API client for fetching fundamental data."""
 import requests
+import time
 from typing import Dict, Optional, Any
 from app.config import get_settings
 
@@ -306,3 +307,36 @@ def hydrate_country_with_eodhd(ticker: str, exchange: Optional[str] = None) -> O
     except Exception as exc:  # noqa: BLE001
         print(f"Country hydration failed for {ticker}: {exc}")
         return None
+
+
+def hydrate_country_with_retry(
+    ticker: str,
+    exchange: Optional[str] = None,
+    max_retries: int = 2,
+    base_delay: float = 0.5
+) -> Optional[str]:
+    """
+    Hydrate country with exponential backoff retry.
+
+    Args:
+        ticker: Stock ticker symbol
+        exchange: Exchange code (defaults to "US")
+        max_retries: Maximum retry attempts (default 2)
+        base_delay: Base delay in seconds for exponential backoff
+
+    Returns:
+        Country string or None if all attempts fail
+    """
+    if not ticker:
+        return None
+
+    for attempt in range(max_retries + 1):
+        result = hydrate_country_with_eodhd(ticker, exchange)
+        if result:
+            return result
+
+        if attempt < max_retries:
+            delay = base_delay * (2 ** attempt)  # 0.5s, 1s, 2s
+            time.sleep(delay)
+
+    return None

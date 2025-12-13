@@ -17,6 +17,7 @@ from app.services.local_cache import (
 )
 from app.utils.supabase_errors import is_supabase_table_missing_error
 from app.services.eodhd_client import hydrate_country_with_eodhd, should_hydrate_country
+from app.services.country_hydration_queue import mark_hydrated
 
 router = APIRouter()
 
@@ -24,6 +25,13 @@ MAX_HISTORY_RESULTS = 50
 
 
 def _hydrate_and_persist_countries(company_map: Dict[str, Dict[str, Any]], supabase) -> None:
+    """
+    Hydrate and persist country data for companies loaded in the dashboard.
+
+    This acts as a safety net - if a company was added but country hydration
+    failed, this will attempt to hydrate it when the dashboard is loaded.
+    Successfully hydrated companies are also removed from the pending queue.
+    """
     for company in company_map.values():
         if not should_hydrate_country(company.get("country")):
             continue
@@ -31,13 +39,22 @@ def _hydrate_and_persist_countries(company_map: Dict[str, Dict[str, Any]], supab
         if not hydrated:
             continue
         company["country"] = hydrated
+        company_id = company.get("id")
         try:
-            supabase.table("companies").update({"country": hydrated}).eq("id", company.get("id")).execute()
+            supabase.table("companies").update({"country": hydrated}).eq("id", company_id).execute()
+            # Clear from pending queue if it was there
+            if company_id:
+                mark_hydrated(str(company_id))
         except Exception as exc:  # noqa: BLE001
             print(f"Dashboard: could not persist hydrated country for {company.get('ticker')}: {exc}")
 
 
 def _hydrate_fallback_countries(company_map: Dict[str, Dict[str, Any]]) -> None:
+    """
+    Hydrate country data for companies in fallback mode (no Supabase).
+
+    Successfully hydrated companies are also removed from the pending queue.
+    """
     updated = False
     for company in company_map.values():
         if not should_hydrate_country(company.get("country")):
@@ -46,7 +63,11 @@ def _hydrate_fallback_countries(company_map: Dict[str, Dict[str, Any]]) -> None:
         if not hydrated:
             continue
         company["country"] = hydrated
-        fallback_companies[str(company.get("id"))] = company
+        company_id = company.get("id")
+        fallback_companies[str(company_id)] = company
+        # Clear from pending queue if it was there
+        if company_id:
+            mark_hydrated(str(company_id))
         updated = True
     if updated:
         save_fallback_companies()

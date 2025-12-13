@@ -15,7 +15,8 @@ from app.models.schemas import (
 )
 from app.services.edgar_fetcher import search_company_by_ticker_or_cik
 from app.services.local_cache import fallback_companies, save_fallback_companies
-from app.services.eodhd_client import hydrate_country_with_eodhd, should_hydrate_country
+from app.services.eodhd_client import hydrate_country_with_eodhd, hydrate_country_with_retry, should_hydrate_country
+from app.services.country_hydration_queue import queue_for_hydration
 from app.config import get_settings
 from app.utils.supabase_errors import is_supabase_table_missing_error
 
@@ -32,17 +33,52 @@ def _supabase_configured(settings) -> bool:
 
 
 async def _ensure_company_country(company: dict) -> dict:
+    """
+    Ensure company has country data, with retry and queuing for failures.
+
+    Uses hydrate_country_with_retry() which attempts up to 3 times with
+    exponential backoff. If all attempts fail, the company is queued
+    for background processing.
+
+    Args:
+        company: Company dict to hydrate
+
+    Returns:
+        Company dict with country field populated (if successful)
+    """
     ticker = company.get("ticker")
+    company_id = company.get("id")
+
     if not ticker or not should_hydrate_country(company.get("country")):
         return company
 
-    hydrated = await asyncio.to_thread(hydrate_country_with_eodhd, ticker, company.get("exchange"))
+    # Try synchronous hydration with retry (up to 3 attempts with backoff)
+    hydrated = await asyncio.to_thread(
+        hydrate_country_with_retry,
+        ticker,
+        company.get("exchange"),
+        2,  # max_retries
+        0.5  # base_delay
+    )
+
     if hydrated:
         company["country"] = hydrated
+    else:
+        # Queue for background retry if we have an ID
+        if company_id and ticker:
+            queue_for_hydration(str(company_id), ticker, company.get("exchange"))
+            print(f"Queued {ticker} for background country hydration")
+
     return company
 
 
 async def _fix_and_persist_countries(records: list, supabase=None) -> list:
+    """
+    Hydrate and persist country data for a list of company records.
+
+    Uses _ensure_company_country() which includes retry logic and
+    queues failed hydrations for background processing.
+    """
     updated: List[tuple[str, str]] = []
     fixed: List[dict] = []
     for record in records:
