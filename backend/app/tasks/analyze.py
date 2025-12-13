@@ -7,7 +7,7 @@ from app.services.ratio_calculator import calculate_ratios
 from app.services.health_scorer import calculate_health_score
 from app.services.gemini_client import get_gemini_client
 from app.services.persona_engine import get_persona_engine
-from app.services.eodhd_client import normalize_eodhd_to_internal_format
+from app.services.eodhd_client import normalize_eodhd_to_internal_format, hydrate_country_with_eodhd, should_hydrate_country
 
 
 @celery_app.task(bind=True)
@@ -49,6 +49,14 @@ def analyze_company_task(
             raise ValueError("Company not found")
         
         company = company_response.data[0]
+        if should_hydrate_country(company.get("country")):
+            hydrated_country = hydrate_country_with_eodhd(company.get("ticker"), company.get("exchange"))
+            if hydrated_country:
+                company["country"] = hydrated_country
+                try:
+                    supabase.table("companies").update({"country": hydrated_country}).eq("id", company_id).execute()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Analyze task: failed to persist hydrated country for {company_id}: {exc}")
         company_name = company["name"]
         
         self.update_state(state='PROGRESS', meta={'progress': 20, 'status': 'Loading financial statements...'})
@@ -342,4 +350,3 @@ def _merge_financial_statements(statements: List[dict]) -> dict:
                             merged[statement_type][line_item].update(values)
     
     return merged
-
