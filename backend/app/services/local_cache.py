@@ -11,6 +11,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 CACHE_DIR = BACKEND_DIR / "data" / "local_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 COMPANIES_CACHE_FILE = CACHE_DIR / "companies.json"
+SUMMARY_EVENTS_CACHE_FILE = CACHE_DIR / "summary_events.json"
 
 
 def _json_default(value: Any) -> str:
@@ -38,10 +39,18 @@ def _save_json(path: Path, payload: Dict[str, Any]) -> None:
 # Stores serialized company dictionaries keyed by company ID (as string)
 fallback_companies: Dict[str, Dict[str, Any]] = _load_json(COMPANIES_CACHE_FILE)
 
+# Append-only list of summary generation events when Supabase is unavailable
+summary_events_cache: List[Dict[str, Any]] = _load_json(SUMMARY_EVENTS_CACHE_FILE).get("events", [])
+
 
 def save_fallback_companies() -> None:
     """Persist current fallback companies to disk."""
     _save_json(COMPANIES_CACHE_FILE, fallback_companies)
+
+
+def save_summary_events_cache() -> None:
+    """Persist summary generation events cache to disk (best-effort)."""
+    _save_json(SUMMARY_EVENTS_CACHE_FILE, {"events": summary_events_cache})
 
 
 # Stores serialized filing dictionaries keyed by company ID (as string)

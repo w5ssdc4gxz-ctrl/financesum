@@ -151,7 +151,22 @@ export default function DashboardContent({
   }, [history])
 
   // Prepare analysis trend data
+  // Prefer backend-provided summary activity so removals from dashboard don't reduce the counts.
   const analysisTrendData = useMemo(() => {
+    const activity = Array.isArray(stats?.summary_activity) ? stats.summary_activity : null
+    if (activity && activity.length) {
+      return activity.map((row: any) => {
+        const parsed = new Date(row.date)
+        const date = Number.isNaN(parsed.getTime()) ? new Date() : parsed
+        return {
+          date,
+          label: date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+          value: Number(row.count) || 0,
+        }
+      })
+    }
+
+    // Fallback: count from current history
     const dailyCounts: Record<string, number> = {}
     history.forEach((item: any) => {
       const dateStr = item.generatedAt ?? item.generated_at
@@ -173,7 +188,7 @@ export default function DashboardContent({
       .sort((a, b) => a.date.getTime() - b.date.getTime())
       .slice(-8)
     return sorted
-  }, [history])
+  }, [history, stats?.summary_activity])
 
   // Prepare sector data
   const { sectorBarData, sectorDonutData, sectorPerformanceData } = useMemo(() => {
@@ -382,10 +397,14 @@ export default function DashboardContent({
             className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4 scroll-mt-8"
           >
             <StatCard
-              title="Total Analyses"
-              value={history.length || 0}
+              title="Total Summaries"
+              value={(stats?.total_summaries ?? history.length) || 0}
               icon={<IconSparkles className="h-5 w-5" />}
-              description={history[0] && (history[0].generatedAt ?? history[0].generated_at) ? `Latest ${relativeTime(history[0].generatedAt ?? history[0].generated_at)}` : 'No analyses yet'}
+              description={
+                history[0] && (history[0].generatedAt ?? history[0].generated_at)
+                  ? `Latest ${relativeTime(history[0].generatedAt ?? history[0].generated_at)}`
+                  : 'No summaries yet'
+              }
             />
             <StatCard
               title="Average Health"

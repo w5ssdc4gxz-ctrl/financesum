@@ -1,10 +1,10 @@
 UNEXPECTED ERROR: invalid group reference 1 at position 1
 Type: <class 're.error'>
 Traceback (most recent call last):
-  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 4954, in generate_filing_summary
+  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 4995, in generate_filing_summary
     summary_text = _ensure_required_sections(
                    ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 6084, in _ensure_required_sections
+  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 6128, in _ensure_required_sections
     text = re.sub(
            ^^^^^^^
   File "/opt/homebrew/Cellar/python@3.11/3.11.14_1/Frameworks/Python.framework/Versions/3.11/lib/python3.11/re/__init__.py", line 185, in sub

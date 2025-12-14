@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from collections import Counter
-from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException
 
@@ -14,6 +14,7 @@ from app.services.local_cache import (
     fallback_analyses,
     fallback_companies,
     save_fallback_companies,
+    summary_events_cache,
 )
 from app.utils.supabase_errors import is_supabase_table_missing_error
 from app.services.eodhd_client import hydrate_country_with_eodhd, should_hydrate_country
@@ -22,6 +23,7 @@ from app.services.country_hydration_queue import mark_hydrated
 router = APIRouter()
 
 MAX_HISTORY_RESULTS = 50
+SUMMARY_ACTIVITY_DAYS = 8
 
 
 def _hydrate_and_persist_countries(company_map: Dict[str, Dict[str, Any]], supabase) -> None:
@@ -99,11 +101,13 @@ async def get_dashboard_overview() -> Dict[str, Any]:
 def _build_supabase_overview() -> Dict[str, Any]:
     supabase = get_supabase_client()
 
-    response = supabase.table("analyses")\
-        .select("*", count="exact")\
-        .order("analysis_date", desc=True)\
-        .limit(MAX_HISTORY_RESULTS)\
+    response = (
+        supabase.table("analyses")
+        .select("*", count="exact")
+        .order("analysis_date", desc=True)
+        .limit(MAX_HISTORY_RESULTS)
         .execute()
+    )
 
     analyses: List[Dict[str, Any]] = response.data or []
     total_analyses = getattr(response, "count", None) or len(analyses)
@@ -116,7 +120,16 @@ def _build_supabase_overview() -> Dict[str, Any]:
         _hydrate_and_persist_countries(company_map, supabase)
 
     history = [_build_history_entry(analysis, company_map.get(analysis.get("company_id"))) for analysis in analyses]
-    stats = _calculate_stats(history, total_analyses=total_analyses)
+
+    # Summary generation metrics (for "Analysis Activity" and totals that should not decrease on dashboard removal)
+    summary_total, summary_activity = _get_summary_generation_metrics_supabase(supabase)
+
+    stats = _calculate_stats(
+        history,
+        total_analyses=total_analyses,
+        total_summaries=summary_total,
+        summary_activity=summary_activity,
+    )
 
     companies = list(company_map.values())
 
@@ -136,10 +149,21 @@ def _build_fallback_overview() -> Dict[str, Any]:
         for analysis in analyses:
             history.append(_build_history_entry(analysis, company))
 
-    history.sort(key=lambda entry: _parse_datetime(entry.get("generated_at")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    history.sort(
+        key=lambda entry: _parse_datetime(entry.get("generated_at")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
     total_analyses = len(history)
     limited_history = history[:MAX_HISTORY_RESULTS]
-    stats = _calculate_stats(limited_history, total_analyses=total_analyses)
+
+    summary_total, summary_activity = _get_summary_generation_metrics_fallback()
+
+    stats = _calculate_stats(
+        limited_history,
+        total_analyses=total_analyses,
+        total_summaries=summary_total,
+        summary_activity=summary_activity,
+    )
 
     companies = list(fallback_companies.values())
 
@@ -181,7 +205,13 @@ def _build_history_entry(analysis: Dict[str, Any], company: Optional[Dict[str, A
     }
 
 
-def _calculate_stats(history: List[Dict[str, Any]], *, total_analyses: int) -> Dict[str, Any]:
+def _calculate_stats(
+    history: List[Dict[str, Any]],
+    *,
+    total_analyses: int,
+    total_summaries: int,
+    summary_activity: List[Dict[str, Any]],
+) -> Dict[str, Any]:
     scores = [
         float(entry["health_score"])
         for entry in history
@@ -199,6 +229,8 @@ def _calculate_stats(history: List[Dict[str, Any]], *, total_analyses: int) -> D
 
     return {
         "total_analyses": total_analyses,
+        "total_summaries": total_summaries,
+        "summary_activity": summary_activity,
         "average_health_score": average_health,
         "latest_analysis_at": latest_dt.isoformat() if latest_dt else None,
         "company_count": len(company_ids),
@@ -217,6 +249,67 @@ def _counter_to_list(values) -> List[Dict[str, Any]]:
         {"label": label, "value": count}
         for label, count in counter.most_common()
     ]
+
+
+def _date_bucket_key(dt: datetime) -> date:
+    return dt.astimezone(timezone.utc).date()
+
+
+def _get_summary_generation_metrics_supabase(supabase) -> Tuple[int, List[Dict[str, Any]]]:
+    """
+    Returns:
+      (total_summaries_all_time, activity_last_N_days)
+    activity_last_N_days is oldest->newest list of { date: 'YYYY-MM-DD', count: int }.
+    """
+    try:
+        resp = supabase.table("filing_summary_events").select("created_at", count="exact").execute()
+        total = getattr(resp, "count", None) or len(resp.data or [])
+        events = resp.data or []
+    except Exception as exc:  # noqa: BLE001
+        if is_supabase_table_missing_error(exc):
+            return 0, _build_empty_activity()
+        raise
+
+    buckets = _build_activity_from_events(events)
+    return total, buckets
+
+
+def _get_summary_generation_metrics_fallback() -> Tuple[int, List[Dict[str, Any]]]:
+    events = summary_events_cache or []
+    total = len(events)
+    buckets = _build_activity_from_events(events)
+    return total, buckets
+
+
+def _build_empty_activity() -> List[Dict[str, Any]]:
+    today = datetime.now(timezone.utc).date()
+    days = []
+    for i in range(SUMMARY_ACTIVITY_DAYS):
+        d = today - timedelta(days=(SUMMARY_ACTIVITY_DAYS - 1 - i))
+        days.append({"date": d.isoformat(), "count": 0})
+    return days
+
+
+def _build_activity_from_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    # last N days inclusive, oldest->newest
+    today = datetime.now(timezone.utc).date()
+    start = today - timedelta(days=SUMMARY_ACTIVITY_DAYS - 1)
+
+    counts: Dict[date, int] = {}
+    for ev in events:
+        dt = _parse_datetime(ev.get("created_at"))
+        if not dt:
+            continue
+        d = dt.date()
+        if d < start or d > today:
+            continue
+        counts[d] = counts.get(d, 0) + 1
+
+    activity: List[Dict[str, Any]] = []
+    for i in range(SUMMARY_ACTIVITY_DAYS):
+        d = start + timedelta(days=i)
+        activity.append({"date": d.isoformat(), "count": counts.get(d, 0)})
+    return activity
 
 
 def _parse_datetime(value: Any) -> Optional[datetime]:

@@ -46,6 +46,8 @@ from app.services.local_cache import (
     fallback_task_status,
     save_fallback_companies,
     progress_cache,
+    summary_events_cache,
+    save_summary_events_cache,
 )
 from app.services.gemini_client import get_gemini_client, generate_growth_assessment
 from app.services.gemini_exceptions import (
@@ -4433,7 +4435,11 @@ def generate_filing_summary(
     preferences: Optional[FilingSummaryPreferences] = Body(default=None),
 ):
     """
-    Returns cached summary if already generated.
+    Generate a filing summary.
+
+    IMPORTANT: This endpoint also logs a durable "summary generated" event so the
+    dashboard can track total summary generations over time even if the user
+    later removes the summary snapshot from the dashboard.
     """
     settings = get_settings()
     preferences = preferences or FilingSummaryPreferences()
@@ -4462,6 +4468,41 @@ def generate_filing_summary(
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error resolving filing: {exc}")
+
+    # Helper: best-effort event logging (Supabase when available; local JSON fallback otherwise).
+    def _log_summary_generation_event(*, cached: bool) -> None:
+        payload = {
+            "filing_id": str(filing_id),
+            "company_id": str(company.get("id")) if company and company.get("id") else None,
+            "mode": getattr(preferences, "mode", None),
+            "cached": bool(cached),
+            "source": context.get("source"),
+        }
+
+        # Prefer Supabase event table when configured/available
+        if _supabase_configured(settings):
+            try:
+                supabase = get_supabase_client()
+                supabase.table("filing_summary_events").insert(payload).execute()
+                return
+            except Exception as exc:  # noqa: BLE001
+                if is_supabase_table_missing_error(exc):
+                    # Fall through to local cache
+                    pass
+                else:
+                    logger.debug("Unable to persist filing_summary_events to Supabase: %s", exc)
+
+        # Local fallback: append to disk-backed JSON cache
+        try:
+            summary_events_cache.append(
+                {
+                    **payload,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            save_summary_events_cache()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Unable to persist local summary events cache: %s", exc)
     
     # Get document content
     local_document = _ensure_local_document(context, settings)
@@ -5059,6 +5100,9 @@ Before you output anything, verify:
         # Cache result
         if use_default_cache:
             fallback_filing_summaries[str(filing_id)] = summary_text
+
+        # Log the generation event (best-effort, should never fail the request).
+        _log_summary_generation_event(cached=False)
         
         response_data = {
             "filing_id": filing_id,
@@ -6081,9 +6125,10 @@ def _ensure_required_sections(
                 if net_margin and net_margin < 0:
                     verdict_concerns.append("net losses")
             patched = _ensure_personal_verdict(existing_closing, company_name, strengths=verdict_strengths, concerns=verdict_concerns)
+            # Use a function replacement to avoid backreference/template parsing issues
             text = re.sub(
                 r'##\s*Closing\s+Takeaway\s*\n+[\s\S]*?(?=\n##\s|\Z)',
-                rf'\1{patched}\n',
+                lambda _m: f"## Closing Takeaway\n{patched}\n",
                 text,
                 flags=re.IGNORECASE,
             )
