@@ -2,7 +2,9 @@
 import requests
 import time
 from typing import Dict, Optional, Any
+from urllib.parse import quote
 from app.config import get_settings
+from app.services.country_resolver import normalize_country
 
 
 settings = get_settings()
@@ -166,6 +168,70 @@ class EODHDClient:
         
         return None
 
+    def search_symbols(self, query: str, limit: int = 10) -> list[Dict[str, Any]]:
+        """
+        Search for symbols by company name or ticker using EODHD's search endpoint.
+
+        Returns a best-effort list of results with at least `ticker`, `name`, and `exchange`.
+        """
+        cleaned = (query or "").strip()
+        if not cleaned:
+            return []
+
+        url = f"{self.BASE_URL}/search/{quote(cleaned)}"
+        params = {
+            "api_token": self.api_key,
+            "fmt": "json",
+        }
+
+        try:
+            response = requests.get(url, params=params, timeout=15)
+            if response.status_code == 404:
+                return []
+            response.raise_for_status()
+            payload = response.json()
+        except requests.exceptions.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code == 403:
+                demo_hint = ""
+                if (self.api_key or "").lower() == "demo":
+                    demo_hint = " The demo API token may not support full symbol search; set EODHD_API_KEY to a paid token."
+                raise EODHDAccessError(f"EODHD rejected the search request (HTTP 403).{demo_hint}") from exc
+            raise EODHDClientError(f"EODHD search request failed with HTTP {status_code or 'unknown'}") from exc
+        except Exception as exc:
+            raise EODHDClientError(f"Error searching symbols: {exc}") from exc
+
+        if not isinstance(payload, list):
+            return []
+
+        results: list[Dict[str, Any]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+
+            ticker = item.get("Code") or item.get("code") or item.get("ticker") or item.get("symbol")
+            name = item.get("Name") or item.get("name") or item.get("title")
+            exchange = item.get("Exchange") or item.get("exchange") or item.get("exch")
+            country = item.get("Country") or item.get("country")
+
+            if not ticker or not name:
+                continue
+
+            results.append(
+                {
+                    "ticker": str(ticker).strip().upper(),
+                    "name": str(name).strip(),
+                    "exchange": str(exchange).strip().upper() if exchange else None,
+                    "country": normalize_country(country) or country,
+                    "type": item.get("Type") or item.get("type"),
+                }
+            )
+
+            if len(results) >= max(1, int(limit or 10)):
+                break
+
+        return results
+
 
 def normalize_eodhd_to_internal_format(eodhd_data: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -251,6 +317,7 @@ US_EQUIVALENTS = {
     "UNITED STATES",
     "UNITED STATES OF AMERICA",
     "UNITEDSTATES",
+    "UNITEDSTATESOFAMERICA",
 }
 
 
@@ -279,17 +346,43 @@ def extract_country_from_eodhd(info: Optional[Dict[str, Any]]) -> Optional[str]:
         "CountryISOAlpha3",
     ]
 
+    candidates: list[str] = []
     for field in country_fields:
         value = _normalize_country_value(info.get(field))
-        if value:
-            return value.upper() if "ISO" in field.upper() else value
+        if not value:
+            continue
+        candidates.append(value.upper() if "ISO" in field.upper() else value)
+
+    # ISIN prefixes are ISO2 country codes (often a strong domicile hint).
+    isin = _normalize_country_value(info.get("ISIN"))
+    if isin:
+        cleaned_isin = str(isin).strip().upper()
+        if len(cleaned_isin) >= 2:
+            prefix = cleaned_isin[:2]
+            if prefix.isalpha():
+                candidates.append(prefix)
 
     address = info.get("AddressData") or info.get("Address") or {}
-    address_country = _normalize_country_value(address.get("Country"))
-    if address_country:
-        return address_country
+    if isinstance(address, dict):
+        address_country = _normalize_country_value(address.get("Country"))
+        if address_country:
+            candidates.append(address_country)
 
-    return None
+    normalized_candidates: list[str] = []
+    for raw in candidates:
+        normalized = normalize_country(raw) or raw
+        if normalized and normalized not in normalized_candidates:
+            normalized_candidates.append(normalized)
+
+    if not normalized_candidates:
+        return None
+
+    # Prefer a non-US value if available (ADR / US listings can otherwise look like US).
+    for candidate in normalized_candidates:
+        if not _is_us_country(candidate):
+            return candidate
+
+    return normalized_candidates[0]
 
 
 def should_hydrate_country(country: Optional[str]) -> bool:
@@ -302,7 +395,10 @@ def hydrate_country_with_eodhd(ticker: str, exchange: Optional[str] = None) -> O
         return None
     try:
         client = EODHDClient()
-        info = client.get_company_info(ticker, exchange or "US")
+        exchange_value = (exchange or "US").strip().upper()
+        if exchange_value in {"NASDAQ", "NYSE", "AMEX", "ARCA", "NMS", "NYQ"}:
+            exchange_value = "US"
+        info = client.get_company_info(ticker, exchange_value)
         return extract_country_from_eodhd(info)
     except Exception as exc:  # noqa: BLE001
         print(f"Country hydration failed for {ticker}: {exc}")

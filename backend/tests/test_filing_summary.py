@@ -67,7 +67,8 @@ def test_summary_uses_serialized_statements(monkeypatch):
     local_cache.fallback_companies[company_id] = {
         "id": company_id,
         "ticker": "TEST",
-        "name": "Test Corp",
+        "name": "Moncler S.p.A.",
+        "country": "US",
         "cik": None,  # Force document download to be skipped so statements are used
     }
     local_cache.fallback_financial_statements[filing_id] = {
@@ -102,6 +103,7 @@ def test_summary_uses_serialized_statements(monkeypatch):
             print(f"DEBUG: Response body: {response.text}")
         assert response.status_code == 200
         assert response.json()["summary"] == "summary"
+        assert response.json()["company_country"] == "IT"
     finally:
         local_cache.fallback_filings_by_id.pop(filing_id, None)
         local_cache.fallback_companies.pop(company_id, None)

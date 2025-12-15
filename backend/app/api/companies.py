@@ -3,7 +3,7 @@ import requests
 import asyncio
 from datetime import datetime
 from uuid import uuid4
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from typing import List
 
@@ -13,9 +13,16 @@ from app.models.schemas import (
     CompanyLookupRequest,
     CompanyLookupResponse,
 )
-from app.services.edgar_fetcher import search_company_by_ticker_or_cik
+from app.services.edgar_fetcher import search_company_by_ticker_or_cik, resolve_country_from_sec_submission
 from app.services.local_cache import fallback_companies, save_fallback_companies
 from app.services.eodhd_client import hydrate_country_with_eodhd, hydrate_country_with_retry, should_hydrate_country
+from app.services.country_resolver import (
+    infer_country_from_company_name,
+    infer_country_from_exchange,
+    infer_country_from_ticker,
+    normalize_country,
+)
+from app.services.yahoo_finance import resolve_country_from_yahoo_asset_profile
 from app.services.country_hydration_queue import queue_for_hydration
 from app.config import get_settings
 from app.utils.supabase_errors import is_supabase_table_missing_error
@@ -30,6 +37,52 @@ def _supabase_configured(settings) -> bool:
     if key.lower().startswith("your_"):
         return False
     return True
+
+
+def _search_fallback_companies(raw_query: str, limit: int = 10) -> List[Company]:
+    query = (raw_query or "").strip()
+    if not query:
+        return []
+
+    query_upper = query.upper()
+    query_folded = query.casefold()
+    cik_digits = "".join(ch for ch in query if ch.isdigit())
+    cik_padded = cik_digits.zfill(10) if cik_digits else None
+
+    scored: list[tuple[int, dict]] = []
+    for record in fallback_companies.values():
+        ticker = (record.get("ticker") or "").strip().upper()
+        name = (record.get("name") or "").strip()
+        name_folded = name.casefold()
+
+        record_cik_digits = "".join(ch for ch in str(record.get("cik") or "") if ch.isdigit())
+        record_cik_padded = record_cik_digits.zfill(10) if record_cik_digits else None
+
+        score = None
+        if ticker and ticker == query_upper:
+            score = 300
+        elif cik_padded and record_cik_padded and record_cik_padded == cik_padded:
+            score = 250
+        elif name_folded and name_folded.startswith(query_folded):
+            score = 200
+        elif query_folded and query_folded in name_folded:
+            score = 150
+        elif ticker and ticker.startswith(query_upper):
+            score = 100
+
+        if score is not None:
+            scored.append((score, record))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+
+    matches: list[Company] = []
+    for _score, record in scored[:limit]:
+        try:
+            matches.append(Company(**record))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Skipping invalid cached company record: {exc}")
+
+    return matches
 
 
 async def _ensure_company_country(company: dict) -> dict:
@@ -49,25 +102,75 @@ async def _ensure_company_country(company: dict) -> dict:
     ticker = company.get("ticker")
     company_id = company.get("id")
 
-    if not ticker or not should_hydrate_country(company.get("country")):
-        return company
+    original_country = company.get("country")
+    original_missing = should_hydrate_country(original_country)
+    resolved_confidently = False
+
+    normalized_existing = normalize_country(company.get("country"))
+    if normalized_existing and normalized_existing != company.get("country"):
+        company["country"] = normalized_existing
+
+    # Treat US placeholders as unresolved so we still attempt stronger inference.
+    if should_hydrate_country(company.get("country")):
+        inferred = infer_country_from_company_name(company.get("name"))
+        if inferred:
+            company["country"] = normalize_country(inferred) or inferred
+            resolved_confidently = True
+
+    if should_hydrate_country(company.get("country")) and ticker:
+        inferred_from_ticker = infer_country_from_ticker(ticker)
+        if inferred_from_ticker:
+            company["country"] = inferred_from_ticker
+            resolved_confidently = True
+
+    # If the company appears on a non-US exchange, use that as a fast, safe hint.
+    if should_hydrate_country(company.get("country")):
+        inferred_exchange = infer_country_from_exchange(company.get("exchange"))
+        if inferred_exchange and inferred_exchange != "US":
+            company["country"] = inferred_exchange
+            resolved_confidently = True
+
+    if should_hydrate_country(company.get("country")) and company.get("cik"):
+        sec_country = await asyncio.to_thread(resolve_country_from_sec_submission, company.get("cik"))
+        if sec_country:
+            company["country"] = normalize_country(sec_country) or sec_country
+            resolved_confidently = True
+
+    if ticker and should_hydrate_country(company.get("country")):
+        yahoo_country = await asyncio.to_thread(resolve_country_from_yahoo_asset_profile, ticker)
+        if yahoo_country:
+            company["country"] = normalize_country(yahoo_country) or yahoo_country
+            resolved_confidently = True
 
     # Try synchronous hydration with retry (up to 3 attempts with backoff)
-    hydrated = await asyncio.to_thread(
-        hydrate_country_with_retry,
-        ticker,
-        company.get("exchange"),
-        2,  # max_retries
-        0.5  # base_delay
-    )
+    hydrated = None
+    if ticker and should_hydrate_country(company.get("country")):
+        hydrated = await asyncio.to_thread(
+            hydrate_country_with_retry,
+            ticker,
+            company.get("exchange"),
+            2,  # max_retries
+            0.5  # base_delay
+        )
 
     if hydrated:
-        company["country"] = hydrated
+        company["country"] = normalize_country(hydrated) or hydrated
     else:
         # Queue for background retry if we have an ID
-        if company_id and ticker:
+        if ticker and should_hydrate_country(company.get("country")) and company_id:
             queue_for_hydration(str(company_id), ticker, company.get("exchange"))
             print(f"Queued {ticker} for background country hydration")
+
+    # If we still only have a US placeholder (or missing) and we didn't find any
+    # domicile/HQ signal, prefer "unknown" over wrongly plotting everything as US.
+    if should_hydrate_country(company.get("country")) and not resolved_confidently and original_missing:
+        company["country"] = None
+
+    if not company.get("country"):
+        inferred = infer_country_from_exchange(company.get("exchange"))
+        # Do not default a US-listed company to US domicile without stronger evidence.
+        if inferred and inferred != "US":
+            company["country"] = inferred
 
     return company
 
@@ -164,14 +267,16 @@ def get_company_logo(ticker: str, exchange: str = "US"):
         raise HTTPException(status_code=500, detail=f"Error fetching logo: {str(e)}")
 
 
-@router.post("/lookup", response_model=CompanyLookupResponse)
-async def lookup_company(request: CompanyLookupRequest):
+async def _lookup_companies(raw_query: str) -> CompanyLookupResponse:
     """
     Search for companies by ticker, CIK, or name.
     First checks local database, then queries EODHD/SEC EDGAR if not found.
     """
     settings = get_settings()
-    query = request.query.strip().upper()
+    query_raw = (raw_query or "").strip()
+    if not query_raw:
+        return CompanyLookupResponse(companies=[])
+    query = query_raw.upper()
     
     # Search local database first (only if Supabase is configured)
     if _supabase_configured(settings):
@@ -192,7 +297,7 @@ async def lookup_company(request: CompanyLookupRequest):
                     return response
                     
                 # Try name match (case-insensitive partial match)
-                return supabase.table("companies").select("*").ilike("name", f"%{query}%").execute()
+                return supabase.table("companies").select("*").ilike("name", f"%{query_raw}%").execute()
 
             response = await asyncio.to_thread(run_supabase_query)
             
@@ -208,13 +313,17 @@ async def lookup_company(request: CompanyLookupRequest):
             print(f"Database search error (skipping): {e}")
     else:
         print("Supabase not configured, skipping database search")
+
+    fallback_matches = _search_fallback_companies(query_raw)
+    if fallback_matches:
+        return CompanyLookupResponse(companies=fallback_matches)
     
     # If not found in database, search EDGAR
     try:
         edgar_companies = await search_company_by_ticker_or_cik(query)
         
         if not edgar_companies:
-            raise HTTPException(status_code=404, detail="Company not found")
+            return CompanyLookupResponse(companies=[])
         
         # Save found companies to database (if Supabase is configured)
         saved_companies = []
@@ -318,6 +427,15 @@ async def lookup_company(request: CompanyLookupRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error searching for company: {str(e)}")
+
+@router.get("/lookup", response_model=CompanyLookupResponse)
+async def lookup_company_get(query: str = Query(..., description="Ticker, CIK, or company name")):
+    return await _lookup_companies(query)
+
+
+@router.post("/lookup", response_model=CompanyLookupResponse)
+async def lookup_company(request: CompanyLookupRequest):
+    return await _lookup_companies(request.query)
 
 
 @router.get("/{company_id}", response_model=Company)

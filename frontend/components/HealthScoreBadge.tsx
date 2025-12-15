@@ -204,7 +204,7 @@ export default function HealthScoreBadge({
               transition={{ delay: 0.3 }}
             >
               <div className="text-xs text-gray-500 dark:text-gray-400">
-                <span className="font-bold">How it's calculated:</span> Weighted average of component scores.
+                <span className="font-bold">How it&apos;s calculated:</span> Weighted average of component scores.
                 Higher scores indicate stronger financial health in each category.
               </div>
             </motion.div>

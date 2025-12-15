@@ -25,6 +25,12 @@ from app.models.schemas import (
 from app.tasks.fetch import fetch_filings_task, run_fetch_filings_inline
 from app.config import get_settings
 from app.api.companies import _supabase_configured
+from app.services.country_resolver import (
+    infer_country_from_company_name,
+    infer_country_from_exchange,
+    infer_country_from_ticker,
+    normalize_country,
+)
 from app.services.eodhd_client import (
     get_eodhd_client,
     EODHDAccessError,
@@ -35,8 +41,10 @@ from app.services.eodhd_client import (
 from app.services.edgar_fetcher import (
     download_filing,
     get_company_filings,
+    resolve_country_from_sec_submission,
     search_company_by_ticker_or_cik,
 )
+from app.services.yahoo_finance import resolve_country_from_yahoo_asset_profile
 from app.services.local_cache import (
     fallback_companies,
     fallback_filings,
@@ -3707,7 +3715,7 @@ def _resolve_filing_context(filing_id: str, settings) -> Dict[str, Any]:
 
         company_response = (
             supabase.table("companies")
-            .select("id, ticker, exchange, cik")
+            .select("id, ticker, exchange, cik, name, country")
             .eq("id", company_id)
             .execute()
         )
@@ -3826,19 +3834,64 @@ def _ensure_local_document(context: Dict[str, Any], settings) -> Optional[Path]:
 
 
 def _ensure_company_country(company: Dict[str, Any], *, supabase=None, company_key: Optional[str] = None) -> Dict[str, Any]:
-    """Hydrate and persist company country when missing or US placeholder."""
-    if not company or not should_hydrate_country(company.get("country")):
+    """Hydrate and persist company domicile country when missing or US placeholder."""
+    if not company:
         return company
 
-    hydrated = hydrate_country_with_eodhd(company.get("ticker"), company.get("exchange"))
-    if not hydrated:
-        return company
+    original = company.get("country")
+    # Treat an unresolved US placeholder (or missing) as "missing" so we don't persist it.
+    original_missing = should_hydrate_country(original)
+    normalized = normalize_country(original)
+    if normalized and normalized != original:
+        company["country"] = normalized
 
-    company["country"] = hydrated
+    resolved_confidently = False
+
+    if should_hydrate_country(company.get("country")):
+        inferred = infer_country_from_company_name(company.get("name"))
+        if inferred:
+            company["country"] = inferred
+            resolved_confidently = True
+
+    if should_hydrate_country(company.get("country")) and company.get("ticker"):
+        inferred_from_ticker = infer_country_from_ticker(company.get("ticker"))
+        if inferred_from_ticker:
+            company["country"] = inferred_from_ticker
+            resolved_confidently = True
+
+    if should_hydrate_country(company.get("country")):
+        inferred_exchange = infer_country_from_exchange(company.get("exchange"))
+        if inferred_exchange and inferred_exchange != "US":
+            company["country"] = inferred_exchange
+            resolved_confidently = True
+
+    if should_hydrate_country(company.get("country")) and company.get("cik"):
+        sec_country = resolve_country_from_sec_submission(company.get("cik"))
+        if sec_country:
+            company["country"] = normalize_country(sec_country) or sec_country
+            resolved_confidently = True
+
+    if should_hydrate_country(company.get("country")) and company.get("ticker"):
+        yahoo_country = resolve_country_from_yahoo_asset_profile(company.get("ticker"))
+        if yahoo_country:
+            company["country"] = normalize_country(yahoo_country) or yahoo_country
+            resolved_confidently = True
+
+    if should_hydrate_country(company.get("country")):
+        hydrated = hydrate_country_with_eodhd(company.get("ticker"), company.get("exchange"))
+        if hydrated:
+            company["country"] = normalize_country(hydrated) or hydrated
+
+    # Avoid persisting a US placeholder when the only result came from EODHD.
+    if should_hydrate_country(company.get("country")) and not resolved_confidently and original_missing:
+        company["country"] = None
+
+    if company.get("country") == original:
+        return company
 
     if supabase and company.get("id"):
         try:
-            supabase.table("companies").update({"country": hydrated}).eq("id", company.get("id")).execute()
+            supabase.table("companies").update({"country": company.get("country")}).eq("id", company.get("id")).execute()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not persist hydrated country for %s: %s", company.get("ticker"), exc)
     elif company_key is not None:
@@ -4464,6 +4517,16 @@ def generate_filing_summary(
         context = _resolve_filing_context(filing_id, settings)
         filing = context["filing"]
         company = context["company"]
+
+        # Ensure company has a domicile country *before* we generate / save a dashboard summary snapshot.
+        # This prevents foreign issuers with US filings/ADRs from being plotted as US by default.
+        try:
+            supabase_client = get_supabase_client() if context.get("source") == "supabase" else None
+            company_key = str(company.get("id")) if context.get("source") == "fallback" else None
+            company = _ensure_company_country(company, supabase=supabase_client, company_key=company_key)
+            context["company"] = company
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Unable to hydrate company country for filing %s summary: %s", filing_id, exc)
     except HTTPException:
         raise
     except Exception as exc:
@@ -5107,7 +5170,8 @@ Before you output anything, verify:
         response_data = {
             "filing_id": filing_id,
             "summary": summary_text,
-            "cached": False
+            "cached": False,
+            "company_country": company.get("country"),
         }
         
         if health_score_data:

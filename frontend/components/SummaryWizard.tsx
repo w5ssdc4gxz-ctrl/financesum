@@ -392,7 +392,7 @@ export default function SummaryWizard({
                         )}
                         {preferences.mode === 'custom' && (
                             <div className="text-center text-xs text-gray-500 font-mono">
-                                Click "Custom" again to configure detailed preferences.
+                                Click &quot;Custom&quot; again to configure detailed preferences.
                             </div>
                         )}
                     </div>
@@ -716,7 +716,7 @@ export default function SummaryWizard({
 
                                 <div className="pt-2">
                                     <p className="text-xs text-gray-500">
-                                        Click "Complete" to start the AI analysis. This process typically takes 10-20 seconds.
+                                        Click &quot;Complete&quot; to start the AI analysis. This process typically takes 10-20 seconds.
                                     </p>
                                 </div>
                             </div>

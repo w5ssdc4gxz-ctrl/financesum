@@ -11,6 +11,7 @@ from app.services.eodhd_client import (
     hydrate_country_with_eodhd,
     should_hydrate_country,
 )
+from app.services.country_resolver import extract_country_from_sec_submission
 
 settings = get_settings()
 
@@ -70,8 +71,6 @@ async def _enrich_with_yahoo(company: Dict, client: httpx.AsyncClient) -> Dict:
                 yahoo_country = quote.get("country") or quote.get("longCountry")
                 if yahoo_country:
                     company["country"] = yahoo_country
-                elif quote.get("region"):
-                    company["country"] = quote.get("region")
 
             print(f"✓ Enriched {ticker} with Yahoo Finance data")
 
@@ -105,6 +104,31 @@ async def search_company_by_ticker_or_cik(query: str) -> List[Dict]:
                     "industry": company_info.get("industry"),
                     "country": company_info.get("country")
                 }]
+
+            # If direct ticker lookup fails, fall back to EODHD's symbol search endpoint
+            search_results = await asyncio.to_thread(eodhd_client.search_symbols, query, 10)
+            if search_results:
+                normalized: list[Dict] = []
+                for match in search_results[:10]:
+                    exchange = (match.get("exchange") or "US").strip().upper()
+                    if exchange in {"NASDAQ", "NYSE", "AMEX", "ARCA", "NMS", "NYQ"}:
+                        exchange = "US"
+
+                    normalized.append(
+                        {
+                            "ticker": (match.get("ticker") or "").upper(),
+                            "cik": match.get("cik"),
+                            "name": match.get("name") or match.get("ticker") or query,
+                            "exchange": exchange,
+                            "sector": match.get("sector"),
+                            "industry": match.get("industry"),
+                            "country": match.get("country"),
+                        }
+                    )
+
+                normalized = [c for c in normalized if c.get("ticker")]
+                if normalized:
+                    return normalized
     except Exception as e:
         print(f"EODHD search error (falling back to EDGAR): {e}")
     
@@ -194,10 +218,10 @@ async def search_company_by_ticker_or_cik(query: str) -> List[Dict]:
                     "ticker": ticker,
                     "cik": quote.get("cik") or quote.get("symbol"),
                     "name": quote.get("longname") or quote.get("shortname") or ticker,
-                    "exchange": quote.get("exchDisp") or quote.get("exchange") or "US",
+                    "exchange": quote.get("exchange") or quote.get("exchDisp") or "US",
                     "sector": quote.get("sectorDisp") or quote.get("sector"),
                     "industry": quote.get("industryDisp") or quote.get("industry"),
-                    "country": quote.get("region"),
+                    "country": quote.get("country") or quote.get("longCountry"),
                 })
 
             if companies:
@@ -208,6 +232,44 @@ async def search_company_by_ticker_or_cik(query: str) -> List[Dict]:
             print(f"Error searching Yahoo Finance: {e}")
 
     return companies
+
+
+def _normalize_cik_value(cik: str) -> Optional[str]:
+    if cik is None:
+        return None
+    digits = "".join(ch for ch in str(cik) if ch.isdigit())
+    if not digits:
+        return None
+    return digits.zfill(10)
+
+
+def resolve_country_from_sec_submission(cik: str) -> Optional[str]:
+    """
+    Best-effort country resolution using the SEC submissions payload.
+
+    This is particularly helpful for foreign issuers trading in the US where
+    the exchange code does not indicate domicile.
+    """
+    cik_padded = _normalize_cik_value(cik)
+    if not cik_padded:
+        return None
+
+    submissions_url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
+    headers = {
+        "User-Agent": settings.edgar_user_agent,
+        "Accept-Encoding": "gzip, deflate",
+        "Host": "data.sec.gov",
+        "Accept": "application/json",
+    }
+
+    try:
+        response = requests.get(submissions_url, headers=headers, timeout=8)
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return None
+
+    return extract_country_from_sec_submission(payload)
 
 
 def get_company_filings(

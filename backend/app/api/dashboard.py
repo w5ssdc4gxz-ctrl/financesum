@@ -19,6 +19,14 @@ from app.services.local_cache import (
 from app.utils.supabase_errors import is_supabase_table_missing_error
 from app.services.eodhd_client import hydrate_country_with_eodhd, should_hydrate_country
 from app.services.country_hydration_queue import mark_hydrated
+from app.services.country_resolver import (
+    infer_country_from_company_name,
+    infer_country_from_exchange,
+    infer_country_from_ticker,
+    normalize_country,
+)
+from app.services.edgar_fetcher import resolve_country_from_sec_submission
+from app.services.yahoo_finance import resolve_country_from_yahoo_asset_profile
 
 router = APIRouter()
 
@@ -35,18 +43,59 @@ def _hydrate_and_persist_countries(company_map: Dict[str, Dict[str, Any]], supab
     Successfully hydrated companies are also removed from the pending queue.
     """
     for company in company_map.values():
-        if not should_hydrate_country(company.get("country")):
-            continue
-        hydrated = hydrate_country_with_eodhd(company.get("ticker"), company.get("exchange"))
-        if not hydrated:
-            continue
-        company["country"] = hydrated
+        original = company.get("country")
+        original_missing = should_hydrate_country(original)
+        resolved_confidently = False
+
+        normalized = normalize_country(original)
+        if normalized and normalized != original:
+            company["country"] = normalized
+
+        if should_hydrate_country(company.get("country")):
+            inferred = infer_country_from_company_name(company.get("name"))
+            if inferred:
+                company["country"] = inferred
+                resolved_confidently = True
+
+        if should_hydrate_country(company.get("country")) and company.get("ticker"):
+            inferred_from_ticker = infer_country_from_ticker(company.get("ticker"))
+            if inferred_from_ticker:
+                company["country"] = inferred_from_ticker
+                resolved_confidently = True
+
+        if should_hydrate_country(company.get("country")):
+            inferred_exchange = infer_country_from_exchange(company.get("exchange"))
+            if inferred_exchange and inferred_exchange != "US":
+                company["country"] = inferred_exchange
+                resolved_confidently = True
+
+        if should_hydrate_country(company.get("country")) and company.get("cik"):
+            sec_country = resolve_country_from_sec_submission(company.get("cik"))
+            if sec_country:
+                company["country"] = normalize_country(sec_country) or sec_country
+                resolved_confidently = True
+
+        if should_hydrate_country(company.get("country")) and company.get("ticker"):
+            yahoo_country = resolve_country_from_yahoo_asset_profile(company.get("ticker"))
+            if yahoo_country:
+                company["country"] = normalize_country(yahoo_country) or yahoo_country
+                resolved_confidently = True
+
+        if should_hydrate_country(company.get("country")):
+            hydrated = hydrate_country_with_eodhd(company.get("ticker"), company.get("exchange"))
+            if hydrated:
+                company["country"] = normalize_country(hydrated) or hydrated
+
+        # Avoid persisting a US placeholder when no domicile/HQ signal is available.
+        if should_hydrate_country(company.get("country")) and not resolved_confidently and original_missing:
+            company["country"] = None
+
         company_id = company.get("id")
         try:
-            supabase.table("companies").update({"country": hydrated}).eq("id", company_id).execute()
-            # Clear from pending queue if it was there
-            if company_id:
-                mark_hydrated(str(company_id))
+            if company.get("country") != original and company_id:
+                supabase.table("companies").update({"country": company.get("country")}).eq("id", company_id).execute()
+                if not should_hydrate_country(company.get("country")):
+                    mark_hydrated(str(company_id))
         except Exception as exc:  # noqa: BLE001
             print(f"Dashboard: could not persist hydrated country for {company.get('ticker')}: {exc}")
 
@@ -59,18 +108,58 @@ def _hydrate_fallback_countries(company_map: Dict[str, Dict[str, Any]]) -> None:
     """
     updated = False
     for company in company_map.values():
-        if not should_hydrate_country(company.get("country")):
-            continue
-        hydrated = hydrate_country_with_eodhd(company.get("ticker"), company.get("exchange"))
-        if not hydrated:
-            continue
-        company["country"] = hydrated
+        original = company.get("country")
+        original_missing = should_hydrate_country(original)
+        resolved_confidently = False
+
+        normalized = normalize_country(original)
+        if normalized and normalized != original:
+            company["country"] = normalized
+
+        if should_hydrate_country(company.get("country")):
+            inferred = infer_country_from_company_name(company.get("name"))
+            if inferred:
+                company["country"] = inferred
+                resolved_confidently = True
+
+        if should_hydrate_country(company.get("country")) and company.get("ticker"):
+            inferred_from_ticker = infer_country_from_ticker(company.get("ticker"))
+            if inferred_from_ticker:
+                company["country"] = inferred_from_ticker
+                resolved_confidently = True
+
+        if should_hydrate_country(company.get("country")):
+            inferred_exchange = infer_country_from_exchange(company.get("exchange"))
+            if inferred_exchange and inferred_exchange != "US":
+                company["country"] = inferred_exchange
+                resolved_confidently = True
+
+        if should_hydrate_country(company.get("country")) and company.get("cik"):
+            sec_country = resolve_country_from_sec_submission(company.get("cik"))
+            if sec_country:
+                company["country"] = normalize_country(sec_country) or sec_country
+                resolved_confidently = True
+
+        if should_hydrate_country(company.get("country")) and company.get("ticker"):
+            yahoo_country = resolve_country_from_yahoo_asset_profile(company.get("ticker"))
+            if yahoo_country:
+                company["country"] = normalize_country(yahoo_country) or yahoo_country
+                resolved_confidently = True
+
+        if should_hydrate_country(company.get("country")):
+            hydrated = hydrate_country_with_eodhd(company.get("ticker"), company.get("exchange"))
+            if hydrated:
+                company["country"] = normalize_country(hydrated) or hydrated
+
+        if should_hydrate_country(company.get("country")) and not resolved_confidently and original_missing:
+            company["country"] = None
+
         company_id = company.get("id")
-        fallback_companies[str(company_id)] = company
-        # Clear from pending queue if it was there
-        if company_id:
-            mark_hydrated(str(company_id))
-        updated = True
+        if company.get("country") != original:
+            fallback_companies[str(company_id)] = company
+            if company_id and not should_hydrate_country(company.get("country")):
+                mark_hydrated(str(company_id))
+            updated = True
     if updated:
         save_fallback_companies()
 

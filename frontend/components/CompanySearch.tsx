@@ -175,7 +175,7 @@ export default function CompanySearch({ onSelectCompany }: CompanySearchProps) {
             </div>
             <h3 className="text-sm font-medium text-gray-900 dark:text-gray-100">No results found</h3>
             <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-              We couldn't find any companies matching "{searchTerm}"
+              We couldn&apos;t find any companies matching &quot;{searchTerm}&quot;
             </p>
           </motion.div>
         )}

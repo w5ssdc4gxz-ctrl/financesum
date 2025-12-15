@@ -99,6 +99,7 @@ type FilingSummary = {
   content: string
   metadata: SummaryPreferenceSnapshot
   generatedAt: string
+  companyCountry?: string | null
   healthRating?: number
   healthComponents?: HealthComponentScores
   healthComponentWeights?: Partial<Record<keyof HealthComponentScores, number>>  // Dynamic weights from user settings
@@ -578,6 +579,7 @@ export default function CompanyPage() {
       const healthComponentWeights = response.data.health_component_weights;
       const healthComponentDescriptions = response.data.health_component_descriptions;
       const healthComponentMetrics = response.data.health_component_metrics;
+      const companyCountry = response.data.company_country ?? null
 
       if (isMountedRef.current) {
         const generatedAt = new Date().toISOString()
@@ -587,6 +589,7 @@ export default function CompanyPage() {
             content: response.data.summary,
             metadata: metadata ?? { mode: 'default' },
             generatedAt,
+            companyCountry,
             healthRating,
             healthComponents,
             healthComponentWeights,
@@ -638,7 +641,7 @@ export default function CompanyPage() {
       exchange: company.exchange,
       sector: company.sector,
       industry: company.industry,
-      country: company.country,
+      country: summary.companyCountry ?? company.country,
       healthScore: healthScore ?? null,
       scoreBand: ratingInfo?.grade ?? null,
       ratingLabel:

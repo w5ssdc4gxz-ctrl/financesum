@@ -157,6 +157,7 @@ export function useDashboardData() {
   const [history, setHistory] = useState<StoredAnalysisSnapshot[]>([])
   const [companies, setCompanies] = useState<StoredCompany[]>([])
   const [preferences, setPreferences] = useState<StoredSummaryPreferences>(DEFAULT_PREFERENCES)
+  const [serverStats, setServerStats] = useState<any>(null)
 
   const syncFromStorage = useCallback(() => {
     setHistory(DashboardStorage.loadAnalysisHistory())
@@ -195,6 +196,11 @@ export function useDashboardData() {
         const response = await dashboardApi.overview()
         if (cancelled) return
         const payload = response.data ?? {}
+
+        if (payload.stats && typeof payload.stats === "object") {
+          setServerStats(payload.stats)
+        }
+
         const normalizedHistory = Array.isArray(payload.history)
           ? payload.history.map(normalizeHistoryEntry).filter((item: StoredAnalysisSnapshot | null): item is StoredAnalysisSnapshot => Boolean(item))
           : []
@@ -247,6 +253,8 @@ export function useDashboardData() {
         bestCompany: null as StoredAnalysisSnapshot | null,
         sectors: [] as Array<{ label: string; value: number }>,
         countries: [] as Array<{ label: string; value: number }>,
+        total_summaries: typeof serverStats?.total_summaries === "number" ? serverStats.total_summaries : 0,
+        summary_activity: Array.isArray(serverStats?.summary_activity) ? serverStats.summary_activity : undefined,
       }
     }
     let scoredCount = 0
@@ -274,7 +282,7 @@ export function useDashboardData() {
       .slice(0, 4)
       .map(([label, value]) => ({ label, value }))
 
-    return {
+    const localStats = {
       analysisCount: history.length,
       scoredCount,
       avgScore: average,
@@ -283,7 +291,15 @@ export function useDashboardData() {
       sectors: topSectors,
       countries: topCountries,
     }
-  }, [history])
+
+    return {
+      ...localStats,
+      // Server-provided, append-only counters for dashboard activity.
+      total_summaries:
+        typeof serverStats?.total_summaries === "number" ? serverStats.total_summaries : localStats.analysisCount,
+      summary_activity: Array.isArray(serverStats?.summary_activity) ? serverStats.summary_activity : undefined,
+    }
+  }, [history, serverStats])
 
   const mapPoints = useMemo(() => {
     return history

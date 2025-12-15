@@ -395,7 +395,7 @@ export default function EnhancedSummary({ content, persona }: EnhancedSummaryPro
               <h3 className="font-black uppercase text-sm">{persona.name}</h3>
             </div>
             <p className="text-xs font-mono text-gray-600 dark:text-gray-400 line-clamp-1 italic">
-              "{persona.tagline}"
+              &quot;{persona.tagline}&quot;
             </p>
           </div>
         </div>

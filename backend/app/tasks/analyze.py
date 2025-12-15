@@ -8,6 +8,14 @@ from app.services.health_scorer import calculate_health_score
 from app.services.gemini_client import get_gemini_client
 from app.services.persona_engine import get_persona_engine
 from app.services.eodhd_client import normalize_eodhd_to_internal_format, hydrate_country_with_eodhd, should_hydrate_country
+from app.services.country_resolver import (
+    infer_country_from_company_name,
+    infer_country_from_exchange,
+    infer_country_from_ticker,
+    normalize_country,
+)
+from app.services.edgar_fetcher import resolve_country_from_sec_submission
+from app.services.yahoo_finance import resolve_country_from_yahoo_asset_profile
 
 
 @celery_app.task(bind=True)
@@ -49,14 +57,57 @@ def analyze_company_task(
             raise ValueError("Company not found")
         
         company = company_response.data[0]
+        original_country = company.get("country")
+        original_missing = should_hydrate_country(original_country)
+        resolved_confidently = False
+        normalized = normalize_country(original_country)
+        if normalized and normalized != original_country:
+            company["country"] = normalized
+
+        if should_hydrate_country(company.get("country")):
+            inferred = infer_country_from_company_name(company.get("name"))
+            if inferred:
+                company["country"] = normalize_country(inferred) or inferred
+                resolved_confidently = True
+
+        if should_hydrate_country(company.get("country")) and company.get("ticker"):
+            inferred_from_ticker = infer_country_from_ticker(company.get("ticker"))
+            if inferred_from_ticker:
+                company["country"] = inferred_from_ticker
+                resolved_confidently = True
+
+        if should_hydrate_country(company.get("country")):
+            inferred_exchange = infer_country_from_exchange(company.get("exchange"))
+            if inferred_exchange and inferred_exchange != "US":
+                company["country"] = inferred_exchange
+                resolved_confidently = True
+
+        if should_hydrate_country(company.get("country")) and company.get("cik"):
+            sec_country = resolve_country_from_sec_submission(company.get("cik"))
+            if sec_country:
+                company["country"] = normalize_country(sec_country) or sec_country
+                resolved_confidently = True
+
+        if should_hydrate_country(company.get("country")) and company.get("ticker"):
+            yahoo_country = resolve_country_from_yahoo_asset_profile(company.get("ticker"))
+            if yahoo_country:
+                company["country"] = normalize_country(yahoo_country) or yahoo_country
+                resolved_confidently = True
+
         if should_hydrate_country(company.get("country")):
             hydrated_country = hydrate_country_with_eodhd(company.get("ticker"), company.get("exchange"))
             if hydrated_country:
-                company["country"] = hydrated_country
-                try:
-                    supabase.table("companies").update({"country": hydrated_country}).eq("id", company_id).execute()
-                except Exception as exc:  # noqa: BLE001
-                    print(f"Analyze task: failed to persist hydrated country for {company_id}: {exc}")
+                company["country"] = normalize_country(hydrated_country) or hydrated_country
+
+        # Avoid persisting a US placeholder when we never found a domicile/HQ signal.
+        if should_hydrate_country(company.get("country")) and not resolved_confidently and original_missing:
+            company["country"] = None
+
+        if company.get("country") != original_country:
+            try:
+                supabase.table("companies").update({"country": company.get("country")}).eq("id", company_id).execute()
+            except Exception as exc:  # noqa: BLE001
+                print(f"Analyze task: failed to persist hydrated country for {company_id}: {exc}")
         company_name = company["name"]
         
         self.update_state(state='PROGRESS', meta={'progress': 20, 'status': 'Loading financial statements...'})
