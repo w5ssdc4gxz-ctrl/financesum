@@ -1,176 +1,449 @@
 'use client'
 
+import { useRef } from 'react'
 import Link from 'next/link'
+import Image from 'next/image'
 import { useRouter } from 'next/navigation'
-import { motion } from 'framer-motion'
+import { motion, useScroll, useTransform } from 'framer-motion'
 import { useAuth } from '@/contexts/AuthContext'
 import Navbar from '@/components/Navbar'
-import LayeredScrollBackground from '@/components/LayeredScrollBackground'
-import LogoLoop from '@/components/LogoLoop'
-import JourneySection from '@/components/JourneySection'
-import ResearchMemoShowcase from '@/components/ResearchMemoShowcase'
-import PersonaSelector from '@/components/PersonaSelector'
-import MegaFooter from '@/components/MegaFooter'
-import { Button } from '@/components/base/buttons/button'
-import CubeBackground from '@/components/CubeBackground'
-import Stack from '@/components/Stack'
+import MinimalFooter from '@/components/MinimalFooter'
+import BottomPopup from '@/components/BottomPopup'
+import { FAQChat } from '@/components/FAQChat'
+import { Float, TextRotator, StackingCards, StackingCardItem, LogoLoop } from '@/components/fancy'
 
+// Rotating words for the hero
+const rotatingWords = ['reimagined.', 'simplified.', 'automated.', 'transformed.']
+
+// Enterprise customer logos
+const enterpriseLogos = [
+  { node: <span className="font-bold tracking-tight">BlackRock</span>, title: 'BlackRock' },
+  { node: <span className="font-bold tracking-tight">JP Morgan</span>, title: 'JP Morgan' },
+  { node: <span className="font-bold tracking-tight">Goldman Sachs</span>, title: 'Goldman Sachs' },
+  { node: <span className="font-bold tracking-tight">Morgan Stanley</span>, title: 'Morgan Stanley' },
+  { node: <span className="font-bold tracking-tight">Citadel</span>, title: 'Citadel' },
+  { node: <span className="font-bold tracking-tight">Bridgewater</span>, title: 'Bridgewater' },
+  { node: <span className="font-bold tracking-tight">Fidelity</span>, title: 'Fidelity' },
+  { node: <span className="font-bold tracking-tight">Vanguard</span>, title: 'Vanguard' },
+]
+
+// Walkthrough card data
+const walkthroughCards = [
+  {
+    step: 1,
+    title: 'Enter Your Company',
+    description: 'Simply type in any publicly traded company ticker or name. Our system instantly recognizes thousands of securities worldwide.',
+    image: '/walkthrough/step-1.png',
+    color: 'bg-[#0015ff]',
+  },
+  {
+    step: 2,
+    title: 'Select Filing Type',
+    description: 'Choose from 10-K annual reports, 10-Q quarterly filings, earnings calls, or let AI recommend the most relevant documents.',
+    image: '/walkthrough/step-2.png',
+    color: 'bg-[#4338ca]',
+  },
+  {
+    step: 3,
+    title: 'Customize Your Analysis',
+    description: 'Define what matters most. Focus on financial metrics, risk factors, management commentary, or get a comprehensive overview.',
+    image: '/walkthrough/step-3.png',
+    color: 'bg-[#7c3aed]',
+  },
+  {
+    step: 4,
+    title: 'AI Processing',
+    description: 'Watch as our AI reads through hundreds of pages in seconds, extracting key insights and synthesizing complex information.',
+    image: '/walkthrough/step-4.png',
+    color: 'bg-[#8b5cf6]',
+  },
+  {
+    step: 5,
+    title: 'Review Your Summary',
+    description: 'Get a beautifully formatted executive memo with key metrics, risks, opportunities, and actionable insights.',
+    image: '/walkthrough/step-5.png',
+    color: 'bg-[#a855f7]',
+  },
+  {
+    step: 6,
+    title: 'Export & Share',
+    description: 'Download your analysis, share with your team, or save to your dashboard for future reference and comparison.',
+    image: '/walkthrough/step-6.png',
+    color: 'bg-[#c084fc]',
+  },
+]
 
 export default function Home() {
-    const { user, signIn } = useAuth()
-    const router = useRouter()
-    const logos = [
-        { node: <div className="text-xl font-bold text-white">BlackRock</div> },
-        { node: <div className="text-xl font-bold text-white">Goldman Sachs</div> },
-        { node: <div className="flex items-center gap-3 text-xl font-bold text-white"><img src="/api/logo?ticker=JPM" alt="JPMorgan" className="h-8 w-auto object-contain brightness-0 invert" /> JPMorgan</div> },
-        { node: <div className="text-xl font-bold text-white">Berkshire Hathaway</div> },
-        { node: <div className="text-xl font-bold text-white">Morgan Stanley</div> },
-        { node: <div className="text-xl font-bold text-white">Vanguard</div> },
-    ]
+  const { user } = useAuth()
+  const router = useRouter()
+  const heroRef = useRef<HTMLDivElement>(null)
+  const walkthroughRef = useRef<HTMLDivElement>(null)
+  const walkthroughPanelHeight = "h-screen min-h-[720px]"
 
-    return (
-        <main className="relative min-h-screen w-full overflow-x-hidden bg-[#050015]">
-            <LayeredScrollBackground />
-            <Navbar />
+  const { scrollYProgress } = useScroll({
+    target: heroRef,
+    offset: ["start start", "end start"]
+  })
 
-            {/* Hero Section */}
-            <section className="relative z-10 flex min-h-screen flex-col items-center justify-center px-4 pt-20 pb-16 text-center sm:px-6 lg:px-8">
-                <motion.div
-                    initial={{ opacity: 0, y: 20 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ duration: 0.8, ease: "easeOut" }}
-                    className="max-w-5xl space-y-8"
-                >
-                    <div className="inline-flex items-center rounded-full border border-primary-500/30 bg-primary-500/10 px-3 py-1 text-sm font-medium text-primary-200 backdrop-blur-sm">
-                        <span className="mr-2 flex h-2 w-2">
-                            <span className="absolute inline-flex h-2 w-2 animate-ping rounded-full bg-primary-400 opacity-75"></span>
-                            <span className="relative inline-flex h-2 w-2 rounded-full bg-primary-500"></span>
-                        </span>
-                        Now in Public Beta
-                    </div>
+  const heroOpacity = useTransform(scrollYProgress, [0, 0.5], [1, 0])
+  const heroY = useTransform(scrollYProgress, [0, 0.5], [0, -50])
 
-                    <h1 className="text-5xl font-black tracking-tight text-white sm:text-7xl lg:text-8xl">
-                        Financial analysis, <br />
-                        <span className="bg-gradient-to-r from-primary-400 via-accent-400 to-primary-400 bg-clip-text text-transparent bg-[length:200%_auto] animate-gradient">
-                            reimagined by AI.
-                        </span>
-                    </h1>
+  return (
+    <main className="relative min-h-screen bg-white">
+      <Navbar />
 
-                    <p className="mx-auto max-w-2xl text-lg text-gray-300 sm:text-xl">
-                        FinanceSum digests 10-Ks, earnings calls, and market news into
-                        executive-grade memos. Stop drowning in filings and start making decisions.
-                    </p>
-
-                    <div className="flex flex-col items-center justify-center gap-4 sm:flex-row">
-                        <Button
-                            size="lg"
-                            className="min-w-[200px] text-lg h-14 rounded-2xl"
-                            onClick={() => {
-                                if (user) {
-                                    router.push('/dashboard')
-                                } else {
-                                    router.push('/signup')
-                                }
-                            }}
-                        >
-                            Start Analyzing
-                        </Button>
-                        <Button
-                            color="secondary"
-                            size="lg"
-                            className="min-w-[200px] text-lg h-14 rounded-2xl border-white/20 text-white hover:bg-white/10 hover:text-white"
-                            onClick={() => {
-                                document.getElementById('journey')?.scrollIntoView({ behavior: 'smooth' })
-                            }}
-                        >
-                            See How It Works
-                        </Button>
-                    </div>
-                </motion.div>
-
-                {/* Hero Visual */}
-                <motion.div
-                    initial={{ opacity: 0, y: 40 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ delay: 0.4, duration: 0.8 }}
-                    className="mt-20 w-full max-w-6xl"
-                >
-                    <div className="relative w-full">
-                        <ResearchMemoShowcase />
-                    </div>
-                </motion.div>
-            </section>
-
-            {/* Social Proof */}
-            <section className="relative z-10 py-12">
-                <div className="mx-auto max-w-7xl px-6 lg:px-8">
-                    <p className="text-center text-sm font-semibold uppercase tracking-widest text-gray-500 mb-8">
-                        Get investing summaries like:
-                    </p>
-                    <LogoLoop logos={logos} speed={0.5} pauseOnHover={true} />
-                </div>
-            </section>
-
-            {/* Journey Section */}
-            <div id="journey" className="relative z-10 w-full">
-                <JourneySection />
-            </div>
-
-            {/* Persona Section */}
-            <section id="personas" className="relative z-10 py-24">
-                <div className="absolute -top-[20%] right-0 w-full h-[140%] md:w-1/2 opacity-60 pointer-events-none mix-blend-screen [mask-image:linear-gradient(to_bottom,black_80%,transparent_100%)]">
-                    <CubeBackground />
-                </div>
-                <div className="mx-auto max-w-7xl px-6 lg:px-8 relative z-10">
-                    <div className="grid gap-12 lg:grid-cols-2 items-center">
-                        <div>
-                            <h2 className="text-3xl font-bold tracking-tight text-white sm:text-4xl">
-                                Analyze through the lens of legends.
-                            </h2>
-                            <p className="mt-4 text-lg text-gray-300">
-                                Adopt the mental models of world-class investors. Toggle personas to see how Buffett, Lynch, or Dalio might view the same set of facts.
-                            </p>
-                            <div className="mt-8">
-                                <PersonaSelector selectedPersonas={['buffett', 'munger']} onSelectionChange={() => { }} />
-                            </div>
-                        </div>
-                        <div className="relative h-[400px] w-full flex items-center justify-center">
-                            {/* Stack moved to separate section */}
-                        </div>
-                    </div>
-                </div>
-            </section>
-
-            {/* Stack Showcase Section */}
-            <section id="visuals" className="relative z-10 py-32 flex flex-col justify-center items-center overflow-hidden">
-                <div className="text-center mb-16 max-w-3xl px-6">
-                    <h2 className="text-4xl md:text-5xl font-bold tracking-tight text-white mb-6">
-                        Visual Intelligence
-                    </h2>
-                    <p className="text-lg md:text-xl text-gray-400 leading-relaxed">
-                        Experience data like never before. Our interface is designed for clarity, speed, and depth, giving you the insights you need at a glance.
-                    </p>
-                </div>
-                <Stack
-                    randomRotation={true}
-                    sensitivity={180}
-                    sendToBackOnClick={false}
-                    cardDimensions={{ width: 600, height: 450 }}
-                    cardsData={[
-                        { id: 1, img: "/concept-1.png" },
-                        { id: 2, img: "/concept-2.png" },
-                        { id: 3, img: "/concept-3.png" },
-                        { id: 4, img: "/concept-1.png" },
-                        { id: 5, img: "/concept-2.png" },
-                        { id: 6, img: "/concept-3.png" },
-                    ]}
+      {/* Hero Section */}
+      <section
+        ref={heroRef}
+        className="relative min-h-screen flex items-center justify-center pt-16 overflow-hidden"
+      >
+        {/* Floating Images - Behind Content */}
+        <div className="absolute inset-0 pointer-events-none z-10">
+          {/* Top Left */}
+          <motion.div
+            initial={{ opacity: 0, y: 60, scale: 0.8 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            transition={{ duration: 1, delay: 0.3, ease: [0.25, 0.46, 0.45, 0.94] }}
+            className="absolute top-[12%] left-[6%] sm:left-[8%] pointer-events-auto"
+          >
+            <Float rotationRange={12} scale={1.02}>
+              <div className="w-36 sm:w-52 md:w-64 rounded-2xl shadow-hero overflow-hidden bg-white">
+                <Image
+                  src="/hero/hero-1.png"
+                  alt="Financial dashboard preview"
+                  width={256}
+                  height={180}
+                  className="w-full h-auto object-cover"
                 />
-            </section>
+              </div>
+            </Float>
+          </motion.div>
 
-            {/* Footer */}
-            {/* Footer */}
-            <MegaFooter />
-        </main>
-    )
+          {/* Top Right */}
+          <motion.div
+            initial={{ opacity: 0, y: 80, scale: 0.8 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            transition={{ duration: 1, delay: 0.5, ease: [0.25, 0.46, 0.45, 0.94] }}
+            className="absolute top-[8%] right-[4%] sm:right-[6%] pointer-events-auto"
+          >
+            <Float rotationRange={10} scale={1.02}>
+              <div className="w-40 sm:w-56 md:w-72 rounded-2xl shadow-hero overflow-hidden bg-white">
+                <Image
+                  src="/hero/hero-2.png"
+                  alt="Analysis interface"
+                  width={288}
+                  height={200}
+                  className="w-full h-auto object-cover"
+                />
+              </div>
+            </Float>
+          </motion.div>
+
+          {/* Middle Left */}
+          <motion.div
+            initial={{ opacity: 0, y: 50, scale: 0.8 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            transition={{ duration: 1, delay: 0.7, ease: [0.25, 0.46, 0.45, 0.94] }}
+            className="absolute top-[42%] left-[2%] sm:left-[4%] pointer-events-auto"
+          >
+            <Float rotationRange={14} scale={1.03}>
+              <div className="w-44 sm:w-60 md:w-80 rounded-2xl shadow-hero overflow-hidden bg-white">
+                <Image
+                  src="/hero/hero-3.png"
+                  alt="Research memo"
+                  width={320}
+                  height={220}
+                  className="w-full h-auto object-cover"
+                />
+              </div>
+            </Float>
+          </motion.div>
+
+          {/* Bottom Right */}
+          <motion.div
+            initial={{ opacity: 0, y: 70, scale: 0.8 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            transition={{ duration: 1, delay: 0.9, ease: [0.25, 0.46, 0.45, 0.94] }}
+            className="absolute top-[58%] right-[2%] sm:right-[5%] pointer-events-auto"
+          >
+            <Float rotationRange={12} scale={1.02}>
+              <div className="w-48 sm:w-64 md:w-88 rounded-2xl shadow-hero overflow-hidden bg-white">
+                <Image
+                  src="/hero/hero-4.png"
+                  alt="Summary generation"
+                  width={352}
+                  height={240}
+                  className="w-full h-auto object-cover"
+                />
+              </div>
+            </Float>
+          </motion.div>
+
+          {/* Bottom Left (Desktop only) */}
+          <motion.div
+            initial={{ opacity: 0, y: 60, scale: 0.8 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            transition={{ duration: 1, delay: 1.1, ease: [0.25, 0.46, 0.45, 0.94] }}
+            className="hidden lg:block absolute bottom-[8%] left-[8%] pointer-events-auto"
+          >
+            <Float rotationRange={10} scale={1.02}>
+              <div className="w-48 md:w-56 rounded-2xl shadow-hero overflow-hidden bg-white">
+                <Image
+                  src="/hero/hero-5.png"
+                  alt="Key metrics"
+                  width={224}
+                  height={160}
+                  className="w-full h-auto object-cover"
+                />
+              </div>
+            </Float>
+          </motion.div>
+        </div>
+
+        {/* Hero Content */}
+        <motion.div
+          className="relative z-20 container-tight text-center"
+          style={{ opacity: heroOpacity, y: heroY }}
+        >
+          {/* Badge */}
+          <motion.div
+            initial={{ opacity: 0, y: 30 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.8, delay: 0.1, ease: [0.25, 0.46, 0.45, 0.94] }}
+            className="mb-8"
+          >
+            <span className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-secondary text-sm font-medium text-muted-foreground">
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#0015ff] opacity-75" />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-[#0015ff]" />
+              </span>
+              Now in Public Beta
+            </span>
+          </motion.div>
+
+          {/* Headline with Playfair Display */}
+          <motion.h1
+            initial={{ opacity: 0, y: 40 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.8, delay: 0.2, ease: [0.25, 0.46, 0.45, 0.94] }}
+            className="text-5xl sm:text-6xl md:text-7xl lg:text-8xl font-bold tracking-tight text-foreground mb-8"
+          >
+            <span className="font-serif italic">Financial analysis,</span>
+            <br />
+            <span className="text-[#0015ff] font-serif italic">
+              <TextRotator 
+                words={rotatingWords} 
+                interval={3000} 
+                animationType="blur"
+              />
+            </span>
+          </motion.h1>
+
+          {/* Subtitle */}
+          <motion.p
+            initial={{ opacity: 0, y: 30 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.8, delay: 0.4, ease: [0.25, 0.46, 0.45, 0.94] }}
+            className="text-lg md:text-xl text-muted-foreground max-w-2xl mx-auto mb-12 text-balance leading-relaxed"
+          >
+            FinanceSum digests 10-Ks, earnings calls, and market news into 
+            executive-grade memos. Stop drowning in filings.
+          </motion.p>
+
+          {/* CTA Buttons */}
+          <motion.div
+            initial={{ opacity: 0, y: 30 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.8, delay: 0.6, ease: [0.25, 0.46, 0.45, 0.94] }}
+            className="flex flex-col sm:flex-row items-center justify-center gap-4 relative z-20"
+          >
+            <button
+              onClick={() => router.push(user ? '/dashboard' : '/signup')}
+              className="btn-primary text-base px-8 py-4 rounded-full"
+            >
+              Start Analyzing
+            </button>
+            <button
+              onClick={() => walkthroughRef.current?.scrollIntoView({ behavior: 'smooth' })}
+              className="btn-secondary text-base px-8 py-4 rounded-full"
+            >
+              See How It Works
+            </button>
+          </motion.div>
+        </motion.div>
+
+      </section>
+
+      {/* Trusted By Section */}
+      <section className="py-16 md:py-20 bg-white border-t border-secondary">
+        <div className="container-wide">
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ duration: 0.6, ease: [0.25, 0.46, 0.45, 0.94] }}
+            className="text-center mb-10"
+          >
+            <span className="text-sm font-medium text-muted-foreground uppercase tracking-wider">
+              Trusted by leading financial institutions
+            </span>
+          </motion.div>
+          <motion.div
+            initial={{ opacity: 0 }}
+            whileInView={{ opacity: 1 }}
+            viewport={{ once: true }}
+            transition={{ duration: 0.8, delay: 0.2 }}
+            className="h-12 overflow-hidden"
+          >
+            <LogoLoop
+              logos={enterpriseLogos}
+              speed={60}
+              direction="left"
+              logoHeight={24}
+              gap={80}
+              hoverSpeed={0}
+              fadeOut
+              fadeOutColor="#ffffff"
+              ariaLabel="Trusted enterprise customers"
+              className="text-muted-foreground/60"
+            />
+          </motion.div>
+        </div>
+      </section>
+
+      {/* Walkthrough Section */}
+      <section ref={walkthroughRef} className="py-16 md:py-20 bg-secondary/30 scroll-mt-24">
+        <div className="container-wide max-w-[90rem]">
+          {/* Section Header */}
+          <motion.div
+            initial={{ opacity: 0, y: 30 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true }}
+            transition={{ duration: 0.8, ease: [0.25, 0.46, 0.45, 0.94] }}
+            className="text-center mb-10"
+          >
+            <span className="text-sm font-medium text-[#0015ff] uppercase tracking-wider mb-4 block">
+              How It Works
+            </span>
+            <h2 className="text-4xl sm:text-5xl md:text-6xl font-bold tracking-tight text-foreground mb-6 font-serif italic">
+              Six steps to clarity
+            </h2>
+            <p className="text-lg text-muted-foreground max-w-2xl mx-auto">
+              From company search to actionable insights in minutes. Follow along as we transform complex filings into clear intelligence.
+            </p>
+          </motion.div>
+
+          {/* Stacking Cards */}
+          <StackingCards totalCards={walkthroughCards.length} scaleMultiplier={0.03} className="relative">
+            {walkthroughCards.map((card, index) => (
+              <StackingCardItem
+                key={card.step}
+                index={index}
+                className={walkthroughPanelHeight}
+                topPosition={`calc(4.5rem + 5vh + ${index * 3}vh)`}
+              >
+                <div className="flex items-start justify-center w-full h-full">
+                  <div className={`${card.color} h-[80%] md:h-[78%] flex-col md:flex-row px-10 md:px-14 py-10 flex w-[96%] rounded-3xl mx-auto relative shadow-2xl`}>
+                    <div className="flex flex-col md:flex-row gap-10 h-full items-center w-full">
+                      {/* Content */}
+                      <div className="flex-1 text-white flex flex-col justify-center">
+                        <span className="inline-block px-3 py-1 bg-white/20 rounded-full text-sm font-medium mb-4">
+                          Step {card.step}
+                        </span>
+                        <h3 className="text-3xl md:text-4xl font-bold mb-5 font-serif italic">
+                          {card.title}
+                        </h3>
+                        <p className="text-white/80 text-lg md:text-xl leading-relaxed">
+                          {card.description}
+                        </p>
+                      </div>
+
+                      {/* Image with Float effect */}
+                      <div className="w-full md:w-1/2">
+                        <Float rotationRange={8} scale={1.02}>
+                          <div className="rounded-2xl overflow-hidden shadow-2xl bg-white aspect-video relative">
+                            <Image
+                              src={card.image}
+                              alt={card.title}
+                              fill
+                              className="object-cover"
+                            />
+                          </div>
+                        </Float>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </StackingCardItem>
+            ))}
+            <div className="h-[45vh]" />
+          </StackingCards>
+        </div>
+      </section>
+
+      {/* FAQ Chat Section */}
+      <FAQChat />
+
+      {/* CTA Section */}
+      <motion.section
+        className="py-24 md:py-32 bg-white overflow-hidden"
+        initial={{ opacity: 0 }}
+        whileInView={{ opacity: 1 }}
+        viewport={{ amount: 0.3 }}
+        transition={{ duration: 0.6 }}
+      >
+        <div className="container-tight text-center">
+          <motion.h2
+            className="text-4xl sm:text-5xl md:text-6xl font-bold tracking-tight text-foreground mb-6 font-serif italic"
+            initial={{ opacity: 0, y: 50, scale: 0.95 }}
+            whileInView={{ opacity: 1, y: 0, scale: 1 }}
+            viewport={{ amount: 0.5 }}
+            transition={{ duration: 0.7, ease: [0.25, 0.46, 0.45, 0.94] }}
+          >
+            Ready to start?
+          </motion.h2>
+          <motion.p
+            className="text-lg text-muted-foreground max-w-xl mx-auto mb-10"
+            initial={{ opacity: 0, y: 30 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ amount: 0.5 }}
+            transition={{ duration: 0.7, delay: 0.15, ease: [0.25, 0.46, 0.45, 0.94] }}
+          >
+            Join thousands of investors who save hours every week with AI-powered financial analysis.
+          </motion.p>
+          <motion.div
+            initial={{ opacity: 0, y: 30, scale: 0.9 }}
+            whileInView={{ opacity: 1, y: 0, scale: 1 }}
+            viewport={{ amount: 0.5 }}
+            transition={{
+              duration: 0.5,
+              delay: 0.3,
+              ease: [0.25, 0.46, 0.45, 0.94],
+              scale: { type: "spring", stiffness: 200, damping: 15 }
+            }}
+          >
+            <Link
+              href={user ? '/dashboard' : '/signup'}
+              className="btn-primary text-lg px-10 py-5 rounded-full inline-flex"
+            >
+              Get Started Free
+            </Link>
+          </motion.div>
+        </div>
+      </motion.section>
+
+      {/* Footer with reveal animation */}
+      <motion.div
+        initial={{ opacity: 0, y: 40 }}
+        whileInView={{ opacity: 1, y: 0 }}
+        viewport={{ amount: 0.2 }}
+        transition={{ duration: 0.8, ease: [0.25, 0.46, 0.45, 0.94] }}
+      >
+        <MinimalFooter />
+      </motion.div>
+
+      {/* Scroll-triggered popup */}
+      <BottomPopup threshold={80} />
+    </main>
+  )
 }
-

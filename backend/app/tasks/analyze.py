@@ -1,5 +1,6 @@
 """Celery tasks for analyzing companies."""
 import json
+from datetime import datetime, timezone
 from typing import List, Optional
 from app.tasks.celery_app import celery_app
 from app.models.database import get_supabase_client
@@ -8,6 +9,7 @@ from app.services.health_scorer import calculate_health_score
 from app.services.gemini_client import get_gemini_client
 from app.services.persona_engine import get_persona_engine
 from app.services.eodhd_client import normalize_eodhd_to_internal_format, hydrate_country_with_eodhd, should_hydrate_country
+from app.services.summary_activity import record_summary_generated_event
 from app.services.country_resolver import (
     infer_country_from_company_name,
     infer_country_from_exchange,
@@ -213,9 +215,19 @@ def analyze_company_task(
 ## Catalysts
 {summary_data.get('catalysts', '')}
 
-## Key KPIs to Monitor
+        ## Key KPIs to Monitor
 {summary_data.get('kpis', '')}
 """
+
+        # Track the completed company summary immediately (best-effort).
+        record_summary_generated_event(
+            summary_id=str(analysis_id),
+            company_id=str(company_id),
+            kind="analysis",
+            cached=False,
+            source="supabase",
+            supabase_client=supabase,
+        )
         
         self.update_state(state='PROGRESS', meta={'progress': 70, 'status': 'Generating persona views...'})
         
@@ -256,6 +268,16 @@ def analyze_company_task(
                     )
                     
                     persona_summaries[persona_id] = persona_analysis
+
+                    # Track each completed persona summary (best-effort).
+                    record_summary_generated_event(
+                        summary_id=f"{analysis_id}:{persona_id}",
+                        company_id=str(company_id),
+                        kind="analysis_persona",
+                        cached=False,
+                        source="supabase",
+                        supabase_client=supabase,
+                    )
                 
                 except Exception as e:
                     print(f"Error generating persona {persona_id}: {e}")

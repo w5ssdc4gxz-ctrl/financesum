@@ -155,8 +155,19 @@ export default function DashboardContent({
   const analysisTrendData = useMemo(() => {
     const activity = Array.isArray(stats?.summary_activity) ? stats.summary_activity : null
     if (activity && activity.length) {
+      const parseActivityDate = (value: any) => {
+        if (typeof value === 'string') {
+          const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
+          if (match) {
+            const [, year, month, day] = match
+            return new Date(Number(year), Number(month) - 1, Number(day))
+          }
+        }
+        return new Date(value)
+      }
+
       return activity.map((row: any) => {
-        const parsed = new Date(row.date)
+        const parsed = parseActivityDate(row.date)
         const date = Number.isNaN(parsed.getTime()) ? new Date() : parsed
         return {
           date,

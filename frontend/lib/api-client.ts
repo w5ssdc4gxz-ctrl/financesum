@@ -103,7 +103,8 @@ export const analysisApi = {
 
 // Dashboard API
 export const dashboardApi = {
-  overview: () => apiClient.get('/api/v1/dashboard/overview'),
+  overview: (params?: { tz_offset_minutes?: number }) =>
+    apiClient.get('/api/v1/dashboard/overview', { params }),
 }
 
 export default apiClient

@@ -29,4 +29,15 @@ def is_supabase_table_missing_error(error: Exception) -> bool:
         or "permission denied" in lowered
         or "not authorized" in lowered
         or "unauthorized" in lowered
+        # Network / connectivity issues should fall back to local mode instead of hanging.
+        or "timed out" in lowered
+        or "timeout" in lowered
+        or "connection refused" in lowered
+        or "failed to establish a new connection" in lowered
+        or "all connection attempts failed" in lowered
+        or "name or service not known" in lowered
+        or "temporary failure in name resolution" in lowered
+        or "nodename nor servname provided" in lowered
+        or "network is unreachable" in lowered
+        or "connection error" in lowered
     )

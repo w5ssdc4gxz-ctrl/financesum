@@ -2,16 +2,47 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List
+from uuid import uuid4
+
+try:  # pragma: no cover - platform dependent
+    import fcntl  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover - platform dependent
+    fcntl = None  # type: ignore[assignment]
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 CACHE_DIR = BACKEND_DIR / "data" / "local_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 COMPANIES_CACHE_FILE = CACHE_DIR / "companies.json"
 SUMMARY_EVENTS_CACHE_FILE = CACHE_DIR / "summary_events.json"
+SUMMARY_EVENTS_LOCK_FILE = CACHE_DIR / "summary_events.lock"
+
+
+@contextmanager
+def _exclusive_lock(path: Path):
+    if fcntl is None:
+        yield
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            yield
+            return
+
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
 
 
 def _json_default(value: Any) -> str:
@@ -31,7 +62,9 @@ def _load_json(path: Path) -> Dict[str, Any]:
 
 def _save_json(path: Path, payload: Dict[str, Any]) -> None:
     try:
-        path.write_text(json.dumps(payload, default=_json_default, indent=2))
+        tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        tmp_path.write_text(json.dumps(payload, default=_json_default, indent=2))
+        tmp_path.replace(path)
     except OSError as exc:  # pragma: no cover - best-effort persistence
         print(f"Unable to persist local cache {path}: {exc}")
 
@@ -43,6 +76,29 @@ fallback_companies: Dict[str, Dict[str, Any]] = _load_json(COMPANIES_CACHE_FILE)
 summary_events_cache: List[Dict[str, Any]] = _load_json(SUMMARY_EVENTS_CACHE_FILE).get("events", [])
 
 
+def load_summary_events_cache() -> List[Dict[str, Any]]:
+    """Reload summary generation events from disk (best-effort)."""
+    global summary_events_cache
+    with _exclusive_lock(SUMMARY_EVENTS_LOCK_FILE):
+        payload = _load_json(SUMMARY_EVENTS_CACHE_FILE)
+        events = payload.get("events", [])
+        summary_events_cache = events if isinstance(events, list) else []
+    return summary_events_cache
+
+
+def append_summary_event(event: Dict[str, Any]) -> None:
+    """Append a summary generation event to the on-disk cache (best-effort)."""
+    global summary_events_cache
+    with _exclusive_lock(SUMMARY_EVENTS_LOCK_FILE):
+        payload = _load_json(SUMMARY_EVENTS_CACHE_FILE)
+        events = payload.get("events", [])
+        if not isinstance(events, list):
+            events = []
+        events.append(event)
+        summary_events_cache = events
+        _save_json(SUMMARY_EVENTS_CACHE_FILE, {"events": events})
+
+
 def save_fallback_companies() -> None:
     """Persist current fallback companies to disk."""
     _save_json(COMPANIES_CACHE_FILE, fallback_companies)
@@ -50,7 +106,8 @@ def save_fallback_companies() -> None:
 
 def save_summary_events_cache() -> None:
     """Persist summary generation events cache to disk (best-effort)."""
-    _save_json(SUMMARY_EVENTS_CACHE_FILE, {"events": summary_events_cache})
+    with _exclusive_lock(SUMMARY_EVENTS_LOCK_FILE):
+        _save_json(SUMMARY_EVENTS_CACHE_FILE, {"events": summary_events_cache})
 
 
 # Stores serialized filing dictionaries keyed by company ID (as string)
@@ -76,4 +133,3 @@ fallback_filing_summaries: Dict[str, str] = {}
 
 # Stores real-time progress status keyed by filing ID (as string)
 progress_cache: Dict[str, str] = {}
-

@@ -1,4 +1,5 @@
 """Filings API endpoints."""
+
 import json
 import logging
 import random
@@ -54,9 +55,8 @@ from app.services.local_cache import (
     fallback_task_status,
     save_fallback_companies,
     progress_cache,
-    summary_events_cache,
-    save_summary_events_cache,
 )
+from app.services.summary_activity import record_summary_generated_event
 from app.services.gemini_client import get_gemini_client, generate_growth_assessment
 from app.services.gemini_exceptions import (
     GeminiRateLimitError,
@@ -154,49 +154,58 @@ def _clamp_target_length(value: Optional[int]) -> Optional[int]:
 
 def _extract_persona_name(investor_focus: Optional[str]) -> Optional[str]:
     """Extract the persona name from the investor_focus prompt text.
-    
+
     The investor_focus typically contains text like:
     "Role: Howard Marks. Personality: Calm, cycle-aware..."
     or
     "Role: Warren Buffett. Personality: Folksy clarity..."
-    
+
     Returns the persona name (e.g., "Howard Marks", "Warren Buffett") or None if not found.
     """
     if not investor_focus:
         return None
-    
+
     # Try to extract from "Role: [Name]." pattern
-    role_match = re.search(r'Role:\s*([^.]+)\.', investor_focus, re.IGNORECASE)
+    role_match = re.search(r"Role:\s*([^.]+)\.", investor_focus, re.IGNORECASE)
     if role_match:
         return role_match.group(1).strip()
-    
+
     # Try to extract from "As [Name]," pattern
-    as_match = re.search(r'As\s+([A-Z][a-z]+\s+[A-Z][a-z]+)', investor_focus)
+    as_match = re.search(r"As\s+([A-Z][a-z]+\s+[A-Z][a-z]+)", investor_focus)
     if as_match:
         return as_match.group(1).strip()
-    
+
     # Common persona names to look for
     persona_names = [
-        "Warren Buffett", "Charlie Munger", "Benjamin Graham", "Peter Lynch",
-        "Ray Dalio", "Cathie Wood", "Joel Greenblatt", "John Bogle",
-        "Howard Marks", "Bill Ackman"
+        "Warren Buffett",
+        "Charlie Munger",
+        "Benjamin Graham",
+        "Peter Lynch",
+        "Ray Dalio",
+        "Cathie Wood",
+        "Joel Greenblatt",
+        "John Bogle",
+        "Howard Marks",
+        "Bill Ackman",
     ]
-    
+
     for name in persona_names:
         if name.lower() in investor_focus.lower():
             return name
-    
+
     return None
 
 
-def _build_closing_takeaway_description(persona_name: Optional[str], company_name: str) -> Tuple[str, str]:
+def _build_closing_takeaway_description(
+    persona_name: Optional[str], company_name: str
+) -> Tuple[str, str]:
     """Build a dynamic Closing Takeaway section description based on the selected persona.
-    
+
     If a persona is selected, the instructions are specifically tailored to that persona's voice.
     If no persona is selected, generic instructions are provided.
     """
     title = "Closing Takeaway"
-    
+
     base_requirements = (
         "Include a concise Closing Takeaway. Keep this balanced with other sections.\n"
         "2-4 COMPLETE sentences (~50-70 words). This is your FINAL INVESTMENT VERDICT.\n\n"
@@ -212,30 +221,27 @@ def _build_closing_takeaway_description(persona_name: Optional[str], company_nam
         "- Trigger: What would change your mind (optional if hitting word limit)\n\n"
         "VERIFICATION: Does your output contain 'I personally would BUY/HOLD/SELL'? If NO, ADD IT NOW.\n"
     )
-    
-    completion_requirements = (
-        "\nEnsure sentences are complete and punctuated. Avoid trailing off or ellipses.\n"
-    )
-    
+
+    completion_requirements = "\nEnsure sentences are complete and punctuated. Avoid trailing off or ellipses.\n"
+
     if persona_name and persona_name in PERSONA_CLOSING_INSTRUCTIONS:
         # Persona-specific instructions
         persona_instructions = PERSONA_CLOSING_INSTRUCTIONS[persona_name]
         description = (
-            base_requirements +
-            f"=== YOU ARE {persona_name.upper()} - WRITE EXACTLY AS THEY WOULD ===\n"
+            base_requirements
+            + f"=== YOU ARE {persona_name.upper()} - WRITE EXACTLY AS THEY WOULD ===\n"
             f"This Closing Takeaway MUST sound like {persona_name} personally wrote it about {company_name}.\n"
             f"Use FIRST PERSON voice throughout ('I', 'my view', 'I would').\n\n"
             f"{persona_instructions}\n"
             f"\nDO NOT write a generic analyst conclusion. Sound EXACTLY like {persona_name}.\n"
             f"The reader should immediately recognize this as {persona_name}'s voice.\n"
-            + completion_requirements +
-            f"This section MUST provide CLOSURE as {persona_name} giving their final verdict on {company_name}."
+            + completion_requirements
+            + f"This section MUST provide CLOSURE as {persona_name} giving their final verdict on {company_name}."
         )
     else:
         # Generic instructions (no persona selected) - HIGH QUALITY OBJECTIVE ANALYSIS
         description = (
-            base_requirements +
-            "=== OBJECTIVE ANALYST MODE (NO PERSONA) ===\n"
+            base_requirements + "=== OBJECTIVE ANALYST MODE (NO PERSONA) ===\n"
             "CRITICAL: You are a NEUTRAL PROFESSIONAL ANALYST. You must NOT adopt any persona.\n\n"
             "FORBIDDEN - DO NOT USE:\n"
             "- First person language ('I', 'my view', 'I would', 'I believe', 'my conviction')\n"
@@ -252,10 +258,10 @@ def _build_closing_takeaway_description(persona_name: Optional[str], company_nam
             "- States a clear recommendation (Buy/Hold/Sell) with supporting metrics\n"
             "- Identifies key risks and opportunities based on financial data\n"
             "- Suggests specific metrics to monitor going forward\n"
-            + completion_requirements +
-            f"This section MUST provide CLOSURE for the analysis of {company_name} using NEUTRAL, OBJECTIVE language."
+            + completion_requirements
+            + f"This section MUST provide CLOSURE for the analysis of {company_name} using NEUTRAL, OBJECTIVE language."
         )
-    
+
     return (title, description)
 
 
@@ -412,7 +418,9 @@ def _call_gemini_client(
                 expected_tokens=expected_tokens,
             )
         except ValueError as exc:
-            if "request_options" in str(exc) and hasattr(gemini_client, "force_http_fallback"):
+            if "request_options" in str(exc) and hasattr(
+                gemini_client, "force_http_fallback"
+            ):
                 gemini_client.force_http_fallback = True
                 try:
                     return gemini_client.stream_generate_content(
@@ -422,16 +430,26 @@ def _call_gemini_client(
                         expected_tokens=expected_tokens,
                     )
                 except Exception:
-                    logger.warning("Streaming failed after forcing HTTP fallback; using non-stream generation.")
+                    logger.warning(
+                        "Streaming failed after forcing HTTP fallback; using non-stream generation."
+                    )
             else:
-                logger.warning("Streaming generation failed with ValueError (%s); using non-stream generation.", exc)
+                logger.warning(
+                    "Streaming generation failed with ValueError (%s); using non-stream generation.",
+                    exc,
+                )
         except Exception as exc:
-            logger.warning("Streaming generation unavailable (%s); using non-stream generation.", exc)
+            logger.warning(
+                "Streaming generation unavailable (%s); using non-stream generation.",
+                exc,
+            )
 
     generator = None
     if hasattr(gemini_client, "generate_content"):
         generator = gemini_client.generate_content
-    elif getattr(gemini_client, "model", None) and hasattr(gemini_client.model, "generate_content"):
+    elif getattr(gemini_client, "model", None) and hasattr(
+        gemini_client.model, "generate_content"
+    ):
         generator = gemini_client.model.generate_content
 
     if not generator:
@@ -452,10 +470,13 @@ def _ensure_gemini_client_interface(gemini_client):
     generator = None
     if hasattr(gemini_client, "generate_content"):
         generator = gemini_client.generate_content
-    elif getattr(gemini_client, "model", None) and hasattr(gemini_client.model, "generate_content"):
+    elif getattr(gemini_client, "model", None) and hasattr(
+        gemini_client.model, "generate_content"
+    ):
         generator = gemini_client.model.generate_content
 
     if generator:
+
         def _shim(prompt: str, **kwargs):
             response = generator(prompt)
             return getattr(response, "text", response)
@@ -468,24 +489,24 @@ def _ensure_gemini_client_interface(gemini_client):
 
 def _fix_inline_section_headers(text: str) -> str:
     """Fix section headers that appear inline with content instead of on their own lines.
-    
+
     This handles patterns like:
     "...business. ## Executive Summary As Bill Ackman, I seek..."
-    
+
     And converts them to:
     "...business.
-    
+
     ## Executive Summary
-    
+
     As Bill Ackman, I seek..."
     """
     if not text:
         return text
-    
+
     # List of all section headers that should be on their own lines
     section_headers = [
         "Financial Health Rating",
-        "Executive Summary", 
+        "Executive Summary",
         "Financial Performance",
         "Management Discussion & Analysis",
         "Management Discussion and Analysis",
@@ -497,80 +518,64 @@ def _fix_inline_section_headers(text: str) -> str:
         "Key Data Appendix",
         "Closing Takeaway",
     ]
-    
+
     result = text
-    
+
     # UNIVERSAL PATTERN: First, ensure ANY ## header has proper newlines before it
     # This catches cases where headers appear inline regardless of surrounding text
     # Pattern: any character (not newline) followed by space(s) and ##
-    result = re.sub(
-        r'([^\n])\s*(##\s*)',
-        r'\1\n\n\2',
-        result
-    )
-    
+    result = re.sub(r"([^\n])\s*(##\s*)", r"\1\n\n\2", result)
+
     # Also ensure newlines after headers before content
-    result = re.sub(
-        r'(##\s*[^\n]+)\n([^\n#])',
-        r'\1\n\n\2',
-        result
-    )
-    
+    result = re.sub(r"(##\s*[^\n]+)\n([^\n#])", r"\1\n\n\2", result)
+
     for header in section_headers:
         # Pattern 1: Header appears after punctuation on same line (now redundant but kept for robustness)
         # e.g., "...business. ## Executive Summary As Bill..."
         pattern1 = re.compile(
-            rf'([.!?])\s*(?:##?\s*)?({re.escape(header)})\s+(\S)',
-            re.IGNORECASE
+            rf"([.!?])\s*(?:##?\s*)?({re.escape(header)})\s+(\S)", re.IGNORECASE
         )
         result = pattern1.sub(
-            lambda m: f'{m.group(1)}\n\n## {header}\n\n{m.group(3)}',
-            result
+            lambda m: f"{m.group(1)}\n\n## {header}\n\n{m.group(3)}", result
         )
-        
+
         # Pattern 2: Header appears mid-sentence without punctuation
         # e.g., "some text ## Executive Summary more text"
         # Only add period if the character before isn't already punctuation
         pattern2 = re.compile(
-            rf'([^.!?\s\n])\s+(?:##?\s*)({re.escape(header)})\s+(\S)',
-            re.IGNORECASE
+            rf"([^.!?\s\n])\s+(?:##?\s*)({re.escape(header)})\s+(\S)", re.IGNORECASE
         )
         result = pattern2.sub(
-            lambda m: f'{m.group(1)}.\n\n## {header}\n\n{m.group(3)}',
-            result
+            lambda m: f"{m.group(1)}.\n\n## {header}\n\n{m.group(3)}", result
         )
-        
+
         # Pattern 3: Header at very start of text without ##
         pattern3 = re.compile(
-            rf'^(?:##?\s*)?({re.escape(header)})\s*\n?',
-            re.IGNORECASE | re.MULTILINE
+            rf"^(?:##?\s*)?({re.escape(header)})\s*\n?", re.IGNORECASE | re.MULTILINE
         )
         if re.match(pattern3, result):
-            result = pattern3.sub(f'## {header}\n\n', result, count=1)
-        
+            result = pattern3.sub(f"## {header}\n\n", result, count=1)
+
         # Pattern 4: Header without ## prefix appearing after newline
         # e.g., "\nExecutive Summary\n" should become "\n## Executive Summary\n"
-        pattern4 = re.compile(
-            rf'\n({re.escape(header)})\s*\n',
-            re.IGNORECASE
-        )
-        result = pattern4.sub(f'\n\n## {header}\n\n', result)
-    
+        pattern4 = re.compile(rf"\n({re.escape(header)})\s*\n", re.IGNORECASE)
+        result = pattern4.sub(f"\n\n## {header}\n\n", result)
+
     # Clean up excessive newlines (more than 3 consecutive)
-    result = re.sub(r'\n{4,}', '\n\n\n', result)
-    
+    result = re.sub(r"\n{4,}", "\n\n\n", result)
+
     # Ensure ## headers are properly formatted (normalize # count)
-    result = re.sub(r'(\n|^)#{1,6}\s+', r'\1## ', result)
-    
+    result = re.sub(r"(\n|^)#{1,6}\s+", r"\1## ", result)
+
     # Clean up double periods that might have been introduced
-    result = re.sub(r'\.{2,}', '.', result)
-    
+    result = re.sub(r"\.{2,}", ".", result)
+
     # Final pass: ensure every ## header has a blank line before it
-    result = re.sub(r'([^\n])\n(## )', r'\1\n\n\2', result)
-    
+    result = re.sub(r"([^\n])\n(## )", r"\1\n\n\2", result)
+
     # And a blank line after header lines (header line = starts with ## and ends at newline)
-    result = re.sub(r'(## [^\n]+)\n([^\n])', r'\1\n\n\2', result)
-    
+    result = re.sub(r"(## [^\n]+)\n([^\n])", r"\1\n\n\2", result)
+
     return result
 
 
@@ -584,36 +589,36 @@ def _remove_filler_phrases(text: str) -> str:
 
     # Comprehensive filler patterns (regex to catch variations)
     filler_patterns = [
-        r'Additional detail covers?\s+[^.]*\.',
-        r'Capital allocation remarks?\s+[^.]*\.',
-        r'Further notes? address(?:es)?\s+[^.]*\.',
-        r'Risk coverage includes?\s+[^.]*\.',
-        r'The analysis (?:also )?outlines?\s+[^.]*\.',
-        r'Valuation context compares?\s+[^.]*\.',
-        r'Management discussion covers?\s+[^.]*\.',
-        r'Strategic initiatives include\s+[^.]*\.',
-        r'Add liquidity and leverage observations[^.]*\.',
-        r'Tie capital deployment[^.]*\.',
-        r'Clarify risk scenarios[^.]*\.',
-        r'Expand margin and cash conversion commentary[^.]*\.',
+        r"Additional detail covers?\s+[^.]*\.",
+        r"Capital allocation remarks?\s+[^.]*\.",
+        r"Further notes? address(?:es)?\s+[^.]*\.",
+        r"Risk coverage includes?\s+[^.]*\.",
+        r"The analysis (?:also )?outlines?\s+[^.]*\.",
+        r"Valuation context compares?\s+[^.]*\.",
+        r"Management discussion covers?\s+[^.]*\.",
+        r"Strategic initiatives include\s+[^.]*\.",
+        r"Add liquidity and leverage observations[^.]*\.",
+        r"Tie capital deployment[^.]*\.",
+        r"Clarify risk scenarios[^.]*\.",
+        r"Expand margin and cash conversion commentary[^.]*\.",
         # Imperative "monitor/track/watch" filler often added to hit word counts
-        r'(?:Additionally,?\s*)?\bMonitor\b[^.]*\.',
-        r'(?:Additionally,?\s*)?\bTrack\b[^.]*\.',
-        r'(?:Additionally,?\s*)?\bWatch\b[^.]*\.',
-        r'(?:Additionally,?\s*)?\bAssess\b[^.]*\.',
-        r'(?:Additionally,?\s*)?\bReview\b[^.]*\.',
-        r'(?:Additionally,?\s*)?\bCompare\b[^.]*\.',
-        r'(?:Additionally,?\s*)?\bConsider\b[^.]*\.',
-        r'(?:Additionally,?\s*)?\bEvaluate\b[^.]*\.',
-        r'(?:Additionally,?\s*)?\bTest\b[^.]*\.',
-        r'(?:Additionally,?\s*)?\bBenchmark\b[^.]*\.',
+        r"(?:Additionally,?\s*)?\bMonitor\b[^.]*\.",
+        r"(?:Additionally,?\s*)?\bTrack\b[^.]*\.",
+        r"(?:Additionally,?\s*)?\bWatch\b[^.]*\.",
+        r"(?:Additionally,?\s*)?\bAssess\b[^.]*\.",
+        r"(?:Additionally,?\s*)?\bReview\b[^.]*\.",
+        r"(?:Additionally,?\s*)?\bCompare\b[^.]*\.",
+        r"(?:Additionally,?\s*)?\bConsider\b[^.]*\.",
+        r"(?:Additionally,?\s*)?\bEvaluate\b[^.]*\.",
+        r"(?:Additionally,?\s*)?\bTest\b[^.]*\.",
+        r"(?:Additionally,?\s*)?\bBenchmark\b[^.]*\.",
         # Catch partial sentences
-        r'Additional detail covers?\.?\s*$',
-        r'Further notes? address\.?\s*$',
-        r'Risk coverage includes?\.?\s*$',
-        r'Add liquidity and leverage observations\.?\s*$',
-        r'Tie capital deployment\.?\s*$',
-        r'Clarify risk scenarios\.?\s*$',
+        r"Additional detail covers?\.?\s*$",
+        r"Further notes? address\.?\s*$",
+        r"Risk coverage includes?\.?\s*$",
+        r"Add liquidity and leverage observations\.?\s*$",
+        r"Tie capital deployment\.?\s*$",
+        r"Clarify risk scenarios\.?\s*$",
     ]
 
     result = text
@@ -623,202 +628,338 @@ def _remove_filler_phrases(text: str) -> str:
         matches = re.findall(pattern, result, re.IGNORECASE | re.MULTILINE)
         if matches:
             removed_count += len(matches)
-            result = re.sub(pattern, '', result, flags=re.IGNORECASE | re.MULTILINE)
+            result = re.sub(pattern, "", result, flags=re.IGNORECASE | re.MULTILINE)
 
     if removed_count > 0:
         logger.info(f"Post-processing removed {removed_count} filler phrase(s)")
 
     # Clean up double spaces or hanging punctuation
-    result = re.sub(r'\s{2,}', ' ', result)
-    result = re.sub(r'\s+\.', '.', result)
-    result = re.sub(r'\.\s*\.', '.', result)
+    result = re.sub(r"\s{2,}", " ", result)
+    result = re.sub(r"\s+\.", ".", result)
+    result = re.sub(r"\.\s*\.", ".", result)
 
     return result
 
 
 def _fix_trailing_ellipsis(text: str) -> str:
     """Fix sentences that trail off with ellipsis (...) or incomplete phrases.
-    
+
     This function finds sentences ending with '...' or incomplete trailing patterns and either:
     1. Completes them with contextually appropriate endings, or
     2. Truncates to the last complete sentence in that paragraph
-    
+
     Handles both line-ending ellipsis and mid-paragraph ellipsis.
     """
     if not text:
         return text
-    
+
     # Comprehensive trailing patterns and their completions
     # Patterns work on both explicit "..." and incomplete trailing phrases
     ellipsis_fixes = [
         # ===== PERSONA-SPECIFIC PATTERNS (Howard Marks, Warren Buffett, etc.) =====
-        (r'I would\s*\.{2,}\s*$', 'I would proceed with caution given current valuations.'),
-        (r'I would\s*$', 'I would proceed with caution given current valuations.'),
-        (r'I need to\s*\.{2,}', 'I need to see clearer evidence before committing capital.'),
-        (r'I believe\s*\.{2,}', 'I believe caution is warranted at current levels.'),
-        (r'I am concerned about\s*\.{2,}', 'I am concerned about the sustainability of current trends.'),
-        (r'Given my focus on\s*\.{2,}', 'Given my focus on risk-reward asymmetry, I remain cautious.'),
-        (r'I prefer to\s*\.{2,}', 'I prefer to wait for a more favorable entry point.'),
-        
+        (
+            r"I would\s*\.{2,}\s*$",
+            "I would proceed with caution given current valuations.",
+        ),
+        (r"I would\s*$", "I would proceed with caution given current valuations."),
+        (
+            r"I need to\s*\.{2,}",
+            "I need to see clearer evidence before committing capital.",
+        ),
+        (r"I believe\s*\.{2,}", "I believe caution is warranted at current levels."),
+        (
+            r"I am concerned about\s*\.{2,}",
+            "I am concerned about the sustainability of current trends.",
+        ),
+        (
+            r"Given my focus on\s*\.{2,}",
+            "Given my focus on risk-reward asymmetry, I remain cautious.",
+        ),
+        (r"I prefer to\s*\.{2,}", "I prefer to wait for a more favorable entry point."),
         # ===== EXECUTIVE SUMMARY / CLOSING PATTERNS =====
-        (r'sustainability and the\s*\.{2,}', 'sustainability and the long-term durability of these exceptional margins.'),
-        (r'sustainability and the\s*$', 'sustainability and the long-term durability of these exceptional margins.'),
-        (r'and the\s*\.{2,}\s*$', 'and the implications for long-term value creation.'),
-        (r'and the\s*$', 'and the implications for long-term value creation.'),
-        (r'but the current\s*\.{2,}', 'but the current valuation leaves limited margin of safety.'),
-        (r'raises concerns about\s*\.{2,}', 'raises concerns about the sustainability of exceptional results.'),
-        
+        (
+            r"sustainability and the\s*\.{2,}",
+            "sustainability and the long-term durability of these exceptional margins.",
+        ),
+        (
+            r"sustainability and the\s*$",
+            "sustainability and the long-term durability of these exceptional margins.",
+        ),
+        (r"and the\s*\.{2,}\s*$", "and the implications for long-term value creation."),
+        (r"and the\s*$", "and the implications for long-term value creation."),
+        (
+            r"but the current\s*\.{2,}",
+            "but the current valuation leaves limited margin of safety.",
+        ),
+        (
+            r"raises concerns about\s*\.{2,}",
+            "raises concerns about the sustainability of exceptional results.",
+        ),
         # ===== MD&A / MANAGEMENT PATTERNS =====
-        (r'uncertainties in global\s*\.{2,}', 'uncertainties in the global supply chain and macroeconomic environment.'),
-        (r'uncertainties in global\s*$', 'uncertainties in the global supply chain and macroeconomic environment.'),
-        (r'in global\s*\.{2,}', 'in global markets and supply chains.'),
-        (r'in global\s*$', 'in global markets and supply chains.'),
-        (r'supply chain complexities\s*\.{2,}', 'supply chain complexities that require ongoing attention.'),
-        (r'strategic agility\s*\.{2,}', 'strategic agility to maintain market leadership.'),
-        
+        (
+            r"uncertainties in global\s*\.{2,}",
+            "uncertainties in the global supply chain and macroeconomic environment.",
+        ),
+        (
+            r"uncertainties in global\s*$",
+            "uncertainties in the global supply chain and macroeconomic environment.",
+        ),
+        (r"in global\s*\.{2,}", "in global markets and supply chains."),
+        (r"in global\s*$", "in global markets and supply chains."),
+        (
+            r"supply chain complexities\s*\.{2,}",
+            "supply chain complexities that require ongoing attention.",
+        ),
+        (
+            r"strategic agility\s*\.{2,}",
+            "strategic agility to maintain market leadership.",
+        ),
         # ===== RISK FACTOR PATTERNS =====
-        (r'a geopolitical\s*\.{2,}', 'a geopolitical risk that warrants close monitoring.'),
-        (r'a geopolitical\s*$', 'a geopolitical risk that warrants close monitoring.'),
-        (r', a geopolitical\s*\.{2,}', ', a geopolitical concern that warrants attention.'),
-        (r', a geopolitical\s*$', ', a geopolitical concern that warrants attention.'),
-        (r'in a key market\s*\.{2,}', 'in a key market that could materially impact results.'),
-        (r'in a key market\s*$', 'in a key market that could materially impact results.'),
-        (r'materially affecting\s*\.{2,}', 'materially affecting the company\'s financial performance.'),
-        (r'geopolitical instability\s*\.{2,}', 'geopolitical instability that could disrupt operations.'),
-        (r'capacity constraints\s*\.{2,}', 'capacity constraints that could limit production.'),
-        
+        (
+            r"a geopolitical\s*\.{2,}",
+            "a geopolitical risk that warrants close monitoring.",
+        ),
+        (r"a geopolitical\s*$", "a geopolitical risk that warrants close monitoring."),
+        (
+            r", a geopolitical\s*\.{2,}",
+            ", a geopolitical concern that warrants attention.",
+        ),
+        (r", a geopolitical\s*$", ", a geopolitical concern that warrants attention."),
+        (
+            r"in a key market\s*\.{2,}",
+            "in a key market that could materially impact results.",
+        ),
+        (
+            r"in a key market\s*$",
+            "in a key market that could materially impact results.",
+        ),
+        (
+            r"materially affecting\s*\.{2,}",
+            "materially affecting the company's financial performance.",
+        ),
+        (
+            r"geopolitical instability\s*\.{2,}",
+            "geopolitical instability that could disrupt operations.",
+        ),
+        (
+            r"capacity constraints\s*\.{2,}",
+            "capacity constraints that could limit production.",
+        ),
         # ===== COMPETITIVE LANDSCAPE PATTERNS =====
         (r"NVIDIA's\s*\.{2,}", "NVIDIA's competitive positioning and pricing power."),
         (r"NVIDIA's\s*$", "NVIDIA's competitive positioning and pricing power."),
-        (r"reliance on NVIDIA's\s*\.{2,}", "reliance on NVIDIA's chips and potentially developing alternatives."),
-        (r"reliance on NVIDIA's\s*$", "reliance on NVIDIA's chips and potentially developing alternatives."),
-        (r'competitive\s+strategies\s*\.{2,}', 'competitive strategies and market positioning.'),
-        (r'competitive\s+strategies\s*$', 'competitive strategies and market positioning.'),
-        (r'potentially reducing their\s*\.{2,}', 'potentially reducing their dependency on external suppliers.'),
-        (r'potentially reducing their\s*$', 'potentially reducing their dependency on external suppliers.'),
-        (r'hyperscalers like\s*\.{2,}', 'hyperscalers like Google, Amazon, and Microsoft.'),
-        (r'eroding\s*\.{2,}', 'eroding market share over time.'),
-        (r'concentration\s*\.{2,}', 'concentration risk that investors should monitor.'),
-        
+        (
+            r"reliance on NVIDIA's\s*\.{2,}",
+            "reliance on NVIDIA's chips and potentially developing alternatives.",
+        ),
+        (
+            r"reliance on NVIDIA's\s*$",
+            "reliance on NVIDIA's chips and potentially developing alternatives.",
+        ),
+        (
+            r"competitive\s+strategies\s*\.{2,}",
+            "competitive strategies and market positioning.",
+        ),
+        (
+            r"competitive\s+strategies\s*$",
+            "competitive strategies and market positioning.",
+        ),
+        (
+            r"potentially reducing their\s*\.{2,}",
+            "potentially reducing their dependency on external suppliers.",
+        ),
+        (
+            r"potentially reducing their\s*$",
+            "potentially reducing their dependency on external suppliers.",
+        ),
+        (
+            r"hyperscalers like\s*\.{2,}",
+            "hyperscalers like Google, Amazon, and Microsoft.",
+        ),
+        (r"eroding\s*\.{2,}", "eroding market share over time."),
+        (
+            r"concentration\s*\.{2,}",
+            "concentration risk that investors should monitor.",
+        ),
         # ===== STRATEGIC INITIATIVES PATTERNS =====
-        (r'technological\s+advancements\s*\.{2,}', 'technological advancements and market adoption milestones.'),
-        (r'technological\s+advancements\s*$', 'technological advancements and market adoption milestones.'),
-        (r'product launches and\s*\.{2,}', 'product launches and technological innovations.'),
-        (r'product launches and\s*$', 'product launches and technological innovations.'),
-        (r'articulated, along with\s*\.{2,}', 'articulated, along with clear performance metrics and timelines.'),
-        (r'articulated, along with\s*$', 'articulated, along with clear performance metrics and timelines.'),
-        (r'value creation and\s*\.{2,}', 'value creation and shareholder returns.'),
-        
+        (
+            r"technological\s+advancements\s*\.{2,}",
+            "technological advancements and market adoption milestones.",
+        ),
+        (
+            r"technological\s+advancements\s*$",
+            "technological advancements and market adoption milestones.",
+        ),
+        (
+            r"product launches and\s*\.{2,}",
+            "product launches and technological innovations.",
+        ),
+        (
+            r"product launches and\s*$",
+            "product launches and technological innovations.",
+        ),
+        (
+            r"articulated, along with\s*\.{2,}",
+            "articulated, along with clear performance metrics and timelines.",
+        ),
+        (
+            r"articulated, along with\s*$",
+            "articulated, along with clear performance metrics and timelines.",
+        ),
+        (r"value creation and\s*\.{2,}", "value creation and shareholder returns."),
         # ===== GENERIC TRAILING PATTERNS =====
-        (r'global\s*\.{2,}', 'global market dynamics and competitive pressures.'),
-        (r'reliance on\s*\.{2,}', 'reliance on key suppliers and partners.'),
-        (r'securing and\s*\.{2,}', 'securing and maintaining market position.'),
-        (r'potentially hindering\s*\.{2,}', 'potentially hindering future growth.'),
-        (r'potentially eroding\s*\.{2,}', 'potentially eroding competitive advantages.'),
-        (r'driven by the\s*\.{2,}', 'driven by strong demand and operational execution.'),
-        (r'driven by\s*\.{2,}', 'driven by favorable market conditions.'),
-        
+        (r"global\s*\.{2,}", "global market dynamics and competitive pressures."),
+        (r"reliance on\s*\.{2,}", "reliance on key suppliers and partners."),
+        (r"securing and\s*\.{2,}", "securing and maintaining market position."),
+        (r"potentially hindering\s*\.{2,}", "potentially hindering future growth."),
+        (
+            r"potentially eroding\s*\.{2,}",
+            "potentially eroding competitive advantages.",
+        ),
+        (
+            r"driven by the\s*\.{2,}",
+            "driven by strong demand and operational execution.",
+        ),
+        (r"driven by\s*\.{2,}", "driven by favorable market conditions."),
         # ===== PATTERNS ENDING WITH PREPOSITIONS/ARTICLES =====
-        (r',\s+but\s+the\s*\.{2,}\s*$', ', but the risks remain manageable for long-term investors.'),
-        (r',\s+but\s+the\s*$', ', but the risks remain manageable for long-term investors.'),
-        (r',\s+although\s+the\s*\.{2,}', ', although the outlook remains uncertain.'),
-        (r',\s+although\s+the\s*$', ', although the outlook remains uncertain.'),
-        (r',\s+while\s+the\s*\.{2,}', ', while the opportunity set remains compelling.'),
-        (r',\s+while\s+the\s*$', ', while the opportunity set remains compelling.'),
-        (r',\s+however\s+the\s*\.{2,}', ', however the valuation provides some cushion.'),
-        (r',\s+however\s+the\s*$', ', however the valuation provides some cushion.'),
-        
+        (
+            r",\s+but\s+the\s*\.{2,}\s*$",
+            ", but the risks remain manageable for long-term investors.",
+        ),
+        (
+            r",\s+but\s+the\s*$",
+            ", but the risks remain manageable for long-term investors.",
+        ),
+        (r",\s+although\s+the\s*\.{2,}", ", although the outlook remains uncertain."),
+        (r",\s+although\s+the\s*$", ", although the outlook remains uncertain."),
+        (
+            r",\s+while\s+the\s*\.{2,}",
+            ", while the opportunity set remains compelling.",
+        ),
+        (r",\s+while\s+the\s*$", ", while the opportunity set remains compelling."),
+        (
+            r",\s+however\s+the\s*\.{2,}",
+            ", however the valuation provides some cushion.",
+        ),
+        (r",\s+however\s+the\s*$", ", however the valuation provides some cushion."),
         # ===== INCOMPLETE ARTICLE/PREPOSITION ENDINGS =====
-        (r'\bthe\s*\.{2,}\s*$', 'the implications for investors.'),
-        (r'\ba\s*\.{2,}\s*$', 'a material consideration for investors.'),
-        (r'\ban\s*\.{2,}\s*$', 'an important factor to monitor.'),
-        (r'\bto\s*\.{2,}\s*$', 'to monitor closely.'),
-        (r'\bof\s*\.{2,}\s*$', 'of significant importance.'),
-        (r'\bfor\s*\.{2,}\s*$', 'for careful consideration.'),
-        (r'\bwith\s*\.{2,}\s*$', 'with appropriate risk management.'),
-        (r'\bin\s*\.{2,}\s*$', 'in the current market environment.'),
+        (r"\bthe\s*\.{2,}\s*$", "the implications for investors."),
+        (r"\ba\s*\.{2,}\s*$", "a material consideration for investors."),
+        (r"\ban\s*\.{2,}\s*$", "an important factor to monitor."),
+        (r"\bto\s*\.{2,}\s*$", "to monitor closely."),
+        (r"\bof\s*\.{2,}\s*$", "of significant importance."),
+        (r"\bfor\s*\.{2,}\s*$", "for careful consideration."),
+        (r"\bwith\s*\.{2,}\s*$", "with appropriate risk management."),
+        (r"\bin\s*\.{2,}\s*$", "in the current market environment."),
     ]
-    
+
     result = text
-    
+
     # Apply pattern-based fixes to the full text
     for pattern, replacement in ellipsis_fixes:
-        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE | re.MULTILINE)
-    
+        result = re.sub(
+            pattern, replacement, result, flags=re.IGNORECASE | re.MULTILINE
+        )
+
     # Handle any remaining ellipsis by finding and fixing them
     # Split into paragraphs (double newline) to preserve structure
-    paragraphs = re.split(r'(\n\n+)', result)
+    paragraphs = re.split(r"(\n\n+)", result)
     fixed_paragraphs = []
-    
+
     for para in paragraphs:
         # Skip paragraph separators
-        if re.match(r'^\n+$', para):
+        if re.match(r"^\n+$", para):
             fixed_paragraphs.append(para)
             continue
-            
+
         # Check for remaining ellipsis in this paragraph
-        if re.search(r'\.{2,}', para):
+        if re.search(r"\.{2,}", para):
             # Find all ellipsis positions and fix each
-            while re.search(r'\.{2,}', para):
-                match = re.search(r'\.{2,}', para)
+            while re.search(r"\.{2,}", para):
+                match = re.search(r"\.{2,}", para)
                 if not match:
                     break
-                    
+
                 pos = match.start()
                 # Get text before ellipsis
                 before = para[:pos].rstrip()
-                after = para[match.end():].lstrip()
-                
+                after = para[match.end() :].lstrip()
+
                 # Find the last complete sentence before this point
-                last_punct = max(before.rfind('. '), before.rfind('! '), before.rfind('? '), before.rfind('.\n'))
-                
+                last_punct = max(
+                    before.rfind(". "),
+                    before.rfind("! "),
+                    before.rfind("? "),
+                    before.rfind(".\n"),
+                )
+
                 if last_punct > len(before) * 0.3:
                     # Truncate to last complete sentence
-                    para = before[:last_punct + 1]
-                    if after and not after.startswith('\n'):
-                        para += ' ' + after
+                    para = before[: last_punct + 1]
+                    if after and not after.startswith("\n"):
+                        para += " " + after
                     else:
                         para += after
                 else:
                     # Add a contextual completion based on surrounding text
                     completion = _get_contextual_completion(before)
-                    para = before + completion + (' ' + after if after and not after.startswith('\n') else after)
-        
+                    para = (
+                        before
+                        + completion
+                        + (
+                            " " + after
+                            if after and not after.startswith("\n")
+                            else after
+                        )
+                    )
+
         fixed_paragraphs.append(para)
-    
-    return ''.join(fixed_paragraphs)
+
+    return "".join(fixed_paragraphs)
 
 
 def _get_contextual_completion(text: str) -> str:
     """Generate a contextual completion for incomplete text based on keywords."""
     text_lower = text.lower()
-    
+
     # Risk-related context
-    if any(kw in text_lower for kw in ['risk', 'concern', 'threat', 'vulnerable', 'exposure']):
-        return ', which warrants careful monitoring by investors.'
-    
+    if any(
+        kw in text_lower
+        for kw in ["risk", "concern", "threat", "vulnerable", "exposure"]
+    ):
+        return ", which warrants careful monitoring by investors."
+
     # Competition-related context
-    if any(kw in text_lower for kw in ['compet', 'rival', 'market share', 'amd', 'intel']):
-        return ', presenting ongoing competitive challenges.'
-    
+    if any(
+        kw in text_lower for kw in ["compet", "rival", "market share", "amd", "intel"]
+    ):
+        return ", presenting ongoing competitive challenges."
+
     # Financial/valuation context
-    if any(kw in text_lower for kw in ['margin', 'profit', 'revenue', 'growth', 'valuation']):
-        return ', which impacts the investment thesis.'
-    
+    if any(
+        kw in text_lower
+        for kw in ["margin", "profit", "revenue", "growth", "valuation"]
+    ):
+        return ", which impacts the investment thesis."
+
     # Management/strategy context
-    if any(kw in text_lower for kw in ['management', 'strategy', 'initiative', 'capital']):
-        return ', requiring continued execution from management.'
-    
+    if any(
+        kw in text_lower for kw in ["management", "strategy", "initiative", "capital"]
+    ):
+        return ", requiring continued execution from management."
+
     # Geopolitical context
-    if any(kw in text_lower for kw in ['geopolitical', 'china', 'taiwan', 'export']):
-        return ', a factor that requires ongoing monitoring.'
-    
+    if any(kw in text_lower for kw in ["geopolitical", "china", "taiwan", "export"]):
+        return ", a factor that requires ongoing monitoring."
+
     # Supply chain context
-    if any(kw in text_lower for kw in ['supply', 'manufacturing', 'tsmc', 'production']):
-        return ', impacting production capabilities.'
-    
+    if any(
+        kw in text_lower for kw in ["supply", "manufacturing", "tsmc", "production"]
+    ):
+        return ", impacting production capabilities."
+
     # Default completion
-    return ', which warrants careful consideration.'
+    return ", which warrants careful consideration."
 
 
 def _fix_health_score_in_summary(
@@ -828,58 +969,60 @@ def _fix_health_score_in_summary(
 ) -> str:
     """
     Post-process the summary to fix any health score mismatch.
-    
+
     The AI sometimes ignores the pre-calculated score instruction and generates
     its own score. This function finds and replaces incorrect scores in the
     Financial Health Rating section.
     """
     if not summary_text or pre_calculated_score is None or not pre_calculated_band:
         return summary_text
-    
+
     # Pattern to match the Financial Health Rating section header and first line
     # Matches patterns like: "## Financial Health Rating" followed by score patterns
     fhr_section_pattern = re.compile(
-        r'(##\s*Financial Health Rating\s*\n+'  # Section header
-        r'[^#]*?)'  # Any content before the score
-        r'(\d{1,3}(?:\.\d+)?/100\s*'  # The score (e.g., "1/100" or "62/100" or "51.1/100")
-        r'(?:\([A-Z]{1,3}\)\s*)?'  # Optional grade/abbrev in parens
-        r'-?\s*(?:Very Healthy|Healthy|Watch|At Risk)?)',  # Optional band
-        re.IGNORECASE | re.DOTALL
+        r"(##\s*Financial Health Rating\s*\n+"  # Section header
+        r"[^#]*?)"  # Any content before the score
+        r"(\d{1,3}(?:\.\d+)?/100\s*"  # The score (e.g., "1/100" or "62/100" or "51.1/100")
+        r"(?:\([A-Z]{1,3}\)\s*)?"  # Optional grade/abbrev in parens
+        r"-?\s*(?:Very Healthy|Healthy|Watch|At Risk)?)",  # Optional band
+        re.IGNORECASE | re.DOTALL,
     )
-    
+
     # Also match arrow-prefixed scores like "→\n1/100 - Watch"
     arrow_score_pattern = re.compile(
-        r'(→\s*\n?\s*)'  # Arrow prefix
-        r'(\d{1,3}(?:\.\d+)?/100\s*'  # Score
-        r'(?:\([A-Z]{1,3}\)\s*)?'  # Optional grade/abbrev
-        r'-?\s*(?:Very Healthy|Healthy|Watch|At Risk)?)',
-        re.IGNORECASE
+        r"(→\s*\n?\s*)"  # Arrow prefix
+        r"(\d{1,3}(?:\.\d+)?/100\s*"  # Score
+        r"(?:\([A-Z]{1,3}\)\s*)?"  # Optional grade/abbrev
+        r"-?\s*(?:Very Healthy|Healthy|Watch|At Risk)?)",
+        re.IGNORECASE,
     )
-    
+
     # Format the correct score - numeric score + band label only (no letter grades/abbreviations).
     correct_score = f"{pre_calculated_score:.0f}/100 - {pre_calculated_band}"
-    
+
     # Track if we made any fixes
     original_text = summary_text
-    
+
     # First, try to fix scores in the Financial Health Rating section
     def replace_fhr_score(match):
         prefix = match.group(1)
         return prefix + correct_score
-    
+
     summary_text = fhr_section_pattern.sub(replace_fhr_score, summary_text, count=1)
-    
+
     # Also fix arrow-prefixed scores
     def replace_arrow_score(match):
         arrow = match.group(1)
         return arrow + correct_score
-    
+
     summary_text = arrow_score_pattern.sub(replace_arrow_score, summary_text, count=1)
-    
+
     # Log if we made a fix
     if summary_text != original_text:
-        logger.info(f"Fixed health score mismatch: replaced AI-generated score with {pre_calculated_score:.1f}/100 - {pre_calculated_band}")
-    
+        logger.info(
+            f"Fixed health score mismatch: replaced AI-generated score with {pre_calculated_score:.1f}/100 - {pre_calculated_band}"
+        )
+
     return summary_text
 
 
@@ -895,55 +1038,55 @@ def _validate_complete_sentences(text: str) -> str:
     if not text:
         return text
 
-    lines = text.split('\n')
+    lines = text.split("\n")
     validated_lines = []
 
     # Patterns that indicate incomplete sentences (more comprehensive)
     incomplete_patterns = [
         # Number without unit at end: "revenue of $3." or "cash flow of $13.47"
-        r'\$\d+(?:\.\d+)?\.?\s*$',
+        r"\$\d+(?:\.\d+)?\.?\s*$",
         # Trailing "of" or "at" with nothing after (not followed by ellipsis)
-        r'\s+(?:of|at|to|for|with)\s*[,]?\s*$',
+        r"\s+(?:of|at|to|for|with)\s*[,]?\s*$",
         # Sentence ending with just comma or colon (not ellipsis)
-        r'[,:]$',
+        r"[,:]$",
         # Blank amount placeholders
-        r'(?:of|at|to)\s*,',
+        r"(?:of|at|to)\s*,",
         # Ends with articles without noun
-        r'\s+(?:the|a|an)\s*$',
+        r"\s+(?:the|a|an)\s*$",
         # Ends with conjunctions without completion
-        r'\s+(?:and|but|or|while|although|however|which)\s*$',
+        r"\s+(?:and|but|or|while|although|however|which)\s*$",
         # Ends with possessive without noun (e.g., "NVIDIA's")
         r"[A-Za-z]+['']s\s*$",
         # Ends with "that" without clause
-        r'\s+that\s*$',
+        r"\s+that\s*$",
         # Ends with incomplete comparisons
-        r'\s+(?:than|as)\s*$',
+        r"\s+(?:than|as)\s*$",
     ]
 
     # Completions for various trailing patterns
     trailing_completions = {
-        r'\s+the\s*$': ' the implications for investors.',
-        r'\s+a\s*$': ' a key consideration.',
-        r'\s+an\s*$': ' an important factor.',
-        r'\s+and\s*$': ' and other relevant factors.',
-        r'\s+but\s*$': ' but caution is warranted.',
-        r'\s+or\s*$': ' or alternative approaches.',
-        r'\s+while\s*$': ' while maintaining focus on fundamentals.',
-        r'\s+although\s*$': ' although the outlook remains uncertain.',
-        r'\s+however\s*$': ' however the valuation provides some cushion.',
-        r'\s+which\s*$': ' which impacts the investment case.',
-        r'\s+that\s*$': ' that warrants attention.',
+        r"\s+the\s*$": " the implications for investors.",
+        r"\s+a\s*$": " a key consideration.",
+        r"\s+an\s*$": " an important factor.",
+        r"\s+and\s*$": " and other relevant factors.",
+        r"\s+but\s*$": " but caution is warranted.",
+        r"\s+or\s*$": " or alternative approaches.",
+        r"\s+while\s*$": " while maintaining focus on fundamentals.",
+        r"\s+although\s*$": " although the outlook remains uncertain.",
+        r"\s+however\s*$": " however the valuation provides some cushion.",
+        r"\s+which\s*$": " which impacts the investment case.",
+        r"\s+that\s*$": " that warrants attention.",
         r"[A-Za-z]+['']s\s*$": "'s strategic positioning.",
     }
 
     for line in lines:
         # Skip empty lines or section headers
-        if not line.strip() or line.strip().startswith('#'):
+        if not line.strip() or line.strip().startswith("#"):
             validated_lines.append(line)
             continue
 
         # Skip bullet points that might intentionally be brief
-        if line.strip().startswith('- ') or line.strip().startswith('→'):
+        if line.strip().startswith("- ") or line.strip().startswith("→"):
             validated_lines.append(line)
             continue
 
@@ -968,13 +1111,13 @@ def _validate_complete_sentences(text: str) -> str:
             if re.search(pattern, line, re.IGNORECASE):
                 is_incomplete = True
                 # Try to fix by finding last complete sentence
-                last_punct = max(line.rfind('.'), line.rfind('!'), line.rfind('?'))
+                last_punct = max(line.rfind("."), line.rfind("!"), line.rfind("?"))
                 if last_punct > len(line) * 0.5:  # Only cut if we keep at least 50%
-                    line = line[:last_punct + 1]
+                    line = line[: last_punct + 1]
                     is_incomplete = False
                 elif last_punct > len(line) * 0.3:
                     # If we can keep at least 30%, cut and add a generic completion
-                    line = line[:last_punct + 1]
+                    line = line[: last_punct + 1]
                     is_incomplete = False
                 break
 
@@ -983,25 +1126,36 @@ def _validate_complete_sentences(text: str) -> str:
         else:
             # If still incomplete, try to add generic completion instead of dropping
             line_stripped = original_line.rstrip()
-            if line_stripped and not line_stripped[-1] in '.!?':
+            if line_stripped and not line_stripped[-1] in ".!?":
                 # Add a contextual ending
-                if 'risk' in line_stripped.lower():
-                    validated_lines.append(line_stripped + ', which warrants monitoring.')
-                elif 'compet' in line_stripped.lower():
-                    validated_lines.append(line_stripped + ', presenting competitive challenges.')
-                elif 'growth' in line_stripped.lower() or 'margin' in line_stripped.lower():
-                    validated_lines.append(line_stripped + ', impacting the investment thesis.')
+                if "risk" in line_stripped.lower():
+                    validated_lines.append(
+                        line_stripped + ", which warrants monitoring."
+                    )
+                elif "compet" in line_stripped.lower():
+                    validated_lines.append(
+                        line_stripped + ", presenting competitive challenges."
+                    )
+                elif (
+                    "growth" in line_stripped.lower()
+                    or "margin" in line_stripped.lower()
+                ):
+                    validated_lines.append(
+                        line_stripped + ", impacting the investment thesis."
+                    )
                 else:
-                    validated_lines.append(line_stripped + ', which requires attention.')
+                    validated_lines.append(
+                        line_stripped + ", which requires attention."
+                    )
             else:
                 validated_lines.append(original_line)
 
-    return '\n'.join(validated_lines)
+    return "\n".join(validated_lines)
 
 
 def _truncate_text_to_word_limit(text: str, max_words: int) -> str:
     """Trim text so it contains at most `max_words` tokens while preserving complete sentences.
-    
+
     CRITICAL: This function NEVER returns incomplete sentences. It will always
     cut back to the last complete sentence, even if that means going significantly
     under the word limit. Complete sentences are more important than hitting word count.
@@ -1016,52 +1170,52 @@ def _truncate_text_to_word_limit(text: str, max_words: int) -> str:
     # Initial hard cutoff
     cutoff_index = matches[max_words - 1].end()
     truncated = text[:cutoff_index].rstrip()
-    
+
     # ALWAYS find the last complete sentence - don't allow incomplete sentences
     # Look for sentence-ending punctuation (.!?) that's NOT followed by a digit
     # (to avoid cutting after "$1." in "$1.2B")
     sentence_endings = []
     for i, char in enumerate(truncated):
-        if char in '.!?':
+        if char in ".!?":
             # Check it's not a decimal point (e.g., "$1.2B" or "3.5%")
             if i + 1 < len(truncated) and truncated[i + 1].isdigit():
                 continue
             # Check it's not an abbreviation mid-sentence
-            if i + 1 < len(truncated) and truncated[i + 1] not in ' \n\t"\'':
+            if i + 1 < len(truncated) and truncated[i + 1] not in " \n\t\"'":
                 continue
             sentence_endings.append(i)
-    
+
     if sentence_endings:
         # Use the last complete sentence
         last_sentence_end = sentence_endings[-1]
-        result = truncated[:last_sentence_end + 1].rstrip()
-        
+        result = truncated[: last_sentence_end + 1].rstrip()
+
         # Verify the result ends with proper punctuation
-        if result and result[-1] in '.!?':
+        if result and result[-1] in ".!?":
             return result
-    
+
     # If we still can't find a good sentence ending, look in the ENTIRE text
     # for the last sentence ending before our word limit
     for i in range(len(truncated) - 1, -1, -1):
-        if truncated[i] in '.!?':
+        if truncated[i] in ".!?":
             # Verify it's not a decimal
             if i + 1 < len(truncated) and truncated[i + 1].isdigit():
                 continue
-            return truncated[:i + 1].rstrip()
-    
+            return truncated[: i + 1].rstrip()
+
     # Absolute last resort: find ANY sentence ending in the original text
     # and cut there, even if it's much shorter
     for i in range(cutoff_index - 1, 0, -1):
-        if text[i] in '.!?':
+        if text[i] in ".!?":
             if i + 1 < len(text) and text[i + 1].isdigit():
                 continue
-            result = text[:i + 1].rstrip()
+            result = text[: i + 1].rstrip()
             if result:
                 return result
-    
+
     # If there's truly no sentence ending (shouldn't happen), return what we have
     # but ensure it ends with a period
-    if truncated and not truncated.rstrip().endswith(('.', '!', '?')):
+    if truncated and not truncated.rstrip().endswith((".", "!", "?")):
         truncated = truncated.rstrip() + "."
     return truncated
 
@@ -1070,7 +1224,7 @@ def _build_padding_block(required_words: int) -> str:
     """Deterministic, finance-relevant padding to safely reach strict word floors."""
     if required_words <= 0:
         return ""
-    
+
     padding_sentences = _generate_padding_sentences(required_words)
     return " ".join(padding_sentences)
 
@@ -1158,7 +1312,9 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
         elif "risk factors" in lower or "strategic initiatives" in lower:
             weights.append(1)
         elif "financial health rating" in lower:
-            weights.append(0)  # NEVER pad health rating - it should be tightly written and quantitative
+            weights.append(
+                0
+            )  # NEVER pad health rating - it should be tightly written and quantitative
         elif "key data appendix" in lower or "key metrics" in lower:
             weights.append(0)  # keep metrics appendix factual/brief
         else:
@@ -1171,7 +1327,9 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
 
     # If all weights were zero (edge case), fall back to non-closing sections, then all sections
     if not target_indices:
-        target_indices = [i for i, h in enumerate(sections) if "closing takeaway" not in h[0].lower()]
+        target_indices = [
+            i for i, h in enumerate(sections) if "closing takeaway" not in h[0].lower()
+        ]
     if not target_indices:
         target_indices = list(range(len(sections)))
 
@@ -1200,15 +1358,22 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
     # If still short, append a final non-duplicate padding line to the longest analysis section
     if words_added < required_words and sections:
         deficit = required_words - words_added
-        candidate_indices = [
-            idx for idx, (heading, _) in enumerate(sections)
-            if "management discussion" in heading.lower()
-            or "financial performance" in heading.lower()
-            or "strategic initiatives" in heading.lower()
-        ] or [
-            idx for idx, (heading, _) in enumerate(sections)
-            if "key metrics" not in heading.lower() and "closing takeaway" not in heading.lower()
-        ] or list(range(len(sections)))
+        candidate_indices = (
+            [
+                idx
+                for idx, (heading, _) in enumerate(sections)
+                if "management discussion" in heading.lower()
+                or "financial performance" in heading.lower()
+                or "strategic initiatives" in heading.lower()
+            ]
+            or [
+                idx
+                for idx, (heading, _) in enumerate(sections)
+                if "key metrics" not in heading.lower()
+                and "closing takeaway" not in heading.lower()
+            ]
+            or list(range(len(sections)))
+        )
         target = candidate_indices[0]
         sentence = _generate_padding_sentences(deficit)[0]
         heading, body = sections[target]
@@ -1225,7 +1390,9 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
     return "\n\n".join(rebuilt_sections).strip()
 
 
-def _clamp_to_band(text: str, lower: int, upper: int, *, allow_padding: bool = True) -> str:
+def _clamp_to_band(
+    text: str, lower: int, upper: int, *, allow_padding: bool = True
+) -> str:
     """Deterministically adjust text to land within [lower, upper] words.
 
     If allow_padding is False, the function will not add template padding when the text is short;
@@ -1348,7 +1515,7 @@ def _deduplicate_sentences(text: str) -> str:
 
         # Split line into sentences
         # Match sentences ending with . ! or ? followed by space or end
-        sentences = re.split(r'(?<=[.!?])\s+', line.strip())
+        sentences = re.split(r"(?<=[.!?])\s+", line.strip())
         unique_sentences: List[str] = []
 
         for sentence in sentences:
@@ -1420,16 +1587,24 @@ def _trim_preserving_headings(text: str, max_words: int) -> str:
 
     # Keep each section reasonably substantive to avoid fragmenting the summary when trimming
     min_words_per_section = max(25, min(60, max_words // max(1, len(sections))))
-    section_word_counts = [max(min_words_per_section, _count_words(body)) for _, body in sections]
+    section_word_counts = [
+        max(min_words_per_section, _count_words(body)) for _, body in sections
+    ]
     total_words = sum(section_word_counts)
     if total_words == 0:
         return _truncate_text_to_word_limit(text, max_words)
 
     appendix_index = next(
-        (i for i, (h, _) in enumerate(sections) if ("key metrics" in h.lower() or "key data appendix" in h.lower())),
+        (
+            i
+            for i, (h, _) in enumerate(sections)
+            if ("key metrics" in h.lower() or "key data appendix" in h.lower())
+        ),
         None,
     )
-    protected_words = section_word_counts[appendix_index] if appendix_index is not None else 0
+    protected_words = (
+        section_word_counts[appendix_index] if appendix_index is not None else 0
+    )
 
     # Allocate budget prioritizing Key Metrics if present
     allocations = [0] * len(sections)
@@ -1442,20 +1617,32 @@ def _trim_preserving_headings(text: str, max_words: int) -> str:
     flexible_indices = [i for i in range(len(sections)) if i != appendix_index]
     flexible_total = sum(section_word_counts[i] for i in flexible_indices)
 
-    if flexible_total == 0 and appendix_index is not None and allocations[appendix_index] > max_words:
+    if (
+        flexible_total == 0
+        and appendix_index is not None
+        and allocations[appendix_index] > max_words
+    ):
         # Trim appendix itself if it's the only section and too long
         allocations[appendix_index] = max_words
     elif flexible_total > 0:
-        flex_scale = min(1.0, max(0, remaining_budget) / flexible_total) if remaining_budget > 0 else 0
+        flex_scale = (
+            min(1.0, max(0, remaining_budget) / flexible_total)
+            if remaining_budget > 0
+            else 0
+        )
         for i in flexible_indices:
-            allocations[i] = max(min_words_per_section, int(section_word_counts[i] * flex_scale))
+            allocations[i] = max(
+                min_words_per_section, int(section_word_counts[i] * flex_scale)
+            )
 
     allocated_total = sum(allocations)
     # Adjust if we over- or under-allocated
     if allocated_total > max_words:
         overflow = allocated_total - max_words
         # Reduce from flexible sections first, leaving the appendix untouched if possible
-        adjustable = [i for i in flexible_indices if allocations[i] > min_words_per_section]
+        adjustable = [
+            i for i in flexible_indices if allocations[i] > min_words_per_section
+        ]
         while overflow > 0 and adjustable:
             idx = adjustable[0]
             allocations[idx] -= 1
@@ -1466,7 +1653,11 @@ def _trim_preserving_headings(text: str, max_words: int) -> str:
         remaining = max_words - allocated_total
         idx = 0
         while remaining > 0:
-            target_idx = flexible_indices[idx % len(flexible_indices)] if flexible_indices else idx % len(allocations)
+            target_idx = (
+                flexible_indices[idx % len(flexible_indices)]
+                if flexible_indices
+                else idx % len(allocations)
+            )
             allocations[target_idx] += 1
             remaining -= 1
             idx += 1
@@ -1519,7 +1710,9 @@ def _compress_summary_to_length(
     return compressed_text, words
 
 
-def _finalize_length_band(summary_text: str, target_length: int, tolerance: int = 10) -> str:
+def _finalize_length_band(
+    summary_text: str, target_length: int, tolerance: int = 10
+) -> str:
     """
     Hard guardrail to guarantee the final text lands within the requested band,
     even if the model repeatedly ignores instructions.
@@ -1573,7 +1766,13 @@ def _finalize_length_band(summary_text: str, target_length: int, tolerance: int 
     return _clamp_to_band(padded, lower, upper)
 
 
-def _force_final_band(summary_text: str, target_length: int, tolerance: int = 10, *, allow_padding: bool = True) -> str:
+def _force_final_band(
+    summary_text: str,
+    target_length: int,
+    tolerance: int = 10,
+    *,
+    allow_padding: bool = True,
+) -> str:
     """
     Absolutely enforce the target band with deterministic padding/trim, even if prior steps failed.
     """
@@ -1611,11 +1810,15 @@ def _force_final_band(summary_text: str, target_length: int, tolerance: int = 10
             summary_text = _truncate_text_to_word_limit(trimmed, upper)
     elif final_words < lower and allow_padding:
         # If still under, distribute a final round of padding away from the Closing Takeaway
-        summary_text = _distribute_padding_across_sections(summary_text, lower - final_words)
+        summary_text = _distribute_padding_across_sections(
+            summary_text, lower - final_words
+        )
     return _clamp_to_band(summary_text, lower, upper, allow_padding=allow_padding)
 
 
-def _needs_length_retry(text: str, target_length: int, cached_count: Optional[int] = None) -> Tuple[bool, int, int]:
+def _needs_length_retry(
+    text: str, target_length: int, cached_count: Optional[int] = None
+) -> Tuple[bool, int, int]:
     """Return tuple indicating if retry needed, actual count, tolerance band size."""
     words = cached_count if cached_count is not None else _count_words(text)
     tolerance = 10  # Strict tolerance as requested by user
@@ -1642,27 +1845,38 @@ def _rewrite_summary_to_length(
     upper = target_length + tolerance
     corrections: List[str] = []
     working_draft = summary_text
-    latest_words = current_words if current_words is not None else _count_words(working_draft)
+    latest_words = (
+        current_words if current_words is not None else _count_words(working_draft)
+    )
     best_valid_draft = working_draft
     best_stats: Tuple[int, int] = (latest_words, tolerance)
 
     def _build_prompt() -> str:
         diff = latest_words - target_length
         abs_diff = abs(diff)
-        has_health = bool(re.search(r"financial health rating", working_draft, re.IGNORECASE))
-        health_cut_line = "   - Financial Health Rating: ~10% of cuts\n" if has_health else ""
+        has_health = bool(
+            re.search(r"financial health rating", working_draft, re.IGNORECASE)
+        )
+        health_cut_line = (
+            "   - Financial Health Rating: ~10% of cuts\n" if has_health else ""
+        )
 
         preserve_titles: List[str] = []
         for title, _min_words in SUMMARY_SECTION_REQUIREMENTS:
-            if re.search(rf"^\s*##?\s*{re.escape(title)}\b", working_draft, re.IGNORECASE | re.MULTILINE):
+            if re.search(
+                rf"^\s*##?\s*{re.escape(title)}\b",
+                working_draft,
+                re.IGNORECASE | re.MULTILINE,
+            ):
                 preserve_titles.append(title)
         if not preserve_titles:
             preserve_titles = [
-                title for title, _ in SUMMARY_SECTION_REQUIREMENTS
+                title
+                for title, _ in SUMMARY_SECTION_REQUIREMENTS
                 if title != "Financial Health Rating" or has_health
             ]
         preserve_clause = ", ".join(preserve_titles)
-        
+
         if latest_words > upper:
             direction_instruction = (
                 f"You are {abs_diff} words OVER the limit. \n"
@@ -1724,14 +1938,18 @@ def _rewrite_summary_to_length(
         if attempt > 1:
             delay_seconds = 2 ** (attempt - 1)  # Exponential: 2s, 4s, 8s...
             delay_seconds = min(delay_seconds, 5)  # Cap at 5 seconds
-            logger.info(f"Waiting {delay_seconds}s before rewrite attempt {attempt}/{MAX_REWRITE_ATTEMPTS}")
+            logger.info(
+                f"Waiting {delay_seconds}s before rewrite attempt {attempt}/{MAX_REWRITE_ATTEMPTS}"
+            )
             time.sleep(delay_seconds)
 
         prompt = _build_prompt()
         raw_text = _call_gemini_client(gemini_client, prompt)
         new_text, reported_count = _extract_word_count_control(raw_text)
         if not new_text.strip():
-            corrections.append("OUTPUT ISSUE: Draft was empty. Provide the full memo with all sections.")
+            corrections.append(
+                "OUTPUT ISSUE: Draft was empty. Provide the full memo with all sections."
+            )
             continue
 
         working_draft = new_text
@@ -1889,9 +2107,13 @@ def _enforce_length_constraints(
             raw_text = _call_gemini_client(gemini_client, emergency_prompt)
             expanded_text, reported_count = _extract_word_count_control(raw_text)
             expanded_words = _count_words(expanded_text)
-            
+
             if expanded_words >= lower:
-                logger.info("Emergency expansion successful: %s words (minimum %s)", expanded_words, lower)
+                logger.info(
+                    "Emergency expansion successful: %s words (minimum %s)",
+                    expanded_words,
+                    lower,
+                )
                 return _finalize_length_band(expanded_text, target_length, tolerance)
             else:
                 logger.error(
@@ -1899,7 +2121,7 @@ def _enforce_length_constraints(
                     actual_words,
                     lower,
                 )
-    
+
     logger.warning(
         "Summary remained outside target range after rewrites (got %s words; target %s±%s). Applying final clamp.",
         _count_words(summary_text),
@@ -1914,7 +2136,9 @@ def _generate_summary_with_length_control(
     base_prompt: str,
     target_length: Optional[int],
 ) -> str:
-    return _generate_summary_with_quality_control(gemini_client, base_prompt, target_length, None)
+    return _generate_summary_with_quality_control(
+        gemini_client, base_prompt, target_length, None
+    )
 
 
 def _generate_summary_with_quality_control(
@@ -2018,7 +2242,7 @@ def _generate_summary_with_quality_control(
         prior_count = reported_count if reported_count is not None else actual_words
         diff = prior_count - target_length
         abs_diff = abs(diff)
-        
+
         if prior_count > (target_length + tolerance):
             sentences_to_cut = max(1, int(abs_diff / 10))
             action = (
@@ -2056,14 +2280,14 @@ def _generate_summary_with_quality_control(
         final_word_count = _count_words(summary_text)
         tolerance = 10
         minimum_acceptable = target_length - tolerance
-        
+
         if final_word_count < minimum_acceptable:
             logger.error(
                 "CRITICAL: Summary is %s words, below minimum of %s. Forcing final expansion.",
                 final_word_count,
-                minimum_acceptable
+                minimum_acceptable,
             )
-            
+
             # Deterministic padding safety net for stubbornly short drafts
             shortfall = minimum_acceptable - final_word_count
             # Add a small cushion to account for tokenizer/word-count discrepancies
@@ -2096,24 +2320,32 @@ def _generate_summary_with_quality_control(
                 "MANDATORY: Keep ALL existing content. Append 'WORD COUNT: ###' at the end.\\n\\n"
                 f"SUMMARY TO EXPAND:\\n{summary_text}"
             )
-            
+
             raw_text = _call_gemini_client(gemini_client, final_expansion_prompt)
             expanded_text, _ = _extract_word_count_control(raw_text)
             expanded_count = _count_words(expanded_text)
-            
+
             if expanded_count >= minimum_acceptable:
-                logger.info("Final expansion successful: %s words (minimum %s)", expanded_count, minimum_acceptable)
+                logger.info(
+                    "Final expansion successful: %s words (minimum %s)",
+                    expanded_count,
+                    minimum_acceptable,
+                )
                 return expanded_text
             else:
                 # Still too short - log and return the best we have
                 logger.error(
                     "FAILED to meet minimum word count after all attempts. "
                     "Returning %s words (minimum %s).",
-                    expanded_count if expanded_count > final_word_count else final_word_count,
-                    minimum_acceptable
+                    expanded_count
+                    if expanded_count > final_word_count
+                    else final_word_count,
+                    minimum_acceptable,
                 )
-                return expanded_text if expanded_count > final_word_count else summary_text
-        
+                return (
+                    expanded_text if expanded_count > final_word_count else summary_text
+                )
+
         # If over minimum, apply the usual length constraints
         summary_text = _enforce_length_constraints(
             summary_text,
@@ -2169,12 +2401,17 @@ SUMMARY_SECTION_REQUIREMENTS: List[Tuple[str, int]] = [
     ("Financial Health Rating", 30),
     ("Executive Summary", 80),  # Tighter: faster read while keeping conviction
     ("Financial Performance", 95),  # More depth on the numbers that matter
-    ("Management Discussion & Analysis", 160),  # Increased - absorbs Strategic Initiatives content
+    (
+        "Management Discussion & Analysis",
+        160,
+    ),  # Increased - absorbs Strategic Initiatives content
     ("Risk Factors", 100),  # Increased per user request
     ("Key Metrics", 35),
     ("Closing Takeaway", 50),  # Concise verdict with personal buy/hold/sell opinion
 ]
-SUMMARY_SECTION_MIN_WORDS = {title: minimum for title, minimum in SUMMARY_SECTION_REQUIREMENTS}
+SUMMARY_SECTION_MIN_WORDS = {
+    title: minimum for title, minimum in SUMMARY_SECTION_REQUIREMENTS
+}
 
 # Section proportional weights for distributing word budgets
 # These represent relative importance/length of each section
@@ -2197,7 +2434,7 @@ def _calculate_section_word_budgets(
 ) -> Dict[str, int]:
     """
     Calculate proportional word budgets for each section based on target length.
-    
+
     Distributes words across sections using weights, ensuring:
     1. Each section gets at least its minimum word count
     2. Remaining words are distributed proportionally
@@ -2207,24 +2444,22 @@ def _calculate_section_word_budgets(
     sections_to_use = list(SECTION_PROPORTIONAL_WEIGHTS.keys())
     if not include_health_rating:
         sections_to_use = [s for s in sections_to_use if s != "Financial Health Rating"]
-    
+
     # Calculate total weight for active sections
-    total_weight = sum(
-        SECTION_PROPORTIONAL_WEIGHTS.get(s, 10) for s in sections_to_use
-    )
-    
+    total_weight = sum(SECTION_PROPORTIONAL_WEIGHTS.get(s, 10) for s in sections_to_use)
+
     # Calculate budgets
     budgets: Dict[str, int] = {}
     for section in sections_to_use:
         weight = SECTION_PROPORTIONAL_WEIGHTS.get(section, 10)
         min_words = SUMMARY_SECTION_MIN_WORDS.get(section, 25)
-        
+
         # Calculate proportional allocation
         proportional_words = int((weight / total_weight) * target_length)
-        
+
         # Ensure minimum is respected
         budgets[section] = max(proportional_words, min_words)
-    
+
     return budgets
 
 
@@ -2236,7 +2471,7 @@ def _format_section_word_budgets(
     Format section word budgets as a readable instruction string.
     """
     budgets = _calculate_section_word_budgets(target_length, include_health_rating)
-    
+
     lines = [
         "=== SECTION WORD BUDGETS (PROPORTIONAL DISTRIBUTION) ===",
         "CRITICAL: Distribute your words PROPORTIONALLY across ALL sections.",
@@ -2244,23 +2479,25 @@ def _format_section_word_budgets(
         "",
         "TARGET WORD ALLOCATION PER SECTION:",
     ]
-    
+
     for section, budget in budgets.items():
         lines.append(f"  • {section}: ~{budget} words")
-    
+
     total_budgeted = sum(budgets.values())
-    lines.extend([
-        "",
-        f"  TOTAL: ~{total_budgeted} words",
-        "",
-        "IMPORTANT:",
-        "- These are TARGET budgets, not hard limits",
-        "- If you need to reduce length, reduce EACH section proportionally",
-        "- The Closing Takeaway should be a COMPLETE verdict (50-80 words typical)",
-        "- Do NOT sacrifice one section to make room for another",
-        "=== END SECTION WORD BUDGETS ===",
-    ])
-    
+    lines.extend(
+        [
+            "",
+            f"  TOTAL: ~{total_budgeted} words",
+            "",
+            "IMPORTANT:",
+            "- These are TARGET budgets, not hard limits",
+            "- If you need to reduce length, reduce EACH section proportionally",
+            "- The Closing Takeaway should be a COMPLETE verdict (50-80 words typical)",
+            "- Do NOT sacrifice one section to make room for another",
+            "=== END SECTION WORD BUDGETS ===",
+        ]
+    )
+
     return "\n".join(lines)
 
 
@@ -2294,13 +2531,13 @@ def _make_section_completeness_validator(include_health_rating: bool):
             heading_token = f"## {target}"
             match_index = lower_text.find(heading_token, search_start)
             if match_index == -1:
-                return (
-                    f"Missing the heading '## {title}'. Use that exact markdown heading (no prefixes) and include substantive content beneath it."
-                )
+                return f"Missing the heading '## {title}'. Use that exact markdown heading (no prefixes) and include substantive content beneath it."
             section_start = match_index + len(heading_token)
             next_section_index = len(text)
             for future_title in ordered_titles[idx + 1 :]:
-                future_pos = lower_text.find(f"## {future_title.lower()}", section_start)
+                future_pos = lower_text.find(
+                    f"## {future_title.lower()}", section_start
+                )
                 if future_pos != -1:
                     next_section_index = future_pos
                     break
@@ -2316,6 +2553,7 @@ def _make_section_completeness_validator(include_health_rating: bool):
         return None
 
     return _validator
+
 
 def _build_preference_instructions(
     preferences: Optional[FilingSummaryPreferences],
@@ -2343,13 +2581,19 @@ def _build_preference_instructions(
         "",
     ]
 
-    investor_focus = preferences.investor_focus.strip() if preferences.investor_focus else None
+    investor_focus = (
+        preferences.investor_focus.strip() if preferences.investor_focus else None
+    )
     if investor_focus:
         focus_clause = (
-            f"{investor_focus} as it relates to {company_name}" if company_name else investor_focus
+            f"{investor_focus} as it relates to {company_name}"
+            if company_name
+            else investor_focus
         )
         instructions.append(f"Investor brief (absolute priority): {focus_clause}")
-        instructions.append("You must explicitly reference this persona by name in your narrative to prove you adopted the viewpoint.")
+        instructions.append(
+            "You must explicitly reference this persona by name in your narrative to prove you adopted the viewpoint."
+        )
         instructions.append(
             f"You MUST adopt this persona/viewpoint COMPLETELY. This is not optional. "
             f"Use STRONG first-person language ('I', 'me', 'my view', 'from my perspective'). "
@@ -2387,7 +2631,9 @@ def _build_preference_instructions(
             f"Primary focus areas (cover strictly in this order and dedicate space):\n{joined}\n"
             f"EACH focus area MUST have its own dedicated paragraph or subsection."
         )
-        ordered_lines = "\n".join(f"   {idx + 1}. {area}" for idx, area in enumerate(preferences.focus_areas))
+        ordered_lines = "\n".join(
+            f"   {idx + 1}. {area}" for idx, area in enumerate(preferences.focus_areas)
+        )
         instructions.append("Focus area execution order:\n" + ordered_lines)
 
     if preferences.tone:
@@ -2396,7 +2642,9 @@ def _build_preference_instructions(
         )
 
     if preferences.target_length:
-        instructions.append(f"Final deliverable must contain {preferences.target_length} words (±10 words).")
+        instructions.append(
+            f"Final deliverable must contain {preferences.target_length} words (±10 words)."
+        )
 
     detail_prompt = DETAIL_LEVEL_PROMPTS.get((preferences.detail_level or "").lower())
     if detail_prompt:
@@ -2416,7 +2664,9 @@ def _build_preference_instructions(
             f"Follow this format strictly throughout the document."
         )
 
-    complexity_prompt = COMPLEXITY_LEVEL_PROMPTS.get((preferences.complexity or "intermediate").lower())
+    complexity_prompt = COMPLEXITY_LEVEL_PROMPTS.get(
+        (preferences.complexity or "intermediate").lower()
+    )
     if complexity_prompt:
         complexity_upper = (preferences.complexity or "intermediate").upper()
         instructions.append(
@@ -2428,13 +2678,15 @@ def _build_preference_instructions(
     if target_length:
         min_words = target_length - 10  # Strict tolerance: ±10 words
         max_words = target_length + 10
-        
+
         # Determine if health rating is included (based on preferences)
-        include_health = bool(preferences and _resolve_health_rating_config(preferences))
-        
+        include_health = bool(
+            preferences and _resolve_health_rating_config(preferences)
+        )
+
         # Add section word budgets for proportional distribution
         section_budgets = _format_section_word_budgets(target_length, include_health)
-        
+
         instructions.append(
             f"""
 === LENGTH GUIDANCE (STRICT - WITHIN 10 WORDS OF TARGET) ===
@@ -2600,7 +2852,13 @@ def _resolve_health_rating_config(
         return None
 
     config = dict(DEFAULT_HEALTH_RATING_CONFIG)
-    for key in ("framework", "primary_factor_weighting", "risk_tolerance", "analysis_depth", "display_style"):
+    for key in (
+        "framework",
+        "primary_factor_weighting",
+        "risk_tolerance",
+        "analysis_depth",
+        "display_style",
+    ):
         value = pref_data.get(key)
         if value:
             config[key] = value
@@ -2634,132 +2892,146 @@ def _build_health_rating_instructions(
             f"Generate a Financial Health Rating for {company_name} on a 0–100 scale (100 = exceptional strength).",
             "",
         ]
-    
+
     # Only include detailed pillar breakdown instructions for score_plus_pillars display style
     if display_style == "score_plus_pillars":
-        directives.extend([
-            "USER SELECTED: Score + 4 Pillars breakdown",
-            "Deliver a four-pillar breakdown (Profitability | Risk | Liquidity | Growth).",
-            "",
-            "CRITICAL: Do NOT show any equations, formulas, or point-by-point math. The overall score is pre-computed by the backend.",
-            "For each pillar, cite the relevant metric(s) and give a short qualitative read (e.g., 'Profitability: strong given 18% operating margin').",
-            "If a pillar lacks data, omit it rather than writing 'N/A' or 'not calculable'.",
-        ])
+        directives.extend(
+            [
+                "USER SELECTED: Score + 4 Pillars breakdown",
+                "Deliver a four-pillar breakdown (Profitability | Risk | Liquidity | Growth).",
+                "",
+                "CRITICAL: Do NOT show any equations, formulas, or point-by-point math. The overall score is pre-computed by the backend.",
+                "For each pillar, cite the relevant metric(s) and give a short qualitative read (e.g., 'Profitability: strong given 18% operating margin').",
+                "If a pillar lacks data, omit it rather than writing 'N/A' or 'not calculable'.",
+            ]
+        )
     elif display_style == "score_only":
-        directives.extend([
-            "USER SELECTED: 0-100 Score Only",
-            "",
-            "CRITICAL - SCORE ONLY FORMAT:",
-            "- Present ONLY a single overall score (e.g., '78/100').",
-            "- Add a brief 1-2 sentence explanation of what drove the score.",
-            "- DO NOT show letter grades, traffic lights, or pillar breakdowns.",
-            "- DO NOT use the format 'Category: X/Y'.",
-            "",
-            f"CORRECT FORMAT: '{company_name} receives a Financial Health Rating of 78/100. Strong profitability and cash generation are offset by elevated leverage.'",
-        ])
+        directives.extend(
+            [
+                "USER SELECTED: 0-100 Score Only",
+                "",
+                "CRITICAL - SCORE ONLY FORMAT:",
+                "- Present ONLY a single overall score (e.g., '78/100').",
+                "- Add a brief 1-2 sentence explanation of what drove the score.",
+                "- DO NOT show letter grades, traffic lights, or pillar breakdowns.",
+                "- DO NOT use the format 'Category: X/Y'.",
+                "",
+                f"CORRECT FORMAT: '{company_name} receives a Financial Health Rating of 78/100. Strong profitability and cash generation are offset by elevated leverage.'",
+            ]
+        )
     elif display_style == "score_plus_grade":
-        directives.extend([
-            "USER SELECTED: Score + Rating Label",
-            "",
-            "MANDATORY FORMAT (YOU MUST INCLUDE ALL ELEMENTS):",
-            "1. The score (0-100) with rating label (Very Healthy/Healthy/Watch/At Risk)",
-            "2. NO letter grades or abbreviations in parentheses",
-            "3. A MANDATORY explanation of 3-4 sentences (40-75 words)",
-            "",
-            "YOUR EXPLANATION MUST COVER:",
-            "- What drove the score (specific metrics with values)",
-            "- Key strength(s) identified",
-            "- Key concern(s) or risk(s)",
-            "- How the user's selected framework influenced the assessment",
-            "",
-            "DO NOT just write the score and stop. The explanation is REQUIRED.",
-            "",
-            f"CORRECT FORMAT EXAMPLE:",
-            f"'{company_name} receives a Financial Health Rating of 78/100 - Healthy. The score reflects strong profitability ",
-            f"with a 56% net margin and robust free cash flow generation of $22B. The balance sheet is conservatively managed ",
-            f"with minimal debt relative to cash holdings. However, applying the user's value investor framework, I note concerns ",
-            f"about customer concentration and cyclical demand patterns that could impact the durability of these margins. ",
-            f"The score would be higher but for these risk factors that warrant monitoring.'",
-            "",
-            "FORBIDDEN: Just writing '{company_name} receives a Financial Health Rating of 78/100 - Healthy.' and stopping.",
-        ])
+        directives.extend(
+            [
+                "USER SELECTED: Score + Rating Label",
+                "",
+                "MANDATORY FORMAT (YOU MUST INCLUDE ALL ELEMENTS):",
+                "1. The score (0-100) with rating label (Very Healthy/Healthy/Watch/At Risk)",
+                "2. NO letter grades or abbreviations in parentheses",
+                "3. A MANDATORY explanation of 3-4 sentences (40-75 words)",
+                "",
+                "YOUR EXPLANATION MUST COVER:",
+                "- What drove the score (specific metrics with values)",
+                "- Key strength(s) identified",
+                "- Key concern(s) or risk(s)",
+                "- How the user's selected framework influenced the assessment",
+                "",
+                "DO NOT just write the score and stop. The explanation is REQUIRED.",
+                "",
+                f"CORRECT FORMAT EXAMPLE:",
+                f"'{company_name} receives a Financial Health Rating of 78/100 - Healthy. The score reflects strong profitability ",
+                f"with a 56% net margin and robust free cash flow generation of $22B. The balance sheet is conservatively managed ",
+                f"with minimal debt relative to cash holdings. However, applying the user's value investor framework, I note concerns ",
+                f"about customer concentration and cyclical demand patterns that could impact the durability of these margins. ",
+                f"The score would be higher but for these risk factors that warrant monitoring.'",
+                "",
+                "FORBIDDEN: Just writing '{company_name} receives a Financial Health Rating of 78/100 - Healthy.' and stopping.",
+            ]
+        )
     elif display_style == "score_plus_traffic_light":
-        directives.extend([
-            "USER SELECTED: Score + Traffic Light",
-            "",
-            "MANDATORY FORMAT (YOU MUST INCLUDE ALL ELEMENTS):",
-            "1. The score (0-100) with traffic light: 70-100=GREEN, 50-69=YELLOW, 0-49=RED",
-            "2. A MANDATORY explanation of 3-4 sentences (40-75 words)",
-            "",
-            "YOUR EXPLANATION MUST COVER:",
-            "- What drove the score (specific metrics with values)",
-            "- Why this traffic light color is appropriate",
-            "- Key factors supporting or concerning the assessment",
-            "",
-            f"CORRECT FORMAT EXAMPLE:",
-            f"'{company_name} receives a Financial Health Rating of 78/100 - GREEN LIGHT. This green light reflects exceptional ",
-            f"profitability with 63% operating margins and strong cash generation. The company maintains a fortress balance sheet ",
-            f"with $11B cash against minimal debt. While cyclical risks exist in the semiconductor industry, the current financial ",
-            f"position supports a constructive investment stance for long-term investors.'",
-        ])
+        directives.extend(
+            [
+                "USER SELECTED: Score + Traffic Light",
+                "",
+                "MANDATORY FORMAT (YOU MUST INCLUDE ALL ELEMENTS):",
+                "1. The score (0-100) with traffic light: 70-100=GREEN, 50-69=YELLOW, 0-49=RED",
+                "2. A MANDATORY explanation of 3-4 sentences (40-75 words)",
+                "",
+                "YOUR EXPLANATION MUST COVER:",
+                "- What drove the score (specific metrics with values)",
+                "- Why this traffic light color is appropriate",
+                "- Key factors supporting or concerning the assessment",
+                "",
+                f"CORRECT FORMAT EXAMPLE:",
+                f"'{company_name} receives a Financial Health Rating of 78/100 - GREEN LIGHT. This green light reflects exceptional ",
+                f"profitability with 63% operating margins and strong cash generation. The company maintains a fortress balance sheet ",
+                f"with $11B cash against minimal debt. While cyclical risks exist in the semiconductor industry, the current financial ",
+                f"position supports a constructive investment stance for long-term investors.'",
+            ]
+        )
     elif display_style == "score_with_narrative":
-        directives.extend([
-            "USER SELECTED: Score + Narrative",
-            "",
-            "MANDATORY FORMAT - EXTENDED NARRATIVE REQUIRED:",
-            "1. The score (0-100) with rating label",
-            "2. A DETAILED narrative paragraph of 5-7 sentences (80-120 words minimum)",
-            "",
-            "YOUR NARRATIVE MUST ANALYZE:",
-            "- Profitability metrics (margins, ROE, ROA) with specific values",
-            "- Cash flow quality (FCF, FCF conversion, cash generation)",
-            "- Balance sheet strength (leverage, liquidity, debt levels)",
-            "- Growth trajectory and sustainability",
-            "- Key risks that impact the score",
-            "- How the user's framework influenced the assessment",
-            "",
-            f"The narrative should read like a mini-analysis, not a single sentence.",
-        ])
+        directives.extend(
+            [
+                "USER SELECTED: Score + Narrative",
+                "",
+                "MANDATORY FORMAT - EXTENDED NARRATIVE REQUIRED:",
+                "1. The score (0-100) with rating label",
+                "2. A DETAILED narrative paragraph of 5-7 sentences (80-120 words minimum)",
+                "",
+                "YOUR NARRATIVE MUST ANALYZE:",
+                "- Profitability metrics (margins, ROE, ROA) with specific values",
+                "- Cash flow quality (FCF, FCF conversion, cash generation)",
+                "- Balance sheet strength (leverage, liquidity, debt levels)",
+                "- Growth trajectory and sustainability",
+                "- Key risks that impact the score",
+                "- How the user's framework influenced the assessment",
+                "",
+                f"The narrative should read like a mini-analysis, not a single sentence.",
+            ]
+        )
     else:
         # Fallback for any other display style
-        directives.extend([
-            "MANDATORY FORMAT - EXPLANATION REQUIRED:",
-            "1. The score (0-100) with rating label",
-            "2. A MANDATORY explanation of 3-4 sentences (40-75 words)",
-            "",
-            "YOUR EXPLANATION MUST COVER:",
-            "- What metrics drove the score",
-            "- Key strengths identified",
-            "- Key concerns or risks",
-            "",
-            f"CORRECT FORMAT: '{company_name} receives a Financial Health Rating of 78/100 - Healthy. The score reflects [specific metrics]. Key strengths include [details]. However, [concerns]. Overall, [assessment].'",
-            "",
-            "FORBIDDEN: Just writing the score without explanation.",
-        ])
-    
+        directives.extend(
+            [
+                "MANDATORY FORMAT - EXPLANATION REQUIRED:",
+                "1. The score (0-100) with rating label",
+                "2. A MANDATORY explanation of 3-4 sentences (40-75 words)",
+                "",
+                "YOUR EXPLANATION MUST COVER:",
+                "- What metrics drove the score",
+                "- Key strengths identified",
+                "- Key concerns or risks",
+                "",
+                f"CORRECT FORMAT: '{company_name} receives a Financial Health Rating of 78/100 - Healthy. The score reflects [specific metrics]. Key strengths include [details]. However, [concerns]. Overall, [assessment].'",
+                "",
+                "FORBIDDEN: Just writing the score without explanation.",
+            ]
+        )
+
     # Common directives for all display styles
-    directives.extend([
-        "",
-        "RATING LABELS (MANDATORY - include with score):",
-        "- 85-100 = Very Healthy",
-        "- 70-84 = Healthy", 
-        "- 50-69 = Watch",
-        "- 0-49 = At Risk",
-        "",
-        "=== MINIMUM CONTENT REQUIREMENT (CRITICAL) ===",
-        "The Financial Health Rating section MUST be at least 40 words.",
-        "A single line like 'Company receives 78/100 - Healthy.' is INVALID.",
-        "You MUST explain WHY the company received this score with specific metrics.",
-        "",
-        "REQUIRED ELEMENTS IN YOUR EXPLANATION:",
-        "1. At least ONE specific profitability metric (e.g., 'net margin of 56%')",
-        "2. At least ONE cash flow metric (e.g., 'FCF of $22B')",
-        "3. At least ONE balance sheet observation (e.g., 'conservative debt levels')",
-        "4. At least ONE risk or concern that impacts the score",
-        "",
-        "If you write fewer than 40 words for this section, your output is INVALID.",
-        "=== END MINIMUM CONTENT REQUIREMENT ===",
-    ])
+    directives.extend(
+        [
+            "",
+            "RATING LABELS (MANDATORY - include with score):",
+            "- 85-100 = Very Healthy",
+            "- 70-84 = Healthy",
+            "- 50-69 = Watch",
+            "- 0-49 = At Risk",
+            "",
+            "=== MINIMUM CONTENT REQUIREMENT (CRITICAL) ===",
+            "The Financial Health Rating section MUST be at least 40 words.",
+            "A single line like 'Company receives 78/100 - Healthy.' is INVALID.",
+            "You MUST explain WHY the company received this score with specific metrics.",
+            "",
+            "REQUIRED ELEMENTS IN YOUR EXPLANATION:",
+            "1. At least ONE specific profitability metric (e.g., 'net margin of 56%')",
+            "2. At least ONE cash flow metric (e.g., 'FCF of $22B')",
+            "3. At least ONE balance sheet observation (e.g., 'conservative debt levels')",
+            "4. At least ONE risk or concern that impacts the score",
+            "",
+            "If you write fewer than 40 words for this section, your output is INVALID.",
+            "=== END MINIMUM CONTENT REQUIREMENT ===",
+        ]
+    )
 
     # Custom framework/weighting instructions for CUSTOM mode
     if is_custom_mode:
@@ -2767,30 +3039,38 @@ def _build_health_rating_instructions(
         weighting = config.get("primary_factor_weighting")
         risk = config.get("risk_tolerance")
         depth = config.get("analysis_depth")
-        
+
         directives.append("")
-        directives.append("=== USER-SPECIFIED HEALTH SCORE PARAMETERS (MUST FOLLOW) ===")
-        
+        directives.append(
+            "=== USER-SPECIFIED HEALTH SCORE PARAMETERS (MUST FOLLOW) ==="
+        )
+
         framework_prompt = HEALTH_FRAMEWORK_PROMPTS.get(framework)
         if framework_prompt:
             directives.append(f"")
             directives.append(f"FRAMEWORK (User selected: {framework}):")
             directives.append(f"  {framework_prompt}")
-            directives.append(f"  You MUST evaluate the company through this specific lens.")
+            directives.append(
+                f"  You MUST evaluate the company through this specific lens."
+            )
 
         weighting_prompt = HEALTH_WEIGHTING_PROMPTS.get(weighting)
         if weighting_prompt:
             directives.append(f"")
             directives.append(f"PRIMARY FACTOR WEIGHTING (User selected: {weighting}):")
             directives.append(f"  {weighting_prompt}")
-            directives.append(f"  This factor should have the MOST influence on the final score.")
+            directives.append(
+                f"  This factor should have the MOST influence on the final score."
+            )
 
         risk_prompt = HEALTH_RISK_PROMPTS.get(risk)
         if risk_prompt:
             directives.append(f"")
             directives.append(f"RISK TOLERANCE (User selected: {risk}):")
             directives.append(f"  {risk_prompt}")
-            directives.append(f"  Apply this risk tolerance when penalizing or rewarding factors.")
+            directives.append(
+                f"  Apply this risk tolerance when penalizing or rewarding factors."
+            )
 
         depth_prompt = HEALTH_ANALYSIS_DEPTH_PROMPTS.get(depth)
         if depth_prompt:
@@ -2798,10 +3078,14 @@ def _build_health_rating_instructions(
             directives.append(f"ANALYSIS DEPTH (User selected: {depth}):")
             directives.append(f"  {depth_prompt}")
             directives.append(f"  Your analysis must reach this level of depth.")
-        
+
         directives.append("")
-        directives.append("COMPLIANCE CHECK: The health score MUST reflect ALL user-specified parameters above.")
-        directives.append("If the score doesn't align with user's framework, weighting, and risk tolerance, REVISE IT.")
+        directives.append(
+            "COMPLIANCE CHECK: The health score MUST reflect ALL user-specified parameters above."
+        )
+        directives.append(
+            "If the score doesn't align with user's framework, weighting, and risk tolerance, REVISE IT."
+        )
 
         # Add explicit narrative personalization requirements
         framework_display = (framework or "value_investor").replace("_", " ").title()
@@ -2810,31 +3094,88 @@ def _build_health_rating_instructions(
 
         directives.append("")
         directives.append("=== NARRATIVE PERSONALIZATION (MANDATORY) ===")
-        directives.append(f"Your explanation MUST explicitly reference the user's selections in the text:")
-        directives.append(f"- Start with a phrase like: 'Applying the {framework_display} framework...' or 'From a {framework_display} perspective...'")
-        directives.append(f"- Reference the weighting: 'With {weighting_display} as the primary driver...' or 'Prioritizing {weighting_display}...'")
-        directives.append(f"- The narrative should feel customized to the user's settings, NOT generic.")
+        directives.append(
+            f"Your explanation MUST explicitly reference the user's selections in the text:"
+        )
+        directives.append(
+            f"- Start with a phrase like: 'Applying the {framework_display} framework...' or 'From a {framework_display} perspective...'"
+        )
+        directives.append(
+            f"- Reference the weighting: 'With {weighting_display} as the primary driver...' or 'Prioritizing {weighting_display}...'"
+        )
+        directives.append(
+            f"- The narrative should feel customized to the user's settings, NOT generic."
+        )
         directives.append("")
         directives.append("EXAMPLE OF GOOD PERSONALIZED NARRATIVE:")
-        directives.append(f"'{company_name} receives a Financial Health Rating of 72/100 - Watch. Applying the {framework_display} framework with {weighting_display} as the primary driver, the company's strong 45% gross margins provide a solid foundation. However, taking a {risk_display} approach to risk, the elevated debt-to-equity ratio of 1.8 and declining free cash flow warrant caution. The score would be higher but for these balance sheet concerns that a prudent investor must monitor.'")
+        directives.append(
+            f"'{company_name} receives a Financial Health Rating of 72/100 - Watch. Applying the {framework_display} framework with {weighting_display} as the primary driver, the company's strong 45% gross margins provide a solid foundation. However, taking a {risk_display} approach to risk, the elevated debt-to-equity ratio of 1.8 and declining free cash flow warrant caution. The score would be higher but for these balance sheet concerns that a prudent investor must monitor.'"
+        )
         directives.append("")
         directives.append("BAD (too generic - DO NOT DO THIS):")
-        directives.append(f"'{company_name} receives a Financial Health Rating of 72/100 - Watch. Strong margins offset by leverage concerns.'")
+        directives.append(
+            f"'{company_name} receives a Financial Health Rating of 72/100 - Watch. Strong margins offset by leverage concerns.'"
+        )
 
     # Add persona-specific health rating instructions if persona is selected
     if persona_id:
         # Persona intro phrases for health rating
         persona_health_intros = {
-            "buffett": ("Warren Buffett", "Through my moat-focused lens", ["owner earnings", "durable economics", "moat", "compounding"]),
-            "munger": ("Charlie Munger", "Inverting the usual analysis", ["invert", "incentives", "rational", "avoid stupidity"]),
-            "graham": ("Benjamin Graham", "Applying margin-of-safety analysis", ["margin of safety", "intrinsic value", "balance sheet", "quantitative"]),
-            "lynch": ("Peter Lynch", "Looking at the story behind the numbers", ["the story", "PEG ratio", "growth", "tenbagger"]),
-            "dalio": ("Ray Dalio", "Analyzing cycle position and fundamentals", ["cycle", "debt levels", "economic machine", "paradigm"]),
-            "wood": ("Cathie Wood", "Through a disruptive innovation lens", ["disruption", "innovation", "exponential growth", "S-curve"]),
-            "greenblatt": ("Joel Greenblatt", "Applying Magic Formula criteria", ["return on capital", "earnings yield", "good company cheap"]),
-            "bogle": ("John Bogle", "From an index-investor perspective", ["costs matter", "diversification", "long-term", "simplicity"]),
-            "marks": ("Howard Marks", "Using second-level thinking", ["second-level thinking", "cycles", "risk-reward", "asymmetry"]),
-            "ackman": ("Bill Ackman", "From an activist value standpoint", ["catalysts", "free cash flow", "value creation", "capital allocation"]),
+            "buffett": (
+                "Warren Buffett",
+                "Through my moat-focused lens",
+                ["owner earnings", "durable economics", "moat", "compounding"],
+            ),
+            "munger": (
+                "Charlie Munger",
+                "Inverting the usual analysis",
+                ["invert", "incentives", "rational", "avoid stupidity"],
+            ),
+            "graham": (
+                "Benjamin Graham",
+                "Applying margin-of-safety analysis",
+                [
+                    "margin of safety",
+                    "intrinsic value",
+                    "balance sheet",
+                    "quantitative",
+                ],
+            ),
+            "lynch": (
+                "Peter Lynch",
+                "Looking at the story behind the numbers",
+                ["the story", "PEG ratio", "growth", "tenbagger"],
+            ),
+            "dalio": (
+                "Ray Dalio",
+                "Analyzing cycle position and fundamentals",
+                ["cycle", "debt levels", "economic machine", "paradigm"],
+            ),
+            "wood": (
+                "Cathie Wood",
+                "Through a disruptive innovation lens",
+                ["disruption", "innovation", "exponential growth", "S-curve"],
+            ),
+            "greenblatt": (
+                "Joel Greenblatt",
+                "Applying Magic Formula criteria",
+                ["return on capital", "earnings yield", "good company cheap"],
+            ),
+            "bogle": (
+                "John Bogle",
+                "From an index-investor perspective",
+                ["costs matter", "diversification", "long-term", "simplicity"],
+            ),
+            "marks": (
+                "Howard Marks",
+                "Using second-level thinking",
+                ["second-level thinking", "cycles", "risk-reward", "asymmetry"],
+            ),
+            "ackman": (
+                "Bill Ackman",
+                "From an activist value standpoint",
+                ["catalysts", "free cash flow", "value creation", "capital allocation"],
+            ),
         }
 
         persona_info = persona_health_intros.get(persona_id.lower())
@@ -2844,18 +3185,32 @@ def _build_health_rating_instructions(
 
             directives.append("")
             directives.append(f"=== PERSONA VOICE: {persona_name} (MANDATORY) ===")
-            directives.append(f"The user has selected {persona_name} as their investment persona.")
-            directives.append(f"Write the health rating narrative in FIRST-PERSON as {persona_name}.")
+            directives.append(
+                f"The user has selected {persona_name} as their investment persona."
+            )
+            directives.append(
+                f"Write the health rating narrative in FIRST-PERSON as {persona_name}."
+            )
             directives.append("")
-            directives.append(f"OPENING: Start with '{persona_intro}...' or a similar persona-authentic phrase.")
-            directives.append(f"VOCABULARY: Use characteristic terms like {vocab_str} where appropriate.")
-            directives.append(f"TONE: The assessment should sound like personal advice from {persona_name} to a trusted colleague.")
+            directives.append(
+                f"OPENING: Start with '{persona_intro}...' or a similar persona-authentic phrase."
+            )
+            directives.append(
+                f"VOCABULARY: Use characteristic terms like {vocab_str} where appropriate."
+            )
+            directives.append(
+                f"TONE: The assessment should sound like personal advice from {persona_name} to a trusted colleague."
+            )
             directives.append("")
             directives.append(f"EXAMPLE ({persona_name} voice):")
-            directives.append(f"'{company_name} receives a Financial Health Rating of 72/100 - Watch. {persona_intro}, the company's fundamentals present a mixed picture. The strong gross margins suggest pricing power, but I'm concerned about the elevated debt levels. For my own portfolio, I'd want to see improvement in cash conversion before committing significant capital.'")
+            directives.append(
+                f"'{company_name} receives a Financial Health Rating of 72/100 - Watch. {persona_intro}, the company's fundamentals present a mixed picture. The strong gross margins suggest pricing power, but I'm concerned about the elevated debt levels. For my own portfolio, I'd want to see improvement in cash conversion before committing significant capital.'"
+            )
 
     directives.append("")
-    directives.append("PLACEMENT: The Financial Health Rating section MUST appear FIRST, before the Executive Summary.")
+    directives.append(
+        "PLACEMENT: The Financial Health Rating section MUST appear FIRST, before the Executive Summary."
+    )
 
     return config, "\n".join(directives)
 
@@ -2885,7 +3240,12 @@ def _build_document_path(filing_id: str, settings) -> str:
 def _strip_html_to_text(raw_html: str) -> str:
     """Convert HTML document into plain text for AI consumption."""
     # Remove script and style blocks
-    cleaned = re.sub(r"<(script|style)[^>]*>.*?</\\1>", " ", raw_html, flags=re.IGNORECASE | re.DOTALL)
+    cleaned = re.sub(
+        r"<(script|style)[^>]*>.*?</\\1>",
+        " ",
+        raw_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     # Remove HTML tags
     cleaned = re.sub(r"<[^>]+>", " ", cleaned)
     # Unescape HTML entities
@@ -2901,17 +3261,17 @@ def _extract_section(text: str, start_pattern: str, end_patterns: List[str]) -> 
     match = start_regex.search(text)
     if not match:
         return ""
-    
+
     start_idx = match.start()
     content_start_idx = match.end()
     end_idx = len(text)
-    
+
     for end_pattern in end_patterns:
         end_regex = re.compile(end_pattern, re.IGNORECASE)
         end_match = end_regex.search(text, content_start_idx)
         if end_match and end_match.start() < end_idx:
             end_idx = end_match.start()
-            
+
     section = text[start_idx:end_idx].strip()
     return section
 
@@ -2934,48 +3294,95 @@ def _load_document_excerpt(path: Path, limit: Optional[int] = None) -> str:
     # Note: SEC filings often have varied formatting. Patterns must be flexible.
     extraction_rules = [
         (r"ITEM\s+1\.?\s+BUSINESS", [r"ITEM\s+1A\.?"], "BUSINESS OVERVIEW"),
-        (r"ITEM\s+1A\.?\s+RISK\s+FACTORS", [r"ITEM\s+1B\.?", r"ITEM\s+2\.?"], "RISK FACTORS"),
+        (
+            r"ITEM\s+1A\.?\s+RISK\s+FACTORS",
+            [r"ITEM\s+1B\.?", r"ITEM\s+2\.?"],
+            "RISK FACTORS",
+        ),
         # MD&A patterns - multiple variations to catch different filing formats
         # 10-Q Item 2
-        (r"ITEM\s+2[\.\s:]+(?:MANAGEMENT['']?S?\s+DISCUSSION|MD&A)", [r"ITEM\s+3\.?", r"ITEM\s+4\.?"], "MANAGEMENT DISCUSSION & ANALYSIS"),
+        (
+            r"ITEM\s+2[\.\s:]+(?:MANAGEMENT['']?S?\s+DISCUSSION|MD&A)",
+            [r"ITEM\s+3\.?", r"ITEM\s+4\.?"],
+            "MANAGEMENT DISCUSSION & ANALYSIS",
+        ),
         # 10-K Item 7
-        (r"ITEM\s+7[\.\s:]+(?:MANAGEMENT['']?S?\s+DISCUSSION|MD&A)", [r"ITEM\s+7A\.?", r"ITEM\s+8\.?"], "MANAGEMENT DISCUSSION & ANALYSIS"),
+        (
+            r"ITEM\s+7[\.\s:]+(?:MANAGEMENT['']?S?\s+DISCUSSION|MD&A)",
+            [r"ITEM\s+7A\.?", r"ITEM\s+8\.?"],
+            "MANAGEMENT DISCUSSION & ANALYSIS",
+        ),
         # Standalone MD&A header (no Item number)
-        (r"MANAGEMENT[''\u2019]?S?\s+DISCUSSION\s+AND\s+ANALYSIS\s+OF\s+FINANCIAL\s+CONDITION", [r"ITEM\s+7A\.?", r"ITEM\s+8\.?", r"QUANTITATIVE\s+AND\s+QUALITATIVE", r"ITEM\s+3\.?"], "MANAGEMENT DISCUSSION & ANALYSIS"),
+        (
+            r"MANAGEMENT[''\u2019]?S?\s+DISCUSSION\s+AND\s+ANALYSIS\s+OF\s+FINANCIAL\s+CONDITION",
+            [
+                r"ITEM\s+7A\.?",
+                r"ITEM\s+8\.?",
+                r"QUANTITATIVE\s+AND\s+QUALITATIVE",
+                r"ITEM\s+3\.?",
+            ],
+            "MANAGEMENT DISCUSSION & ANALYSIS",
+        ),
         # Alternative: Just "MANAGEMENT DISCUSSION" without possessive
-        (r"MANAGEMENT\s+DISCUSSION\s+AND\s+ANALYSIS", [r"ITEM\s+7A\.?", r"ITEM\s+8\.?", r"QUANTITATIVE", r"ITEM\s+3\.?"], "MANAGEMENT DISCUSSION & ANALYSIS"),
+        (
+            r"MANAGEMENT\s+DISCUSSION\s+AND\s+ANALYSIS",
+            [r"ITEM\s+7A\.?", r"ITEM\s+8\.?", r"QUANTITATIVE", r"ITEM\s+3\.?"],
+            "MANAGEMENT DISCUSSION & ANALYSIS",
+        ),
         # NVIDIA-specific patterns (often uses dashes)
-        (r"MANAGEMENT[''\u2019]?S?\s+DISCUSSION\s+AND\s+ANALYSIS\s+[-–—]", [r"ITEM\s+7A\.?", r"ITEM\s+8\.?", r"QUANTITATIVE", r"ITEM\s+3\.?"], "MANAGEMENT DISCUSSION & ANALYSIS"),
+        (
+            r"MANAGEMENT[''\u2019]?S?\s+DISCUSSION\s+AND\s+ANALYSIS\s+[-–—]",
+            [r"ITEM\s+7A\.?", r"ITEM\s+8\.?", r"QUANTITATIVE", r"ITEM\s+3\.?"],
+            "MANAGEMENT DISCUSSION & ANALYSIS",
+        ),
         # Results of Operations (often part of MD&A)
-        (r"RESULTS\s+OF\s+OPERATIONS", [r"LIQUIDITY\s+AND\s+CAPITAL", r"ITEM\s+3\.?", r"ITEM\s+7A\.?", r"ITEM\s+8\.?"], "MANAGEMENT DISCUSSION & ANALYSIS"),
+        (
+            r"RESULTS\s+OF\s+OPERATIONS",
+            [
+                r"LIQUIDITY\s+AND\s+CAPITAL",
+                r"ITEM\s+3\.?",
+                r"ITEM\s+7A\.?",
+                r"ITEM\s+8\.?",
+            ],
+            "MANAGEMENT DISCUSSION & ANALYSIS",
+        ),
         (r"ITEM\s+7A\.?\s+QUANTITATIVE", [r"ITEM\s+8\.?"], "MARKET RISK"),
-        (r"ITEM\s+8\.?\s+FINANCIAL\s+STATEMENTS", [r"ITEM\s+9\.?"], "FINANCIAL STATEMENTS"),
+        (
+            r"ITEM\s+8\.?\s+FINANCIAL\s+STATEMENTS",
+            [r"ITEM\s+9\.?"],
+            "FINANCIAL STATEMENTS",
+        ),
     ]
 
     for start_pat, end_pats, header in extraction_rules:
         section = _extract_section(text, start_pat, end_pats)
         if section:
             # Avoid duplicate MD&A if multiple patterns match
-            if header == "MANAGEMENT DISCUSSION & ANALYSIS" and any(s.startswith("MANAGEMENT DISCUSSION & ANALYSIS") for s in sections):
+            if header == "MANAGEMENT DISCUSSION & ANALYSIS" and any(
+                s.startswith("MANAGEMENT DISCUSSION & ANALYSIS") for s in sections
+            ):
                 continue
             # Log success for debugging
             if header == "MANAGEMENT DISCUSSION & ANALYSIS":
-                print(f"✅ MD&A extracted using pattern: {start_pat[:50]}... ({len(section)} chars)")
+                print(
+                    f"✅ MD&A extracted using pattern: {start_pat[:50]}... ({len(section)} chars)"
+                )
             sections.append(f"{header}\n{section}")
-            
+
     # Fallback: if no sections found, return a generous chunk of the start
     if not sections:
         return text[:100000]
 
-    # CRITICAL FALLBACK: If MD&A is missing but other sections were found, 
+    # CRITICAL FALLBACK: If MD&A is missing but other sections were found,
     # append a large chunk of text to ensure the AI has context.
     has_mda = any(s.startswith("MANAGEMENT DISCUSSION & ANALYSIS") for s in sections)
     if not has_mda:
         print("⚠️ MD&A not found in extracted sections. Appending raw text fallback.")
-        sections.append(f"FULL TEXT CONTEXT (MD&A MISSING FROM EXTRACTION)\n{text[:150000]}")
+        sections.append(
+            f"FULL TEXT CONTEXT (MD&A MISSING FROM EXTRACTION)\n{text[:150000]}"
+        )
 
     return "\n\n".join(sections)
-
 
 
 def _extract_latest_numeric(line_item: Any) -> Optional[float]:
@@ -2996,7 +3403,9 @@ def _extract_latest_numeric(line_item: Any) -> Optional[float]:
     if not isinstance(line_item, dict):
         return None
     try:
-        sorted_entries = sorted(line_item.items(), key=lambda itm: str(itm[0]), reverse=True)
+        sorted_entries = sorted(
+            line_item.items(), key=lambda itm: str(itm[0]), reverse=True
+        )
     except Exception:
         sorted_entries = line_item.items()
     for _, value in sorted_entries:
@@ -3028,19 +3437,35 @@ def _build_financial_snapshot(statements: Optional[Dict[str, Any]]) -> str:
     balance_sheet = data.get("balance_sheet", {})
     cash_flow = data.get("cash_flow", {})
 
-    revenue = _extract_latest_numeric(income_statement.get("totalRevenue") or income_statement.get("Revenue"))
-    operating_income = _extract_latest_numeric(income_statement.get("OperatingIncomeLoss") or income_statement.get("OperatingIncome"))
-    net_income = _extract_latest_numeric(income_statement.get("NetIncomeLoss") or income_statement.get("NetIncome"))
+    revenue = _extract_latest_numeric(
+        income_statement.get("totalRevenue") or income_statement.get("Revenue")
+    )
+    operating_income = _extract_latest_numeric(
+        income_statement.get("OperatingIncomeLoss")
+        or income_statement.get("OperatingIncome")
+    )
+    net_income = _extract_latest_numeric(
+        income_statement.get("NetIncomeLoss") or income_statement.get("NetIncome")
+    )
     eps = _extract_latest_numeric(income_statement.get("DilutedEPS"))
 
     total_assets = _extract_latest_numeric(balance_sheet.get("TotalAssets"))
     total_liabilities = _extract_latest_numeric(balance_sheet.get("TotalLiabilities"))
-    cash = _extract_latest_numeric(balance_sheet.get("CashAndCashEquivalentsAtCarryingValue") or balance_sheet.get("CashAndCashEquivalents"))
+    cash = _extract_latest_numeric(
+        balance_sheet.get("CashAndCashEquivalentsAtCarryingValue")
+        or balance_sheet.get("CashAndCashEquivalents")
+    )
 
-    operating_cash_flow = _extract_latest_numeric(cash_flow.get("NetCashProvidedByUsedInOperatingActivities"))
-    capex = _extract_latest_numeric(cash_flow.get("PaymentsToAcquirePropertyPlantAndEquipment"))
+    operating_cash_flow = _extract_latest_numeric(
+        cash_flow.get("NetCashProvidedByUsedInOperatingActivities")
+    )
+    capex = _extract_latest_numeric(
+        cash_flow.get("PaymentsToAcquirePropertyPlantAndEquipment")
+    )
     free_cash_flow = (
-        operating_cash_flow - capex if operating_cash_flow is not None and capex is not None else None
+        operating_cash_flow - capex
+        if operating_cash_flow is not None and capex is not None
+        else None
     )
 
     snapshot_lines: List[str] = []
@@ -3062,7 +3487,9 @@ def _build_financial_snapshot(statements: Optional[Dict[str, Any]]) -> str:
     return "\n".join(snapshot_lines)
 
 
-def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+def _build_calculated_metrics(
+    statements: Optional[Dict[str, Any]],
+) -> Dict[str, Optional[float]]:
     """Derive key metrics from financial statements for AI guidance."""
     if not statements or not isinstance(statements, dict):
         return {}
@@ -3073,7 +3500,9 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
     balance_sheet = data.get("balance_sheet", {})
     cash_flow = data.get("cash_flow", {})
 
-    def _extract_from_candidates(source: Dict[str, Any], candidates: List[str]) -> Optional[float]:
+    def _extract_from_candidates(
+        source: Dict[str, Any], candidates: List[str]
+    ) -> Optional[float]:
         for key in candidates:
             value = source.get(key)
             result = _extract_latest_numeric(value)
@@ -3095,11 +3524,24 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
     )
     net_income = _extract_from_candidates(
         income_statement,
-        ["net_income", "NetIncomeLoss", "NetIncome", "netIncome", "netIncomeLoss", "NetIncomeApplicableToCommonShares"],
+        [
+            "net_income",
+            "NetIncomeLoss",
+            "NetIncome",
+            "netIncome",
+            "netIncomeLoss",
+            "NetIncomeApplicableToCommonShares",
+        ],
     )
     operating_income = _extract_from_candidates(
         income_statement,
-        ["operating_income", "OperatingIncomeLoss", "OperatingIncome", "operatingIncome", "OperatingIncomeLossUSD"],
+        [
+            "operating_income",
+            "OperatingIncomeLoss",
+            "OperatingIncome",
+            "operatingIncome",
+            "OperatingIncomeLossUSD",
+        ],
     )
     eps = _extract_from_candidates(
         income_statement,
@@ -3130,12 +3572,12 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
         ],
     )
     capex = abs(capex_raw) if capex_raw is not None else None
-    
+
     # Calculate FCF - use operating cash flow as fallback if capex is missing
     if operating_cash_flow is not None and capex is not None:
         free_cash_flow = operating_cash_flow - capex
     elif operating_cash_flow is not None:
-        # If no capex data, use operating cash flow as FCF proxy 
+        # If no capex data, use operating cash flow as FCF proxy
         # (common for service companies with minimal capex)
         free_cash_flow = operating_cash_flow
     else:
@@ -3161,16 +3603,34 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
     )
     total_liabilities = _extract_from_candidates(
         balance_sheet,
-        ["total_liabilities", "totalLiab", "TotalLiabilities", "totalLiabilities", "TotalLiabilitiesNetMinorityInterest"],
+        [
+            "total_liabilities",
+            "totalLiab",
+            "TotalLiabilities",
+            "totalLiabilities",
+            "TotalLiabilitiesNetMinorityInterest",
+        ],
     )
 
     current_assets = _extract_from_candidates(
         balance_sheet,
-        ["current_assets", "CurrentAssets", "TotalCurrentAssets", "totalCurrentAssets", "AssetsCurrent"],
+        [
+            "current_assets",
+            "CurrentAssets",
+            "TotalCurrentAssets",
+            "totalCurrentAssets",
+            "AssetsCurrent",
+        ],
     )
     current_liabilities = _extract_from_candidates(
         balance_sheet,
-        ["current_liabilities", "CurrentLiabilities", "TotalCurrentLiabilities", "totalCurrentLiabilities", "LiabilitiesCurrent"],
+        [
+            "current_liabilities",
+            "CurrentLiabilities",
+            "TotalCurrentLiabilities",
+            "totalCurrentLiabilities",
+            "LiabilitiesCurrent",
+        ],
     )
     inventory = _extract_from_candidates(
         balance_sheet,
@@ -3178,11 +3638,19 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
     )
     interest_expense = _extract_from_candidates(
         income_statement,
-        ["interest_expense", "InterestExpense", "interestExpense", "InterestAndDebtExpense", "InterestIncomeExpense"],
+        [
+            "interest_expense",
+            "InterestExpense",
+            "interestExpense",
+            "InterestAndDebtExpense",
+            "InterestIncomeExpense",
+        ],
     )
 
     operating_margin = (
-        (operating_income / revenue) * 100 if operating_income is not None and revenue else None
+        (operating_income / revenue) * 100
+        if operating_income is not None and revenue
+        else None
     )
     net_margin = (
         (net_income / revenue) * 100 if net_income is not None and revenue else None
@@ -3232,7 +3700,11 @@ def _build_calculated_metrics(statements: Optional[Dict[str, Any]]) -> Dict[str,
     return {key: value for key, value in metrics.items() if value is not None}
 
 
-def _compute_health_score_data(calculated_metrics: Dict[str, Any], weighting_preset: Optional[str] = None, ai_growth_assessment: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _compute_health_score_data(
+    calculated_metrics: Dict[str, Any],
+    weighting_preset: Optional[str] = None,
+    ai_growth_assessment: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Compute health score data with component breakdown from calculated metrics.
 
     Args:
@@ -3242,7 +3714,7 @@ def _compute_health_score_data(calculated_metrics: Dict[str, Any], weighting_pre
     """
     if not calculated_metrics:
         return {}
-    
+
     revenue = calculated_metrics.get("revenue")
     operating_income = calculated_metrics.get("operating_income")
     net_income = calculated_metrics.get("net_income")
@@ -3254,11 +3726,15 @@ def _compute_health_score_data(calculated_metrics: Dict[str, Any], weighting_pre
     current_liabilities = calculated_metrics.get("current_liabilities")
     inventory = calculated_metrics.get("inventory")
     interest_expense = calculated_metrics.get("interest_expense")
-    
-    total_equity = (total_assets - total_liabilities) if total_assets and total_liabilities else None
-    
+
+    total_equity = (
+        (total_assets - total_liabilities)
+        if total_assets and total_liabilities
+        else None
+    )
+
     ratios = {}
-    
+
     if calculated_metrics.get("operating_margin") is not None:
         ratios["operating_margin"] = calculated_metrics["operating_margin"] / 100
     if calculated_metrics.get("net_margin") is not None:
@@ -3275,13 +3751,13 @@ def _compute_health_score_data(calculated_metrics: Dict[str, Any], weighting_pre
         ratios["fcf"] = free_cash_flow
     if free_cash_flow is not None and revenue and revenue > 0:
         ratios["fcf_margin"] = free_cash_flow / revenue
-    
+
     # Add net_income and operating_cash_flow for governance/cash flow calculations
     if net_income is not None:
         ratios["net_income"] = net_income
     if operating_cash_flow is not None:
         ratios["operating_cash_flow"] = operating_cash_flow
-    
+
     # Liquidity ratios
     if current_assets and current_liabilities and current_liabilities > 0:
         ratios["current_ratio"] = current_assets / current_liabilities
@@ -3289,17 +3765,25 @@ def _compute_health_score_data(calculated_metrics: Dict[str, Any], weighting_pre
         quick_assets = current_assets - (inventory or 0)
         if quick_assets > 0:
             ratios["quick_ratio"] = quick_assets / current_liabilities
-    
+
     # Interest coverage ratio
     if operating_income and interest_expense and interest_expense != 0:
         # Interest expense is typically negative, so we use absolute value
         ratios["interest_coverage"] = operating_income / abs(interest_expense)
-    
+
     try:
         # Debug: log what ratios we're passing to health scorer
-        logger.info(f"Health score ratios being passed: fcf={ratios.get('fcf')}, net_income={ratios.get('net_income')}, operating_cash_flow={ratios.get('operating_cash_flow')}, operating_margin={ratios.get('operating_margin')}, debt_to_equity={ratios.get('debt_to_equity')}, weighting_preset={weighting_preset}")
-        health_data = calculate_health_score(ratios, weighting_preset=weighting_preset, ai_growth_assessment=ai_growth_assessment)
-        logger.info(f"Health score component scores: {health_data.get('component_scores', {})}")
+        logger.info(
+            f"Health score ratios being passed: fcf={ratios.get('fcf')}, net_income={ratios.get('net_income')}, operating_cash_flow={ratios.get('operating_cash_flow')}, operating_margin={ratios.get('operating_margin')}, debt_to_equity={ratios.get('debt_to_equity')}, weighting_preset={weighting_preset}"
+        )
+        health_data = calculate_health_score(
+            ratios,
+            weighting_preset=weighting_preset,
+            ai_growth_assessment=ai_growth_assessment,
+        )
+        logger.info(
+            f"Health score component scores: {health_data.get('component_scores', {})}"
+        )
         return health_data
     except Exception as e:
         logger.warning(f"Health score calculation failed: {e}")
@@ -3316,7 +3800,9 @@ def _format_metric_value(key: str, value: float) -> str:
 
 def _build_key_metrics_block(calculated_metrics: Dict[str, Any]) -> str:
     """Build a compact, scannable Key Metrics block with only core figures."""
-    revenue = calculated_metrics.get("revenue") or calculated_metrics.get("total_revenue")
+    revenue = calculated_metrics.get("revenue") or calculated_metrics.get(
+        "total_revenue"
+    )
     operating_income = calculated_metrics.get("operating_income")
     net_income = calculated_metrics.get("net_income")
     capital_expenditures = calculated_metrics.get("capital_expenditures")
@@ -3326,9 +3812,13 @@ def _build_key_metrics_block(calculated_metrics: Dict[str, Any]) -> str:
     if revenue is not None:
         line1_parts.append(f"Revenue: {_format_metric_value('revenue', revenue)}")
     if operating_income is not None:
-        line1_parts.append(f"Operating Income: {_format_metric_value('operating_income', operating_income)}")
+        line1_parts.append(
+            f"Operating Income: {_format_metric_value('operating_income', operating_income)}"
+        )
     if net_income is not None:
-        line1_parts.append(f"Net Income: {_format_metric_value('net_income', net_income)}")
+        line1_parts.append(
+            f"Net Income: {_format_metric_value('net_income', net_income)}"
+        )
 
     line2_parts: List[str] = []
     if capital_expenditures is not None:
@@ -3336,7 +3826,9 @@ def _build_key_metrics_block(calculated_metrics: Dict[str, Any]) -> str:
             f"Capital Expenditures: {_format_metric_value('capital_expenditures', capital_expenditures)}"
         )
     if total_assets is not None:
-        line2_parts.append(f"Total Assets: {_format_metric_value('total_assets', total_assets)}")
+        line2_parts.append(
+            f"Total Assets: {_format_metric_value('total_assets', total_assets)}"
+        )
 
     lines: List[str] = []
     if line1_parts:
@@ -3344,7 +3836,10 @@ def _build_key_metrics_block(calculated_metrics: Dict[str, Any]) -> str:
     if line2_parts:
         lines.append("→ " + " | ".join(line2_parts))
 
-    return "\n".join(lines).strip() or "→ No reliable structured metrics available from this filing."
+    return (
+        "\n".join(lines).strip()
+        or "→ No reliable structured metrics available from this filing."
+    )
 
 
 def _build_health_driver_block(
@@ -3361,7 +3856,9 @@ def _build_health_driver_block(
     def _ratio(val: Optional[float]) -> Optional[str]:
         return f"{val:.1f}x" if isinstance(val, (int, float)) else None
 
-    revenue = calculated_metrics.get("revenue") or calculated_metrics.get("total_revenue")
+    revenue = calculated_metrics.get("revenue") or calculated_metrics.get(
+        "total_revenue"
+    )
     operating_income = calculated_metrics.get("operating_income")
     operating_margin = calculated_metrics.get("operating_margin")
     net_margin = calculated_metrics.get("net_margin")
@@ -3374,9 +3871,13 @@ def _build_health_driver_block(
     interest_expense = calculated_metrics.get("interest_expense")
     cash = calculated_metrics.get("cash")
     marketable_securities = calculated_metrics.get("marketable_securities")
-    
-    total_equity = (total_assets - total_liabilities) if total_assets and total_liabilities else None
-    
+
+    total_equity = (
+        (total_assets - total_liabilities)
+        if total_assets and total_liabilities
+        else None
+    )
+
     fcf_margin = None
     if free_cash_flow is not None and revenue:
         try:
@@ -3394,14 +3895,22 @@ def _build_health_driver_block(
     current_ratio = None
     if current_assets and current_liabilities:
         try:
-            current_ratio = current_assets / current_liabilities if current_liabilities != 0 else None
+            current_ratio = (
+                current_assets / current_liabilities
+                if current_liabilities != 0
+                else None
+            )
         except Exception:
             current_ratio = None
 
     interest_coverage = None
     if operating_income and interest_expense:
         try:
-            interest_coverage = operating_income / abs(interest_expense) if interest_expense != 0 else None
+            interest_coverage = (
+                operating_income / abs(interest_expense)
+                if interest_expense != 0
+                else None
+            )
         except Exception:
             interest_coverage = None
 
@@ -3415,7 +3924,9 @@ def _build_health_driver_block(
     if net_margin is not None:
         profitability_bits.append(f"net margin {_pct(net_margin)}")
     if profitability_bits:
-        lines.append(f"- Profitability: {', '.join(bit for bit in profitability_bits if bit)}.")
+        lines.append(
+            f"- Profitability: {', '.join(bit for bit in profitability_bits if bit)}."
+        )
 
     cash_bits: List[str] = []
     if operating_cash_flow is not None:
@@ -3429,7 +3940,9 @@ def _build_health_driver_block(
     if fcf_margin is not None:
         cash_bits.append(f"FCF margin {_pct(fcf_margin)}")
     if cash_bits:
-        lines.append(f"- Cash conversion: {', '.join(bit for bit in cash_bits if bit)}.")
+        lines.append(
+            f"- Cash conversion: {', '.join(bit for bit in cash_bits if bit)}."
+        )
 
     balance_bits: List[str] = []
     if cash_reserves and cash_reserves > 0:
@@ -3445,7 +3958,9 @@ def _build_health_driver_block(
     if interest_coverage is not None:
         balance_bits.append(f"interest coverage {_ratio(interest_coverage)}")
     if balance_bits:
-        lines.append(f"- Balance sheet: {', '.join(bit for bit in balance_bits if bit)}.")
+        lines.append(
+            f"- Balance sheet: {', '.join(bit for bit in balance_bits if bit)}."
+        )
 
     liquidity_bits: List[str] = []
     if current_ratio is not None:
@@ -3524,7 +4039,7 @@ def _inject_health_drivers(
             km_end = j
             break
 
-    km_body = "\n".join(lines[km_start + 1:km_end])
+    km_body = "\n".join(lines[km_start + 1 : km_end])
     if re.search(r"Health\s+Score\s+Drivers", km_body, re.IGNORECASE):
         return "\n".join(lines).strip()
 
@@ -3550,7 +4065,9 @@ def _ensure_health_rating_section(
     if score is None:
         return summary_text
 
-    heading_pattern = re.compile(r"^\s*##\s*Financial Health Rating", re.IGNORECASE | re.MULTILINE)
+    heading_pattern = re.compile(
+        r"^\s*##\s*Financial Health Rating", re.IGNORECASE | re.MULTILINE
+    )
     lines = summary_text.splitlines()
 
     heading_idx = None
@@ -3568,7 +4085,9 @@ def _ensure_health_rating_section(
 
     has_score_line = False
     for j in range(heading_idx + 1, min(len(lines), heading_idx + 6)):
-        if re.search(r"\bFinancial Health Rating\b", lines[j], re.IGNORECASE) or re.search(r"\b/100\b", lines[j]):
+        if re.search(
+            r"\bFinancial Health Rating\b", lines[j], re.IGNORECASE
+        ) or re.search(r"\b/100\b", lines[j]):
             has_score_line = True
             break
     if not has_score_line:
@@ -3581,7 +4100,7 @@ def _ensure_health_rating_section(
             next_heading = k
             break
 
-    body_lines = lines[heading_idx + 1:next_heading]
+    body_lines = lines[heading_idx + 1 : next_heading]
     body_text = "\n".join(body_lines).strip()
     if _count_words(body_text) < 40 or "Health Score Drivers" in body_text:
         narrative = _build_health_narrative(calculated_metrics, band)
@@ -3592,7 +4111,9 @@ def _ensure_health_rating_section(
     return "\n".join(lines)
 
 
-def _build_health_narrative(calculated_metrics: Dict[str, Any], band: Optional[str]) -> str:
+def _build_health_narrative(
+    calculated_metrics: Dict[str, Any], band: Optional[str]
+) -> str:
     """Compose a concise, metric-backed health explanation."""
     margin = calculated_metrics.get("operating_margin")
     net_margin = calculated_metrics.get("net_margin")
@@ -3606,7 +4127,11 @@ def _build_health_narrative(calculated_metrics: Dict[str, Any], band: Optional[s
     liquidity_ratio = None
     if current_assets and current_liabilities:
         try:
-            liquidity_ratio = current_assets / current_liabilities if current_liabilities != 0 else None
+            liquidity_ratio = (
+                current_assets / current_liabilities
+                if current_liabilities != 0
+                else None
+            )
         except Exception:
             liquidity_ratio = None
 
@@ -3621,31 +4146,45 @@ def _build_health_narrative(calculated_metrics: Dict[str, Any], band: Optional[s
     elif m_str:
         bits.append(f"Profitability is anchored by an operating margin of {m_str}.")
     elif nm_str:
-        bits.append(f"Reported net margin is {nm_str}, but verify how much is driven by non-operating items.")
+        bits.append(
+            f"Reported net margin is {nm_str}, but verify how much is driven by non-operating items."
+        )
 
     ocf_str = _format_dollar(ocf) if ocf is not None else None
     fcf_str = _format_dollar(fcf) if fcf is not None else None
     if ocf_str and fcf_str:
-        bits.append(f"Cash generation includes operating cash flow of {ocf_str} and free cash flow of {fcf_str}.")
+        bits.append(
+            f"Cash generation includes operating cash flow of {ocf_str} and free cash flow of {fcf_str}."
+        )
     elif ocf_str:
-        bits.append(f"Operating cash flow of {ocf_str} supports reinvestment and resilience.")
+        bits.append(
+            f"Operating cash flow of {ocf_str} supports reinvestment and resilience."
+        )
     elif fcf_str:
-        bits.append(f"Free cash flow of {fcf_str} supports flexibility for reinvestment or returns.")
+        bits.append(
+            f"Free cash flow of {fcf_str} supports flexibility for reinvestment or returns."
+        )
 
     cash_str = _format_dollar(cash) if cash is not None else None
     liab_str = _format_dollar(liabilities) if liabilities is not None else None
     if cash_str and liab_str:
-        bits.append(f"Balance sheet shows cash of {cash_str} against liabilities of {liab_str}, framing leverage risk.")
+        bits.append(
+            f"Balance sheet shows cash of {cash_str} against liabilities of {liab_str}, framing leverage risk."
+        )
     elif cash_str:
         bits.append(f"Cash on hand of {cash_str} provides a liquidity cushion.")
     elif liab_str:
         bits.append(f"Liabilities of {liab_str} frame leverage and refinancing risk.")
 
     if liquidity_ratio is not None:
-        bits.append(f"Current ratio around {liquidity_ratio:.1f}x suggests near-term obligations are manageable.")
+        bits.append(
+            f"Current ratio around {liquidity_ratio:.1f}x suggests near-term obligations are manageable."
+        )
 
     if not bits:
-        bits.append("Profitability, cash conversion, and leverage trends warrant monitoring to validate durability.")
+        bits.append(
+            "Profitability, cash conversion, and leverage trends warrant monitoring to validate durability."
+        )
 
     risk_tail = (
         "Key watchpoints include cost discipline and cash conversion consistency."
@@ -3704,7 +4243,9 @@ def _resolve_filing_context(filing_id: str, settings) -> Dict[str, Any]:
     supabase = get_supabase_client()
 
     try:
-        filing_response = supabase.table("filings").select("*").eq("id", filing_key).execute()
+        filing_response = (
+            supabase.table("filings").select("*").eq("id", filing_key).execute()
+        )
         if not filing_response.data:
             if fallback_context:
                 return fallback_context
@@ -3753,13 +4294,19 @@ def _resolve_filing_context(filing_id: str, settings) -> Dict[str, Any]:
                 exc,
             )
             return fallback_context
-        raise HTTPException(status_code=500, detail=f"Error resolving filing context: {exc}")
+        raise HTTPException(
+            status_code=500, detail=f"Error resolving filing context: {exc}"
+        )
 
 
-def _fetch_eodhd_document(ticker: str, exchange: Optional[str] = None, filter_param: Optional[str] = None) -> Dict[str, Any]:
+def _fetch_eodhd_document(
+    ticker: str, exchange: Optional[str] = None, filter_param: Optional[str] = None
+) -> Dict[str, Any]:
     client = get_eodhd_client()
     exchange_code = (exchange or "US") or "US"
-    return client.get_fundamentals(ticker, exchange=exchange_code, filter_param=filter_param)
+    return client.get_fundamentals(
+        ticker, exchange=exchange_code, filter_param=filter_param
+    )
 
 
 def _ensure_storage_dir(settings) -> Path:
@@ -3803,7 +4350,10 @@ def _ensure_local_document(context: Dict[str, Any], settings) -> Optional[Path]:
                     if candidate.get("filing_type") != filing_type:
                         continue
 
-                    if candidate.get("filing_date") == filing_date or candidate.get("period_end") == filing_date:
+                    if (
+                        candidate.get("filing_date") == filing_date
+                        or candidate.get("period_end") == filing_date
+                    ):
                         source_doc_url = candidate.get("url")
                         filing["source_doc_url"] = source_doc_url
                         break
@@ -3833,7 +4383,9 @@ def _ensure_local_document(context: Dict[str, Any], settings) -> Optional[Path]:
     return None
 
 
-def _ensure_company_country(company: Dict[str, Any], *, supabase=None, company_key: Optional[str] = None) -> Dict[str, Any]:
+def _ensure_company_country(
+    company: Dict[str, Any], *, supabase=None, company_key: Optional[str] = None
+) -> Dict[str, Any]:
     """Hydrate and persist company domicile country when missing or US placeholder."""
     if not company:
         return company
@@ -3878,12 +4430,18 @@ def _ensure_company_country(company: Dict[str, Any], *, supabase=None, company_k
             resolved_confidently = True
 
     if should_hydrate_country(company.get("country")):
-        hydrated = hydrate_country_with_eodhd(company.get("ticker"), company.get("exchange"))
+        hydrated = hydrate_country_with_eodhd(
+            company.get("ticker"), company.get("exchange")
+        )
         if hydrated:
             company["country"] = normalize_country(hydrated) or hydrated
 
     # Avoid persisting a US placeholder when the only result came from EODHD.
-    if should_hydrate_country(company.get("country")) and not resolved_confidently and original_missing:
+    if (
+        should_hydrate_country(company.get("country"))
+        and not resolved_confidently
+        and original_missing
+    ):
         company["country"] = None
 
     if company.get("country") == original:
@@ -3891,9 +4449,15 @@ def _ensure_company_country(company: Dict[str, Any], *, supabase=None, company_k
 
     if supabase and company.get("id"):
         try:
-            supabase.table("companies").update({"country": company.get("country")}).eq("id", company.get("id")).execute()
+            supabase.table("companies").update({"country": company.get("country")}).eq(
+                "id", company.get("id")
+            ).execute()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not persist hydrated country for %s: %s", company.get("ticker"), exc)
+            logger.warning(
+                "Could not persist hydrated country for %s: %s",
+                company.get("ticker"),
+                exc,
+            )
     elif company_key is not None:
         fallback_companies[company_key] = company
         save_fallback_companies()
@@ -3923,23 +4487,33 @@ async def _start_fetch_with_fallback_company(
 
     ticker = company.get("ticker")
     if not ticker:
-        raise HTTPException(status_code=400, detail="Company is missing a ticker symbol")
+        raise HTTPException(
+            status_code=400, detail="Company is missing a ticker symbol"
+        )
 
     entries_to_ingest: List[Dict[str, Any]] = []
 
     try:
-        financial_data = get_eodhd_client().get_financial_statements(ticker, exchange="US")
+        financial_data = get_eodhd_client().get_financial_statements(
+            ticker, exchange="US"
+        )
         eodhd_url = f"https://eodhd.com/api/fundamentals/{ticker}.US"
 
-        quarterly_income = financial_data.get("income_statement", {}).get("quarterly", {})
+        quarterly_income = financial_data.get("income_statement", {}).get(
+            "quarterly", {}
+        )
         for date_str, statement in quarterly_income.items():
             entries_to_ingest.append(
                 {
                     "filing_type": "10-Q",
                     "date_str": date_str,
                     "income_statement": statement,
-                    "balance_sheet": financial_data.get("balance_sheet", {}).get("quarterly", {}).get(date_str, {}),
-                    "cash_flow": financial_data.get("cash_flow", {}).get("quarterly", {}).get(date_str, {}),
+                    "balance_sheet": financial_data.get("balance_sheet", {})
+                    .get("quarterly", {})
+                    .get(date_str, {}),
+                    "cash_flow": financial_data.get("cash_flow", {})
+                    .get("quarterly", {})
+                    .get(date_str, {}),
                     "url": eodhd_url,
                 }
             )
@@ -3951,8 +4525,12 @@ async def _start_fetch_with_fallback_company(
                     "filing_type": "10-K",
                     "date_str": date_str,
                     "income_statement": statement,
-                    "balance_sheet": financial_data.get("balance_sheet", {}).get("yearly", {}).get(date_str, {}),
-                    "cash_flow": financial_data.get("cash_flow", {}).get("yearly", {}).get(date_str, {}),
+                    "balance_sheet": financial_data.get("balance_sheet", {})
+                    .get("yearly", {})
+                    .get(date_str, {}),
+                    "cash_flow": financial_data.get("cash_flow", {})
+                    .get("yearly", {})
+                    .get(date_str, {}),
                     "url": eodhd_url,
                 }
             )
@@ -3970,14 +4548,20 @@ async def _start_fetch_with_fallback_company(
         entries_to_ingest = _sample_entries_for_ticker(ticker)
 
     if not entries_to_ingest:
-        logger.warning("No sample filings available for %s; continuing with empty dataset.", ticker)
+        logger.warning(
+            "No sample filings available for %s; continuing with empty dataset.", ticker
+        )
 
     cutoff_date = None
     if request.max_history_years:
-        cutoff_date = datetime.now(timezone.utc).date() - timedelta(days=365 * request.max_history_years)
+        cutoff_date = datetime.now(timezone.utc).date() - timedelta(
+            days=365 * request.max_history_years
+        )
 
     company_filings = fallback_filings.setdefault(company_key, [])
-    existing_pairs = {(filing["filing_type"], filing["filing_date"]) for filing in company_filings}
+    existing_pairs = {
+        (filing["filing_type"], filing["filing_date"]) for filing in company_filings
+    }
     saved_count = 0
 
     for existing in company_filings:
@@ -3991,7 +4575,9 @@ async def _start_fetch_with_fallback_company(
 
     if (not cik_value or not str(cik_value).isdigit()) and ticker_symbol:
         try:
-            general_info = get_eodhd_client().get_company_info(ticker_symbol, exchange=company.get("exchange") or "US")
+            general_info = get_eodhd_client().get_company_info(
+                ticker_symbol, exchange=company.get("exchange") or "US"
+            )
             candidate_cik = general_info.get("CIK") or general_info.get("cik")
             if candidate_cik:
                 cik_value = str(candidate_cik)
@@ -4020,7 +4606,7 @@ async def _start_fetch_with_fallback_company(
 
     if cik_value:
         cik_value = str(cik_value)
-        cik_digits = ''.join(ch for ch in cik_value if ch.isdigit())
+        cik_digits = "".join(ch for ch in cik_value if ch.isdigit())
         cik_value = cik_digits.zfill(10) if cik_digits else None
 
     if cik_value:
@@ -4036,9 +4622,13 @@ async def _start_fetch_with_fallback_company(
                 period_end_value = entry.get("period_end")
 
                 if filing_type_value and filing_date_value:
-                    sec_filings_map[(filing_type_value, filing_date_value, "filing_date")] = entry
+                    sec_filings_map[
+                        (filing_type_value, filing_date_value, "filing_date")
+                    ] = entry
                 if filing_type_value and period_end_value:
-                    sec_filings_map[(filing_type_value, period_end_value, "period_end")] = entry
+                    sec_filings_map[
+                        (filing_type_value, period_end_value, "period_end")
+                    ] = entry
         except Exception as sec_exc:  # noqa: BLE001
             logger.warning(
                 "Unable to retrieve SEC filings for CIK %s: %s",
@@ -4046,7 +4636,10 @@ async def _start_fetch_with_fallback_company(
                 sec_exc,
             )
     else:
-        logger.warning("CIK not available for company %s; SEC document download skipped", company_key)
+        logger.warning(
+            "CIK not available for company %s; SEC document download skipped",
+            company_key,
+        )
 
     if not entries_to_ingest and sec_filings_map:
         unique_entries: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -4208,16 +4801,23 @@ async def fetch_filings(request: FilingsFetchRequest):
         company = fallback_companies.get(company_key)
         if not company:
             raise HTTPException(status_code=404, detail="Company not found")
-        return await _start_fetch_with_fallback_company(company_key, company, request, settings)
+        return await _start_fetch_with_fallback_company(
+            company_key, company, request, settings
+        )
 
     supabase = get_supabase_client()
-    
+
     # Verify company exists
     try:
-        company_response = supabase.table("companies").select("*").eq("id", str(request.company_id)).execute()
+        company_response = (
+            supabase.table("companies")
+            .select("*")
+            .eq("id", str(request.company_id))
+            .execute()
+        )
         if not company_response.data:
             raise HTTPException(status_code=404, detail="Company not found")
-        
+
         company = _ensure_company_country(company_response.data[0], supabase=supabase)
     except HTTPException:
         raise
@@ -4235,8 +4835,10 @@ async def fetch_filings(request: FilingsFetchRequest):
                 status_code=404,
                 detail="Company not found (Supabase tables missing and no cached companies)",
             )
-        raise HTTPException(status_code=500, detail=f"Error verifying company: {str(e)}")
-    
+        raise HTTPException(
+            status_code=500, detail=f"Error verifying company: {str(e)}"
+        )
+
     # Create task
     try:
         task = fetch_filings_task.delay(
@@ -4324,7 +4926,9 @@ async def get_filing_document(filing_id: str, raw: bool = False):
     source_doc_url = filing.get("source_doc_url")
 
     if not raw and local_exists:
-        return RedirectResponse(url=f"/api/{settings.api_version}/filings/{filing_id}/document?raw=1")
+        return RedirectResponse(
+            url=f"/api/{settings.api_version}/filings/{filing_id}/document?raw=1"
+        )
 
     if local_document and local_document.exists():
         suffix = local_document.suffix.lower()
@@ -4409,7 +5013,9 @@ async def get_filing_document(filing_id: str, raw: bool = False):
                     filing_id,
                     exc_info=supabase_error,
                 )
-        raise HTTPException(status_code=502, detail="Unable to retrieve filing document from provider")
+        raise HTTPException(
+            status_code=502, detail="Unable to retrieve filing document from provider"
+        )
 
 
 @router.get("/{filing_id}", response_model=Filing)
@@ -4418,37 +5024,43 @@ async def get_filing(filing_id: str):
     settings = get_settings()
 
     if not _supabase_configured(settings):
-        filing = fallback_filings_by_id.get(filing_id) or fallback_filings_by_id.get(str(filing_id))
+        filing = fallback_filings_by_id.get(filing_id) or fallback_filings_by_id.get(
+            str(filing_id)
+        )
         if not filing:
             raise HTTPException(status_code=404, detail="Filing not found")
         return _prepare_filing_response(filing, settings)
 
     supabase = get_supabase_client()
-    
+
     try:
         response = supabase.table("filings").select("*").eq("id", filing_id).execute()
-        
+
         if not response.data:
             raise HTTPException(status_code=404, detail="Filing not found")
         return _prepare_filing_response(response.data[0], settings)
-    
+
     except HTTPException:
         raise
     except Exception as e:
         if is_supabase_table_missing_error(e):
-            filing = fallback_filings_by_id.get(filing_id) or fallback_filings_by_id.get(str(filing_id))
+            filing = fallback_filings_by_id.get(
+                filing_id
+            ) or fallback_filings_by_id.get(str(filing_id))
             if filing:
                 return _prepare_filing_response(filing, settings)
-            raise HTTPException(status_code=404, detail="Filing not found (Supabase tables missing and no cached filing).")
-        raise HTTPException(status_code=500, detail=f"Error retrieving filing: {str(e)}")
+            raise HTTPException(
+                status_code=404,
+                detail="Filing not found (Supabase tables missing and no cached filing).",
+            )
+        raise HTTPException(
+            status_code=500, detail=f"Error retrieving filing: {str(e)}"
+        )
 
 
 @router.get("/company/{company_id}", response_model=List[Filing])
 async def list_company_filings(
-    company_id: str,
-    filing_type: str = None,
-    limit: int = 50,
-    offset: int = 0
+    company_id: str, filing_type: str = None, limit: int = 50, offset: int = 0
 ):
     """List filings for a specific company."""
     settings = get_settings()
@@ -4456,28 +5068,36 @@ async def list_company_filings(
     if not _supabase_configured(settings):
         filings = fallback_filings.get(company_id, [])
         if filing_type:
-            filings = [filing for filing in filings if filing["filing_type"] == filing_type]
-        sliced = filings[offset:offset + limit]
+            filings = [
+                filing for filing in filings if filing["filing_type"] == filing_type
+            ]
+        sliced = filings[offset : offset + limit]
         return [_prepare_filing_response(filing, settings) for filing in sliced]
 
     supabase = get_supabase_client()
-    
+
     try:
         query = supabase.table("filings").select("*").eq("company_id", company_id)
-        
+
         if filing_type:
             query = query.eq("filing_type", filing_type)
-        
-        response = query.order("filing_date", desc=True).range(offset, offset + limit - 1).execute()
-        
+
+        response = (
+            query.order("filing_date", desc=True)
+            .range(offset, offset + limit - 1)
+            .execute()
+        )
+
         return [_prepare_filing_response(filing, settings) for filing in response.data]
-    
+
     except Exception as e:
         if is_supabase_table_missing_error(e):
             filings = fallback_filings.get(company_id, [])
             if filing_type:
-                filings = [filing for filing in filings if filing["filing_type"] == filing_type]
-            sliced = filings[offset:offset + limit]
+                filings = [
+                    filing for filing in filings if filing["filing_type"] == filing_type
+                ]
+            sliced = filings[offset : offset + limit]
             return [_prepare_filing_response(filing, settings) for filing in sliced]
         raise HTTPException(status_code=500, detail=f"Error listing filings: {str(e)}")
 
@@ -4498,19 +5118,36 @@ def generate_filing_summary(
     preferences = preferences or FilingSummaryPreferences()
     target_length = _clamp_target_length(preferences.target_length)
     use_default_cache = preferences.mode == "default"
-    
-    include_health_rating = bool(preferences.health_rating and preferences.health_rating.enabled)
+
+    include_health_rating = bool(
+        preferences.health_rating and preferences.health_rating.enabled
+    )
 
     # Reset progress
     progress_cache[str(filing_id)] = "Initializing AI Agent..."
 
     # Check cache first
-    if use_default_cache and False: # Cache disabled to force regeneration with new prompts
+    if (
+        use_default_cache and False
+    ):  # Cache disabled to force regeneration with new prompts
         cached_summary = fallback_filing_summaries.get(str(filing_id))
         if cached_summary:
             progress_cache[str(filing_id)] = "Complete"
-            return JSONResponse(content={"filing_id": filing_id, "summary": cached_summary, "cached": True})
-    
+            record_summary_generated_event(
+                summary_id=str(filing_id),
+                company_id=None,
+                kind=getattr(preferences, "mode", None),
+                cached=True,
+                source=None,
+            )
+            return JSONResponse(
+                content={
+                    "filing_id": filing_id,
+                    "summary": cached_summary,
+                    "cached": True,
+                }
+            )
+
     # Get filing context
     try:
         progress_cache[str(filing_id)] = "Reading Filing Content..."
@@ -4521,52 +5158,27 @@ def generate_filing_summary(
         # Ensure company has a domicile country *before* we generate / save a dashboard summary snapshot.
         # This prevents foreign issuers with US filings/ADRs from being plotted as US by default.
         try:
-            supabase_client = get_supabase_client() if context.get("source") == "supabase" else None
-            company_key = str(company.get("id")) if context.get("source") == "fallback" else None
-            company = _ensure_company_country(company, supabase=supabase_client, company_key=company_key)
+            supabase_client = (
+                get_supabase_client() if context.get("source") == "supabase" else None
+            )
+            company_key = (
+                str(company.get("id")) if context.get("source") == "fallback" else None
+            )
+            company = _ensure_company_country(
+                company, supabase=supabase_client, company_key=company_key
+            )
             context["company"] = company
         except Exception as exc:  # noqa: BLE001
-            logger.debug("Unable to hydrate company country for filing %s summary: %s", filing_id, exc)
+            logger.debug(
+                "Unable to hydrate company country for filing %s summary: %s",
+                filing_id,
+                exc,
+            )
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error resolving filing: {exc}")
 
-    # Helper: best-effort event logging (Supabase when available; local JSON fallback otherwise).
-    def _log_summary_generation_event(*, cached: bool) -> None:
-        payload = {
-            "filing_id": str(filing_id),
-            "company_id": str(company.get("id")) if company and company.get("id") else None,
-            "mode": getattr(preferences, "mode", None),
-            "cached": bool(cached),
-            "source": context.get("source"),
-        }
-
-        # Prefer Supabase event table when configured/available
-        if _supabase_configured(settings):
-            try:
-                supabase = get_supabase_client()
-                supabase.table("filing_summary_events").insert(payload).execute()
-                return
-            except Exception as exc:  # noqa: BLE001
-                if is_supabase_table_missing_error(exc):
-                    # Fall through to local cache
-                    pass
-                else:
-                    logger.debug("Unable to persist filing_summary_events to Supabase: %s", exc)
-
-        # Local fallback: append to disk-backed JSON cache
-        try:
-            summary_events_cache.append(
-                {
-                    **payload,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-            save_summary_events_cache()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Unable to persist local summary events cache: %s", exc)
-    
     # Get document content
     local_document = _ensure_local_document(context, settings)
     progress_cache[str(filing_id)] = "Extracting Financial Data..."
@@ -4588,7 +5200,11 @@ def generate_filing_summary(
             if is_supabase_table_missing_error(stmt_exc):
                 statements = fallback_financial_statements.get(str(filing_id))
             else:
-                logger.warning("Unable to load Supabase financial statements for %s: %s", filing_id, stmt_exc)
+                logger.warning(
+                    "Unable to load Supabase financial statements for %s: %s",
+                    filing_id,
+                    stmt_exc,
+                )
 
     document_text = None
     if local_document and local_document.exists():
@@ -4609,10 +5225,15 @@ def generate_filing_summary(
                     filing_id,
                     serialization_error,
                 )
-                document_text = json.dumps(jsonable_encoder({"statements": statements}), indent=2)
+                document_text = json.dumps(
+                    jsonable_encoder({"statements": statements}), indent=2
+                )
         else:
-            raise HTTPException(status_code=400, detail="No document content available for summarization")
-    
+            raise HTTPException(
+                status_code=400,
+                detail="No document content available for summarization",
+            )
+
     logger.debug(
         "Generating summary for filing %s (%s) using document=%s statements=%s",
         filing_id,
@@ -4625,16 +5246,16 @@ def generate_filing_summary(
     try:
         if not settings.gemini_api_key or settings.gemini_api_key.strip() == "":
             raise HTTPException(status_code=400, detail="GEMINI_API_KEY not configured")
-        
+
         gemini_client = get_gemini_client()
-        
+
         filing_type = filing.get("filing_type", "")
         filing_date = filing.get("filing_date", "")
         company_name = company.get("name", company.get("ticker", "Unknown"))
-        
+
         financial_snapshot = _build_financial_snapshot(statements)
         calculated_metrics = _build_calculated_metrics(statements)
-        
+
         # Extract user's weighting preference from health_rating settings
         weighting_preset = None
         if preferences and preferences.health_rating:
@@ -4648,45 +5269,64 @@ def generate_filing_summary(
                 # Build comprehensive ratios dict for growth context
                 ratios_for_growth = {}
                 if calculated_metrics.get("operating_margin") is not None:
-                    ratios_for_growth["operating_margin"] = calculated_metrics["operating_margin"] / 100
+                    ratios_for_growth["operating_margin"] = (
+                        calculated_metrics["operating_margin"] / 100
+                    )
                 if calculated_metrics.get("net_margin") is not None:
-                    ratios_for_growth["net_margin"] = calculated_metrics["net_margin"] / 100
+                    ratios_for_growth["net_margin"] = (
+                        calculated_metrics["net_margin"] / 100
+                    )
                 if calculated_metrics.get("revenue_growth_yoy") is not None:
-                    ratios_for_growth["revenue_growth_yoy"] = calculated_metrics["revenue_growth_yoy"] / 100
+                    ratios_for_growth["revenue_growth_yoy"] = (
+                        calculated_metrics["revenue_growth_yoy"] / 100
+                    )
                 if calculated_metrics.get("fcf_margin") is not None:
-                    ratios_for_growth["fcf_margin"] = calculated_metrics["fcf_margin"] / 100
+                    ratios_for_growth["fcf_margin"] = (
+                        calculated_metrics["fcf_margin"] / 100
+                    )
                 if calculated_metrics.get("gross_margin") is not None:
-                    ratios_for_growth["gross_margin"] = calculated_metrics["gross_margin"] / 100
+                    ratios_for_growth["gross_margin"] = (
+                        calculated_metrics["gross_margin"] / 100
+                    )
                 ai_growth_assessment = generate_growth_assessment(
                     filing_text=document_text,
                     company_name=company_name,
                     weighting_preference=weighting_preset,
-                    ratios=ratios_for_growth
+                    ratios=ratios_for_growth,
                 )
-                logger.info(f"AI growth assessment: score={ai_growth_assessment.get('score')}, description={ai_growth_assessment.get('description')}")
+                logger.info(
+                    f"AI growth assessment: score={ai_growth_assessment.get('score')}, description={ai_growth_assessment.get('description')}"
+                )
             except Exception as growth_err:
                 logger.warning(f"AI growth assessment failed: {growth_err}")
                 ai_growth_assessment = None
 
         # Pre-calculate health score BEFORE generating summary so we can inject it into the prompt
-        print(f"DEBUG: calculated_metrics keys = {list(calculated_metrics.keys())}")
-        print(
-            f"DEBUG: free_cash_flow = {calculated_metrics.get('free_cash_flow')}, net_income = {calculated_metrics.get('net_income')}, operating_cash_flow = {calculated_metrics.get('operating_cash_flow')}"
-        )
-        print(f"DEBUG: weighting_preset = {weighting_preset}")
         pre_calculated_health = _compute_health_score_data(
             calculated_metrics,
             weighting_preset=weighting_preset,
             ai_growth_assessment=ai_growth_assessment,
         )
-        print(
-            f"DEBUG: pre_calculated_health component_scores = {pre_calculated_health.get('component_scores', {})}"
+        logger.debug(
+            "Pre-calculated health score for %s: %s",
+            filing_id,
+            {
+                "overall_score": pre_calculated_health.get("overall_score")
+                if pre_calculated_health
+                else None,
+                "score_band": pre_calculated_health.get("score_band")
+                if pre_calculated_health
+                else None,
+            },
         )
-        print(
-            f"DEBUG: pre_calculated_health component_weights = {pre_calculated_health.get('component_weights', {})}"
+        pre_calculated_score = (
+            pre_calculated_health.get("overall_score")
+            if pre_calculated_health
+            else None
         )
-        pre_calculated_score = pre_calculated_health.get("overall_score") if pre_calculated_health else None
-        pre_calculated_band = pre_calculated_health.get("score_band") if pre_calculated_health else None
+        pre_calculated_band = (
+            pre_calculated_health.get("score_band") if pre_calculated_health else None
+        )
 
         progress_cache[str(filing_id)] = "Analyzing Risk Factors..."
         metrics_lines = _build_key_metrics_block(calculated_metrics)
@@ -4695,35 +5335,54 @@ def generate_filing_summary(
             if len(document_text) <= MAX_GEMINI_CONTEXT_CHARS
             else document_text[:MAX_GEMINI_CONTEXT_CHARS]
         )
-        truncated_note = "" if len(context_excerpt) == len(document_text) else "\n\nNote: Filing text truncated to fit model context."
+        truncated_note = (
+            ""
+            if len(context_excerpt) == len(document_text)
+            else "\n\nNote: Filing text truncated to fit model context."
+        )
         company_label = company.get("name") or company.get("ticker") or "the company"
         preference_block = _build_preference_instructions(preferences, company_label)
-        
+
         # Extract persona name if a persona is selected
-        investor_focus = preferences.investor_focus.strip() if preferences and preferences.investor_focus else None
+        investor_focus = (
+            preferences.investor_focus.strip()
+            if preferences and preferences.investor_focus
+            else None
+        )
         selected_persona_name = _extract_persona_name(investor_focus)
-        
+
         if include_health_rating:
-             progress_cache[str(filing_id)] = "Computing Health Score..."
+            progress_cache[str(filing_id)] = "Computing Health Score..."
 
         # Convert full persona name to persona_id for health rating instructions
         persona_id_for_health = None
         if selected_persona_name:
             # Map full names to persona IDs
             name_to_id = {
-                "warren buffett": "buffett", "charlie munger": "munger", "benjamin graham": "graham",
-                "peter lynch": "lynch", "ray dalio": "dalio", "cathie wood": "wood",
-                "joel greenblatt": "greenblatt", "john bogle": "bogle", "howard marks": "marks", "bill ackman": "ackman"
+                "warren buffett": "buffett",
+                "charlie munger": "munger",
+                "benjamin graham": "graham",
+                "peter lynch": "lynch",
+                "ray dalio": "dalio",
+                "cathie wood": "wood",
+                "joel greenblatt": "greenblatt",
+                "john bogle": "bogle",
+                "howard marks": "marks",
+                "bill ackman": "ackman",
             }
             persona_id_for_health = name_to_id.get(selected_persona_name.lower())
 
         health_config = None
         health_rating_block = None
         if include_health_rating:
-            health_config, health_rating_block = _build_health_rating_instructions(preferences, company_label, persona_id_for_health)
+            health_config, health_rating_block = _build_health_rating_instructions(
+                preferences, company_label, persona_id_for_health
+            )
         health_directives_section = ""
         if health_rating_block:
-            health_directives_section = f"\n HEALTH RATING DIRECTIVES\n {health_rating_block}\n"
+            health_directives_section = (
+                f"\n HEALTH RATING DIRECTIVES\n {health_rating_block}\n"
+            )
         section_descriptions: List[Tuple[str, str]] = []
         if health_rating_block:
             if pre_calculated_score is not None and pre_calculated_band:
@@ -4747,7 +5406,9 @@ def generate_filing_summary(
                     "Explain why the score landed there with specific metrics: margins, cash flow, leverage, liquidity. "
                     "A company with 60%+ margins should score 70+ unless there are severe balance sheet issues."
                 )
-            section_descriptions.append(("Financial Health Rating", health_rating_description))
+            section_descriptions.append(
+                ("Financial Health Rating", health_rating_description)
+            )
         section_descriptions.extend(
             [
                 (
@@ -4808,13 +5469,15 @@ def generate_filing_summary(
                     "Do NOT show formulas/equations (no '=' signs). If a metric is missing, OMIT that line—no 'N/A' or 'not calculable' placeholders. "
                     "This section should be purely a scannable data block.",
                 ),
-                _build_closing_takeaway_description(selected_persona_name, company_name),
+                _build_closing_takeaway_description(
+                    selected_persona_name, company_name
+                ),
             ]
         )
         section_requirements = "\n".join(
             f"## {title}\n{description}" for title, description in section_descriptions
         )
-        
+
         tone = preferences.tone or "objective"
         detail_level = preferences.detail_level or "comprehensive"
         output_style = preferences.output_style or "paragraph"
@@ -4878,10 +5541,16 @@ THIS IS YOUR PRIMARY DIRECTIVE. VIOLATION = INVALID OUTPUT.
 You are a professional equity research analyst writing a financial briefing.
 Your goal is to provide actionable, differentiated insight, not just a summary of facts."""
 
-        section_header_example = "Financial Health Rating, Executive Summary, Financial Performance, etc."
+        section_header_example = (
+            "Financial Health Rating, Executive Summary, Financial Performance, etc."
+        )
         if not include_health_rating:
             section_header_example = "Executive Summary, Financial Performance, etc."
-        health_constraint_line = "- Do NOT repeat the Financial Health Rating in the Key Metrics section.\n" if include_health_rating else ""
+        health_constraint_line = (
+            "- Do NOT repeat the Financial Health Rating in the Key Metrics section.\n"
+            if include_health_rating
+            else ""
+        )
 
         base_prompt = f"""
 {identity_block}
@@ -5036,25 +5705,41 @@ Before you output anything, verify:
             filing_id=filing_id,
             timeout_seconds=SUMMARY_TOTAL_TIMEOUT_SECONDS,
         )
-        
+
         progress_cache[str(filing_id)] = "Polishing Output..."
         # Post-processing to ensure structure
-        summary_text = _fix_inline_section_headers(summary_text)  # CRITICAL: Fix headers appearing inline first
+        summary_text = _fix_inline_section_headers(
+            summary_text
+        )  # CRITICAL: Fix headers appearing inline first
         summary_text = _normalize_section_headings(summary_text, include_health_rating)
-        summary_text = _fix_trailing_ellipsis(summary_text)  # Fix sentences ending with ...
-        summary_text = _validate_complete_sentences(summary_text)  # Fix other incomplete sentences
-        summary_text = _remove_filler_phrases(summary_text)  # Remove filler phrases that slipped through
-        summary_text = _normalize_casing(summary_text)  # Convert shouty/all-caps body text to sentence case
+        summary_text = _fix_trailing_ellipsis(
+            summary_text
+        )  # Fix sentences ending with ...
+        summary_text = _validate_complete_sentences(
+            summary_text
+        )  # Fix other incomplete sentences
+        summary_text = _remove_filler_phrases(
+            summary_text
+        )  # Remove filler phrases that slipped through
+        summary_text = _normalize_casing(
+            summary_text
+        )  # Convert shouty/all-caps body text to sentence case
         summary_text = _strip_directive_lines(summary_text)
         summary_text = _dedupe_consecutive_sentences(summary_text)
         # NOTE: _ensure_required_sections() moved to end to avoid duplicate Closing Takeaway
         if target_length:
-            summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
+            summary_text = _finalize_length_band(
+                summary_text, target_length, tolerance=10
+            )
             # NOTE: Removed duplicate _ensure_required_sections() call here to avoid duplicate Closing Takeaway
-            summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
+            summary_text = _finalize_length_band(
+                summary_text, target_length, tolerance=10
+            )
             # Final pass to normalize headings and length in case prior rewrites removed structure
             summary_text = _fix_inline_section_headers(summary_text)
-            summary_text = _normalize_section_headings(summary_text, include_health_rating)
+            summary_text = _normalize_section_headings(
+                summary_text, include_health_rating
+            )
             summary_text = _ensure_required_sections(
                 summary_text,
                 include_health_rating=include_health_rating,
@@ -5065,9 +5750,18 @@ Before you output anything, verify:
                 health_rating_config=health_config,
                 persona_name=selected_persona_name,
             )
-            summary_text = _finalize_length_band(summary_text, target_length, tolerance=10)
-            summary_text = _force_final_band(summary_text, target_length, tolerance=10, allow_padding=False)
-            summary_text = _clamp_to_band(summary_text, target_length - 10, target_length + 10, allow_padding=False)
+            summary_text = _finalize_length_band(
+                summary_text, target_length, tolerance=10
+            )
+            summary_text = _force_final_band(
+                summary_text, target_length, tolerance=10, allow_padding=False
+            )
+            summary_text = _clamp_to_band(
+                summary_text,
+                target_length - 10,
+                target_length + 10,
+                allow_padding=False,
+            )
         else:
             # When no target_length, only backfill sections if the model produced headers
             if re.search(r"^\s*##\s", summary_text or "", re.MULTILINE):
@@ -5103,7 +5797,11 @@ Before you output anything, verify:
         # Use pre-calculated health score data (computed before summary generation)
         health_score_data = pre_calculated_health
         has_health_section = bool(
-            re.search(r"^\s*##\s*Financial Health Rating", summary_text or "", re.IGNORECASE | re.MULTILINE)
+            re.search(
+                r"^\s*##\s*Financial Health Rating",
+                summary_text or "",
+                re.IGNORECASE | re.MULTILINE,
+            )
         )
 
         # Final cleanup after any length adjustments to remove stray directives
@@ -5114,19 +5812,31 @@ Before you output anything, verify:
                 calculated_metrics,
                 company_name,
             )
-            summary_text = _inject_health_drivers(summary_text, calculated_metrics, health_score_data or {})
-        summary_text = _enforce_section_order(summary_text, include_health_rating=include_health_rating)
+            summary_text = _inject_health_drivers(
+                summary_text, calculated_metrics, health_score_data or {}
+            )
+        summary_text = _enforce_section_order(
+            summary_text, include_health_rating=include_health_rating
+        )
         summary_text = _strip_directive_lines(summary_text)
         summary_text = _dedupe_consecutive_sentences(summary_text)
         summary_text = _normalize_casing(summary_text)
         if target_length:
             # Re-enforce strict word band after cleanup; padding uses substantive templates
-            summary_text = _force_final_band(summary_text, target_length, tolerance=10, allow_padding=True)
-            summary_text = _clamp_to_band(summary_text, target_length - 10, target_length + 10, allow_padding=True)
+            summary_text = _force_final_band(
+                summary_text, target_length, tolerance=10, allow_padding=True
+            )
+            summary_text = _clamp_to_band(
+                summary_text, target_length - 10, target_length + 10, allow_padding=True
+            )
             # Final structural normalization in case clamps introduced inline headings
             summary_text = _fix_inline_section_headers(summary_text)
-            summary_text = _normalize_section_headings(summary_text, include_health_rating)
-            summary_text = _enforce_section_order(summary_text, include_health_rating=include_health_rating)
+            summary_text = _normalize_section_headings(
+                summary_text, include_health_rating
+            )
+            summary_text = _enforce_section_order(
+                summary_text, include_health_rating=include_health_rating
+            )
             summary_text = _normalize_casing(summary_text)
 
             # Extra guard for whitespace token counts (tests/UI count markdown tokens too)
@@ -5134,11 +5844,17 @@ Before you output anything, verify:
             ws_count = len(summary_text.split())
             if ws_count > ws_upper:
                 excess = ws_count - ws_upper
-                target_words = max(target_length - 10, _count_words(summary_text) - excess)
+                target_words = max(
+                    target_length - 10, _count_words(summary_text) - excess
+                )
                 summary_text = _truncate_text_to_word_limit(summary_text, target_words)
                 summary_text = _fix_inline_section_headers(summary_text)
-                summary_text = _normalize_section_headings(summary_text, include_health_rating)
-                summary_text = _enforce_section_order(summary_text, include_health_rating=include_health_rating)
+                summary_text = _normalize_section_headings(
+                    summary_text, include_health_rating
+                )
+                summary_text = _enforce_section_order(
+                    summary_text, include_health_rating=include_health_rating
+                )
 
         # Final backfill to guarantee Closing Takeaway and Key Metrics survive trims
         if target_length or re.search(r"^\s*##\s", summary_text or "", re.MULTILINE):
@@ -5152,12 +5868,20 @@ Before you output anything, verify:
                 health_rating_config=health_config,
                 persona_name=selected_persona_name,
             )
-            summary_text = _enforce_section_order(summary_text, include_health_rating=include_health_rating)
+            summary_text = _enforce_section_order(
+                summary_text, include_health_rating=include_health_rating
+            )
             if target_length:
-                summary_text = _force_final_band(summary_text, target_length, tolerance=10, allow_padding=True)
+                summary_text = _force_final_band(
+                    summary_text, target_length, tolerance=10, allow_padding=True
+                )
 
         # Final guard: ensure the document ends with punctuation for substantive outputs
-        if summary_text and _count_words(summary_text) >= 5 and not summary_text.rstrip().endswith((".", "!", "?")):
+        if (
+            summary_text
+            and _count_words(summary_text) >= 5
+            and not summary_text.rstrip().endswith((".", "!", "?"))
+        ):
             summary_text = summary_text.rstrip() + "."
 
         # Cache result
@@ -5165,28 +5889,46 @@ Before you output anything, verify:
             fallback_filing_summaries[str(filing_id)] = summary_text
 
         # Log the generation event (best-effort, should never fail the request).
-        _log_summary_generation_event(cached=False)
-        
+        record_summary_generated_event(
+            summary_id=str(filing_id),
+            company_id=str(company.get("id"))
+            if company and company.get("id")
+            else None,
+            kind=getattr(preferences, "mode", None),
+            cached=False,
+            source=context.get("source"),
+        )
+
         response_data = {
             "filing_id": filing_id,
             "summary": summary_text,
             "cached": False,
             "company_country": company.get("country"),
         }
-        
+
         if health_score_data:
             response_data["health_score"] = health_score_data.get("overall_score")
             response_data["health_band"] = health_score_data.get("score_band")
-            response_data["health_components"] = health_score_data.get("component_scores")
-            response_data["health_component_weights"] = health_score_data.get("component_weights")
-            response_data["health_component_descriptions"] = health_score_data.get("component_descriptions")
-            response_data["health_component_metrics"] = health_score_data.get("component_metrics")
-        
+            response_data["health_components"] = health_score_data.get(
+                "component_scores"
+            )
+            response_data["health_component_weights"] = health_score_data.get(
+                "component_weights"
+            )
+            response_data["health_component_descriptions"] = health_score_data.get(
+                "component_descriptions"
+            )
+            response_data["health_component_metrics"] = health_score_data.get(
+                "component_metrics"
+            )
+
         return JSONResponse(content=response_data)
-        
+
     except GeminiRateLimitError as rate_limit_exc:
         # Rate limit exceeded - return 429 with retry information
-        progress_cache[str(filing_id)] = "Rate limit exceeded - please retry in a moment"
+        progress_cache[str(filing_id)] = (
+            "Rate limit exceeded - please retry in a moment"
+        )
 
         retry_after_seconds = rate_limit_exc.retry_after or 60
         logger.warning(
@@ -5204,22 +5946,24 @@ Before you output anything, verify:
                 "message": "The AI service rate limit has been exceeded. Please wait and try again.",
                 "retry_after_seconds": retry_after_seconds,
                 "filing_id": str(filing_id),
-                "attempts_made": 5
-            }
+                "attempts_made": 5,
+            },
         ) from rate_limit_exc
 
     except GeminiTimeoutError as timeout_exc:
         # Request timed out
         progress_cache[str(filing_id)] = "Request timed out - please try again"
-        logger.error("Gemini request timed out for filing %s: %s", filing_id, timeout_exc)
+        logger.error(
+            "Gemini request timed out for filing %s: %s", filing_id, timeout_exc
+        )
 
         raise HTTPException(
             status_code=504,
             detail={
                 "error": "request_timeout",
                 "message": "The AI service took too long to respond. Try again or use a shorter summary length.",
-                "filing_id": str(filing_id)
-            }
+                "filing_id": str(filing_id),
+            },
         ) from timeout_exc
 
     except GeminiAPIError as api_exc:
@@ -5229,7 +5973,7 @@ Before you output anything, verify:
             "Gemini API error for filing %s: status=%s, message=%s",
             filing_id,
             api_exc.status_code,
-            str(api_exc)
+            str(api_exc),
         )
 
         # Map Gemini errors to appropriate HTTP codes
@@ -5242,7 +5986,9 @@ Before you output anything, verify:
             # Server error (5xx from Gemini)
             status_code = 502  # Bad Gateway
             error_type = "upstream_service_error"
-            user_message = "The AI service encountered an error. Please try again later."
+            user_message = (
+                "The AI service encountered an error. Please try again later."
+            )
 
         raise HTTPException(
             status_code=status_code,
@@ -5250,8 +5996,8 @@ Before you output anything, verify:
                 "error": error_type,
                 "message": user_message,
                 "filing_id": str(filing_id),
-                "upstream_status": api_exc.status_code
-            }
+                "upstream_status": api_exc.status_code,
+            },
         ) from api_exc
 
     except TimeoutError as timeout_exc:
@@ -5260,7 +6006,7 @@ Before you output anything, verify:
         logger.error(
             "Summary generation timed out for %s after %s seconds",
             filing_id,
-            SUMMARY_TOTAL_TIMEOUT_SECONDS
+            SUMMARY_TOTAL_TIMEOUT_SECONDS,
         )
 
         raise HTTPException(
@@ -5268,10 +6014,10 @@ Before you output anything, verify:
             detail={
                 "error": "generation_timeout",
                 "message": f"Summary generation exceeded {SUMMARY_TOTAL_TIMEOUT_SECONDS}s timeout. "
-                          "Try with default mode or shorter target length.",
+                "Try with default mode or shorter target length.",
                 "filing_id": str(filing_id),
-                "timeout_seconds": SUMMARY_TOTAL_TIMEOUT_SECONDS
-            }
+                "timeout_seconds": SUMMARY_TOTAL_TIMEOUT_SECONDS,
+            },
         ) from timeout_exc
 
     except Exception as unexpected_exc:
@@ -5281,15 +6027,17 @@ Before you output anything, verify:
             f.write(f"Type: {type(unexpected_exc)}\n")
             traceback.print_exc(file=f)
 
-        logger.exception(f"Unexpected error during summary generation for filing {filing_id}")
+        logger.exception(
+            f"Unexpected error during summary generation for filing {filing_id}"
+        )
 
         raise HTTPException(
             status_code=500,
             detail={
                 "error": "internal_error",
                 "message": "An unexpected error occurred. Our team has been notified.",
-                "filing_id": str(filing_id)
-            }
+                "filing_id": str(filing_id),
+            },
         )
 
 
@@ -5300,46 +6048,51 @@ async def parse_filing(filing_id: str):
     Returns a task ID for tracking progress.
     """
     from app.tasks.parse import parse_document_task
-    
+
     settings = get_settings()
 
     if not _supabase_configured(settings):
-        raise HTTPException(status_code=404, detail="Filings not available without Supabase configuration")
+        raise HTTPException(
+            status_code=404,
+            detail="Filings not available without Supabase configuration",
+        )
 
     supabase = get_supabase_client()
-    
+
     # Verify filing exists
     try:
-        filing_response = supabase.table("filings").select("*").eq("id", filing_id).execute()
+        filing_response = (
+            supabase.table("filings").select("*").eq("id", filing_id).execute()
+        )
         if not filing_response.data:
             raise HTTPException(status_code=404, detail="Filing not found")
-        
+
         filing = filing_response.data[0]
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error verifying filing: {str(e)}")
-    
+
     # Create task
     try:
         task = parse_document_task.delay(filing_id=filing_id)
-        
+
         # Store task status
         task_data = {
             "task_id": task.id,
             "task_type": "parse_document",
             "status": "pending",
-            "progress": 0
+            "progress": 0,
         }
         supabase.table("task_status").insert(task_data).execute()
-        
-        return {
-            "task_id": task.id,
-            "message": f"Started parsing filing {filing_id}"
-        }
-    
+
+        return {"task_id": task.id, "message": f"Started parsing filing {filing_id}"}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error starting parse task: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error starting parse task: {str(e)}"
+        )
+
 
 WORD_COUNT_PATTERN = re.compile(r"WORD\s+COUNT:\s*(\d+)\s*$", re.IGNORECASE)
 
@@ -5364,12 +6117,11 @@ def _normalize_casing(summary_text: str) -> str:
     Convert shouty/all-caps body lines to sentence case while preserving headings.
     Only adjusts lines where most alphabetic characters are uppercase.
     """
+
     def _sentence_case(line: str) -> str:
         lowered = line.lower()
         return re.sub(
-            r'(^|[\.!?])\s*([A-Z])',
-            lambda m: m.group(1) + m.group(2).upper(),
-            lowered
+            r"(^|[\.!?])\s*([A-Z])", lambda m: m.group(1) + m.group(2).upper(), lowered
         )
 
     normalized_lines: List[str] = []
@@ -5377,7 +6129,7 @@ def _normalize_casing(summary_text: str) -> str:
         if line.strip().startswith("##"):
             normalized_lines.append(line)
             continue
-        letters_only = ''.join(c for c in line if c.isalpha())
+        letters_only = "".join(c for c in line if c.isalpha())
         if not letters_only:
             normalized_lines.append(line)
             continue
@@ -5396,19 +6148,19 @@ def _strip_directive_lines(text: str) -> str:
     Remove residual directive lines (e.g., "Add liquidity...", "Expand margin...") that degrade quality.
     """
     directive_patterns = [
-        r'^\s*Add liquidity and leverage observations',
-        r'^\s*Tie capital deployment',
-        r'^\s*Clarify risk scenarios',
-        r'^\s*Expand margin and cash conversion commentary',
-        r'^\s*Anchor valuation view',
-        r'^\s*Discuss competitive position',
-        r'^\s*Highlight how revenue growth translated into operating margin movement',
-        r'^\s*Highlight how leverage and liquidity shape flexibility',
-        r'^\s*Address how leverage and liquidity shape flexibility',
-        r'^\s*Call out whether cash conversion improved quarter over quarter and why',
-        r'^\s*Point to the key catalyst or risk that could change the rating in the next 12 months',
-        r'^\s*Emphasize what the market may be underpricing about cash generation durability',
-        r'^\s*Note any mix shift between Mobility and Delivery that affected unit economics',
+        r"^\s*Add liquidity and leverage observations",
+        r"^\s*Tie capital deployment",
+        r"^\s*Clarify risk scenarios",
+        r"^\s*Expand margin and cash conversion commentary",
+        r"^\s*Anchor valuation view",
+        r"^\s*Discuss competitive position",
+        r"^\s*Highlight how revenue growth translated into operating margin movement",
+        r"^\s*Highlight how leverage and liquidity shape flexibility",
+        r"^\s*Address how leverage and liquidity shape flexibility",
+        r"^\s*Call out whether cash conversion improved quarter over quarter and why",
+        r"^\s*Point to the key catalyst or risk that could change the rating in the next 12 months",
+        r"^\s*Emphasize what the market may be underpricing about cash generation durability",
+        r"^\s*Note any mix shift between Mobility and Delivery that affected unit economics",
     ]
     compiled = [re.compile(pat, re.IGNORECASE) for pat in directive_patterns]
     cleaned_lines: List[str] = []
@@ -5420,27 +6172,27 @@ def _strip_directive_lines(text: str) -> str:
 
     # Remove lingering directive sentences even if embedded mid-paragraph
     phrase_patterns = [
-        r'Highlight how revenue growth translated into operating margin movement over the latest period\.?',
-        r'Call out whether cash conversion improved quarter over quarter and why\.?',
-        r'Note any mix shift between Mobility and Delivery that affected unit economics\.?',
-        r'Address how leverage and liquidity shape flexibility for capital deployment\.?',
-        r'Point to the key catalyst or risk that could change the rating in the next 12 months\.?',
-        r'Emphasize what the market may be underpricing about cash generation durability\.?',
+        r"Highlight how revenue growth translated into operating margin movement over the latest period\.?",
+        r"Call out whether cash conversion improved quarter over quarter and why\.?",
+        r"Note any mix shift between Mobility and Delivery that affected unit economics\.?",
+        r"Address how leverage and liquidity shape flexibility for capital deployment\.?",
+        r"Point to the key catalyst or risk that could change the rating in the next 12 months\.?",
+        r"Emphasize what the market may be underpricing about cash generation durability\.?",
     ]
     for pat in phrase_patterns:
-        cleaned = re.sub(pat, '', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
 
     # Remove standalone imperative lines or bullets that start with directive verbs
     cleaned = re.sub(
-        r'^\s*(?:[-•→]?\s*)?(?:Highlight|Call out|Note|Address|Point to|Emphasize)\b[^\n]*',
-        '',
+        r"^\s*(?:[-•→]?\s*)?(?:Highlight|Call out|Note|Address|Point to|Emphasize)\b[^\n]*",
+        "",
         cleaned,
         flags=re.IGNORECASE | re.MULTILINE,
     )
 
     # Tidy up extra whitespace left after removals
-    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
-    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned.strip()
 
 
@@ -5462,7 +6214,7 @@ def _dedupe_consecutive_sentences(text: str) -> str:
             prev_norm = None
             continue
 
-        sentences = re.split(r'(?<=[.!?])\s+', stripped)
+        sentences = re.split(r"(?<=[.!?])\s+", stripped)
         unique: List[str] = []
         for sent in sentences:
             norm = " ".join(sent.lower().split())
@@ -5476,14 +6228,16 @@ def _dedupe_consecutive_sentences(text: str) -> str:
 
 def _normalize_section_headings(text: str, include_health_rating: bool) -> str:
     """Ensure each required section begins with the expected markdown heading on its own line.
-    
+
     This handles cases where:
     1. Headers appear inline with content (e.g., "...business. ## Executive Summary As Bill...")
     2. Headers are missing the ## prefix
     3. Headers have extra whitespace or formatting issues
     """
     required_titles = [
-        title for title, _ in SUMMARY_SECTION_REQUIREMENTS if title != "Financial Health Rating"
+        title
+        for title, _ in SUMMARY_SECTION_REQUIREMENTS
+        if title != "Financial Health Rating"
     ]
     if include_health_rating:
         required_titles = [title for title, _ in SUMMARY_SECTION_REQUIREMENTS]
@@ -5497,7 +6251,11 @@ def _normalize_section_headings(text: str, include_health_rating: bool) -> str:
         if stripped.lower() in {"f", "e", "m", "r", "s", "k"} and idx + 1 < len(lines):
             next_line = lines[idx + 1].strip()
             target_match = next(
-                (heading for heading in required_titles if next_line.lower().startswith(heading.lower())),
+                (
+                    heading
+                    for heading in required_titles
+                    if next_line.lower().startswith(heading.lower())
+                ),
                 None,
             )
             if target_match:
@@ -5507,7 +6265,7 @@ def _normalize_section_headings(text: str, include_health_rating: bool) -> str:
         idx += 1
 
     normalized_text = "\n".join(normalized_lines)
-    
+
     # CRITICAL: First, handle INLINE section headers (headers appearing mid-line)
     # This catches patterns like "...business. ## Executive Summary As Bill..."
     # and splits them into proper separate lines
@@ -5515,54 +6273,61 @@ def _normalize_section_headings(text: str, include_health_rating: bool) -> str:
         # Pattern to find inline headers: text before + ## Title + trailing content
         # IMPORTANT: Capture the first character after the title to preserve content
         inline_pattern = re.compile(
-            rf'([.!?])\s*(?:##?\s*)?({re.escape(title)})\s*(\S)',
-            re.IGNORECASE
+            rf"([.!?])\s*(?:##?\s*)?({re.escape(title)})\s*(\S)", re.IGNORECASE
         )
         # Replace with: punctuation + double newline + ## Title + double newline + preserved trailing char
         normalized_text = inline_pattern.sub(
-            lambda m: f'{m.group(1)}\n\n## {title}\n\n{m.group(3)}',
-            normalized_text
+            lambda m: f"{m.group(1)}\n\n## {title}\n\n{m.group(3)}", normalized_text
         )
-    
+
     # Also handle cases where the header appears without preceding punctuation but inline
     # e.g., "some text ## Executive Summary more text"
     for title in required_titles:
         inline_no_punct_pattern = re.compile(
-            rf'(\S)\s+(?:##?\s*)({re.escape(title)})\s+(\S)',
-            re.IGNORECASE
+            rf"(\S)\s+(?:##?\s*)({re.escape(title)})\s+(\S)", re.IGNORECASE
         )
         normalized_text = inline_no_punct_pattern.sub(
-            lambda m: f'{m.group(1)}\n\n## {title}\n\n{m.group(3)}',
-            normalized_text
+            lambda m: f"{m.group(1)}\n\n## {title}\n\n{m.group(3)}", normalized_text
         )
 
     # Now normalize headers that are on their own lines but might be missing ##
     for title in required_titles:
-        pattern = re.compile(rf"(^|\n)\s*(?:##\s*)?{re.escape(title)}\s*(?:\n|$)", re.IGNORECASE | re.MULTILINE)
-        normalized_text = pattern.sub(lambda _: f"\n\n## {title}\n\n", normalized_text, count=1)
-    
+        pattern = re.compile(
+            rf"(^|\n)\s*(?:##\s*)?{re.escape(title)}\s*(?:\n|$)",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        normalized_text = pattern.sub(
+            lambda _: f"\n\n## {title}\n\n", normalized_text, count=1
+        )
+
     # Clean up any excessive newlines (more than 2 consecutive)
-    normalized_text = re.sub(r'\n{4,}', '\n\n\n', normalized_text)
-    
+    normalized_text = re.sub(r"\n{4,}", "\n\n\n", normalized_text)
+
     # Ensure headers have exactly one blank line before and after
     for title in required_titles:
         # Fix cases where header doesn't have proper spacing
         header_spacing_pattern = re.compile(
-            rf'([^\n])(\n*)(\s*##\s*{re.escape(title)})(\n*)([^\n])',
-            re.IGNORECASE
+            rf"([^\n])(\n*)(\s*##\s*{re.escape(title)})(\n*)([^\n])", re.IGNORECASE
         )
+
         def ensure_spacing(m):
             before_char = m.group(1)
-            before_newlines = '\n\n' if before_char not in '\n' else ''
-            after_newlines = '\n\n'
+            before_newlines = "\n\n" if before_char not in "\n" else ""
+            after_newlines = "\n\n"
             after_char = m.group(5)
-            return f'{before_char}{before_newlines}## {title}{after_newlines}{after_char}'
-        
+            return (
+                f"{before_char}{before_newlines}## {title}{after_newlines}{after_char}"
+            )
+
         normalized_text = header_spacing_pattern.sub(ensure_spacing, normalized_text)
-    
+
     # Final cleanup: ensure no header is followed immediately by another header without content
-    normalized_text = re.sub(r'(## [^\n]+)\n\n(## )', r'\1\n\n[Section content pending]\n\n\2', normalized_text)
-    
+    normalized_text = re.sub(
+        r"(## [^\n]+)\n\n(## )",
+        r"\1\n\n[Section content pending]\n\n\2",
+        normalized_text,
+    )
+
     return normalized_text.strip()
 
 
@@ -5670,7 +6435,7 @@ def _generate_fallback_closing_takeaway(
     persona_name: Optional[str] = None,
 ) -> str:
     """Generate a substantive closing takeaway from available financial metrics.
-    
+
     This provides a data-driven conclusion when the AI fails to generate one.
     If a persona is selected, the output is styled to match that persona's voice.
     """
@@ -5679,13 +6444,17 @@ def _generate_fallback_closing_takeaway(
     net_margin = calculated_metrics.get("net_margin")
     free_cash_flow = calculated_metrics.get("free_cash_flow")
     cash = calculated_metrics.get("cash")
-    total_debt = calculated_metrics.get("total_debt") or calculated_metrics.get("total_liabilities")
-    revenue = calculated_metrics.get("revenue") or calculated_metrics.get("total_revenue")
-    
+    total_debt = calculated_metrics.get("total_debt") or calculated_metrics.get(
+        "total_liabilities"
+    )
+    revenue = calculated_metrics.get("revenue") or calculated_metrics.get(
+        "total_revenue"
+    )
+
     # Assess overall financial quality
     strengths = []
     concerns = []
-    
+
     # Profitability assessment
     if operating_margin is not None:
         if operating_margin > 25:
@@ -5694,7 +6463,7 @@ def _generate_fallback_closing_takeaway(
             strengths.append("solid profitability")
         elif operating_margin < 5:
             concerns.append("thin margins")
-    
+
     # Cash flow assessment
     if free_cash_flow is not None:
         if free_cash_flow > 0:
@@ -5705,14 +6474,14 @@ def _generate_fallback_closing_takeaway(
                 strengths.append("positive free cash flow")
         else:
             concerns.append("negative free cash flow")
-    
+
     # Balance sheet assessment
     if cash is not None and total_debt is not None:
         if cash > total_debt:
             strengths.append("net cash position")
         elif total_debt > cash * 3:
             concerns.append("elevated leverage")
-    
+
     # Determine quality assessment
     if strengths and not concerns:
         quality = "high-quality" if len(strengths) >= 2 else "solid"
@@ -5730,7 +6499,7 @@ def _generate_fallback_closing_takeaway(
         quality = "uncertain"
         is_positive = False
         is_mixed = False
-    
+
     # Persona-specific closing templates
     if persona_name and persona_name in PERSONA_CLOSING_INSTRUCTIONS:
         closing = _generate_persona_flavored_closing(
@@ -5748,7 +6517,11 @@ def _generate_fallback_closing_takeaway(
 
     # Generic fallback (no persona selected) - concise but complete (~40-50 words)
     rng = random.Random(uuid4().int)
-    strengths_str = " and ".join(strengths[:2]) if strengths else "limited visibility into fundamentals"
+    strengths_str = (
+        " and ".join(strengths[:2])
+        if strengths
+        else "limited visibility into fundamentals"
+    )
     concerns_str = " and ".join(concerns[:2]) if concerns else "no major red flags"
     rev_str = _format_dollar(revenue) if revenue else None
 
@@ -5822,11 +6595,17 @@ def _generate_persona_flavored_closing(
     operating_margin: Optional[float],
 ) -> str:
     """Generate a closing takeaway in the voice of the selected persona."""
-    
-    strengths_str = " and ".join(strengths[:2]) if strengths else "limited visibility into fundamentals"
+
+    strengths_str = (
+        " and ".join(strengths[:2])
+        if strengths
+        else "limited visibility into fundamentals"
+    )
     concerns_str = " and ".join(concerns[:2]) if concerns else "no major red flags"
-    margin_str = f"{operating_margin:.1f}%" if operating_margin else "undisclosed margins"
-    
+    margin_str = (
+        f"{operating_margin:.1f}%" if operating_margin else "undisclosed margins"
+    )
+
     if persona_name == "Warren Buffett":
         if is_positive:
             return (
@@ -5844,7 +6623,7 @@ def _generate_persona_flavored_closing(
                 f"I struggle to understand the long-term economics here. {company_name} faces {concerns_str}, "
                 f"which makes it difficult to assess the durability of any moat. I would pass and wait for a better opportunity."
             )
-    
+
     elif persona_name == "Charlie Munger":
         if is_positive:
             return (
@@ -5862,7 +6641,7 @@ def _generate_persona_flavored_closing(
                 f"Avoid this one. {company_name} has {concerns_str}—the kind of structural issues that tend to compound. "
                 f"There are simpler, better businesses to own."
             )
-    
+
     elif persona_name == "Benjamin Graham":
         if is_positive:
             return (
@@ -5880,7 +6659,7 @@ def _generate_persona_flavored_closing(
                 f"The margin of safety is insufficient. {company_name} shows {concerns_str}, "
                 f"leaving limited downside protection. This is speculation, not investment."
             )
-    
+
     elif persona_name == "Peter Lynch":
         if is_positive:
             return (
@@ -5897,7 +6676,7 @@ def _generate_persona_flavored_closing(
                 f"{company_name} doesn't fit my playbook. With {concerns_str}, the story here is more turnaround than growth. "
                 f"I would rather find a company where the growth is already visible."
             )
-    
+
     elif persona_name == "Ray Dalio":
         if is_positive:
             return (
@@ -5914,7 +6693,7 @@ def _generate_persona_flavored_closing(
                 f"The economic machine suggests caution. {company_name} faces {concerns_str}, "
                 f"which could amplify in a deleveraging scenario. Risk parity considerations favor underweight or avoidance."
             )
-    
+
     elif persona_name == "Cathie Wood":
         if is_positive:
             return (
@@ -5931,7 +6710,7 @@ def _generate_persona_flavored_closing(
                 f"{company_name} faces {concerns_str}, which constrains its ability to invest in disruptive innovation. "
                 f"Without clear technology catalysts, I would look elsewhere for exponential growth opportunities."
             )
-    
+
     elif persona_name == "Joel Greenblatt":
         if is_positive:
             return (
@@ -5948,7 +6727,7 @@ def _generate_persona_flavored_closing(
                 f"The Magic Formula doesn't favor {company_name} here. With {concerns_str}, "
                 f"the return on capital or earnings yield is insufficient. Pass."
             )
-    
+
     elif persona_name == "John Bogle":
         if is_positive:
             return (
@@ -5969,7 +6748,7 @@ def _generate_persona_flavored_closing(
                 f"For individual stock holders, I would SELL or avoid entirely. These challenges underscore why I believe in index investing. "
                 f"Only a dramatic improvement in fundamentals would change my view. Stay the course with the index fund."
             )
-    
+
     elif persona_name == "Howard Marks":
         if is_positive:
             return (
@@ -5986,7 +6765,7 @@ def _generate_persona_flavored_closing(
                 f"The risk here is not being adequately compensated. {company_name} shows {concerns_str}, "
                 f"and the pendulum of sentiment may have further to fall. I would wait for better asymmetry."
             )
-    
+
     elif persona_name == "Bill Ackman":
         if is_positive:
             return (
@@ -6003,7 +6782,7 @@ def _generate_persona_flavored_closing(
                 f"{company_name} is not the kind of simple, predictable business I favor. With {concerns_str}, "
                 f"there's no clear catalyst to unlock value. I would pass."
             )
-    
+
     # Fallback if persona not matched (shouldn't happen given the check above)
     return f"{company_name} requires further analysis to form a definitive investment view."
 
@@ -6061,7 +6840,9 @@ def _ensure_required_sections(
 
     # 1. Financial Health Rating - only add if we have actual data
     if include_health_rating and not _section_present("Financial Health Rating"):
-        score_match = re.search(r"Financial Health Rating[:\s]+(\d{1,3})", text, re.IGNORECASE)
+        score_match = re.search(
+            r"Financial Health Rating[:\s]+(\d{1,3})", text, re.IGNORECASE
+        )
         if score_match:
             health_score_val = float(score_match.group(1))
         else:
@@ -6070,7 +6851,9 @@ def _ensure_required_sections(
         label = _get_score_label(health_score_val)
         fcf_str = _format_number_or_default(calculated_metrics.get("free_cash_flow"))
         cash_str = _format_number_or_default(calculated_metrics.get("cash"))
-        liabilities_str = _format_number_or_default(calculated_metrics.get("total_liabilities"))
+        liabilities_str = _format_number_or_default(
+            calculated_metrics.get("total_liabilities")
+        )
 
         body = f"{company_name} receives a Financial Health Rating of {health_score_val:.0f}/100 - {label}."
 
@@ -6096,27 +6879,49 @@ def _ensure_required_sections(
         net_margin_match = re.search(r"Net Margin[:\s]+([-\d.]+)%", metrics_lines)
         fcf_match = re.search(r"Free Cash Flow[:\s]+\$?([\d.,]+)", metrics_lines)
         ocf_match = re.search(r"Operating Cash Flow[:\s]+\$?([\d.,]+)", metrics_lines)
-        capex_match = re.search(r"Capital Expenditures[:\s]+\$?([\d.,]+)", metrics_lines)
+        capex_match = re.search(
+            r"Capital Expenditures[:\s]+\$?([\d.,]+)", metrics_lines
+        )
 
         if rev_match and op_inc_match:
             parts.append(
                 f"Revenue of ${rev_match.group(1)} with operating income of ${op_inc_match.group(1)} frames current scale."
             )
         if op_margin_match:
-            parts.append(f"Operating margin of {op_margin_match.group(1)}% shows core profitability.")
+            parts.append(
+                f"Operating margin of {op_margin_match.group(1)}% shows core profitability."
+            )
         if net_margin_match:
-            parts.append(f"Net margin of {net_margin_match.group(1)}% highlights the impact of below-the-line items.")
+            parts.append(
+                f"Net margin of {net_margin_match.group(1)}% highlights the impact of below-the-line items."
+            )
         if ocf_match:
             ocf = ocf_match.group(1)
-            fcf_text = f"free cash flow of ${fcf_match.group(1)}" if fcf_match else "free cash flow not provided"
-            capex_text = f"capex of ${capex_match.group(1)}" if capex_match else "capex not disclosed"
-            parts.append(f"Operating cash flow of ${ocf} converts to {fcf_text} with {capex_text}.")
+            fcf_text = (
+                f"free cash flow of ${fcf_match.group(1)}"
+                if fcf_match
+                else "free cash flow not provided"
+            )
+            capex_text = (
+                f"capex of ${capex_match.group(1)}"
+                if capex_match
+                else "capex not disclosed"
+            )
+            parts.append(
+                f"Operating cash flow of ${ocf} converts to {fcf_text} with {capex_text}."
+            )
         elif fcf_match:
-            parts.append(f"Free cash flow of ${fcf_match.group(1)} suggests healthy cash conversion.")
+            parts.append(
+                f"Free cash flow of ${fcf_match.group(1)} suggests healthy cash conversion."
+            )
 
         if not parts:
-            parts.append("Financial performance commentary not provided in the draft; add revenue, margin, and cash flow context.")
-        parts.append("Connect revenue trends to margin direction and cash conversion to show sustainability.")
+            parts.append(
+                "Financial performance commentary not provided in the draft; add revenue, margin, and cash flow context."
+            )
+        parts.append(
+            "Connect revenue trends to margin direction and cash conversion to show sustainability."
+        )
         return " ".join(parts)
 
     def _has_numeric_content(section_body: str) -> bool:
@@ -6124,13 +6929,19 @@ def _ensure_required_sections(
 
     def _synthesize_mdna() -> str:
         lines: List[str] = []
-        lines.append(f"Management discussion should focus on how {company_name} is deploying capital and managing cost levers.")
+        lines.append(
+            f"Management discussion should focus on how {company_name} is deploying capital and managing cost levers."
+        )
         if calculated_metrics.get("operating_cash_flow") is not None:
             lines.append(
                 f"Reference operating cash flow of {_format_metric_value('operating_cash_flow', calculated_metrics.get('operating_cash_flow'))} to anchor guidance credibility."
             )
-        lines.append("Flag any gaps between stated strategy and the reported operating margin trajectory.")
-        lines.append("Call out liquidity and debt maturity profile if leverage is material.")
+        lines.append(
+            "Flag any gaps between stated strategy and the reported operating margin trajectory."
+        )
+        lines.append(
+            "Call out liquidity and debt maturity profile if leverage is material."
+        )
         return " ".join(lines)
 
     # Add minimal Financial Performance and MD&A sections if the model omitted them
@@ -6138,12 +6949,19 @@ def _ensure_required_sections(
         _append_section("Financial Performance", _synthesize_financial_performance())
     else:
         # If section exists but lacks numbers, append a concise metric summary
-        fp_match = re.search(r'##\s*Financial Performance\s*\n+([\s\S]*?)(?=\n##\s|\Z)', text, re.IGNORECASE)
+        fp_match = re.search(
+            r"##\s*Financial Performance\s*\n+([\s\S]*?)(?=\n##\s|\Z)",
+            text,
+            re.IGNORECASE,
+        )
         if fp_match:
             body = fp_match.group(1).strip()
             if not _has_numeric_content(body):
                 supplement = _synthesize_financial_performance()
-                text = text.replace(fp_match.group(0), f"## Financial Performance\n{body}\n\n{supplement}\n")
+                text = text.replace(
+                    fp_match.group(0),
+                    f"## Financial Performance\n{body}\n\n{supplement}\n",
+                )
 
     if not _section_present("Management Discussion & Analysis"):
         _append_section("Management Discussion & Analysis", _synthesize_mdna())
@@ -6151,8 +6969,14 @@ def _ensure_required_sections(
     # 6. Key Metrics - always useful to include a factual appendix
     if not _section_present("Key Metrics") and metrics_lines.strip():
         body = metrics_lines.strip()
-        if include_health_rating and health_score_data and "Health Score Drivers" not in body:
-            drivers_block = _build_health_driver_block(calculated_metrics, health_score_data)
+        if (
+            include_health_rating
+            and health_score_data
+            and "Health Score Drivers" not in body
+        ):
+            drivers_block = _build_health_driver_block(
+                calculated_metrics, health_score_data
+            )
             if drivers_block:
                 body = f"{body}\n\n{drivers_block}".strip()
         _append_section("Key Metrics", body)
@@ -6162,22 +6986,26 @@ def _ensure_required_sections(
     # Also replace if the existing one is under the minimum word count
     # Pass persona_name to maintain persona voice in fallback
     min_closing_words = SUMMARY_SECTION_MIN_WORDS.get("Closing Takeaway", 75)
-    
+
     # Check if closing takeaway exists and count its words
     existing_closing = None
-    closing_match = re.search(r'##\s*Closing\s+Takeaway\s*\n+([\s\S]*?)(?=\n##\s|\Z)', text, re.IGNORECASE)
+    closing_match = re.search(
+        r"##\s*Closing\s+Takeaway\s*\n+([\s\S]*?)(?=\n##\s|\Z)", text, re.IGNORECASE
+    )
     if closing_match:
         existing_closing = closing_match.group(1).strip()
         existing_word_count = len(existing_closing.split())
         # If persona is selected but the closing lacks an explicit personal verdict, add one
-        if persona_name and not re.search(r"\bi\s+personally\s+would\b", existing_closing, re.IGNORECASE):
+        if persona_name and not re.search(
+            r"\bi\s+personally\s+would\b", existing_closing, re.IGNORECASE
+        ):
             # Determine buy/hold/sell based on actual metrics
             verdict_strengths = []
             verdict_concerns = []
             if calculated_metrics:
-                op_margin = calculated_metrics.get('operating_margin', 0)
-                net_margin = calculated_metrics.get('net_margin', 0)
-                fcf = calculated_metrics.get('free_cash_flow', 0)
+                op_margin = calculated_metrics.get("operating_margin", 0)
+                net_margin = calculated_metrics.get("net_margin", 0)
+                fcf = calculated_metrics.get("free_cash_flow", 0)
                 if op_margin and op_margin > 15:
                     verdict_strengths.append("strong operating margin")
                 if net_margin and net_margin > 10:
@@ -6188,10 +7016,15 @@ def _ensure_required_sections(
                     verdict_concerns.append("thin margins")
                 if net_margin and net_margin < 0:
                     verdict_concerns.append("net losses")
-            patched = _ensure_personal_verdict(existing_closing, company_name, strengths=verdict_strengths, concerns=verdict_concerns)
+            patched = _ensure_personal_verdict(
+                existing_closing,
+                company_name,
+                strengths=verdict_strengths,
+                concerns=verdict_concerns,
+            )
             # Use a function replacement to avoid backreference/template parsing issues
             text = re.sub(
-                r'##\s*Closing\s+Takeaway\s*\n+[\s\S]*?(?=\n##\s|\Z)',
+                r"##\s*Closing\s+Takeaway\s*\n+[\s\S]*?(?=\n##\s|\Z)",
                 lambda _m: f"## Closing Takeaway\n{patched}\n",
                 text,
                 flags=re.IGNORECASE,
@@ -6201,13 +7034,18 @@ def _ensure_required_sections(
     else:
         existing_word_count = 0
 
-    if not _section_present("Closing Takeaway") or existing_word_count < min_closing_words:
-        closing_body = _generate_fallback_closing_takeaway(company_name, calculated_metrics, persona_name)
+    if (
+        not _section_present("Closing Takeaway")
+        or existing_word_count < min_closing_words
+    ):
+        closing_body = _generate_fallback_closing_takeaway(
+            company_name, calculated_metrics, persona_name
+        )
         if existing_closing and existing_word_count < min_closing_words:
             # Remove the short closing takeaway and replace it
             text = re.sub(
-                r'##\s*Closing\s+Takeaway\s*\n+[\s\S]*?(?=\n##\s|\Z)',
-                '',
+                r"##\s*Closing\s+Takeaway\s*\n+[\s\S]*?(?=\n##\s|\Z)",
+                "",
                 text,
                 flags=re.IGNORECASE,
             )
@@ -6217,11 +7055,13 @@ def _ensure_required_sections(
     if metrics_lines.strip() and _section_present("Key Metrics"):
         desired_body = metrics_lines.strip()
         if include_health_rating and health_score_data:
-            drivers_block = _build_health_driver_block(calculated_metrics, health_score_data)
+            drivers_block = _build_health_driver_block(
+                calculated_metrics, health_score_data
+            )
             if drivers_block and "Health Score Drivers" not in desired_body:
                 desired_body = f"{desired_body}\n\n{drivers_block}".strip()
         km_pattern = re.compile(
-            r'##\s*(Key Metrics|Key Data Appendix)\s*\n+[\s\S]*?(?=\n##\s|\Z)',
+            r"##\s*(Key Metrics|Key Data Appendix)\s*\n+[\s\S]*?(?=\n##\s|\Z)",
             re.IGNORECASE,
         )
         text = km_pattern.sub(f"## Key Metrics\n{desired_body}\n", text)
@@ -6235,6 +7075,7 @@ async def get_filing_summary_progress(filing_id: str):
     status = progress_cache.get(str(filing_id), "Initializing...")
     return {"status": status}
 
+
 @router.get("/{filing_id}/health")
 async def get_filing_health(filing_id: str):
     """Get health score for a filing."""
@@ -6243,11 +7084,11 @@ async def get_filing_health(filing_id: str):
         context = _resolve_filing_context(filing_id, settings)
         filing = context["filing"]
         company = context["company"]
-        
+
         # Get document content
         local_document = _ensure_local_document(context, settings)
         statements = fallback_financial_statements.get(str(filing_id))
-        
+
         if not statements:
             # Fallback to financial statements
             try:
@@ -6261,28 +7102,36 @@ async def get_filing_health(filing_id: str):
                 if statement_response.data:
                     statements = statement_response.data[0]
             except Exception as exc:
-                logger.warning(f"Failed to load financial statements for {filing_id}: {exc}")
-        
+                logger.warning(
+                    f"Failed to load financial statements for {filing_id}: {exc}"
+                )
+
         if not statements:
-            return JSONResponse(content={"error": "No financial data available for health scoring"})
-        
+            return JSONResponse(
+                content={"error": "No financial data available for health scoring"}
+            )
+
         # Extract calculated metrics
         calculated_metrics = _build_calculated_metrics(statements)
-        
+
         # Compute health score
         health_data = _compute_health_score_data(calculated_metrics)
-        
-        return JSONResponse(content={
-            "filing_id": filing_id,
-            "company": company.get("name"),
-            "health_score": health_data.get("overall_score"),
-            "health_band": health_data.get("score_band"),
-            "health_components": health_data.get("component_scores"),
-            "health_component_weights": health_data.get("component_weights"),
-            "health_component_descriptions": health_data.get("component_descriptions"),
-            "health_component_metrics": health_data.get("component_metrics"),
-            "calculated_metrics": calculated_metrics
-        })
+
+        return JSONResponse(
+            content={
+                "filing_id": filing_id,
+                "company": company.get("name"),
+                "health_score": health_data.get("overall_score"),
+                "health_band": health_data.get("score_band"),
+                "health_components": health_data.get("component_scores"),
+                "health_component_weights": health_data.get("component_weights"),
+                "health_component_descriptions": health_data.get(
+                    "component_descriptions"
+                ),
+                "health_component_metrics": health_data.get("component_metrics"),
+                "calculated_metrics": calculated_metrics,
+            }
+        )
     except Exception as exc:
         logger.error(f"Error getting filing health: {exc}")
         return JSONResponse(content={"error": str(exc)}, status_code=500)

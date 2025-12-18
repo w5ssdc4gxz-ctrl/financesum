@@ -24,6 +24,7 @@ from app.services.local_cache import (
     fallback_financial_statements,
     fallback_task_status,
 )
+from app.services.summary_activity import record_summary_generated_event
 from app.services.ratio_calculator import calculate_ratios
 from app.services.sample_data import sample_filings_by_ticker
 from app.services.gemini_client import get_gemini_client
@@ -96,6 +97,25 @@ def run_analysis(request: AnalysisRunRequest) -> AnalysisRunResponse:
             generated_at=now,
         )
         fallback_task_status[task_record["task_id"]] = task_record
+
+        # Track the completed summaries (main + any persona views). Best-effort only.
+        record_summary_generated_event(
+            summary_id=analysis_id,
+            company_id=company_id,
+            kind="analysis",
+            cached=False,
+            source="fallback",
+        )
+        persona_summaries = analysis_record.get("investor_persona_summaries") or {}
+        if isinstance(persona_summaries, dict):
+            for persona_id in persona_summaries.keys():
+                record_summary_generated_event(
+                    summary_id=f"{analysis_id}:{persona_id}",
+                    company_id=company_id,
+                    kind="analysis_persona",
+                    cached=False,
+                    source="fallback",
+                )
 
         return AnalysisRunResponse(
             analysis_id=analysis_id,

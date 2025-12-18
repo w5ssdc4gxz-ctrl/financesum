@@ -193,7 +193,8 @@ export function useDashboardData() {
     let cancelled = false
     const fetchOverview = async () => {
       try {
-        const response = await dashboardApi.overview()
+        const tzOffsetMinutes = new Date().getTimezoneOffset()
+        const response = await dashboardApi.overview({ tz_offset_minutes: tzOffsetMinutes })
         if (cancelled) return
         const payload = response.data ?? {}
 

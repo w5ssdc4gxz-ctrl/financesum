@@ -16,7 +16,7 @@ export default function SignupPage() {
     <div className="relative min-h-screen overflow-hidden bg-[#050015] text-white">
       <LayeredScrollBackground />
       <div className="relative z-10">
-        <Navbar />
+        <Navbar variant="dark" />
         <main className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-16">
           <motion.div
             className="grid gap-10 rounded-[40px] border border-white/10 bg-white/5 p-8 shadow-[0_35px_120px_rgba(5,0,21,0.55)] lg:grid-cols-[1.1fr,0.9fr]"
