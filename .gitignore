@@ -31,9 +31,12 @@ wheels/
 .env.test.local
 .env.production.local
 frontend/.env.local
+.financesum_backend.pid
+.financesum_frontend.pid
 
 # Next.js
 .next/
+.next-dev/
 out/
 .vercel
 
@@ -73,4 +76,3 @@ temp/
 
 # Redis
 dump.rdb
-

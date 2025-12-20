@@ -8,7 +8,42 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent
-ROOT_DIR = BASE_DIR.parent.parent
+BACKEND_DIR = BASE_DIR.parent.parent
+REPO_ROOT_DIR = BACKEND_DIR.parent
+
+ENV_FILES = [
+    REPO_ROOT_DIR / ".env",
+    BACKEND_DIR / ".env",
+]
+
+
+def ensure_env_loaded() -> None:
+    """Best-effort dotenv loader for dev ergonomics.
+
+    Pydantic settings reads env files at process start. During local development,
+    users often edit `.env` without restarting the backend; this helper lets
+    endpoints re-load missing variables safely without overriding existing ones.
+    """
+    try:
+        from dotenv import dotenv_values
+    except Exception:  # noqa: BLE001
+        return
+
+    for path in ENV_FILES:
+        try:
+            if not path.exists():
+                continue
+
+            values = dotenv_values(path)
+            for key, value in values.items():
+                if value is None:
+                    continue
+                # Only write when missing/blank so real env vars can still override `.env`.
+                if os.environ.get(key, ""):
+                    continue
+                os.environ[key] = value
+        except Exception:  # noqa: BLE001
+            continue
 
 DEFAULT_CORS_ORIGINS = [
     "http://localhost:3000",
@@ -22,7 +57,7 @@ class Settings(BaseSettings):
     """Application settings."""
 
     model_config = SettingsConfigDict(
-        env_file=str((ROOT_DIR / ".env").resolve()),
+        env_file=[str(path.resolve()) for path in ENV_FILES],
         case_sensitive=False,
     )
     
@@ -56,6 +91,14 @@ class Settings(BaseSettings):
 
     # Redis configuration (defaults to localhost)
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+    # Stripe billing configuration
+    stripe_secret_key: str = os.getenv("STRIPE_SECRET_KEY", "")
+    stripe_publishable_key: str = os.getenv("STRIPE_PUBLISHABLE_KEY", "")
+    stripe_webhook_secret: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+    stripe_price_lookup_key: str = os.getenv("STRIPE_PRICE_LOOKUP_KEY", "")
+    stripe_price_id: str = os.getenv("STRIPE_PRICE_ID", "")
+    site_url: str = os.getenv("SITE_URL", "")
 
     # CORS configuration
     cors_origins: List[str] = Field(default_factory=lambda: DEFAULT_CORS_ORIGINS.copy())
@@ -111,5 +154,15 @@ def get_settings() -> Settings:
         secret = _fetch_secret_from_supabase(settings, "GEMINI_API_KEY")
         if secret:
             settings.gemini_api_key = secret
+
+    if not settings.stripe_secret_key:
+        secret = _fetch_secret_from_supabase(settings, "STRIPE_SECRET_KEY")
+        if secret:
+            settings.stripe_secret_key = secret
+
+    if not settings.stripe_webhook_secret:
+        secret = _fetch_secret_from_supabase(settings, "STRIPE_WEBHOOK_SECRET")
+        if secret:
+            settings.stripe_webhook_secret = secret
 
     return settings

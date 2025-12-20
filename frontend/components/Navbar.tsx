@@ -53,14 +53,14 @@ export default function Navbar({ variant = 'light' }: NavbarProps) {
                 <LetterSwapForward label="Dashboard" />
               </Link>
               <Link
-                href="/compare"
+                href="/billing"
                 className={`text-sm font-medium transition-colors ${
                   isDark
                     ? 'text-white/70 hover:text-white'
                     : 'text-muted-foreground hover:text-foreground'
                 }`}
               >
-                <LetterSwapForward label="Compare" />
+                <LetterSwapForward label="Billing" />
               </Link>
             </motion.div>
           )}

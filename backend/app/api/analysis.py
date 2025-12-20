@@ -1,6 +1,12 @@
 """Analysis API endpoints."""
-from fastapi import APIRouter, HTTPException
-from typing import List
+
+import io
+import re
+from typing import List, Literal, Optional
+
+from fastapi import APIRouter, Body, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from app.models.database import get_supabase_client
 from app.models.schemas import (
     Analysis,
@@ -11,6 +17,7 @@ from app.models.schemas import (
 from app.tasks.analyze import analyze_company_task
 from app.config import get_settings
 from app.api.companies import _supabase_configured
+from app.services.summary_export import build_summary_docx, build_summary_pdf
 from app.services.analysis_fallback import (
     get_analysis as fallback_get_analysis,
     get_analysis_status as fallback_get_analysis_status,
@@ -22,6 +29,18 @@ from app.services.local_cache import fallback_analysis_by_id, fallback_analyses
 from app.utils.supabase_errors import is_supabase_table_missing_error
 
 router = APIRouter()
+
+
+class AnalysisExportRequest(BaseModel):
+    format: Literal["pdf", "docx"] = Field(...)
+    summary: str = Field(..., min_length=1, max_length=250_000)
+    title: Optional[str] = Field(default=None, max_length=200)
+    ticker: Optional[str] = Field(default=None, max_length=25)
+    company_name: Optional[str] = Field(default=None, max_length=200)
+    analysis_date: Optional[str] = Field(default=None, max_length=50)
+    generated_at: Optional[str] = Field(default=None, max_length=50)
+    filing_type: Optional[str] = Field(default=None, max_length=50)
+    filing_date: Optional[str] = Field(default=None, max_length=50)
 
 
 @router.post("/run", response_model=AnalysisRunResponse)
@@ -244,6 +263,65 @@ async def get_task_status(task_id: str):
         if is_supabase_table_missing_error(e):
             return fallback_get_task_status(task_id)
         raise HTTPException(status_code=500, detail=f"Error retrieving task status: {str(e)}")
+
+
+@router.post("/{analysis_id}/export")
+async def export_analysis(
+    analysis_id: str,
+    payload: AnalysisExportRequest = Body(...),
+):
+    """Export an analysis summary as a PDF or Word (DOCX) document.
+
+    Note: we accept the markdown content from the client so exports work for
+    both live analyses and locally cached dashboard snapshots.
+    """
+    metadata_lines: list[str] = [f"Analysis ID: {analysis_id}"]
+    if payload.ticker:
+        metadata_lines.append(f"Ticker: {payload.ticker}")
+    if payload.company_name:
+        metadata_lines.append(f"Company: {payload.company_name}")
+    if payload.filing_type:
+        metadata_lines.append(f"Filing Type: {payload.filing_type}")
+    if payload.filing_date:
+        metadata_lines.append(f"Filing Date: {payload.filing_date}")
+    if payload.analysis_date:
+        metadata_lines.append(f"Analysis Date: {payload.analysis_date}")
+    if payload.generated_at:
+        metadata_lines.append(f"Generated: {payload.generated_at}")
+
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", analysis_id).strip("_")[:60] or "analysis"
+
+    try:
+        if payload.format == "pdf":
+            pdf_bytes = build_summary_pdf(
+                summary_md=payload.summary,
+                title=payload.title or "AI Analysis",
+                metadata_lines=metadata_lines,
+            )
+            return StreamingResponse(
+                io.BytesIO(pdf_bytes),
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f'attachment; filename="analysis-{safe_id}.pdf"'
+                },
+            )
+
+        docx_bytes = build_summary_docx(
+            summary_md=payload.summary,
+            title=payload.title or "AI Analysis",
+            metadata_lines=metadata_lines,
+        )
+        return StreamingResponse(
+            io.BytesIO(docx_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={
+                "Content-Disposition": f'attachment; filename="analysis-{safe_id}.docx"'
+            },
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail="Failed to export analysis") from exc
 
 
 @router.delete("/{analysis_id}", status_code=204)

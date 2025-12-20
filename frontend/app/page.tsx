@@ -10,6 +10,7 @@ import Navbar from '@/components/Navbar'
 import MinimalFooter from '@/components/MinimalFooter'
 import BottomPopup from '@/components/BottomPopup'
 import { FAQChat } from '@/components/FAQChat'
+import PricingSection from '@/components/PricingSection'
 import { Float, TextRotator, StackingCards, StackingCardItem, LogoLoop } from '@/components/fancy'
 
 // Rotating words for the hero
@@ -31,43 +32,43 @@ const enterpriseLogos = [
 const walkthroughCards = [
   {
     step: 1,
-    title: 'Enter Your Company',
-    description: 'Simply type in any publicly traded company ticker or name. Our system instantly recognizes thousands of securities worldwide.',
+    title: 'Customize Output',
+    description: 'Pick your focus areas, tone, detail level, complexity, and target length to shape the brief exactly the way you want.',
     image: '/walkthrough/step-1.png',
     color: 'bg-[#0015ff]',
   },
   {
     step: 2,
-    title: 'Select Filing Type',
-    description: 'Choose from 10-K annual reports, 10-Q quarterly filings, earnings calls, or let AI recommend the most relevant documents.',
-    image: '/walkthrough/step-2.png',
+    title: 'Health Analysis',
+    description: 'Choose whether to include a detailed Financial Health Rating section in your brief.',
+    image: '/walkthrough/step-3.png',
     color: 'bg-[#4338ca]',
   },
   {
     step: 3,
-    title: 'Customize Your Analysis',
-    description: 'Define what matters most. Focus on financial metrics, risk factors, management commentary, or get a comprehensive overview.',
-    image: '/walkthrough/step-3.png',
+    title: 'Configure Health Score',
+    description: 'If included, tune the framework, weighting, risk tolerance, and analysis depth for the health score.',
+    image: '/walkthrough/step-2.png',
     color: 'bg-[#7c3aed]',
   },
   {
     step: 4,
-    title: 'AI Processing',
-    description: 'Watch as our AI reads through hundreds of pages in seconds, extracting key insights and synthesizing complex information.',
+    title: 'Select Investor Persona',
+    description: 'Optionally apply an investor lens (e.g., Buffett, Lynch) so the brief is written in that style and decision framework.',
     image: '/walkthrough/step-4.png',
     color: 'bg-[#8b5cf6]',
   },
   {
     step: 5,
-    title: 'Review Your Summary',
-    description: 'Get a beautifully formatted executive memo with key metrics, risks, opportunities, and actionable insights.',
+    title: 'Additional Instructions',
+    description: 'Add any extra context or specific requests for the AI to incorporate into the brief.',
     image: '/walkthrough/step-5.png',
     color: 'bg-[#a855f7]',
   },
   {
     step: 6,
-    title: 'Export & Share',
-    description: 'Download your analysis, share with your team, or save to your dashboard for future reference and comparison.',
+    title: 'Ready to Generate',
+    description: 'Review your selections and click Complete to generate the brief.',
     image: '/walkthrough/step-6.png',
     color: 'bg-[#c084fc]',
   },
@@ -106,7 +107,7 @@ export default function Home() {
             transition={{ duration: 1, delay: 0.3, ease: [0.25, 0.46, 0.45, 0.94] }}
             className="absolute top-[12%] left-[6%] sm:left-[8%] pointer-events-auto"
           >
-            <Float rotationRange={12} scale={1.02}>
+            <Float rotationRange={[2, 2, 1]} amplitude={[3, 5, 0]} speed={0.3} timeOffset={0}>
               <div className="w-36 sm:w-52 md:w-64 rounded-2xl shadow-hero overflow-hidden bg-white">
                 <Image
                   src="/hero/hero-1.png"
@@ -126,7 +127,7 @@ export default function Home() {
             transition={{ duration: 1, delay: 0.5, ease: [0.25, 0.46, 0.45, 0.94] }}
             className="absolute top-[8%] right-[4%] sm:right-[6%] pointer-events-auto"
           >
-            <Float rotationRange={10} scale={1.02}>
+            <Float rotationRange={[2, 3, 1]} amplitude={[4, 6, 0]} speed={0.25} timeOffset={2}>
               <div className="w-40 sm:w-56 md:w-72 rounded-2xl shadow-hero overflow-hidden bg-white">
                 <Image
                   src="/hero/hero-2.png"
@@ -146,7 +147,7 @@ export default function Home() {
             transition={{ duration: 1, delay: 0.7, ease: [0.25, 0.46, 0.45, 0.94] }}
             className="absolute top-[42%] left-[2%] sm:left-[4%] pointer-events-auto"
           >
-            <Float rotationRange={14} scale={1.03}>
+            <Float rotationRange={[3, 3, 1]} amplitude={[4, 7, 0]} speed={0.28} timeOffset={4}>
               <div className="w-44 sm:w-60 md:w-80 rounded-2xl shadow-hero overflow-hidden bg-white">
                 <Image
                   src="/hero/hero-3.png"
@@ -166,7 +167,7 @@ export default function Home() {
             transition={{ duration: 1, delay: 0.9, ease: [0.25, 0.46, 0.45, 0.94] }}
             className="absolute top-[58%] right-[2%] sm:right-[5%] pointer-events-auto"
           >
-            <Float rotationRange={12} scale={1.02}>
+            <Float rotationRange={[2, 2, 1]} amplitude={[3, 5, 0]} speed={0.32} timeOffset={6}>
               <div className="w-48 sm:w-64 md:w-88 rounded-2xl shadow-hero overflow-hidden bg-white">
                 <Image
                   src="/hero/hero-4.png"
@@ -186,7 +187,7 @@ export default function Home() {
             transition={{ duration: 1, delay: 1.1, ease: [0.25, 0.46, 0.45, 0.94] }}
             className="hidden lg:block absolute bottom-[8%] left-[8%] pointer-events-auto"
           >
-            <Float rotationRange={10} scale={1.02}>
+            <Float rotationRange={[2, 2, 1]} amplitude={[3, 5, 0]} speed={0.35} timeOffset={8}>
               <div className="w-48 md:w-56 rounded-2xl shadow-hero overflow-hidden bg-white">
                 <Image
                   src="/hero/hero-5.png"
@@ -358,19 +359,18 @@ export default function Home() {
                         </p>
                       </div>
 
-                      {/* Image with Float effect */}
+                      {/* Image */}
                       <div className="w-full md:w-1/2">
-                        <Float rotationRange={8} scale={1.02}>
-                          <div className="rounded-2xl overflow-hidden shadow-2xl bg-white aspect-video relative">
-                            <Image
-                              src={card.image}
-                              alt={card.title}
-                              fill
-                              className="object-cover"
-                            />
-                          </div>
-                        </Float>
-                      </div>
+                        <div className="rounded-2xl overflow-hidden shadow-2xl bg-white aspect-video relative">
+	                          <Image
+	                            src={card.image}
+	                            alt={card.title}
+	                            fill
+	                            sizes="(max-width: 768px) 100vw, 50vw"
+	                            className="object-cover"
+	                          />
+	                        </div>
+	                      </div>
                     </div>
                   </div>
                 </div>
@@ -383,6 +383,9 @@ export default function Home() {
 
       {/* FAQ Chat Section */}
       <FAQChat />
+
+      {/* Pricing Section */}
+      <PricingSection />
 
       {/* CTA Section */}
       <motion.section

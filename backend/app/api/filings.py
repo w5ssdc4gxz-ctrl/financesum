@@ -1,6 +1,7 @@
 """Filings API endpoints."""
 
 import json
+import io
 import logging
 import random
 import re
@@ -10,11 +11,12 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple, Callable, Literal
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Depends
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from pydantic import BaseModel, Field
 from uuid import UUID, uuid4
 from app.models.database import get_supabase_client
 from app.models.schemas import (
@@ -23,6 +25,7 @@ from app.models.schemas import (
     FilingsFetchResponse,
     FilingSummaryPreferences,
 )
+from app.api.auth import CurrentUser, get_current_user
 from app.tasks.fetch import fetch_filings_task, run_fetch_filings_inline
 from app.config import get_settings
 from app.api.companies import _supabase_configured
@@ -57,6 +60,8 @@ from app.services.local_cache import (
     progress_cache,
 )
 from app.services.summary_activity import record_summary_generated_event
+from app.services.billing_usage import get_summary_usage_status
+from app.services.summary_export import build_summary_docx, build_summary_pdf
 from app.services.gemini_client import get_gemini_client, generate_growth_assessment
 from app.services.gemini_exceptions import (
     GeminiRateLimitError,
@@ -5106,6 +5111,7 @@ async def list_company_filings(
 def generate_filing_summary(
     filing_id: str,
     preferences: Optional[FilingSummaryPreferences] = Body(default=None),
+    user: CurrentUser = Depends(get_current_user),
 ):
     """
     Generate a filing summary.
@@ -5126,6 +5132,22 @@ def generate_filing_summary(
     # Reset progress
     progress_cache[str(filing_id)] = "Initializing AI Agent..."
 
+    usage_status = get_summary_usage_status(user.id)
+    if usage_status.remaining <= 0:
+        if usage_status.plan == "pro":
+            reset_date = usage_status.period_end.date().isoformat() if usage_status.period_end else "the next cycle"
+            detail = (
+                f"Monthly summary limit reached (1000/month). "
+                f"Your limit resets on {reset_date}."
+            )
+        else:
+            detail = (
+                "Free trial summary already used. "
+                "Upgrade to Pro to continue generating summaries."
+            )
+        progress_cache[str(filing_id)] = "Monthly summary limit reached."
+        raise HTTPException(status_code=402, detail=detail)
+
     # Check cache first
     if (
         use_default_cache and False
@@ -5136,6 +5158,7 @@ def generate_filing_summary(
             record_summary_generated_event(
                 summary_id=str(filing_id),
                 company_id=None,
+                user_id=user.id,
                 kind=getattr(preferences, "mode", None),
                 cached=True,
                 source=None,
@@ -5894,6 +5917,7 @@ Before you output anything, verify:
             company_id=str(company.get("id"))
             if company and company.get("id")
             else None,
+            user_id=user.id,
             kind=getattr(preferences, "mode", None),
             cached=False,
             source=context.get("source"),
@@ -7067,6 +7091,65 @@ def _ensure_required_sections(
         text = km_pattern.sub(f"## Key Metrics\n{desired_body}\n", text)
 
     return text
+
+
+class SummaryExportRequest(BaseModel):
+    format: Literal["pdf", "docx"] = Field(...)
+    summary: str = Field(..., min_length=1, max_length=250_000)
+    title: Optional[str] = Field(default=None, max_length=200)
+    filing_type: Optional[str] = Field(default=None, max_length=50)
+    filing_date: Optional[str] = Field(default=None, max_length=50)
+    generated_at: Optional[str] = Field(default=None, max_length=50)
+
+
+@router.post("/{filing_id}/summary/export")
+async def export_filing_summary(
+    filing_id: str,
+    payload: SummaryExportRequest = Body(...),
+):
+    """Export a generated summary as a PDF or Word (DOCX) document."""
+    metadata_lines: list[str] = [f"Filing ID: {filing_id}"]
+    if payload.filing_type:
+        metadata_lines.append(f"Filing Type: {payload.filing_type}")
+    if payload.filing_date:
+        metadata_lines.append(f"Filing Date: {payload.filing_date}")
+    if payload.generated_at:
+        metadata_lines.append(f"Generated: {payload.generated_at}")
+
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", filing_id).strip("_")[:60] or "summary"
+
+    try:
+        if payload.format == "pdf":
+            pdf_bytes = build_summary_pdf(
+                summary_md=payload.summary,
+                title=payload.title or "AI Brief",
+                metadata_lines=metadata_lines,
+            )
+            return StreamingResponse(
+                io.BytesIO(pdf_bytes),
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f'attachment; filename="summary-{safe_id}.pdf"'
+                },
+            )
+
+        docx_bytes = build_summary_docx(
+            summary_md=payload.summary,
+            title=payload.title or "AI Brief",
+            metadata_lines=metadata_lines,
+        )
+        return StreamingResponse(
+            io.BytesIO(docx_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={
+                "Content-Disposition": f'attachment; filename="summary-{safe_id}.docx"'
+            },
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Summary export failed for %s", filing_id)
+        raise HTTPException(status_code=500, detail="Failed to export summary") from exc
 
 
 @router.get("/{filing_id}/progress")

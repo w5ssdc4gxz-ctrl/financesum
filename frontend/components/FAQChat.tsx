@@ -42,9 +42,9 @@ const faqItems: FAQItem[] = [
   },
   {
     id: 6,
-    question: "What's included in the free plan?",
+    question: "What&apos;s included in the free plan?",
     answer:
-      "The free plan includes 5 filing analyses per month, basic summaries, and access to our filings database. Upgrade anytime for unlimited analyses and advanced features.",
+      "The free plan includes a 1-summary trial so you can test FinanceSum. Upgrade anytime for 1,000 summaries per month and advanced features.",
   },
 ];
 
@@ -196,7 +196,7 @@ export function FAQChat() {
                 >
                   <div className="bg-gray-100 text-foreground rounded-2xl rounded-tl-md px-5 py-3.5 max-w-[85%]">
                     <p className="text-[15px] leading-relaxed">
-                      Hi there! I'm here to answer your questions about FinanceSum. Click any
+                      Hi there! I&apos;m here to answer your questions about FinanceSum. Click any
                       question below to get started.
                     </p>
                   </div>

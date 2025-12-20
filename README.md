@@ -42,13 +42,15 @@ A comprehensive web application that fetches, analyzes, and summarizes quarterly
 2. **Configure environment variables**
    ```bash
    cp .env.example .env
-   # Edit .env with your Supabase and Gemini API credentials
+   # Edit .env with your Supabase and Gemini API credentials (and Stripe if using billing)
    ```
 
-   Update `frontend/.env.local` as well. By default the app expects real Supabase OAuth (`NEXT_PUBLIC_AUTH_MODE=supabase`).  
+   Update `frontend/.env.local` as well (see `frontend/.env.local.example`). By default the app expects real Supabase OAuth (`NEXT_PUBLIC_AUTH_MODE=supabase`).  
    - Set `NEXT_PUBLIC_ALLOW_DEMO_FALLBACK=true` (default) if you’d like the UI to automatically fall back to a local demo session whenever Google sign-in isn’t configured yet.  
    - To opt into demo-only mode, set `NEXT_PUBLIC_AUTH_MODE=demo`.  
    Remember to configure the Google provider inside Supabase Auth and whitelist your site URL in the redirect list before using the real flow.
+
+   If you want subscriptions/billing, follow `STRIPE_SETUP.md`.
 
 3. **Start everything with one command (no Docker)**
    ```bash

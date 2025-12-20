@@ -187,7 +187,7 @@ const healthRatingDefaults: HealthRatingFormState = {
 }
 
 const createDefaultSummaryPreferences = (): SummaryPreferenceFormState => ({
-  mode: 'default',
+  mode: 'custom',
   investorFocus: '',
   focusAreas: ['Financial performance', 'Risk factors'],
   tone: 'objective',
@@ -237,39 +237,19 @@ const buildPreferencePayload = (prefs: SummaryPreferenceFormState): FilingSummar
 
   const finalInvestorFocus = (prefs.investorFocus.trim() + healthPromptInjection + personaPrompt).trim();
 
-  if (prefs.mode === 'custom') {
-    return {
-      mode: 'custom',
-      investor_focus: finalInvestorFocus || undefined,
-      focus_areas: prefs.focusAreas.length ? prefs.focusAreas : undefined,
-      tone: prefs.tone,
-      detail_level: prefs.detailLevel,
-      output_style: prefs.outputStyle,
-      target_length: clampTargetLength(prefs.targetLength),
-      health_rating: buildHealthRating(),
-    }
+  return {
+    mode: 'custom',
+    investor_focus: finalInvestorFocus || undefined,
+    focus_areas: prefs.focusAreas.length ? prefs.focusAreas : undefined,
+    tone: prefs.tone,
+    detail_level: prefs.detailLevel,
+    output_style: prefs.outputStyle,
+    target_length: clampTargetLength(prefs.targetLength),
+    health_rating: buildHealthRating(),
   }
-
-  if (isHealthEnabled) {
-    return {
-      mode: 'default',
-      health_rating: buildHealthRating(),
-      // For default mode, we can't easily inject into investor_focus if it's not used by the backend for default mode,
-      // but we can try setting it if the backend respects it.
-      investor_focus: (healthPromptInjection + personaPrompt).trim(),
-    }
-  }
-
-  return undefined
 }
 
 const snapshotPreferences = (prefs: SummaryPreferenceFormState): SummaryPreferenceSnapshot => {
-  if (prefs.mode === 'default') {
-    return {
-      mode: 'default',
-      healthRating: prefs.healthRating.enabled ? { ...prefs.healthRating } : undefined,
-    }
-  }
   return {
     mode: 'custom',
     investorFocus: prefs.investorFocus.trim() || undefined,
@@ -304,7 +284,7 @@ const isHealthDisplayValue = (value: string | undefined): value is HealthDisplay
   typeof value === 'string' && healthDisplayOptions.some(option => option.value === value)
 
 const sanitizeStoredPreferences = (stored: StoredSummaryPreferences): SummaryPreferenceFormState => ({
-  mode: stored.mode === 'custom' ? 'custom' : 'default',
+  mode: 'custom',
   investorFocus: stored.investorFocus ?? '',
   focusAreas: Array.isArray(stored.focusAreas) ? stored.focusAreas : [],
   tone: isSummaryToneValue(stored.tone) ? stored.tone : 'objective',
@@ -431,6 +411,10 @@ export default function CompanyPage() {
   const [customLengthInput, setCustomLengthInput] = useState(() => String(createDefaultSummaryPreferences().targetLength))
   const [dashboardSavedSummaries, setDashboardSavedSummaries] = useState<Record<string, boolean>>({})
   const [showSavedPopup, setShowSavedPopup] = useState(false)
+  const [copiedSummaries, setCopiedSummaries] = useState<Record<string, boolean>>({})
+  const [exportingSummaries, setExportingSummaries] = useState<Record<string, 'pdf' | 'docx'>>({})
+  const [copiedAnalysis, setCopiedAnalysis] = useState(false)
+  const [exportingAnalysis, setExportingAnalysis] = useState<null | 'pdf' | 'docx'>(null)
   const summaryCardRef = useRef<HTMLDivElement | null>(null)
   const preferencesHydratedRef = useRef(false)
   const isSummaryGenerating = selectedFilingForSummary ? !!loadingSummaries[selectedFilingForSummary] : false
@@ -587,7 +571,7 @@ export default function CompanyPage() {
           ...prev,
           [filingId]: {
             content: response.data.summary,
-            metadata: metadata ?? { mode: 'default' },
+            metadata: metadata ?? { mode: 'custom' },
             generatedAt,
             companyCountry,
             healthRating,
@@ -645,7 +629,7 @@ export default function CompanyPage() {
       healthScore: healthScore ?? null,
       scoreBand: ratingInfo?.grade ?? null,
       ratingLabel:
-        ratingInfo?.label ?? (summary.metadata?.mode === 'custom' ? 'Custom brief' : 'Quick brief'),
+        ratingInfo?.label ?? 'Custom brief',
       summaryMd: summary.content,
       summaryPreview: buildSummaryPreview(summary.content),
       filingId: filing?.id ?? filingId,
@@ -657,6 +641,199 @@ export default function CompanyPage() {
     setDashboardSavedSummaries(prev => ({ ...prev, [filingId]: true }))
     emitDashboardSync()
     setShowSavedPopup(true)
+  }
+
+  const clearCopiedFlag = (filingId: string) => {
+    setCopiedSummaries(prev => {
+      const next = { ...prev }
+      delete next[filingId]
+      return next
+    })
+  }
+
+  const clearCopiedAnalysisFlag = () => {
+    setCopiedAnalysis(false)
+  }
+
+  const handleCopySummary = async (filingId: string) => {
+    const summary = filingSummaries[filingId]
+    if (!summary?.content) return
+
+    try {
+      await navigator.clipboard.writeText(summary.content)
+    } catch (error) {
+      const textarea = document.createElement('textarea')
+      textarea.value = summary.content
+      textarea.style.position = 'fixed'
+      textarea.style.left = '-9999px'
+      textarea.style.top = '0'
+      document.body.appendChild(textarea)
+      textarea.focus()
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+    }
+
+    setCopiedSummaries(prev => ({ ...prev, [filingId]: true }))
+    window.setTimeout(() => clearCopiedFlag(filingId), 1500)
+  }
+
+  const handleCopyAnalysis = async () => {
+    const content = (analysisToDisplay as any)?.summary_md || (analysisToDisplay as any)?.summaryMd || (analysisToDisplay as any)?.content || ''
+    if (!content) return
+
+    try {
+      await navigator.clipboard.writeText(content)
+    } catch (error) {
+      const textarea = document.createElement('textarea')
+      textarea.value = content
+      textarea.style.position = 'fixed'
+      textarea.style.left = '-9999px'
+      textarea.style.top = '0'
+      document.body.appendChild(textarea)
+      textarea.focus()
+      textarea.select()
+      document.execCommand('copy')
+      document.body.removeChild(textarea)
+    }
+
+    setCopiedAnalysis(true)
+    window.setTimeout(clearCopiedAnalysisFlag, 1500)
+  }
+
+  const sanitizeDownloadFilename = (value: string) =>
+    value
+      .trim()
+      .replace(/[\s/\\]+/g, '_')
+      .replace(/[^a-zA-Z0-9._-]+/g, '')
+      .replace(/_+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 140) || 'summary'
+
+  const handleExportSummary = async (filingId: string, format: 'pdf' | 'docx') => {
+    const summary = filingSummaries[filingId]
+    if (!summary?.content) return
+
+    const filing = filings?.find((item: any) => item.id === filingId)
+    const companyLabel = company?.ticker || company?.name || 'Company'
+    const filingType = filing?.filing_type || 'Filing'
+    const filingDate = filing?.filing_date || ''
+
+    const baseName = sanitizeDownloadFilename(
+      [companyLabel, filingType, filingDate, 'brief'].filter(Boolean).join('_')
+    )
+    const filename = `${baseName}.${format === 'pdf' ? 'pdf' : 'docx'}`
+
+    setExportingSummaries(prev => ({ ...prev, [filingId]: format }))
+    try {
+      const response = await filingsApi.exportSummary(filingId, {
+        format,
+        title: `${companyLabel} ${filingType} Brief`,
+        summary: summary.content,
+        filing_type: filingType,
+        filing_date: filingDate || undefined,
+        generated_at: summary.generatedAt || undefined,
+      })
+
+      const blob = response.data as Blob
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      window.URL.revokeObjectURL(url)
+    } catch (error: any) {
+      const message = error?.response?.data?.detail ?? 'Failed to export summary'
+      alert(message)
+    } finally {
+      setExportingSummaries(prev => {
+        const next = { ...prev }
+        delete next[filingId]
+        return next
+      })
+    }
+  }
+
+  const handleExportAnalysis = async (format: 'pdf' | 'docx') => {
+    const content = (analysisToDisplay as any)?.summary_md || (analysisToDisplay as any)?.summaryMd || (analysisToDisplay as any)?.content || ''
+    if (!content) return
+
+    const analysisIdentifier = String((analysisToDisplay as any)?.id ?? currentAnalysisId ?? '')
+    if (!analysisIdentifier) return
+
+    const companyLabel = company?.ticker || company?.name || 'Company'
+
+    // If the analysis is actually a locally cached filing summary (dashboard snapshot),
+    // reuse the filings export endpoint so the metadata stays consistent.
+    const isSummarySnapshot = analysisIdentifier.startsWith('summary-') || isLocalAnalysisId
+
+    const inferredGeneratedAt =
+      (analysisToDisplay as any)?.analysis_date ||
+      (analysisToDisplay as any)?.analysis_datetime ||
+      (analysisToDisplay as any)?.created_at ||
+      (analysisToDisplay as any)?.updated_at ||
+      localAnalysisSnapshot?.generatedAt ||
+      new Date().toISOString()
+
+    const filingType =
+      (analysisToDisplay as any)?.primary_filing_type ||
+      (analysisToDisplay as any)?.filing_type ||
+      localAnalysisSnapshot?.filingType ||
+      undefined
+    const filingDate =
+      (analysisToDisplay as any)?.primary_filing_date ||
+      (analysisToDisplay as any)?.filing_date ||
+      localAnalysisSnapshot?.filingDate ||
+      undefined
+
+    const baseName = sanitizeDownloadFilename(
+      isSummarySnapshot
+        ? [companyLabel, filingType, filingDate, 'brief'].filter(Boolean).join('_')
+        : [companyLabel, 'analysis', inferredGeneratedAt].filter(Boolean).join('_')
+    )
+    const filename = `${baseName}.${format === 'pdf' ? 'pdf' : 'docx'}`
+
+    setExportingAnalysis(format)
+
+    try {
+      const response = isSummarySnapshot
+        ? await filingsApi.exportSummary(localAnalysisSnapshot?.filingId || analysisIdentifier.replace('summary-', ''), {
+          format,
+          title: `${companyLabel} ${filingType ?? 'Filing'} Brief`,
+          summary: content,
+          filing_type: filingType,
+          filing_date: filingDate,
+          generated_at: inferredGeneratedAt,
+        })
+        : await analysisApi.exportAnalysis(analysisIdentifier, {
+          format,
+          title: `${companyLabel} Financial Analysis`,
+          summary: content,
+          ticker: company?.ticker,
+          company_name: company?.name,
+          analysis_date: (analysisToDisplay as any)?.analysis_date || (analysisToDisplay as any)?.analysis_datetime,
+          generated_at: inferredGeneratedAt,
+          filing_type: filingType,
+          filing_date: filingDate,
+        })
+
+      const blob = response.data as Blob
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      window.URL.revokeObjectURL(url)
+    } catch (error: any) {
+      const message = error?.response?.data?.detail ?? 'Failed to export analysis'
+      alert(message)
+    } finally {
+      setExportingAnalysis(null)
+    }
   }
 
   const scrollToSummaryCard = () => {
@@ -1194,7 +1371,7 @@ export default function CompanyPage() {
                   <div className="lg:col-span-1 bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)] h-fit sticky top-4">
                     <h3 className="text-lg font-black uppercase mb-6 flex items-center gap-2">
                       <span className="w-3 h-3 bg-blue-600"></span>
-                      Generate Brief
+                      Custom
                     </h3>
 
                     <div className="space-y-6">
@@ -1249,13 +1426,33 @@ export default function CompanyPage() {
                                   Filing ID: {fid.slice(0, 8)}...
                                 </p>
                               </div>
-                              <div className="flex gap-2">
+                              <div className="flex flex-wrap gap-2 justify-end">
                                 <BrutalButton
                                   onClick={() => handleAddSummaryToDashboard(fid)}
                                   disabled={dashboardSavedSummaries[fid]}
                                   className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-green-400 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)] disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
                                   {dashboardSavedSummaries[fid] ? 'Saved' : 'Save to Dashboard'}
+                                </BrutalButton>
+                                <BrutalButton
+                                  onClick={() => handleCopySummary(fid)}
+                                  className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-yellow-300 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)]"
+                                >
+                                  {copiedSummaries[fid] ? 'Copied' : 'Copy'}
+                                </BrutalButton>
+                                <BrutalButton
+                                  onClick={() => handleExportSummary(fid, 'pdf')}
+                                  disabled={!!exportingSummaries[fid]}
+                                  className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-blue-300 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)] disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                  {exportingSummaries[fid] === 'pdf' ? 'Exporting...' : 'Export PDF'}
+                                </BrutalButton>
+                                <BrutalButton
+                                  onClick={() => handleExportSummary(fid, 'docx')}
+                                  disabled={!!exportingSummaries[fid]}
+                                  className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-blue-300 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)] disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                  {exportingSummaries[fid] === 'docx' ? 'Exporting...' : 'Export Word'}
                                 </BrutalButton>
                                 <BrutalButton
                                   onClick={() => {
@@ -1372,19 +1569,42 @@ export default function CompanyPage() {
                 className="space-y-8"
               >
                 <div className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)]">
-                  <div className="flex justify-between items-center mb-8">
+                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-8 gap-4">
                     <h2 className="text-xl font-black uppercase flex items-center gap-3">
                       <span className="w-4 h-4 bg-emerald-600"></span>
                       Financial Analysis
                     </h2>
                     {analysisToDisplay && (
-                      <BrutalButton
-                        onClick={handleManualDashboardUpdate}
-                        variant="outline-rounded"
-                        className="text-xs"
-                      >
-                        Update Dashboard
-                      </BrutalButton>
+                      <div className="flex flex-wrap gap-2 justify-end">
+                        <BrutalButton
+                          onClick={handleManualDashboardUpdate}
+                          variant="outline-rounded"
+                          className="text-xs"
+                        >
+                          Update Dashboard
+                        </BrutalButton>
+                        <BrutalButton
+                          onClick={handleCopyAnalysis}
+                          disabled={!(analysisToDisplay.summary_md || analysisToDisplay.content)}
+                          className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-yellow-300 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)] disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {copiedAnalysis ? 'Copied' : 'Copy'}
+                        </BrutalButton>
+                        <BrutalButton
+                          onClick={() => handleExportAnalysis('pdf')}
+                          disabled={!(analysisToDisplay.summary_md || analysisToDisplay.content) || !!exportingAnalysis}
+                          className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-blue-300 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)] disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {exportingAnalysis === 'pdf' ? 'Exporting...' : 'Export PDF'}
+                        </BrutalButton>
+                        <BrutalButton
+                          onClick={() => handleExportAnalysis('docx')}
+                          disabled={!(analysisToDisplay.summary_md || analysisToDisplay.content) || !!exportingAnalysis}
+                          className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-blue-300 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)] disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {exportingAnalysis === 'docx' ? 'Exporting...' : 'Export Word'}
+                        </BrutalButton>
+                      </div>
                     )}
                   </div>
 

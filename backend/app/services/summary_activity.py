@@ -147,6 +147,7 @@ def record_summary_generated_event(
     *,
     summary_id: str,
     company_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     kind: Optional[str] = None,
     cached: bool = False,
     source: Optional[str] = None,
@@ -160,6 +161,8 @@ def record_summary_generated_event(
         "cached": bool(cached),
         "source": source,
     }
+    if user_id:
+        payload["user_id"] = str(user_id)
 
     if supabase_client is None:
         settings = get_settings()
@@ -181,6 +184,90 @@ def record_summary_generated_event(
         local_cache.append_summary_event({**payload, "created_at": datetime.now(timezone.utc).isoformat()})
     except Exception as exc:  # noqa: BLE001
         logger.debug("Unable to persist local summary events cache: %s", exc)
+
+
+def _looks_like_missing_user_id_column(error: Exception) -> bool:
+    try:
+        message = str(error)
+    except Exception:  # noqa: BLE001
+        return False
+    lowered = message.lower()
+    return "user_id" in lowered and "column" in lowered and "does not exist" in lowered
+
+
+def count_user_summary_events(
+    *,
+    user_id: str,
+    start: datetime,
+    end: datetime,
+    supabase_client=None,
+) -> int:
+    """Return summary generation events for a user within [start, end)."""
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+
+    if supabase_client is None:
+        settings = get_settings()
+        if _supabase_configured(settings):
+            try:
+                supabase_client = get_supabase_client()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Unable to create Supabase client for usage counts: %s", exc)
+                supabase_client = None
+
+    if supabase_client is not None:
+        try:
+            events: List[Dict[str, Any]] = []
+            page_size = 1000
+            offset = 0
+            while True:
+                page = (
+                    supabase_client.table(SUMMARY_EVENTS_TABLE)
+                    .select("user_id, created_at")
+                    .eq("user_id", user_id)
+                    .gte("created_at", start.isoformat())
+                    .lt("created_at", end.isoformat())
+                    .order("created_at", desc=False)
+                    .range(offset, offset + page_size - 1)
+                    .execute()
+                )
+                rows = page.data or []
+                events.extend(rows)
+                if len(rows) < page_size:
+                    break
+                offset += page_size
+
+            supabase_count = sum(1 for row in events if str(row.get("user_id") or "") == user_id)
+            local_events = _load_local_events()
+            local_count = 0
+            for event in local_events:
+                if str(event.get("user_id") or "") != user_id:
+                    continue
+                created_at = _parse_datetime(event.get("created_at"))
+                if not created_at:
+                    continue
+                if start <= created_at < end:
+                    local_count += 1
+            return supabase_count + local_count
+        except Exception as exc:  # noqa: BLE001
+            if is_supabase_table_missing_error(exc) or _looks_like_missing_user_id_column(exc):
+                supabase_client = None
+            else:
+                raise
+
+    events = _load_local_events()
+    count = 0
+    for event in events:
+        if str(event.get("user_id") or "") != user_id:
+            continue
+        created_at = _parse_datetime(event.get("created_at"))
+        if not created_at:
+            continue
+        if start <= created_at < end:
+            count += 1
+    return count
 
 
 def build_activity_buckets(

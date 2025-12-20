@@ -306,14 +306,9 @@ export default function SummaryWizard({
         updatePref({ focusAreas: updated });
     };
 
-    const handleCustomClick = () => {
+    const handleCustomizeClick = () => {
         updatePref({ mode: 'custom' });
         setIsModalOpen(true);
-    };
-
-    const handleDefaultClick = () => {
-        updatePref({ mode: 'default' });
-        setIsModalOpen(false);
     };
 
     const handleModalComplete = () => {
@@ -356,45 +351,18 @@ export default function SummaryWizard({
 
                 {selectedFilingId && (
                     <div className="space-y-4 pt-4 border-t-2 border-gray-100 dark:border-gray-800">
-                        <div className="grid grid-cols-2 gap-4">
-                            <button
-                                onClick={handleDefaultClick}
-                                className={cn(
-                                    "p-4 border-2 border-black dark:border-white font-bold uppercase transition-all",
-                                    preferences.mode === 'default'
-                                        ? "bg-black text-white dark:bg-white dark:text-black shadow-[4px_4px_0px_0px_rgba(128,128,128,1)]"
-                                        : "bg-white dark:bg-black hover:bg-gray-50"
-                                )}
-                            >
-                                Default
-                            </button>
-                            <button
-                                onClick={handleCustomClick}
-                                className={cn(
-                                    "p-4 border-2 border-black dark:border-white font-bold uppercase transition-all",
-                                    preferences.mode === 'custom'
-                                        ? "bg-black text-white dark:bg-white dark:text-black shadow-[4px_4px_0px_0px_rgba(128,128,128,1)]"
-                                        : "bg-white dark:bg-black hover:bg-gray-50"
-                                )}
-                            >
-                                Custom
-                            </button>
-                        </div>
-
-                        {preferences.mode === 'default' && (
+                        <div className="flex flex-col gap-3">
                             <BrutalButton
-                                onClick={onGenerate}
+                                onClick={handleCustomizeClick}
                                 disabled={isGenerating}
                                 className="w-full"
                             >
-                                {isGenerating ? 'Generating...' : 'Generate Summary'}
+                                Custom
                             </BrutalButton>
-                        )}
-                        {preferences.mode === 'custom' && (
                             <div className="text-center text-xs text-gray-500 font-mono">
-                                Click &quot;Custom&quot; again to configure detailed preferences.
+                                Configure custom preferences, then complete the wizard to generate.
                             </div>
-                        )}
+                        </div>
                     </div>
                 )}
             </div>
@@ -642,23 +610,21 @@ export default function SummaryWizard({
                         </div>
                     </Step>
 
-                    {/* Step 5: Additional Instructions (Custom Only) */}
-                    {preferences.mode === 'custom' && (
-                        <Step>
-                            <div className="space-y-6">
-                                <h2 className="text-xl font-black uppercase">5. Additional Instructions</h2>
-                                <p className="text-sm text-gray-600 dark:text-gray-400">
-                                    Any specific requests or context for the AI?
-                                </p>
-                                <textarea
-                                    value={preferences.investorFocus}
-                                    onChange={(e) => updatePref({ investorFocus: e.target.value })}
-                                    placeholder="E.g., Focus on the impact of recent regulatory changes..."
-                                    className="w-full h-32 p-4 bg-white dark:bg-black border-2 border-black dark:border-white font-mono text-sm focus:outline-none focus:shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] transition-shadow resize-none"
-                                />
-                            </div>
-                        </Step>
-                    )}
+                    {/* Step 5: Additional Instructions */}
+                    <Step>
+                        <div className="space-y-6">
+                            <h2 className="text-xl font-black uppercase">5. Additional Instructions</h2>
+                            <p className="text-sm text-gray-600 dark:text-gray-400">
+                                Any specific requests or context for the AI?
+                            </p>
+                            <textarea
+                                value={preferences.investorFocus}
+                                onChange={(e) => updatePref({ investorFocus: e.target.value })}
+                                placeholder="E.g., Focus on the impact of recent regulatory changes..."
+                                className="w-full h-32 p-4 bg-white dark:bg-black border-2 border-black dark:border-white font-mono text-sm focus:outline-none focus:shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] transition-shadow resize-none"
+                            />
+                        </div>
+                    </Step>
 
                     {/* Final Step: Review */}
                     <Step>
@@ -667,52 +633,43 @@ export default function SummaryWizard({
 
                             <div className="border-2 border-black dark:border-white p-6 space-y-4 bg-white dark:bg-black shadow-[4px_4px_0px_0px_rgba(0,0,0,1)]">
                                 <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
-                                    <span className="font-bold uppercase text-sm">Mode</span>
-                                    <span className="font-mono text-sm">{preferences.mode}</span>
+                                    <span className="font-bold uppercase text-sm">Focus Areas</span>
+                                    <span className="font-mono text-sm text-right">
+                                        {preferences.focusAreas.length > 0 ? preferences.focusAreas.join(', ') : 'None'}
+                                    </span>
                                 </div>
-
-                                {preferences.mode === 'custom' && (
-                                    <>
-                                        <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
-                                            <span className="font-bold uppercase text-sm">Focus Areas</span>
-                                            <span className="font-mono text-sm text-right">
-                                                {preferences.focusAreas.length > 0 ? preferences.focusAreas.join(', ') : 'None'}
-                                            </span>
-                                        </div>
-                                        <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
-                                            <span className="font-bold uppercase text-sm">Tone</span>
-                                            <span className="font-mono text-sm">{preferences.tone}</span>
-                                        </div>
-                                        <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
-                                            <span className="font-bold uppercase text-sm">Health Score</span>
-                                            <span className={cn("font-mono text-sm font-bold", preferences.includeHealthScore ? "text-green-600" : "text-gray-400")}>
-                                                {preferences.includeHealthScore ? 'INCLUDED' : 'EXCLUDED'}
-                                            </span>
-                                        </div>
-                                        <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
-                                            <span className="font-bold uppercase text-sm">Investor Persona</span>
-                                            <span className="font-mono text-sm font-bold text-blue-500">
-                                                {preferences.selectedPersona ? INVESTOR_PERSONAS.find(p => p.id === preferences.selectedPersona)?.name : 'None'}
-                                            </span>
-                                        </div>
-                                        {preferences.investorFocus && (
-                                            <div className="flex flex-col gap-1 border-b border-gray-200 dark:border-gray-800 pb-2">
-                                                <span className="font-bold uppercase text-sm">Instructions</span>
-                                                <span className="font-mono text-xs text-gray-600 dark:text-gray-400 line-clamp-2">
-                                                    {preferences.investorFocus}
-                                                </span>
-                                            </div>
-                                        )}
-                                        <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
-                                            <span className="font-bold uppercase text-sm">Target Length</span>
-                                            <span className="font-mono text-sm">{preferences.targetLength} words</span>
-                                        </div>
-                                        <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
-                                            <span className="font-bold uppercase text-sm">Complexity</span>
-                                            <span className="font-mono text-sm capitalize">{preferences.complexity}</span>
-                                        </div>
-                                    </>
+                                <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
+                                    <span className="font-bold uppercase text-sm">Tone</span>
+                                    <span className="font-mono text-sm">{preferences.tone}</span>
+                                </div>
+                                <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
+                                    <span className="font-bold uppercase text-sm">Health Score</span>
+                                    <span className={cn("font-mono text-sm font-bold", preferences.includeHealthScore ? "text-green-600" : "text-gray-400")}>
+                                        {preferences.includeHealthScore ? 'INCLUDED' : 'EXCLUDED'}
+                                    </span>
+                                </div>
+                                <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
+                                    <span className="font-bold uppercase text-sm">Investor Persona</span>
+                                    <span className="font-mono text-sm font-bold text-blue-500">
+                                        {preferences.selectedPersona ? INVESTOR_PERSONAS.find(p => p.id === preferences.selectedPersona)?.name : 'None'}
+                                    </span>
+                                </div>
+                                {preferences.investorFocus && (
+                                    <div className="flex flex-col gap-1 border-b border-gray-200 dark:border-gray-800 pb-2">
+                                        <span className="font-bold uppercase text-sm">Instructions</span>
+                                        <span className="font-mono text-xs text-gray-600 dark:text-gray-400 line-clamp-2">
+                                            {preferences.investorFocus}
+                                        </span>
+                                    </div>
                                 )}
+                                <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
+                                    <span className="font-bold uppercase text-sm">Target Length</span>
+                                    <span className="font-mono text-sm">{preferences.targetLength} words</span>
+                                </div>
+                                <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
+                                    <span className="font-bold uppercase text-sm">Complexity</span>
+                                    <span className="font-mono text-sm capitalize">{preferences.complexity}</span>
+                                </div>
 
                                 <div className="pt-2">
                                     <p className="text-xs text-gray-500">
