@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Literal, Optional
 from uuid import uuid4
 
@@ -83,6 +84,77 @@ def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
         return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
     except Exception:  # noqa: BLE001
         return None
+
+
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(int(value), tz=timezone.utc)
+        except Exception:  # noqa: BLE001
+            return None
+    if isinstance(value, str):
+        return _parse_iso_datetime(value)
+    return None
+
+
+def _add_months(value: datetime, months: int) -> datetime:
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def _add_interval(value: datetime, *, interval: str, count: int) -> datetime:
+    if interval == "day":
+        return value + timedelta(days=count)
+    if interval == "week":
+        return value + timedelta(weeks=count)
+    if interval == "month":
+        return _add_months(value, count)
+    if interval == "year":
+        return _add_months(value, count * 12)
+    return value
+
+
+def _extract_recurring_interval(subscription: Any) -> tuple[Optional[str], int]:
+    items = getattr(subscription, "items", None)
+    data = getattr(items, "data", None) if items is not None else None
+    first = data[0] if data else None
+    price = getattr(first, "price", None) if first is not None else None
+    recurring = getattr(price, "recurring", None) if price is not None else None
+    interval = getattr(recurring, "interval", None) if recurring is not None else None
+    interval_count = getattr(recurring, "interval_count", None) if recurring is not None else None
+    if not interval:
+        return None, 1
+    try:
+        count = int(interval_count or 1)
+    except (TypeError, ValueError):
+        count = 1
+    return str(interval), max(count, 1)
+
+
+def _resolve_period_bounds(subscription: Any) -> tuple[Optional[datetime], Optional[datetime]]:
+    start = _parse_timestamp(getattr(subscription, "current_period_start", None))
+    end = _parse_timestamp(getattr(subscription, "current_period_end", None))
+
+    if start is None:
+        start = _parse_timestamp(getattr(subscription, "billing_cycle_anchor", None))
+    if start is None:
+        start = _parse_timestamp(getattr(subscription, "start_date", None))
+    if start is None:
+        start = _parse_timestamp(getattr(subscription, "created", None))
+
+    if end is None and start is not None:
+        interval, count = _extract_recurring_interval(subscription)
+        if interval:
+            end = _add_interval(start, interval=interval, count=count)
+
+    return start, end
 
 
 async def _resolve_price_id() -> str:
@@ -280,6 +352,8 @@ def _upsert_subscription_from_stripe(
     if not cancel_at_period_end and cancel_at:
         cancel_at_period_end = True
 
+    period_start, period_end = _resolve_period_bounds(subscription)
+
     record: Dict[str, Any] = {
         "stripe_subscription_id": stripe_subscription_id,
         "user_id": user_id,
@@ -287,8 +361,8 @@ def _upsert_subscription_from_stripe(
         "status": str(getattr(subscription, "status", "") or ""),
         "price_id": price_id,
         "product_id": product_id,
-        "current_period_start": _ts_to_iso(getattr(subscription, "current_period_start", None)),
-        "current_period_end": _ts_to_iso(getattr(subscription, "current_period_end", None)),
+        "current_period_start": period_start.isoformat() if period_start else None,
+        "current_period_end": period_end.isoformat() if period_end else None,
         "cancel_at_period_end": cancel_at_period_end,
         "canceled_at": _ts_to_iso(getattr(subscription, "canceled_at", None)),
         "ended_at": _ts_to_iso(getattr(subscription, "ended_at", None)),
@@ -329,6 +403,8 @@ def _stripe_subscription_to_record(subscription: Any, *, user_id: str) -> Dict[s
     if not cancel_at_period_end and cancel_at:
         cancel_at_period_end = True
 
+    period_start, period_end = _resolve_period_bounds(subscription)
+
     return {
         "stripe_subscription_id": str(getattr(subscription, "id", "") or ""),
         "user_id": user_id,
@@ -336,8 +412,8 @@ def _stripe_subscription_to_record(subscription: Any, *, user_id: str) -> Dict[s
         "status": str(getattr(subscription, "status", "") or ""),
         "price_id": price_id,
         "product_id": product_id,
-        "current_period_start": _ts_to_iso(getattr(subscription, "current_period_start", None)),
-        "current_period_end": _ts_to_iso(getattr(subscription, "current_period_end", None)),
+        "current_period_start": period_start.isoformat() if period_start else None,
+        "current_period_end": period_end.isoformat() if period_end else None,
         "cancel_at_period_end": cancel_at_period_end,
         "canceled_at": _ts_to_iso(getattr(subscription, "canceled_at", None)),
         "ended_at": _ts_to_iso(getattr(subscription, "ended_at", None)),
@@ -396,6 +472,27 @@ async def _resolve_stripe_customer_id_for_user(user: CurrentUser, *, supabase: A
     subscriptions = await _search_subscriptions_by_user_id(user.id)
     chosen = _pick_best_subscription(subscriptions)
     if chosen is None:
+        if user.email:
+            try:
+                customers = await asyncio.to_thread(
+                    stripe.Customer.list,
+                    email=user.email,
+                    limit=10,
+                )
+            except Exception:  # noqa: BLE001
+                customers = None
+
+            customer_data = getattr(customers, "data", None) or []
+            for customer in customer_data:
+                customer_id = str(getattr(customer, "id", "") or "")
+                if not customer_id:
+                    continue
+                metadata = getattr(customer, "metadata", None) or {}
+                meta_user_id = str(getattr(metadata, "get", lambda *_: None)("user_id") or "")
+                if meta_user_id and meta_user_id != user.id:
+                    continue
+                return customer_id
+
         return None
     customer = getattr(chosen, "customer", None)
     customer_id = str(getattr(customer, "id", customer) or "")
@@ -622,13 +719,25 @@ async def sync_checkout_session(
 
     subscription = getattr(session, "subscription", None)
     subscription_id = str(getattr(subscription, "id", subscription) or "") or None
+    subscription_obj: Any | None = subscription
+
+    if subscription_id and (subscription is None or isinstance(subscription, str)):
+        try:
+            subscription_obj = await asyncio.to_thread(
+                stripe.Subscription.retrieve,
+                subscription_id,
+                expand=["items.data.price"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"Billing: unable to retrieve subscription {subscription_id} while syncing checkout session: {exc}")
+            subscription_obj = None
 
     if customer_id:
         await _ensure_customer_metadata(customer_id=customer_id, user_id=user.id)
         _upsert_billing_customer(supabase, user_id=user.id, stripe_customer_id=customer_id, email=user.email)
 
-    if subscription is not None and hasattr(subscription, "id"):
-        _upsert_subscription_from_stripe(supabase, user_id=user.id, subscription=subscription)
+    if subscription_obj is not None and hasattr(subscription_obj, "id"):
+        _upsert_subscription_from_stripe(supabase, user_id=user.id, subscription=subscription_obj)
 
     return SyncCheckoutSessionResponse(synced=True, customer_id=customer_id, subscription_id=subscription_id)
 
@@ -670,6 +779,37 @@ async def get_subscription(
             except HTTPException:
                 subscriptions = []
             chosen = _pick_best_subscription(subscriptions)
+
+    if chosen is None and user.email:
+        try:
+            customers = await asyncio.to_thread(
+                stripe.Customer.list,
+                email=user.email,
+                limit=10,
+            )
+        except Exception:  # noqa: BLE001
+            customers = None
+
+        customer_data = getattr(customers, "data", None) or []
+        email_candidates: list[Any] = []
+        for customer in customer_data:
+            customer_id = str(getattr(customer, "id", "") or "")
+            if not customer_id:
+                continue
+            try:
+                email_candidates.extend(await _search_subscriptions_by_customer_id(customer_id))
+            except HTTPException:
+                continue
+
+        filtered: list[Any] = []
+        for subscription in email_candidates:
+            metadata = getattr(subscription, "metadata", None) or {}
+            meta_user_id = str(getattr(metadata, "get", lambda *_: None)("user_id") or "")
+            if meta_user_id and meta_user_id != user.id:
+                continue
+            filtered.append(subscription)
+
+        chosen = _pick_best_subscription(filtered or email_candidates)
 
     if chosen is not None:
         stripe_subscription_record = _stripe_subscription_to_record(chosen, user_id=user.id)

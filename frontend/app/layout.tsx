@@ -55,7 +55,11 @@ export const metadata: Metadata = {
   title: 'FinanceSum - Financial Analysis Platform',
   description: 'Comprehensive financial analysis and investor insights',
   icons: {
-    icon: '/icon.svg',
+    icon: [
+      { url: '/favicon.png', type: 'image/png' },
+      { url: '/favicon.ico', sizes: 'any' },
+    ],
+    apple: [{ url: '/favicon.png', type: 'image/png' }],
   },
 }
 

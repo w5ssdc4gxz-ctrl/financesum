@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from 'next/server'
 const DEFAULT_BACKEND_URL = 'http://127.0.0.1:8000'
 const BACKEND_BASE_URL =
   process.env.BACKEND_API_URL ||
+  process.env.BACKEND_URL ||
   process.env.NEXT_PUBLIC_API_URL ||
   DEFAULT_BACKEND_URL
 
@@ -34,12 +35,33 @@ const HOP_BY_HOP_HEADERS = [
   'content-length',
 ]
 const backendBase = normalizeBaseUrl(BACKEND_BASE_URL)
+const parsedBackendBase = (() => {
+  try {
+    return new URL(backendBase)
+  } catch {
+    return null
+  }
+})()
+const isCloudConsoleBackend =
+  backendBase.includes('console.cloud.google.com') ||
+  parsedBackendBase?.hostname === 'console.cloud.google.com'
 
 type Params = {
   path?: string[]
 }
 
 async function proxy(request: NextRequest, context: { params: Promise<Params> }) {
+  if (isCloudConsoleBackend) {
+    return NextResponse.json(
+      {
+        error: 'Misconfigured backend URL',
+        detail:
+          'Your backend base URL points to the Google Cloud Console (console.cloud.google.com). Set BACKEND_API_URL (or BACKEND_URL) to your Cloud Run service URL (https://*.a.run.app), not the Console page URL.',
+      },
+      { status: 500 },
+    )
+  }
+
   // Next.js 14+: params is now a Promise that must be awaited
   const resolvedParams = await context.params
   const pathSegments = resolvedParams?.path ?? []

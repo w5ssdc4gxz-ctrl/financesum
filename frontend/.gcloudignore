@@ -1,0 +1,11 @@
+# Exclude local artifacts and keep Cloud Build uploads small.
+.git/
+.gitignore
+node_modules/
+.next/
+.next-dev/
+.DS_Store
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log

@@ -4,15 +4,15 @@ import { motion } from 'framer-motion'
 import { useTheme } from 'next-themes'
 import Navbar from '@/components/Navbar'
 import LayeredScrollBackground from '@/components/LayeredScrollBackground'
-import SignupForm from '@/components/SignupForm'
+import SigninForm from '@/components/SigninForm'
 
-const signupHighlights = [
-  'AI summaries tailored to legendary investor lenses.',
-  'Instant KPIs, risk factors, and distribution-ready briefs.',
-  'Secure Google sign-in with optional demo workspace.',
+const signinHighlights = [
+  'Pick up where you left off across your investor memos.',
+  'Secure auth with Supabase + Stripe subscriptions.',
+  'Switch themes anytime in settings.',
 ]
 
-export default function SignupPage() {
+export default function SigninPage() {
   const { resolvedTheme } = useTheme()
   const isDark = resolvedTheme === 'dark'
 
@@ -44,16 +44,16 @@ export default function SignupPage() {
                     : 'border-slate-200 bg-slate-50 text-slate-500'
                 }`}
               >
-                Early Access
+                Account
               </p>
               <h1 className={`text-4xl font-black leading-tight ${isDark ? 'text-white' : 'text-slate-900'}`}>
-                Sign up in minutes and start briefing investors today.
+                Sign in to FinanceSum.
               </h1>
               <p className={`text-lg ${isDark ? 'text-gray-200' : 'text-slate-600'}`}>
-                Bring every SEC filing to life with AI-crafted narratives, actionable KPIs, and cinematic workspaces that teams can trust.
+                Manage your filings, summaries, and billing in one place.
               </p>
               <ul className="space-y-4">
-                {signupHighlights.map((item) => (
+                {signinHighlights.map((item) => (
                   <li key={item} className={`flex items-start gap-3 ${isDark ? 'text-gray-200' : 'text-slate-600'}`}>
                     <span className={`mt-1 h-2 w-2 rounded-full ${isDark ? 'bg-primary-300' : 'bg-primary'}`} />
                     <span>{item}</span>
@@ -61,10 +61,11 @@ export default function SignupPage() {
                 ))}
               </ul>
             </div>
-            <SignupForm className="!max-w-full lg:max-w-lg" />
+            <SigninForm className="!max-w-full lg:max-w-lg" />
           </motion.div>
         </main>
       </div>
     </div>
   )
 }
+

@@ -31,7 +31,7 @@ from app.services.gemini_client import get_gemini_client
 from app.services.persona_engine import get_persona_engine
 
 
-def run_analysis(request: AnalysisRunRequest) -> AnalysisRunResponse:
+def run_analysis(request: AnalysisRunRequest, *, user_id: Optional[str] = None) -> AnalysisRunResponse:
     """Execute a synchronous analysis using cached filings."""
     try:
         company_id = str(request.company_id)
@@ -86,6 +86,7 @@ def run_analysis(request: AnalysisRunRequest) -> AnalysisRunResponse:
             health_score_data=health_score_data,
             analysis_options=request.analysis_options,
             generated_at=now,
+            user_id=user_id,
         )
 
         _store_analysis(company_id, analysis_record)
@@ -102,6 +103,7 @@ def run_analysis(request: AnalysisRunRequest) -> AnalysisRunResponse:
         record_summary_generated_event(
             summary_id=analysis_id,
             company_id=company_id,
+            user_id=user_id,
             kind="analysis",
             cached=False,
             source="fallback",
@@ -112,6 +114,7 @@ def run_analysis(request: AnalysisRunRequest) -> AnalysisRunResponse:
                 record_summary_generated_event(
                     summary_id=f"{analysis_id}:{persona_id}",
                     company_id=company_id,
+                    user_id=user_id,
                     kind="analysis_persona",
                     cached=False,
                     source="fallback",
@@ -128,20 +131,28 @@ def run_analysis(request: AnalysisRunRequest) -> AnalysisRunResponse:
         raise HTTPException(status_code=500, detail=f"Fallback analysis error: {exc}")
 
 
-def get_analysis(analysis_id: str) -> Analysis:
+def get_analysis(analysis_id: str, *, user_id: Optional[str] = None) -> Analysis:
     """Return a cached analysis."""
 
     record = fallback_analysis_by_id.get(analysis_id)
-    if not record:
+    if not record or (user_id and str(record.get("user_id") or "") != user_id):
         raise HTTPException(status_code=404, detail="Analysis not found")
 
     return Analysis(**record)
 
 
-def list_company_analyses(company_id: str, limit: Optional[int] = None, offset: int = 0) -> List[Analysis]:
+def list_company_analyses(
+    company_id: str,
+    limit: Optional[int] = None,
+    offset: int = 0,
+    *,
+    user_id: Optional[str] = None,
+) -> List[Analysis]:
     """Return cached analyses for a company, most recent first."""
 
     analyses = fallback_analyses.get(company_id, [])
+    if user_id:
+        analyses = [record for record in analyses if str(record.get("user_id") or "") == user_id]
 
     start = max(offset, 0)
     end = start + limit if limit is not None else None
@@ -150,11 +161,11 @@ def list_company_analyses(company_id: str, limit: Optional[int] = None, offset: 
     return [Analysis(**record) for record in sliced]
 
 
-def get_analysis_status(analysis_id: str) -> Dict[str, Any]:
+def get_analysis_status(analysis_id: str, *, user_id: Optional[str] = None) -> Dict[str, Any]:
     """Return status information for a cached analysis."""
 
     record = fallback_analysis_by_id.get(analysis_id)
-    if not record:
+    if not record or (user_id and str(record.get("user_id") or "") != user_id):
         raise HTTPException(status_code=404, detail="Analysis not found")
 
     return {
@@ -263,13 +274,23 @@ def _build_analysis_record(
     health_score_data: Dict[str, Any],
     analysis_options: Optional[Dict[str, Any]],
     generated_at: datetime,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    usage_context = {
+        "request_id": f"analysis-fallback-{analysis_id}",
+        "request_type": "analysis_summary_fallback",
+        "analysis_id": analysis_id,
+        "company_id": company_id,
+        "user_id": str(user_id) if user_id else None,
+    }
+
     summary_md, persona_summaries = _build_summary(
         company_name,
         health_score_data,
         ratios,
         len(filing_ids),
         filing_ids,
+        usage_context=usage_context,
     )
 
     record = {
@@ -293,6 +314,8 @@ def _build_analysis_record(
         },
         "error_message": None,
     }
+    if user_id:
+        record["user_id"] = str(user_id)
 
     return record
 
@@ -337,6 +360,7 @@ def _build_summary(
     ratios: Dict[str, Any],
     filings_count: int,
     filing_ids: List[str],
+    usage_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     overall = health_score_data.get("overall_score")
     band = health_score_data.get("score_band")
@@ -401,6 +425,7 @@ def _build_summary(
         health_score=overall,
         narrative="\n".join(thesis_points),
         filing_ids=filing_ids,
+        usage_context=usage_context,
     )
 
     # Build overall takeaway
@@ -521,6 +546,7 @@ def _generate_ai_sections(
     health_score: Optional[float],
     narrative: str,
     filing_ids: List[str],
+    usage_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, str], Dict[str, Any]]:
     """Generates AI-generated sections for the analysis."""
     ai_summary: Dict[str, str] = {}
@@ -534,6 +560,7 @@ def _generate_ai_sections(
             ai_summary = _generate_fallback_summary(company_name, ratios, health_score, narrative)
         else:
             gemini_client = get_gemini_client()
+            gemini_client.set_usage_context(usage_context)
             ai_summary = gemini_client.generate_company_summary(
                 company_name=company_name,
                 financial_data={"filings": filing_ids},

@@ -76,6 +76,7 @@ const buildCompanyRoute = (companyId?: string | null, ticker?: string | null, an
 export default function DashboardPage() {
   const router = useRouter()
   const { user } = useAuth()
+  const pinStorageKey = user?.id ? `${PIN_STORAGE_KEY}.${user.id}` : null
   const [pinnedBriefs, setPinnedBriefs] = useState<Record<string, boolean>>({})
   const {
     history,
@@ -91,9 +92,13 @@ export default function DashboardPage() {
 
   useEffect(() => {
     if (typeof window === 'undefined') return
+    if (!pinStorageKey) {
+      setPinnedBriefs({})
+      return
+    }
     const loadPins = () => {
       try {
-        const stored = window.localStorage.getItem(PIN_STORAGE_KEY)
+        const stored = window.localStorage.getItem(pinStorageKey)
         if (stored) {
           setPinnedBriefs(JSON.parse(stored))
         } else {
@@ -105,13 +110,13 @@ export default function DashboardPage() {
     }
     loadPins()
     const handleStorage = (event: StorageEvent) => {
-      if (event.key === PIN_STORAGE_KEY) {
+      if (event.key === pinStorageKey) {
         loadPins()
       }
     }
     window.addEventListener('storage', handleStorage)
     return () => window.removeEventListener('storage', handleStorage)
-  }, [])
+  }, [pinStorageKey])
 
   const statsCards = useMemo(
     () => [
@@ -269,7 +274,6 @@ const SectionHeader = ({ eyebrow, title, description, action }: SectionHeaderPro
     </div>
   )
 }
-
 
 
 

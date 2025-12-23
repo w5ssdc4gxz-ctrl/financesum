@@ -13,6 +13,20 @@ export default function AuthCallback() {
 
   useEffect(() => {
     const handleCallback = async () => {
+      const code =
+        typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('code') : null
+
+      if (code) {
+        const { error } = await supabase.auth.exchangeCodeForSession(code)
+        if (error) {
+          console.error('Supabase auth code exchange failed', error)
+        } else if (typeof window !== 'undefined') {
+          const url = new URL(window.location.href)
+          url.searchParams.delete('code')
+          window.history.replaceState(window.history.state, '', url.toString())
+        }
+      }
+
       // Supabase will parse the auth redirect URL automatically, but we still
       // refresh once to ensure we have a valid access token before calling our backend.
       const {
@@ -53,9 +67,7 @@ export default function AuthCallback() {
 
         router.push('/dashboard')
       } else {
-        // Keep any upgrade intent so we can retry after a fresh login.
-        const intent = typeof window !== 'undefined' ? window.localStorage.getItem(UPGRADE_INTENT_KEY) : null
-        router.push(intent === 'pro' ? '/signup' : '/')
+        router.push('/signin')
       }
     }
 
@@ -71,9 +83,6 @@ export default function AuthCallback() {
     </div>
   )
 }
-
-
-
 
 
 

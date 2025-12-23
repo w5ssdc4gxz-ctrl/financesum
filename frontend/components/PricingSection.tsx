@@ -8,6 +8,7 @@ import { useAuth } from '@/contexts/AuthContext'
 import { billingApi } from '@/lib/api-client'
 
 const UPGRADE_INTENT_KEY = 'financesum.intent.checkout.plan'
+const CHECKOUT_SESSION_STORAGE_KEY = 'financesum.checkout.session_id'
 
 interface PricingCardProps {
   title: string
@@ -336,7 +337,11 @@ export default function PricingSection() {
     try {
       const response = await billingApi.createCheckoutSession({ plan: 'pro' }, session.access_token)
       const url = response.data?.url as string | undefined
+      const sessionId = response.data?.id as string | undefined
       if (!url) throw new Error('Missing checkout URL')
+      if (sessionId && typeof window !== 'undefined') {
+        window.localStorage.setItem(CHECKOUT_SESSION_STORAGE_KEY, sessionId)
+      }
       window.location.href = url
     } catch (error) {
       console.error('Unable to start Stripe Checkout', error)
@@ -376,7 +381,7 @@ export default function PricingSection() {
       period: '/month',
       description: 'For serious investors and analysts',
       features: [
-        '1,000 summaries per month',
+        '100 summaries per month',
         'Advanced AI analysis',
         'Financial health scores',
         'Investor persona insights',

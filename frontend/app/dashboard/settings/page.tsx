@@ -125,7 +125,7 @@ export default function SettingsPage() {
     const upgradeDescription =
         remainingCount <= 0
             ? "Upgrade to Pro to keep generating summaries."
-            : "Get 1,000 summaries per month, priority support, and all export formats."
+            : "Get 100 summaries per month, priority support, and all export formats."
     const isCanceling = Boolean(
         isProPlan && (usage?.cancel_at_period_end || usage?.subscription_status === "canceled")
     )
@@ -447,14 +447,10 @@ export default function SettingsPage() {
                                         <Button
                                             onClick={handleOpenStripePortal}
                                             color="ghost"
-                                            className="border-red-200 text-red-600 hover:text-red-700 hover:border-red-300"
+                                            className="border-slate-200 text-slate-700 hover:text-slate-900 hover:border-slate-300 dark:border-white/10 dark:text-gray-200 dark:hover:text-white dark:hover:border-white/20"
                                             disabled={cancelLoading}
                                         >
-                                            {cancelLoading
-                                                ? "Opening Stripe…"
-                                                : isCanceling
-                                                    ? "Manage in Stripe"
-                                                    : "Cancel in Stripe"}
+                                            {cancelLoading ? "Opening Stripe…" : "Open Stripe Portal"}
                                         </Button>
                                     )}
                                 </div>

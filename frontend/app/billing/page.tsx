@@ -1,8 +1,8 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import Navbar from '@/components/Navbar'
 import { useAuth } from '@/contexts/AuthContext'
 import { billingApi } from '@/lib/api-client'
@@ -22,7 +22,9 @@ type SubscriptionResponse = {
 
 export default function BillingPage() {
   const router = useRouter()
+  const searchParams = useSearchParams()
   const { user, session, loading: authLoading } = useAuth()
+  const sessionIdFromUrl = searchParams.get('session_id')
 
   const [loading, setLoading] = useState(true)
   const [payload, setPayload] = useState<SubscriptionResponse | null>(null)
@@ -30,6 +32,9 @@ export default function BillingPage() {
   const [stripeConfigured, setStripeConfigured] = useState<boolean | null>(null)
   const [portalLoading, setPortalLoading] = useState(false)
   const [checkoutLoading, setCheckoutLoading] = useState(false)
+  const [syncTick, setSyncTick] = useState(0)
+  const syncInFlight = useRef(false)
+  const syncedSessionId = useRef<string | null>(null)
 
   const refreshStripeConfig = async () => {
     try {
@@ -46,7 +51,7 @@ export default function BillingPage() {
   useEffect(() => {
     if (authLoading) return
     if (!user || !session) {
-      router.push('/signup')
+      router.push('/signin')
     }
   }, [authLoading, user, session, router])
 
@@ -66,6 +71,53 @@ export default function BillingPage() {
       cancelled = true
     }
   }, [])
+
+  useEffect(() => {
+    if (!user || !session) return
+
+    const storedSessionId =
+      typeof window !== 'undefined' ? window.localStorage.getItem(CHECKOUT_SESSION_STORAGE_KEY) : null
+    const pendingSessionId = sessionIdFromUrl || storedSessionId
+    if (!pendingSessionId) return
+    if (syncInFlight.current) return
+    if (syncedSessionId.current === pendingSessionId) return
+
+    let cancelled = false
+
+    const syncSession = async () => {
+      syncInFlight.current = true
+      const configured = stripeConfigured === true ? true : await refreshStripeConfig()
+      if (!configured || cancelled) {
+        syncInFlight.current = false
+        return
+      }
+      syncedSessionId.current = pendingSessionId
+      setError(null)
+      try {
+        await billingApi.syncCheckoutSession(pendingSessionId, session.access_token)
+        if (cancelled) return
+        if (typeof window !== 'undefined') {
+          window.localStorage.removeItem(CHECKOUT_SESSION_STORAGE_KEY)
+        }
+        if (sessionIdFromUrl) {
+          router.replace('/billing')
+        }
+        setSyncTick((value) => value + 1)
+      } catch (err: any) {
+        if (cancelled) return
+        setError(err?.response?.data?.detail || err?.message || 'Unable to sync checkout session.')
+      } finally {
+        if (cancelled) return
+        syncInFlight.current = false
+      }
+    }
+
+    syncSession()
+
+    return () => {
+      cancelled = true
+    }
+  }, [user, session, sessionIdFromUrl, stripeConfigured, router])
 
   useEffect(() => {
     if (!user || !session) return
@@ -97,7 +149,7 @@ export default function BillingPage() {
     return () => {
       cancelled = true
     }
-  }, [user, session, stripeConfigured])
+  }, [user, session, stripeConfigured, syncTick])
 
   const isPro = Boolean(payload?.is_pro)
   const subscription = payload?.subscription ?? null
@@ -120,7 +172,7 @@ export default function BillingPage() {
 
   const handleOpenPortal = async () => {
     if (!session?.access_token) {
-      router.push('/signup')
+      router.push('/signin')
       return
     }
     const configured = stripeConfigured === true ? true : await refreshStripeConfig()
@@ -144,7 +196,7 @@ export default function BillingPage() {
 
   const handleUpgrade = async () => {
     if (!session?.access_token) {
-      router.push('/signup')
+      router.push('/signin')
       return
     }
     const configured = stripeConfigured === true ? true : await refreshStripeConfig()

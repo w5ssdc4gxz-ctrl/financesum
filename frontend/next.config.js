@@ -4,15 +4,6 @@ const { PHASE_DEVELOPMENT_SERVER } = require('next/constants')
 const baseConfig = {
   reactStrictMode: true,
   swcMinify: true,
-  async rewrites() {
-    const backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
-    return [
-      {
-        source: '/api/backend/:path*',
-        destination: `${backendUrl}/:path*`,
-      },
-    ]
-  },
 }
 
 module.exports = (phase) => {
@@ -25,8 +16,6 @@ module.exports = (phase) => {
     distDir: isDev ? '.next-dev' : '.next',
   }
 }
-
-
 
 
 

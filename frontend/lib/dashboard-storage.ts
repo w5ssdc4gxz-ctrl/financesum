@@ -14,6 +14,9 @@ const MAX_RECENT_COMPANIES = 12
 
 const isBrowser = () => typeof window !== "undefined"
 
+const buildStorageKey = (baseKey: string, userId?: string | null) =>
+  userId ? `${baseKey}.${userId}` : baseKey
+
 const safeParse = <T>(value: string | null, fallback: T): T => {
   if (!value) return fallback
   try {
@@ -131,22 +134,24 @@ const dedupeSnapshots = (snapshots: StoredAnalysisSnapshot[]) => {
 }
 
 export const DashboardStorage = {
-  loadAnalysisHistory(): StoredAnalysisSnapshot[] {
+  loadAnalysisHistory(userId?: string | null): StoredAnalysisSnapshot[] {
     if (!isBrowser()) return []
+    const storageKey = buildStorageKey(ANALYSIS_HISTORY_KEY, userId)
     const parsed = safeParse<StoredAnalysisSnapshot[]>(
-      window.localStorage.getItem(ANALYSIS_HISTORY_KEY),
+      window.localStorage.getItem(storageKey),
       [],
     )
     const cleaned = dedupeSnapshots(parsed)
     if (cleaned.length !== parsed.length) {
-      writeStorage(ANALYSIS_HISTORY_KEY, cleaned)
+      writeStorage(storageKey, cleaned)
     }
     return cleaned
   },
 
-  upsertAnalysisSnapshot(snapshot: StoredAnalysisSnapshot) {
+  upsertAnalysisSnapshot(snapshot: StoredAnalysisSnapshot, userId?: string | null) {
     if (!isBrowser()) return
-    const existing = DashboardStorage.loadAnalysisHistory()
+    const storageKey = buildStorageKey(ANALYSIS_HISTORY_KEY, userId)
+    const existing = DashboardStorage.loadAnalysisHistory(userId)
     const snapshotSource = resolveSnapshotSource(snapshot)
     const filtered = existing.filter((item) => {
       if (item.analysisId === snapshot.analysisId) {
@@ -163,63 +168,71 @@ export const DashboardStorage = {
       return true
     })
     const updated = dedupeSnapshots([snapshot, ...filtered]).slice(0, MAX_ANALYSIS_HISTORY)
-    writeStorage(ANALYSIS_HISTORY_KEY, updated)
+    writeStorage(storageKey, updated)
   },
 
-  replaceAnalysisHistory(snapshots: StoredAnalysisSnapshot[]) {
+  replaceAnalysisHistory(snapshots: StoredAnalysisSnapshot[], userId?: string | null) {
     if (!isBrowser()) return
+    const storageKey = buildStorageKey(ANALYSIS_HISTORY_KEY, userId)
     const limited = dedupeSnapshots(snapshots).slice(0, MAX_ANALYSIS_HISTORY)
-    writeStorage(ANALYSIS_HISTORY_KEY, limited)
+    writeStorage(storageKey, limited)
   },
 
-  removeAnalysisSnapshot(analysisId: string) {
+  removeAnalysisSnapshot(analysisId: string, userId?: string | null) {
     if (!isBrowser()) return
-    const filtered = DashboardStorage.loadAnalysisHistory().filter(
+    const storageKey = buildStorageKey(ANALYSIS_HISTORY_KEY, userId)
+    const filtered = DashboardStorage.loadAnalysisHistory(userId).filter(
       (item) => item.analysisId !== analysisId
     )
-    writeStorage(ANALYSIS_HISTORY_KEY, filtered)
+    writeStorage(storageKey, filtered)
   },
 
-  loadRecentCompanies(): StoredCompany[] {
+  loadRecentCompanies(userId?: string | null): StoredCompany[] {
     if (!isBrowser()) return []
+    const storageKey = buildStorageKey(RECENT_COMPANIES_KEY, userId)
     return safeParse<StoredCompany[]>(
-      window.localStorage.getItem(RECENT_COMPANIES_KEY),
+      window.localStorage.getItem(storageKey),
       [],
     )
   },
 
-  upsertRecentCompany(company: StoredCompany) {
+  upsertRecentCompany(company: StoredCompany, userId?: string | null) {
     if (!isBrowser()) return
-    const existing = DashboardStorage.loadRecentCompanies()
+    const storageKey = buildStorageKey(RECENT_COMPANIES_KEY, userId)
+    const existing = DashboardStorage.loadRecentCompanies(userId)
     const filtered = existing.filter((item) => item.id !== company.id)
     const updated = [company, ...filtered].slice(0, MAX_RECENT_COMPANIES)
-    writeStorage(RECENT_COMPANIES_KEY, updated)
+    writeStorage(storageKey, updated)
   },
 
-  replaceRecentCompanies(companies: StoredCompany[]) {
+  replaceRecentCompanies(companies: StoredCompany[], userId?: string | null) {
     if (!isBrowser()) return
+    const storageKey = buildStorageKey(RECENT_COMPANIES_KEY, userId)
     const limited = companies.slice(0, MAX_RECENT_COMPANIES)
-    writeStorage(RECENT_COMPANIES_KEY, limited)
+    writeStorage(storageKey, limited)
   },
 
-  removeRecentCompany(companyId: string) {
+  removeRecentCompany(companyId: string, userId?: string | null) {
     if (!isBrowser()) return
-    const filtered = DashboardStorage.loadRecentCompanies().filter(
+    const storageKey = buildStorageKey(RECENT_COMPANIES_KEY, userId)
+    const filtered = DashboardStorage.loadRecentCompanies(userId).filter(
       (item) => item.id !== companyId
     )
-    writeStorage(RECENT_COMPANIES_KEY, filtered)
+    writeStorage(storageKey, filtered)
   },
 
-  loadSummaryPreferences(): StoredSummaryPreferences | null {
+  loadSummaryPreferences(userId?: string | null): StoredSummaryPreferences | null {
     if (!isBrowser()) return null
+    const storageKey = buildStorageKey(SUMMARY_PREFERENCES_KEY, userId)
     return safeParse<StoredSummaryPreferences | null>(
-      window.localStorage.getItem(SUMMARY_PREFERENCES_KEY),
+      window.localStorage.getItem(storageKey),
       null,
     )
   },
 
-  saveSummaryPreferences(preferences: StoredSummaryPreferences) {
-    writeStorage(SUMMARY_PREFERENCES_KEY, preferences)
+  saveSummaryPreferences(preferences: StoredSummaryPreferences, userId?: string | null) {
+    const storageKey = buildStorageKey(SUMMARY_PREFERENCES_KEY, userId)
+    writeStorage(storageKey, preferences)
   },
 }
 

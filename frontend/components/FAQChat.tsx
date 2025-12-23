@@ -42,9 +42,9 @@ const faqItems: FAQItem[] = [
   },
   {
     id: 6,
-    question: "What&apos;s included in the free plan?",
+    question: "What's included in the free plan?",
     answer:
-      "The free plan includes a 1-summary trial so you can test FinanceSum. Upgrade anytime for 1,000 summaries per month and advanced features.",
+      "The free plan includes a 1-summary trial so you can test FinanceSum. Upgrade anytime for 100 summaries per month and advanced features.",
   },
 ];
 

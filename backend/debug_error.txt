@@ -1,23 +1,7 @@
-UNEXPECTED ERROR: invalid group reference 1 at position 1
-Type: <class 're.error'>
+UNEXPECTED ERROR: 'DummyClient' object has no attribute 'set_usage_context'
+Type: <class 'AttributeError'>
 Traceback (most recent call last):
-  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 4995, in generate_filing_summary
-    summary_text = _ensure_required_sections(
-                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 6128, in _ensure_required_sections
-    text = re.sub(
-           ^^^^^^^
-  File "/opt/homebrew/Cellar/python@3.11/3.11.14_1/Frameworks/Python.framework/Versions/3.11/lib/python3.11/re/__init__.py", line 185, in sub
-    return _compile(pattern, flags).sub(repl, string, count)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/homebrew/Cellar/python@3.11/3.11.14_1/Frameworks/Python.framework/Versions/3.11/lib/python3.11/re/__init__.py", line 317, in _subx
-    template = _compile_repl(template, pattern)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/homebrew/Cellar/python@3.11/3.11.14_1/Frameworks/Python.framework/Versions/3.11/lib/python3.11/re/__init__.py", line 308, in _compile_repl
-    return _parser.parse_template(repl, pattern)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/homebrew/Cellar/python@3.11/3.11.14_1/Frameworks/Python.framework/Versions/3.11/lib/python3.11/re/_parser.py", line 1081, in parse_template
-    addgroup(int(this[1:]), len(this) - 1)
-  File "/opt/homebrew/Cellar/python@3.11/3.11.14_1/Frameworks/Python.framework/Versions/3.11/lib/python3.11/re/_parser.py", line 1017, in addgroup
-    raise s.error("invalid group reference %d" % index, pos)
-re.error: invalid group reference 1 at position 1
+  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 5275, in generate_filing_summary
+    gemini_client.set_usage_context(
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'DummyClient' object has no attribute 'set_usage_context'

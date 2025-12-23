@@ -18,8 +18,7 @@ export function CompanyLogo({ ticker, exchange = 'US', className, fallback }: Co
   }
 
   const cleanTicker = ticker.split('.')[0] // Handle cases where ticker is passed as 'AAPL.US'
-  // Use the backend proxy - version is hardcoded to v1 for now, or could use env var if exposed
-  const src = `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/v1/companies/logo/${cleanTicker}?exchange=${exchange}`
+  const src = `/api/backend/api/v1/companies/logo/${cleanTicker}?exchange=${exchange}`
 
   return (
     <img 

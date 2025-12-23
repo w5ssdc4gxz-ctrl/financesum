@@ -115,7 +115,7 @@ export default function CompanySearch({ onSelectCompany }: CompanySearchProps) {
                   {/* Logo */}
                   <div className="relative h-10 w-10 flex-shrink-0 rounded-lg bg-gray-100 dark:bg-zinc-800 overflow-hidden flex items-center justify-center">
                     <img
-                      src={`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/v1/companies/logo/${company.ticker}`}
+                      src={`/api/backend/api/v1/companies/logo/${company.ticker}`}
                       alt={`${company.name} logo`}
                       className="h-full w-full object-contain p-1"
                       onError={(e) => {
@@ -183,6 +183,5 @@ export default function CompanySearch({ onSelectCompany }: CompanySearchProps) {
     </div>
   )
 }
-
 
 

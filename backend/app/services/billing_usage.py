@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+import calendar
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Literal
 
 import stripe
@@ -13,7 +14,7 @@ from app.config import ensure_env_loaded, get_settings
 from app.services.summary_activity import count_user_summary_events
 from app.models.database import get_supabase_client
 
-PRO_SUMMARY_LIMIT = 1000
+PRO_SUMMARY_LIMIT = 100
 FREE_SUMMARY_LIMIT = 1
 
 
@@ -81,21 +82,85 @@ def _parse_datetime(value: object) -> Optional[datetime]:
     return None
 
 
+def _add_months(value: datetime, months: int) -> datetime:
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def _add_interval(value: datetime, *, interval: str, count: int) -> datetime:
+    if interval == "day":
+        return value + timedelta(days=count)
+    if interval == "week":
+        return value + timedelta(weeks=count)
+    if interval == "month":
+        return _add_months(value, count)
+    if interval == "year":
+        return _add_months(value, count * 12)
+    return value
+
+
+def _extract_recurring_interval(subscription: object) -> tuple[Optional[str], int]:
+    items = _get_subscription_value(subscription, "items")
+    data = None
+    if isinstance(items, dict):
+        data = items.get("data")
+    else:
+        data = getattr(items, "data", None)
+    first = data[0] if data else None
+    if first is None:
+        return None, 1
+    price = first.get("price") if isinstance(first, dict) else getattr(first, "price", None)
+    if price is None:
+        return None, 1
+    recurring = price.get("recurring") if isinstance(price, dict) else getattr(price, "recurring", None)
+    if recurring is None:
+        return None, 1
+    interval = recurring.get("interval") if isinstance(recurring, dict) else getattr(recurring, "interval", None)
+    interval_count = recurring.get("interval_count") if isinstance(recurring, dict) else getattr(recurring, "interval_count", None)
+    if not interval:
+        return None, 1
+    try:
+        count = int(interval_count or 1)
+    except (TypeError, ValueError):
+        count = 1
+    return str(interval), max(count, 1)
+
+
 def _subscription_period(subscription: object) -> tuple[Optional[datetime], Optional[datetime]]:
     start_ts = _get_subscription_value(subscription, "current_period_start")
     end_ts = _get_subscription_value(subscription, "current_period_end")
-    return _parse_datetime(start_ts), _parse_datetime(end_ts)
+    start = _parse_datetime(start_ts)
+    end = _parse_datetime(end_ts)
+
+    if start is None:
+        start = _parse_datetime(_get_subscription_value(subscription, "billing_cycle_anchor"))
+    if start is None:
+        start = _parse_datetime(_get_subscription_value(subscription, "start_date"))
+    if start is None:
+        start = _parse_datetime(_get_subscription_value(subscription, "created"))
+
+    if end is None and start is not None:
+        interval, count = _extract_recurring_interval(subscription)
+        if interval:
+            end = _add_interval(start, interval=interval, count=count)
+
+    return start, end
 
 
 def _subscription_canceling(subscription: object, now: datetime) -> bool:
+    period_end = _subscription_period(subscription)[1]
     cancel_at_period_end = bool(_get_subscription_value(subscription, "cancel_at_period_end") or False)
     if cancel_at_period_end:
+        if period_end and period_end <= now:
+            return False
         return True
     cancel_at = _parse_datetime(_get_subscription_value(subscription, "cancel_at"))
-    if cancel_at and cancel_at > now:
-        return True
+    if cancel_at:
+        return cancel_at > now
     canceled_at = _parse_datetime(_get_subscription_value(subscription, "canceled_at"))
-    period_end = _subscription_period(subscription)[1]
     if canceled_at and period_end and period_end > now:
         return True
     return False

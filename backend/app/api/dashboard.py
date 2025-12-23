@@ -5,9 +5,10 @@ from collections import Counter
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 
 from app.api.companies import _supabase_configured
+from app.api.auth import CurrentUser, get_current_user
 from app.config import get_settings
 from app.models.database import get_supabase_client
 from app.services.local_cache import (
@@ -136,7 +137,10 @@ def _hydrate_fallback_countries(company_map: Dict[str, Dict[str, Any]]) -> None:
 
 
 @router.get("/overview")
-async def get_dashboard_overview(tz_offset_minutes: Optional[int] = None) -> Dict[str, Any]:
+async def get_dashboard_overview(
+    tz_offset_minutes: Optional[int] = None,
+    user: CurrentUser = Depends(get_current_user),
+) -> Dict[str, Any]:
     """
     Return aggregated dashboard metrics and the most recent analyses.
 
@@ -146,24 +150,25 @@ async def get_dashboard_overview(tz_offset_minutes: Optional[int] = None) -> Dic
     settings = get_settings()
 
     if not _supabase_configured(settings):
-        return _build_fallback_overview(tz_offset_minutes=tz_offset_minutes)
+        return _build_fallback_overview(user_id=user.id, tz_offset_minutes=tz_offset_minutes)
 
     try:
-        return _build_supabase_overview(tz_offset_minutes=tz_offset_minutes)
+        return _build_supabase_overview(user_id=user.id, tz_offset_minutes=tz_offset_minutes)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
         if is_supabase_table_missing_error(exc):
-            return _build_fallback_overview(tz_offset_minutes=tz_offset_minutes)
+            return _build_fallback_overview(user_id=user.id, tz_offset_minutes=tz_offset_minutes)
         raise HTTPException(status_code=500, detail=f"Error loading dashboard overview: {exc}") from exc
 
 
-def _build_supabase_overview(*, tz_offset_minutes: Optional[int] = None) -> Dict[str, Any]:
+def _build_supabase_overview(*, user_id: str, tz_offset_minutes: Optional[int] = None) -> Dict[str, Any]:
     supabase = get_supabase_client()
 
     response = (
         supabase.table("analyses")
         .select("*", count="exact")
+        .eq("user_id", user_id)
         .order("analysis_date", desc=True)
         .limit(MAX_HISTORY_RESULTS)
         .execute()
@@ -182,7 +187,11 @@ def _build_supabase_overview(*, tz_offset_minutes: Optional[int] = None) -> Dict
     history = [_build_history_entry(analysis, company_map.get(analysis.get("company_id"))) for analysis in analyses]
 
     # Summary generation metrics (for "Analysis Activity" and totals that should not decrease on dashboard removal)
-    summary_total, summary_activity = get_summary_generation_metrics(supabase_client=supabase, tz_offset_minutes=tz_offset_minutes)
+    summary_total, summary_activity = get_summary_generation_metrics(
+        supabase_client=supabase,
+        tz_offset_minutes=tz_offset_minutes,
+        user_id=user_id,
+    )
 
     stats = _calculate_stats(
         history,
@@ -200,13 +209,15 @@ def _build_supabase_overview(*, tz_offset_minutes: Optional[int] = None) -> Dict
     }
 
 
-def _build_fallback_overview(*, tz_offset_minutes: Optional[int] = None) -> Dict[str, Any]:
+def _build_fallback_overview(*, user_id: str, tz_offset_minutes: Optional[int] = None) -> Dict[str, Any]:
     _hydrate_fallback_countries(fallback_companies)
 
     history: List[Dict[str, Any]] = []
     for company_id, analyses in fallback_analyses.items():
         company = fallback_companies.get(str(company_id))
         for analysis in analyses:
+            if user_id and str(analysis.get("user_id") or "") != user_id:
+                continue
             history.append(_build_history_entry(analysis, company))
 
     history.sort(
@@ -216,7 +227,10 @@ def _build_fallback_overview(*, tz_offset_minutes: Optional[int] = None) -> Dict
     total_analyses = len(history)
     limited_history = history[:MAX_HISTORY_RESULTS]
 
-    summary_total, summary_activity = get_summary_generation_metrics(tz_offset_minutes=tz_offset_minutes)
+    summary_total, summary_activity = get_summary_generation_metrics(
+        tz_offset_minutes=tz_offset_minutes,
+        user_id=user_id,
+    )
 
     stats = _calculate_stats(
         limited_history,

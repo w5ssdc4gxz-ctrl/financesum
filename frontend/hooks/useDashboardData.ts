@@ -6,6 +6,7 @@ import DashboardStorage, {
   StoredCompany,
   StoredSummaryPreferences,
 } from "@/lib/dashboard-storage"
+import { useAuth } from "@/contexts/AuthContext"
 import { buildSummaryPreview, scoreToRating } from "@/lib/analysis-insights"
 import { getCompanyCoordinates } from "@/lib/country-geo"
 import { buildEodSymbol } from "@/lib/logo-utils"
@@ -154,26 +155,39 @@ const mergeCompanies = (current: StoredCompany[], incoming: StoredCompany[]): St
 }
 
 export function useDashboardData() {
+  const { user } = useAuth()
   const [history, setHistory] = useState<StoredAnalysisSnapshot[]>([])
   const [companies, setCompanies] = useState<StoredCompany[]>([])
   const [preferences, setPreferences] = useState<StoredSummaryPreferences>(DEFAULT_PREFERENCES)
   const [serverStats, setServerStats] = useState<any>(null)
+  const userId = user?.id ?? null
+
+  useEffect(() => {
+    setServerStats(null)
+  }, [userId])
 
   const syncFromStorage = useCallback(() => {
-    setHistory(DashboardStorage.loadAnalysisHistory())
-    setCompanies(DashboardStorage.loadRecentCompanies())
-    setPreferences(DashboardStorage.loadSummaryPreferences() ?? DEFAULT_PREFERENCES)
-  }, [])
+    if (!userId) {
+      setHistory([])
+      setCompanies([])
+      setPreferences(DEFAULT_PREFERENCES)
+      return
+    }
+    setHistory(DashboardStorage.loadAnalysisHistory(userId))
+    setCompanies(DashboardStorage.loadRecentCompanies(userId))
+    setPreferences(DashboardStorage.loadSummaryPreferences(userId) ?? DEFAULT_PREFERENCES)
+  }, [userId])
 
   const removeHistoryEntry = useCallback(async (analysisId: string) => {
-    DashboardStorage.removeAnalysisSnapshot(analysisId)
-    setHistory(DashboardStorage.loadAnalysisHistory())
+    if (!userId) return
+    DashboardStorage.removeAnalysisSnapshot(analysisId, userId)
+    setHistory(DashboardStorage.loadAnalysisHistory(userId))
     try {
       await analysisApi.deleteAnalysis(analysisId)
     } catch (error) {
       console.error("Failed to delete analysis from backend", error)
     }
-  }, [])
+  }, [userId])
 
   useEffect(() => {
     if (typeof window === "undefined") return
@@ -190,6 +204,7 @@ export function useDashboardData() {
 
   useEffect(() => {
     if (typeof window === "undefined") return
+    if (!userId) return
     let cancelled = false
     const fetchOverview = async () => {
       try {
@@ -211,7 +226,7 @@ export function useDashboardData() {
             if (merged === prev) {
               return prev
             }
-            DashboardStorage.replaceAnalysisHistory(merged)
+            DashboardStorage.replaceAnalysisHistory(merged, userId)
             return merged
           })
         }
@@ -225,7 +240,7 @@ export function useDashboardData() {
             if (merged === prev) {
               return prev
             }
-            DashboardStorage.replaceRecentCompanies(merged)
+            DashboardStorage.replaceRecentCompanies(merged, userId)
             return merged
           })
         }
@@ -239,7 +254,7 @@ export function useDashboardData() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [userId])
 
   const primaryAnalysis = history.length ? history[0] : null
   const personaSignals = primaryAnalysis?.personaSignals ?? []

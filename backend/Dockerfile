@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
     ghostscript \
     libmagic1 \
     poppler-utils \
-    openjdk-17-jre-headless \
+    default-jre-headless \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -27,9 +27,7 @@ COPY . .
 EXPOSE 8000
 
 # Run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
-
-
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers ${UVICORN_WORKERS:-1} --proxy-headers --forwarded-allow-ips='*'"]
 
 
 

@@ -23,6 +23,7 @@ from app.services.gemini_exceptions import (
     GeminiAPIError,
     GeminiTimeoutError,
 )
+from app.services.gemini_usage import record_gemini_usage
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,10 @@ class GeminiClient:
         # "ValueError: Unknown field for GenerateContentRequest: request_options"
         # Forcing HTTP fallback bypasses the SDK entirely and makes direct REST calls.
         self.force_http_fallback = True
+        self.usage_context: Optional[Dict[str, Any]] = None
+
+    def set_usage_context(self, context: Optional[Dict[str, Any]]) -> None:
+        self.usage_context = context or None
     
     def _resolve_model_path(self, use_persona_model: bool = False) -> str:
         raw_name = self.persona_model_name if use_persona_model else self.model_name
@@ -121,6 +126,7 @@ class GeminiClient:
         use_persona_model: bool = False,
         progress_callback: Optional[Callable[[int, str], None]] = None,
         stage_name: str = "Generating",
+        usage_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Lightweight HTTP fallback with proper error handling.
@@ -198,6 +204,8 @@ class GeminiClient:
                 response_body=None
             ) from unexpected_exc
 
+        usage_metadata = data.get("usageMetadata") if isinstance(data, dict) else None
+
         # Parse response text
         text_response = ""
         for candidate in data.get("candidates") or []:
@@ -215,6 +223,14 @@ class GeminiClient:
                 response_body=str(data)
             )
 
+        record_gemini_usage(
+            prompt=prompt,
+            response_text=text_response,
+            usage_metadata=usage_metadata,
+            model=self.persona_model_name if use_persona_model else self.model_name,
+            usage_context=usage_context or self.usage_context,
+        )
+
         if progress_callback:
             progress_callback(100, f"{stage_name}... Complete")
 
@@ -226,6 +242,7 @@ class GeminiClient:
         use_persona_model: bool = False,
         progress_callback: Optional[Callable[[int, str], None]] = None,
         stage_name: str = "Generating",
+        usage_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Wrapper around _http_generate_content with exponential backoff retry logic.
@@ -267,7 +284,8 @@ class GeminiClient:
                 prompt=prompt,
                 use_persona_model=use_persona_model,
                 progress_callback=progress_callback,
-                stage_name=stage_name
+                stage_name=stage_name,
+                usage_context=usage_context,
             )
 
         try:
@@ -282,7 +300,8 @@ class GeminiClient:
         progress_callback: Optional[Callable[[int, str], None]] = None,
         stage_name: str = "Generating",
         expected_tokens: int = 4000,
-        use_persona_model: bool = False
+        use_persona_model: bool = False,
+        usage_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Generate content with streaming and real-time progress updates.
@@ -303,6 +322,7 @@ class GeminiClient:
                 use_persona_model=use_persona_model,
                 progress_callback=progress_callback,
                 stage_name=stage_name,
+                usage_context=usage_context,
             )
 
         model = self.persona_model if use_persona_model else self.model
@@ -323,7 +343,15 @@ class GeminiClient:
             
             if progress_callback:
                 progress_callback(100, f"{stage_name}... Complete")
-            
+
+            record_gemini_usage(
+                prompt=prompt,
+                response_text=accumulated_text,
+                usage_metadata=None,
+                model=self.persona_model_name if use_persona_model else self.model_name,
+                usage_context=usage_context or self.usage_context,
+            )
+
             return accumulated_text
             
         except ValueError as e:
@@ -336,13 +364,22 @@ class GeminiClient:
                     use_persona_model=use_persona_model,
                     progress_callback=progress_callback,
                     stage_name=stage_name,
+                    usage_context=usage_context,
                 )
             raise
         except Exception as e:  # noqa: BLE001
             print(f"Streaming generation error: {e}")
             try:
                 response = model.generate_content(prompt)
-                return response.text
+                text = response.text
+                record_gemini_usage(
+                    prompt=prompt,
+                    response_text=text,
+                    usage_metadata=_coerce_usage_metadata(response),
+                    model=self.persona_model_name if use_persona_model else self.model_name,
+                    usage_context=usage_context or self.usage_context,
+                )
+                return text
             except Exception as secondary:  # noqa: BLE001
                 print(f"Non-stream generation also failed: {secondary}")
                 self.force_http_fallback = True
@@ -351,6 +388,7 @@ class GeminiClient:
                     use_persona_model=use_persona_model,
                     progress_callback=progress_callback,
                     stage_name=stage_name,
+                    usage_context=usage_context,
                 )
 
     def generate_content(
@@ -358,6 +396,7 @@ class GeminiClient:
         prompt: str,
         use_persona_model: bool = False,
         timeout: Optional[int] = None,
+        usage_context: Optional[Dict[str, Any]] = None,
     ):
         """Wrapper to enforce request timeouts on non-streaming calls."""
         if self.force_http_fallback:
@@ -365,19 +404,29 @@ class GeminiClient:
                 prompt,
                 use_persona_model=use_persona_model,
                 stage_name="Generating",
+                usage_context=usage_context,
             )
             return SimpleNamespace(text=fallback_text)
 
         model = self.persona_model if use_persona_model else self.model
         # Rely on outer timeout guards instead of per-call request_options to avoid SDK/proto mismatches
         try:
-            return model.generate_content(prompt)
+            response = model.generate_content(prompt)
+            record_gemini_usage(
+                prompt=prompt,
+                response_text=response.text,
+                usage_metadata=_coerce_usage_metadata(response),
+                model=self.persona_model_name if use_persona_model else self.model_name,
+                usage_context=usage_context or self.usage_context,
+            )
+            return response
         except ValueError as exc:
             if "request_options" in str(exc):
                 fallback_text = self._http_generate_content_with_retry(
                     prompt,
                     use_persona_model=use_persona_model,
                     stage_name="Generating",
+                    usage_context=usage_context,
                 )
                 self.force_http_fallback = True
                 return SimpleNamespace(text=fallback_text)
@@ -387,9 +436,26 @@ class GeminiClient:
                 prompt,
                 use_persona_model=use_persona_model,
                 stage_name="Generating",
+                usage_context=usage_context,
             )
             self.force_http_fallback = True
             return SimpleNamespace(text=fallback_text)
+
+
+def _coerce_usage_metadata(response: Any) -> Optional[Dict[str, Any]]:
+    usage = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return usage
+    data: Dict[str, Any] = {}
+    for attr in ("prompt_token_count", "candidates_token_count", "total_token_count"):
+        if hasattr(usage, attr):
+            data[attr] = getattr(usage, attr)
+    for attr in ("promptTokenCount", "candidatesTokenCount", "totalTokenCount"):
+        if hasattr(usage, attr):
+            data[attr] = getattr(usage, attr)
+    return data or None
 
     def _post_process_summary(self, response_text: str) -> str:
         """
@@ -1087,10 +1153,12 @@ Analysis Structure (FOLLOW EXACTLY):
 {structure_template}
 
 CLOSING TAKEAWAY REQUIREMENT (MANDATORY - NEVER SKIP):
-If your analysis includes a "Closing Takeaway" or "Conclusion" section, you MUST end that section with {persona_name}'s personal opinion. The FINAL sentence of the Closing Takeaway MUST be a first-person personal recommendation. Use one of these exact formats:
-- "I personally would buy/hold/sell [Company] because..."
-- "For my own portfolio, I would buy/hold/sell here."
-- "My personal recommendation: buy/hold/sell."
+If your analysis includes a "Closing Takeaway" or "Conclusion" section, you MUST end that section with {persona_name}'s personal opinion. The FINAL sentence of the Closing Takeaway MUST be a first-person recommendation that explicitly includes BUY/HOLD/SELL (or PASS/WAIT if appropriate).
+Do NOT use a fixed template; vary phrasing and sentence openings across outputs.
+Examples (choose a style; do NOT copy verbatim):
+- "For my own portfolio, I'd HOLD [Company] at this valuation."
+- "If I had to act today, I'd BUY [Company] because..."
+- "My call: SELL [Company] until [condition]."
 This closing statement should feel like genuine advice from {persona_name} to a friend. The Closing Takeaway is INCOMPLETE without this personal stance.
 
 Task: Think first, then write the analysis. Be extremely concise. No filler.
@@ -1268,12 +1336,14 @@ UNIFIED DOCUMENT RULES:
   2. Conviction level: High, Medium, or Low
   3. A 2-3 sentence rationale synthesizing your key findings
   4. What conditions would change your recommendation
-  5. **PERSONAL CLOSING (MANDATORY - NEVER SKIP)**: The FINAL sentence MUST be a first-person personal recommendation using one of these exact formats:
-     - "I personally would buy/hold/sell [Company] because..."
-     - "For my own portfolio, I would buy/hold/sell here."
-     - "My personal recommendation: buy/hold/sell."
+  5. **PERSONAL CLOSING (MANDATORY - NEVER SKIP)**: The FINAL sentence MUST be a first-person recommendation that explicitly includes BUY/HOLD/SELL (and ideally mentions the company).
+     - Do NOT use a fixed template; vary phrasing and sentence openings.
+     - Examples (choose a style; do NOT copy verbatim):
+       - "For my own portfolio, I'd HOLD [Company] at this valuation."
+       - "If I had to act today, I'd BUY [Company] because..."
+       - "My call: SELL [Company] until [condition]."
   This closing statement is genuine advice from {persona_name} to a friend. The analysis is INCOMPLETE without this.
-  Example format: "**My Verdict: HOLD (Medium Conviction)** - While [Company] demonstrates [strength], the [concern] gives me pause. I would become a buyer if [condition], but would exit if [risk materializes]. I personally would hold here and wait for a better entry point."
+  Example format: "**My Verdict: HOLD (Medium Conviction)** - While [Company] demonstrates [strength], the [concern] gives me pause. I'd become a buyer if [condition], but would exit if [risk materializes]. For my own portfolio, I'd HOLD at this valuation and reassess if the facts change."
 
 ABSOLUTE SENTENCE COMPLETION REQUIREMENTS (CRITICAL - DO NOT VIOLATE):
 - EVERY sentence MUST be complete. Never end a sentence mid-thought.
@@ -1294,10 +1364,12 @@ FINANCIAL PERIOD CONSISTENCY:
 {structure_template}
 
 CLOSING TAKEAWAY REQUIREMENT (MANDATORY - NEVER SKIP):
-If your analysis includes a "Closing Takeaway" or "Conclusion" section, you MUST end that section with {persona_name}'s personal opinion. The FINAL sentence of the Closing Takeaway MUST be a first-person personal recommendation. Use one of these exact formats:
-- "I personally would buy/hold/sell [Company] because..."
-- "For my own portfolio, I would buy/hold/sell here."
-- "My personal recommendation: buy/hold/sell."
+If your analysis includes a "Closing Takeaway" or "Conclusion" section, you MUST end that section with {persona_name}'s personal opinion. The FINAL sentence of the Closing Takeaway MUST be a first-person recommendation that explicitly includes BUY/HOLD/SELL (or PASS/WAIT if appropriate).
+Do NOT use a fixed template; vary phrasing and sentence openings across outputs.
+Examples (choose a style; do NOT copy verbatim):
+- "For my own portfolio, I'd HOLD [Company] at this valuation."
+- "If I had to act today, I'd BUY [Company] because..."
+- "My call: SELL [Company] until [condition]."
 This closing statement should feel like genuine advice from {persona_name} to a friend. The Closing Takeaway is INCOMPLETE without this personal stance.
 
 At the end, include ONLY these two lines (no headers, just the content):

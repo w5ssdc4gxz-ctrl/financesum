@@ -28,7 +28,8 @@ def analyze_company_task(
     filing_ids: List[str],
     include_personas: Optional[List[str]] = None,
     target_length: Optional[int] = None,
-    complexity: str = "intermediate"
+    complexity: str = "intermediate",
+    user_id: Optional[str] = None,
 ):
     """
     Background task to analyze a company.
@@ -189,6 +190,15 @@ def analyze_company_task(
         
         # Generate AI summary
         gemini_client = get_gemini_client()
+        gemini_client.set_usage_context(
+            {
+                "request_id": f"analysis-{analysis_id}",
+                "request_type": "analysis_summary",
+                "analysis_id": str(analysis_id),
+                "company_id": str(company_id),
+                "user_id": str(user_id) if user_id else None,
+            }
+        )
         summary_data = gemini_client.generate_company_summary(
             company_name=company_name,
             financial_data=merged_financial_data,
@@ -223,6 +233,7 @@ def analyze_company_task(
         record_summary_generated_event(
             summary_id=str(analysis_id),
             company_id=str(company_id),
+            user_id=user_id,
             kind="analysis",
             cached=False,
             source="supabase",
@@ -273,6 +284,7 @@ def analyze_company_task(
                     record_summary_generated_event(
                         summary_id=f"{analysis_id}:{persona_id}",
                         company_id=str(company_id),
+                        user_id=user_id,
                         kind="analysis_persona",
                         cached=False,
                         source="supabase",

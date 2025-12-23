@@ -1,10 +1,11 @@
 """Companies API endpoints."""
 import requests
 import asyncio
+from html import escape as html_escape
 from datetime import datetime
 from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response
 from typing import List
 
 from app.models.database import get_supabase_client
@@ -233,38 +234,63 @@ async def _hydrate_company_from_ticker(company_id: str, ticker: str) -> Company:
 router = APIRouter()
 
 
+_EXCHANGE_ALIASES = {
+    "NASDAQ": "US",
+    "NYSE": "US",
+    "NYSEARCA": "US",
+    "AMEX": "US",
+    "OTC": "US",
+}
+
+
+def _logo_placeholder_response(ticker: str) -> Response:
+    label = (ticker or "").strip().upper()
+    label = label[:4] if label else "CO"
+    safe_label = html_escape(label)
+
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect width="128" height="128" fill="#F3F4F6"/>
+  <rect x="8" y="8" width="112" height="112" rx="16" fill="#E5E7EB" stroke="#D1D5DB"/>
+  <text x="64" y="66" text-anchor="middle" dominant-baseline="middle" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial" font-size="40" font-weight="700" fill="#374151">{safe_label}</text>
+</svg>"""
+    return Response(
+        content=svg.encode("utf-8"),
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @router.get("/logo/{ticker}")
 def get_company_logo(ticker: str, exchange: str = "US"):
     """Proxy for EODHD company logo."""
     settings = get_settings()
     api_key = settings.eodhd_api_key
     
-    if not api_key:
-        raise HTTPException(status_code=500, detail="EODHD API key not configured")
-    
     # Clean ticker input
     clean_ticker = ticker.strip().upper()
-    clean_exchange = exchange.strip().upper()
+    clean_exchange = _EXCHANGE_ALIASES.get(exchange.strip().upper(), exchange.strip().upper())
+
+    if clean_ticker.endswith(f".{clean_exchange}"):
+        clean_ticker = clean_ticker[: -(len(clean_exchange) + 1)]
+
+    if not api_key:
+        return _logo_placeholder_response(clean_ticker)
     
     url = f"https://eodhd.com/api/logo/{clean_ticker}.{clean_exchange}"
     params = {"api_token": api_key}
     
     try:
-        # Stream the response
-        r = requests.get(url, params=params, stream=True, timeout=10)
+        r = requests.get(url, params=params, timeout=10)
         if r.status_code != 200:
-            # If logo not found, return 404
-            raise HTTPException(status_code=r.status_code, detail="Logo not found")
-            
-        return StreamingResponse(
-            r.iter_content(chunk_size=8192), 
+            return _logo_placeholder_response(clean_ticker)
+
+        return Response(
+            content=r.content,
             media_type=r.headers.get("content-type", "image/png"),
-            headers={"Cache-Control": "public, max-age=86400"}
+            headers={"Cache-Control": "public, max-age=86400"},
         )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching logo: {str(e)}")
+    except Exception:
+        return _logo_placeholder_response(clean_ticker)
 
 
 async def _lookup_companies(raw_query: str) -> CompanyLookupResponse:

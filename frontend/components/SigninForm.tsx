@@ -1,19 +1,21 @@
 "use client";
 
 import React, { useState } from "react";
-import { IconBrandGoogle } from "@tabler/icons-react";
 import Link from "next/link";
+import { IconBrandGoogle } from "@tabler/icons-react";
+
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/contexts/AuthContext";
 
-interface SignupFormProps {
+interface SigninFormProps {
   className?: string;
 }
 
-export default function SignupForm({ className }: SignupFormProps) {
+export default function SigninForm({ className }: SigninFormProps) {
   const { signIn } = useAuth();
   const [message, setMessage] = useState<string | null>(null);
   const [googleLoading, setGoogleLoading] = useState(false);
+
   const handleGoogleSignIn = async () => {
     try {
       setGoogleLoading(true);
@@ -34,10 +36,10 @@ export default function SignupForm({ className }: SignupFormProps) {
       )}
     >
       <h2 className="text-2xl font-bold text-neutral-900 dark:text-neutral-100">
-        Join FinanceSum
+        Welcome back
       </h2>
       <p className="mt-2 text-sm text-neutral-600 dark:text-neutral-300">
-        Continue with Google to create your account.
+        Continue with Google to sign in.
       </p>
 
       <div className="my-8 space-y-6">
@@ -55,9 +57,9 @@ export default function SignupForm({ className }: SignupFormProps) {
         </button>
 
         <p className="text-center text-sm text-neutral-500 dark:text-neutral-300">
-          Already have an account?{" "}
-          <Link href="/signin" className="font-semibold text-neutral-900 dark:text-white">
-            Sign in
+          Don&apos;t have an account yet?{" "}
+          <Link href="/signup" className="font-semibold text-neutral-900 dark:text-white">
+            Sign up
           </Link>
         </p>
 

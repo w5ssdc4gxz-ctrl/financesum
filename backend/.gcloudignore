@@ -1,0 +1,18 @@
+# Exclude local dev artifacts and large folders from Cloud Build uploads.
+.git/
+.gitignore
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+data/
+temp/
+*.pdf
+*.html

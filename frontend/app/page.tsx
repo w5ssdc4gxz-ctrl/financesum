@@ -74,6 +74,20 @@ const walkthroughCards = [
   },
 ]
 
+const IMAGE_BLUR_DATA_URL =
+  'data:image/svg+xml;charset=utf-8,' +
+  encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 20">
+      <defs>
+        <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#f3f4f6"/>
+          <stop offset="100%" stop-color="#e5e7eb"/>
+        </linearGradient>
+      </defs>
+      <rect width="32" height="20" fill="url(#g)"/>
+    </svg>`
+  )
+
 export default function Home() {
   const { user } = useAuth()
   const router = useRouter()
@@ -114,6 +128,10 @@ export default function Home() {
                   alt="Financial dashboard preview"
                   width={256}
                   height={180}
+                  sizes="(min-width: 768px) 256px, (min-width: 640px) 208px, 144px"
+                  placeholder="blur"
+                  blurDataURL={IMAGE_BLUR_DATA_URL}
+                  priority
                   className="w-full h-auto object-cover"
                 />
               </div>
@@ -134,6 +152,10 @@ export default function Home() {
                   alt="Analysis interface"
                   width={288}
                   height={200}
+                  sizes="(min-width: 768px) 288px, (min-width: 640px) 224px, 160px"
+                  placeholder="blur"
+                  blurDataURL={IMAGE_BLUR_DATA_URL}
+                  priority
                   className="w-full h-auto object-cover"
                 />
               </div>
@@ -154,6 +176,10 @@ export default function Home() {
                   alt="Research memo"
                   width={320}
                   height={220}
+                  sizes="(min-width: 768px) 320px, (min-width: 640px) 240px, 176px"
+                  placeholder="blur"
+                  blurDataURL={IMAGE_BLUR_DATA_URL}
+                  loading="eager"
                   className="w-full h-auto object-cover"
                 />
               </div>
@@ -174,6 +200,10 @@ export default function Home() {
                   alt="Summary generation"
                   width={352}
                   height={240}
+                  sizes="(min-width: 768px) 352px, (min-width: 640px) 256px, 192px"
+                  placeholder="blur"
+                  blurDataURL={IMAGE_BLUR_DATA_URL}
+                  loading="eager"
                   className="w-full h-auto object-cover"
                 />
               </div>
@@ -194,6 +224,9 @@ export default function Home() {
                   alt="Key metrics"
                   width={224}
                   height={160}
+                  sizes="(min-width: 1024px) 224px, 0px"
+                  placeholder="blur"
+                  blurDataURL={IMAGE_BLUR_DATA_URL}
                   className="w-full h-auto object-cover"
                 />
               </div>
@@ -367,6 +400,8 @@ export default function Home() {
 	                            alt={card.title}
 	                            fill
 	                            sizes="(max-width: 768px) 100vw, 50vw"
+	                            placeholder="blur"
+	                            blurDataURL={IMAGE_BLUR_DATA_URL}
 	                            className="object-cover"
 	                          />
 	                        </div>

@@ -5,6 +5,7 @@ import json
 import requests  # Used for synchronous SEC calls
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 from app.config import get_settings
 from app.services.eodhd_client import (
     EODHDClient,
@@ -349,6 +350,18 @@ def download_filing(url: str, output_path: str) -> bool:
     """
     Download a filing from SEC EDGAR.
     """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        print(f"Refusing to download invalid URL: {url}")
+        return False
+
+    if (parsed.scheme or "").lower() not in {"http", "https"} or not (
+        (parsed.hostname or "").lower().endswith("sec.gov")
+    ):
+        print(f"Refusing to download non-SEC filing URL: {url}")
+        return False
+
     headers = {
         "User-Agent": settings.edgar_user_agent,
         "Accept-Encoding": "gzip, deflate"

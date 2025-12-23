@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Callable, Literal
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Body, HTTPException, Depends
 from fastapi.encoders import jsonable_encoder
@@ -211,20 +212,36 @@ def _build_closing_takeaway_description(
     """
     title = "Closing Takeaway"
 
-    base_requirements = (
+    common_requirements = (
         "Include a concise Closing Takeaway. Keep this balanced with other sections.\n"
         "2-4 COMPLETE sentences (~50-70 words). This is your FINAL INVESTMENT VERDICT.\n\n"
-        "=== MANDATORY FIRST ELEMENT (CANNOT BE OMITTED) ===\n"
-        "Your FIRST or LAST sentence MUST be a clear personal investment opinion:\n"
-        "- 'I personally would BUY [Company] at current levels because [reason].'\n"
-        "- 'I personally would HOLD [Company] given current valuations.'\n"
-        "- 'I personally would SELL [Company] due to [reason].'\n"
-        "This is NON-NEGOTIABLE. Without 'I personally would BUY/HOLD/SELL', the Closing Takeaway FAILS.\n\n"
         "=== SUPPORTING ELEMENTS (BRIEF) ===\n"
         "- Quality assessment: High-quality, average, or poor business (1 phrase)\n"
         "- Key driver: The #1 factor behind your decision (1 phrase)\n"
         "- Trigger: What would change your mind (optional if hitting word limit)\n\n"
-        "VERIFICATION: Does your output contain 'I personally would BUY/HOLD/SELL'? If NO, ADD IT NOW.\n"
+    )
+
+    persona_verdict_requirement = (
+        "=== REQUIRED VERDICT SENTENCE (CANNOT BE OMITTED) ===\n"
+        "Your FIRST or LAST sentence MUST state a clear action (BUY/HOLD/SELL) in first person and mention the company.\n"
+        "Do NOT use a fixed template; vary phrasing and sentence openings across summaries.\n"
+        "Avoid stock openers like 'Where are we in the cycle?' unless uniquely relevant; if you mention the cycle, phrase it differently.\n"
+        "Examples (choose a style; do NOT copy verbatim):\n"
+        "- 'For my own portfolio, I'd HOLD [Company] at this valuation.'\n"
+        "- 'If I had to act today, I'd BUY [Company] because [reason].'\n"
+        "- 'My stance is SELL on [Company] until [condition].'\n"
+        "VERIFICATION: Does your Closing Takeaway include a first-person BUY/HOLD/SELL sentence? If NO, add one.\n\n"
+    )
+
+    objective_verdict_requirement = (
+        "=== REQUIRED RECOMMENDATION (CANNOT BE OMITTED) ===\n"
+        "Your FIRST or LAST sentence MUST state a clear recommendation (Buy/Hold/Sell) in third person.\n"
+        "Do NOT use a fixed template; vary phrasing and sentence openings across summaries.\n"
+        "Examples (choose a style; do NOT copy verbatim):\n"
+        "- 'A Hold rating appears warranted at current levels.'\n"
+        "- 'The appropriate stance is Buy given [reason].'\n"
+        "- 'A Sell recommendation is justified until [condition].'\n"
+        "VERIFICATION: Does your Closing Takeaway include an explicit Buy/Hold/Sell recommendation? If NO, add one.\n\n"
     )
 
     completion_requirements = "\nEnsure sentences are complete and punctuated. Avoid trailing off or ellipses.\n"
@@ -233,7 +250,8 @@ def _build_closing_takeaway_description(
         # Persona-specific instructions
         persona_instructions = PERSONA_CLOSING_INSTRUCTIONS[persona_name]
         description = (
-            base_requirements
+            common_requirements
+            + persona_verdict_requirement
             + f"=== YOU ARE {persona_name.upper()} - WRITE EXACTLY AS THEY WOULD ===\n"
             f"This Closing Takeaway MUST sound like {persona_name} personally wrote it about {company_name}.\n"
             f"Use FIRST PERSON voice throughout ('I', 'my view', 'I would').\n\n"
@@ -246,7 +264,9 @@ def _build_closing_takeaway_description(
     else:
         # Generic instructions (no persona selected) - HIGH QUALITY OBJECTIVE ANALYSIS
         description = (
-            base_requirements + "=== OBJECTIVE ANALYST MODE (NO PERSONA) ===\n"
+            common_requirements
+            + objective_verdict_requirement
+            + "=== OBJECTIVE ANALYST MODE (NO PERSONA) ===\n"
             "CRITICAL: You are a NEUTRAL PROFESSIONAL ANALYST. You must NOT adopt any persona.\n\n"
             "FORBIDDEN - DO NOT USE:\n"
             "- First person language ('I', 'my view', 'I would', 'I believe', 'my conviction')\n"
@@ -271,7 +291,7 @@ def _build_closing_takeaway_description(
 
 
 # Persona-specific closing templates for dynamic generation
-# CRITICAL: All personas MUST end with "I personally would buy/hold/sell" statement
+# CRITICAL: All personas MUST end with a first-person buy/hold/sell recommendation (wording should vary).
 PERSONA_CLOSING_INSTRUCTIONS = {
     "Warren Buffett": (
         "As Warren Buffett, your closing MUST:\n"
@@ -279,19 +299,19 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Reference whether you'd 'hold for decades'\n"
         "- Assess the moat (wide/narrow/non-existent)\n"
         "- Use folksy language and analogies\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell [Company] because...' or 'For my own portfolio, I would buy/hold/sell here.'\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be a first-person BUY/HOLD/SELL recommendation that mentions the company (vary wording; do not always use 'I personally would').\n"
         "EXAMPLE: 'This is a wonderful business with a wide moat built on [specific advantage]. "
         "The economics are durable, and I would be comfortable holding for decades. "
-        "At current prices, Mr. Market is offering a fair deal for patient capital. I personally would buy and hold for the long term.'"
+        "At current prices, Mr. Market is offering a fair deal for patient capital. For my own portfolio, I'd buy and hold for the long term.'"
     ),
     "Charlie Munger": (
         "As Charlie Munger, your closing MUST:\n"
         "- Use inversion: 'What would make this a terrible investment?'\n"
         "- Discuss incentives alignment\n"
         "- Be blunt and pithy\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...' or similar personal stance.\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a blunt first-person BUY/HOLD/SELL stance (vary wording; do not always use 'I personally would').\n"
         "EXAMPLE: 'Inverting the question: what would make this a disaster? [Answer]. "
-        "The incentives are properly aligned. The economics make sense. I personally would buy at these levels.'"
+        "The incentives are properly aligned. The economics make sense. If I had to act today, I'd buy.'"
     ),
     "Benjamin Graham": (
         "As Benjamin Graham, your closing MUST:\n"
@@ -299,10 +319,10 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Discuss intrinsic value vs market price\n"
         "- Use 'intelligent investor' language\n"
         "- Be quantitative and methodical\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...' or 'For the intelligent investor, I would...' with clear action.\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a clear, first-person BUY/HOLD/SELL stance (wording should vary).\n"
         "EXAMPLE: 'The margin of safety at current prices is [adequate/insufficient]. "
         "For the intelligent investor, this represents [investment/speculation]. "
-        "The balance sheet strength [supports/undermines] the thesis. I personally would hold until a larger margin of safety appears.'"
+        "The balance sheet strength [supports/undermines] the thesis. I'd hold until a wider margin of safety appears.'"
     ),
     "Peter Lynch": (
         "As Peter Lynch, your closing MUST:\n"
@@ -310,9 +330,9 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Reference PEG ratio if applicable\n"
         "- Classify as stalwart/fast grower/turnaround/cyclical\n"
         "- Be enthusiastic if bullish\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...' with enthusiasm if bullish.\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a first-person BUY/HOLD/SELL stance with Lynch-like energy (wording should vary).\n"
         "EXAMPLE: 'Here's the story: [simple explanation]. The PEG of [X] says this is [cheap/fair/expensive]. "
-        "This is a [category] that I would [verdict]. You don't need an MBA to understand this one. I personally would buy this stalwart and hold on.'"
+        "This is a [category] that I would [verdict]. You don't need an MBA to understand this one. I'd buy it and put it away.'"
     ),
     "Ray Dalio": (
         "As Ray Dalio, your closing MUST:\n"
@@ -320,9 +340,9 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Discuss risk parity considerations\n"
         "- Mention correlation to macro factors\n"
         "- Use systems thinking language\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...' with sizing rationale.\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a first-person BUY/HOLD/SELL stance plus sizing rationale (wording should vary).\n"
         "EXAMPLE: 'At this point in the cycle, [assessment]. The risk parity consideration suggests [sizing]. "
-        "Understanding the machine, I personally would hold with a moderate position size given the current cycle position.'"
+        "Understanding the machine, I'd hold in moderate size given the current cycle position.'"
     ),
     "Cathie Wood": (
         "As Cathie Wood, your closing MUST:\n"
@@ -330,9 +350,9 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Mention Wright's Law or S-curves if relevant\n"
         "- Give a 5-year or 2030 vision\n"
         "- Express high conviction in innovation\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...' with conviction.\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a first-person BUY/HOLD/SELL stance with conviction (wording should vary).\n"
         "EXAMPLE: 'The disruptive innovation potential here is [assessment]. "
-        "Wright's Law suggests costs will [trajectory]. By 2030, [vision]. I personally would buy with high conviction for the next 5 years.'"
+        "Wright's Law suggests costs will [trajectory]. By 2030, [vision]. I'd buy with high conviction for the next 5 years.'"
     ),
     "Joel Greenblatt": (
         "As Joel Greenblatt, your closing MUST:\n"
@@ -341,13 +361,13 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Be quantitative and direct - cite specific numbers\n"
         "- Assess if this is a 'clean situation' or if there are complications\n"
         "- END WITH PERSONAL RECOMMENDATION (MANDATORY - FINAL SENTENCE):\n"
-        "  Your VERY LAST sentence MUST be one of these exact formats:\n"
-        "  * 'I personally would buy [Company] at these levels.'\n"
-        "  * 'I personally would hold [Company] but not add here.'\n"
-        "  * 'I personally would sell/pass on [Company].'\n"
-        "  This is NON-NEGOTIABLE. Without this sentence, your analysis is INCOMPLETE.\n"
+        "  Your VERY LAST sentence MUST be a first-person recommendation that includes BUY/HOLD/SELL/PASS and mentions the company.\n"
+        "  Use one of these styles (do NOT copy verbatim):\n"
+        "  * 'My call: HOLD [Company] (but don't add).'\n"
+        "  * 'On the Magic Formula, I'd BUY [Company] at this price.'\n"
+        "  * 'I'd PASS on [Company] until the screen improves.'\n"
         "EXAMPLE: 'Return on capital is 25%, earnings yield is 8%. By the Magic Formula, this is a good business at a fair price - but not clearly cheap. "
-        "The cash generation is strong, but leverage concerns limit the margin of safety. I personally would hold UBER and wait for a better entry point.'"
+        "The cash generation is strong, but leverage concerns limit the margin of safety. My call: HOLD UBER, but don't add until it screens cheaper.'"
     ),
     "John Bogle": (
         "As John Bogle, your closing MUST:\n"
@@ -357,9 +377,9 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Be humble and prudent\n"
         "- STATE A CLEAR VERDICT: Even as an index advocate, give your assessment\n"
         "- Include what would change your view (e.g., 'valuation, competitive threats')\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...' or 'For those who insist on individual stocks, I personally would...'.\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a clear, humble first-person BUY/HOLD/SELL recommendation (wording should vary).\n"
         "EXAMPLE: 'This is a fine business with exceptional profitability. But why own one needle when you can own the haystack? "
-        "Costs matter, and 90% of active managers fail. If valuation became more attractive, I might reconsider. I personally would hold this one but still prefer the index fund.'"
+        "Costs matter, and 90% of active managers fail. If valuation became more attractive, I might reconsider. For those who insist on individual stocks, I'd hold this one—but I'd still prefer the index fund.'"
     ),
     "Howard Marks": (
         "As Howard Marks, your closing MUST:\n"
@@ -369,9 +389,9 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Consider 'what's priced in'\n"
         "- STATE A CLEAR VERDICT: BUY, HOLD, SELL, or WAIT with your reasoning\n"
         "- Include what would change your view (cycle shift, valuation change)\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...'.\n"
-        "EXAMPLE: 'Where are we in the cycle? The optimism is elevated but not extreme. Second-level thinking suggests the market is not fully pricing in competitive risks. "
-        "The risk-reward asymmetry favors caution. I personally would hold at these levels and wait for a better entry point.'"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a first-person BUY/HOLD/SELL/WAIT stance (wording should vary).\n"
+        "EXAMPLE: 'Cycle check: optimism is elevated but not extreme. Second-level thinking suggests the market is not fully pricing in competitive risks. "
+        "The risk-reward asymmetry favors caution. If it were my money, I'd hold and wait for better asymmetry.'"
     ),
     "Bill Ackman": (
         "As Bill Ackman, your closing MUST:\n"
@@ -381,9 +401,9 @@ PERSONA_CLOSING_INSTRUCTIONS = {
         "- Express conviction level\n"
         "- STATE A CLEAR VERDICT: BUY, HOLD, or SELL with conviction level\n"
         "- Include what would change your view (catalyst, management action)\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be 'I personally would buy/hold/sell...' with conviction.\n"
+        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a first-person BUY/HOLD/SELL stance with conviction (wording should vary).\n"
         "EXAMPLE: 'This is simple, predictable, and free-cash-flow generative—exactly what I look for. "
-        "The catalyst for value creation is clear. Management MUST maintain discipline. I personally would buy with high conviction at these levels.'"
+        "The catalyst for value creation is clear. Management MUST maintain discipline. I'd buy with high conviction at these levels.'"
     ),
 }
 
@@ -2403,7 +2423,7 @@ def _validate_mdna_section(text: str) -> Optional[str]:
 
 
 SUMMARY_SECTION_REQUIREMENTS: List[Tuple[str, int]] = [
-    ("Financial Health Rating", 30),
+    ("Financial Health Rating", 40),
     ("Executive Summary", 80),  # Tighter: faster read while keeping conviction
     ("Financial Performance", 95),  # More depth on the numbers that matter
     (
@@ -2773,7 +2793,7 @@ REQUIRED CONTENT (5-7 sentences):
 3. KEY REASONING: The #1 factor driving your decision (in persona's framework)
 4. SUPPORTING FACTORS: Secondary considerations that reinforce your stance
 5. ACTIONABLE CONDITION: What would change your mind (price target, metric threshold, or catalyst)
-6. PERSONAL CLOSING (MANDATORY): End with a first-person statement like "I personally would buy/hold/sell..." or "For my own portfolio, I would..." - this should feel like genuine advice from the persona to a friend
+6. PERSONAL CLOSING (MANDATORY): End with a first-person BUY/HOLD/SELL recommendation (wording should vary; avoid repeating fixed phrases like "I personally would") - this should feel like genuine advice from the persona to a friend
 
 PERSONA-SPECIFIC VOICE EXAMPLES:
 
@@ -2932,7 +2952,7 @@ def _build_health_rating_instructions(
                 "MANDATORY FORMAT (YOU MUST INCLUDE ALL ELEMENTS):",
                 "1. The score (0-100) with rating label (Very Healthy/Healthy/Watch/At Risk)",
                 "2. NO letter grades or abbreviations in parentheses",
-                "3. A MANDATORY explanation of 3-4 sentences (40-75 words)",
+                "3. A MANDATORY explanation of 4-5 sentences (55-90 words)",
                 "",
                 "YOUR EXPLANATION MUST COVER:",
                 "- What drove the score (specific metrics with values)",
@@ -2940,14 +2960,15 @@ def _build_health_rating_instructions(
                 "- Key concern(s) or risk(s)",
                 "- How the user's selected framework influenced the assessment",
                 "",
+                "FLOW (CRITICAL): Write this as a cohesive mini-paragraph that naturally sets up the Executive Summary. Avoid abrupt, one-line conclusions.",
+                "",
                 "DO NOT just write the score and stop. The explanation is REQUIRED.",
                 "",
                 f"CORRECT FORMAT EXAMPLE:",
                 f"'{company_name} receives a Financial Health Rating of 78/100 - Healthy. The score reflects strong profitability ",
                 f"with a 56% net margin and robust free cash flow generation of $22B. The balance sheet is conservatively managed ",
-                f"with minimal debt relative to cash holdings. However, applying the user's value investor framework, I note concerns ",
-                f"about customer concentration and cyclical demand patterns that could impact the durability of these margins. ",
-                f"The score would be higher but for these risk factors that warrant monitoring.'",
+                f"with minimal debt relative to cash holdings. However, under a value-investor lens, customer concentration and cyclical demand patterns could ",
+                f"pressure durability and justify some caution. The score would be higher if those risks were lower and cash conversion remained consistently strong.'",
                 "",
                 "FORBIDDEN: Just writing '{company_name} receives a Financial Health Rating of 78/100 - Healthy.' and stopping.",
             ]
@@ -4060,9 +4081,12 @@ def _ensure_health_rating_section(
     health_score_data: Dict[str, Any],
     calculated_metrics: Dict[str, Any],
     company_name: str,
+    *,
+    health_rating_config: Optional[Dict[str, Any]] = None,
+    target_length: Optional[int] = None,
 ) -> str:
-    """Guarantee the health rating heading, score line, and a substantive narrative are present."""
-    if not health_score_data:
+    """Guarantee the health rating section is present, well-placed, and reads coherently."""
+    if not summary_text or not health_score_data:
         return summary_text
 
     score = health_score_data.get("overall_score")
@@ -4071,132 +4095,271 @@ def _ensure_health_rating_section(
         return summary_text
 
     heading_pattern = re.compile(
-        r"^\s*##\s*Financial Health Rating", re.IGNORECASE | re.MULTILINE
+        r"^\s*##\s*Financial Health Rating\b", re.IGNORECASE | re.MULTILINE
     )
-    lines = summary_text.splitlines()
-
-    heading_idx = None
-    for idx, line in enumerate(lines):
-        if heading_pattern.match(line):
-            heading_idx = idx
-            break
+    inline_score_pattern = re.compile(
+        r"^\s*(?:Financial\s+Health\s+Rating|Health\s+Score)\s*:\s*\d{1,3}(?:\.\d+)?/100\b.*$",
+        re.IGNORECASE,
+    )
 
     band_text = f" - {band}" if band else ""
-    score_line = f"{company_name} receives a Financial Health Rating of {score:.0f}/100{band_text} based on profitability, cash conversion, and balance sheet resilience."
+    score_line = (
+        f"{company_name} receives a Financial Health Rating of {score:.0f}/100{band_text} "
+        "based on profitability, cash conversion, and balance sheet resilience."
+    )
+    narrative = _build_health_narrative(
+        calculated_metrics,
+        health_score_data=health_score_data,
+        health_rating_config=health_rating_config,
+        target_length=target_length,
+    )
+
+    lines = summary_text.splitlines()
+    heading_idx = next(
+        (idx for idx, line in enumerate(lines) if heading_pattern.match(line)), None
+    )
 
     if heading_idx is None:
-        narrative = _build_health_narrative(calculated_metrics, band)
-        return f"## Financial Health Rating\n{score_line}\n\n{narrative}\n\n{summary_text}".strip()
+        cleaned_lines = [line for line in lines if not inline_score_pattern.match(line)]
+        cleaned_text = "\n".join(cleaned_lines).strip()
+        return (
+            f"## Financial Health Rating\n{score_line}\n\n{narrative}\n\n{cleaned_text}"
+        ).strip()
 
-    has_score_line = False
-    for j in range(heading_idx + 1, min(len(lines), heading_idx + 6)):
-        if re.search(
-            r"\bFinancial Health Rating\b", lines[j], re.IGNORECASE
-        ) or re.search(r"\b/100\b", lines[j]):
-            has_score_line = True
-            break
-    if not has_score_line:
-        lines.insert(heading_idx + 1, score_line)
-
-    # Ensure the narrative under the health section is meaningful and long enough
-    next_heading = len(lines)
-    for k in range(heading_idx + 1, len(lines)):
-        if re.match(r"^\s*##\s+", lines[k]):
-            next_heading = k
+    # Find end of the health section
+    section_end = len(lines)
+    for idx in range(heading_idx + 1, len(lines)):
+        if re.match(r"^\s*##\s+", lines[idx]):
+            section_end = idx
             break
 
-    body_lines = lines[heading_idx + 1 : next_heading]
-    body_text = "\n".join(body_lines).strip()
-    if _count_words(body_text) < 40 or "Health Score Drivers" in body_text:
-        narrative = _build_health_narrative(calculated_metrics, band)
-        # Insert narrative after score line (which may be first body line)
-        insert_at = heading_idx + 2 if has_score_line else heading_idx + 1
-        lines.insert(insert_at, narrative)
+    # Remove stray inline "Financial Health Rating: X/100" lines outside the health section
+    cleaned: List[str] = []
+    for idx, line in enumerate(lines):
+        if idx < heading_idx or idx >= section_end:
+            if inline_score_pattern.match(line):
+                continue
+        cleaned.append(line)
+    lines = cleaned
 
-    return "\n".join(lines)
+    # Recompute indices after cleanup
+    heading_idx = next(
+        (idx for idx, line in enumerate(lines) if heading_pattern.match(line)), None
+    )
+    if heading_idx is None:
+        return "\n".join(lines).strip()
+
+    section_end = len(lines)
+    for idx in range(heading_idx + 1, len(lines)):
+        if re.match(r"^\s*##\s+", lines[idx]):
+            section_end = idx
+            break
+
+    body_lines = lines[heading_idx + 1 : section_end]
+
+    # Drop Health Score Drivers from this section; it belongs under Key Metrics
+    filtered_body: List[str] = []
+    skipping_drivers = False
+    for line in body_lines:
+        if re.search(r"Health\s+Score\s+Drivers", line, re.IGNORECASE):
+            skipping_drivers = True
+            continue
+        if skipping_drivers:
+            if not line.strip():
+                continue
+            if re.match(r"^\s*[-•→]", line):
+                continue
+            skipping_drivers = False
+        filtered_body.append(line)
+
+    # Normalize the score line to be the first non-empty line after the heading
+    while filtered_body and not filtered_body[0].strip():
+        filtered_body.pop(0)
+
+    if not filtered_body:
+        filtered_body = [score_line]
+    else:
+        first = filtered_body[0].strip()
+        if "/100" in first or "financial health rating" in first.lower():
+            filtered_body[0] = score_line
+        else:
+            filtered_body.insert(0, score_line)
+
+    # Preserve pillar breakdown lines (if present), but ensure a coherent narrative paragraph exists.
+    pillar_re = re.compile(
+        r"^\s*(Profitability|Risk|Liquidity|Growth)\s*:", re.IGNORECASE
+    )
+    pillar_lines = [line for line in filtered_body[1:] if pillar_re.match(line)]
+    narrative_lines = [line for line in filtered_body[1:] if not pillar_re.match(line)]
+    narrative_text = "\n".join(narrative_lines).strip()
+
+    min_narrative_words = 50 if (target_length and target_length >= 600) else 45
+    needs_rebuild = (
+        _count_words(narrative_text) < min_narrative_words
+        or narrative_text.count(".") + narrative_text.count("!") + narrative_text.count("?") < 2
+        or not re.search(r"\d", narrative_text)
+        or re.search(r"Health\s+Score\s+Drivers", narrative_text, re.IGNORECASE)
+    )
+    if needs_rebuild:
+        narrative_text = narrative
+
+    rebuilt_section_lines: List[str] = [score_line, "", narrative_text.strip()]
+    if pillar_lines:
+        rebuilt_section_lines.extend(["", *pillar_lines])
+
+    replacement = ["## Financial Health Rating", *rebuilt_section_lines]
+
+    lines = lines[:heading_idx] + replacement + lines[section_end:]
+    return "\n".join(lines).strip()
 
 
 def _build_health_narrative(
-    calculated_metrics: Dict[str, Any], band: Optional[str]
+    calculated_metrics: Dict[str, Any],
+    *,
+    health_score_data: Optional[Dict[str, Any]] = None,
+    health_rating_config: Optional[Dict[str, Any]] = None,
+    target_length: Optional[int] = None,
 ) -> str:
-    """Compose a concise, metric-backed health explanation."""
-    margin = calculated_metrics.get("operating_margin")
+    """Compose a metric-backed health explanation that reads like a mini-paragraph."""
+    band = (health_score_data or {}).get("score_band")
+
+    framework = (health_rating_config or {}).get("framework")
+    weighting = (health_rating_config or {}).get("primary_factor_weighting")
+
+    framework_labels = {
+        "value_investor_default": "a value-investor lens",
+        "quality_moat_focus": "a quality-first lens",
+        "financial_resilience": "a resilience/stress-test lens",
+        "growth_sustainability": "a growth-sustainability lens",
+        "user_defined_mix": "a balanced multi-factor lens",
+    }
+    weighting_labels = {
+        "profitability_margins": "profitability and margin quality",
+        "cash_flow_conversion": "cash conversion and free cash flow",
+        "balance_sheet_strength": "leverage and balance sheet resilience",
+        "liquidity_near_term_risk": "near-term liquidity and refinancing risk",
+        "execution_competitiveness": "execution and operating efficiency",
+    }
+
+    sentences: List[str] = []
+    lens = framework_labels.get(framework)
+    focus = weighting_labels.get(weighting)
+    if lens and focus:
+        sentences.append(f"Under {lens}, the score is weighted most toward {focus}.")
+    elif focus:
+        sentences.append(f"The score places the most weight on {focus}.")
+
+    operating_margin = calculated_metrics.get("operating_margin")
     net_margin = calculated_metrics.get("net_margin")
-    ocf = calculated_metrics.get("operating_cash_flow")
-    fcf = calculated_metrics.get("free_cash_flow")
-    liabilities = calculated_metrics.get("total_liabilities")
-    cash = calculated_metrics.get("cash")
-    current_assets = calculated_metrics.get("current_assets")
-    current_liabilities = calculated_metrics.get("current_liabilities")
-
-    liquidity_ratio = None
-    if current_assets and current_liabilities:
-        try:
-            liquidity_ratio = (
-                current_assets / current_liabilities
-                if current_liabilities != 0
-                else None
+    if operating_margin is not None and net_margin is not None:
+        gap = net_margin - operating_margin
+        gap_clause = ""
+        if abs(gap) >= 5:
+            gap_clause = (
+                " with meaningful below-the-line drag"
+                if gap < 0
+                else " helped by below-the-line items"
             )
+        sentences.append(
+            f"Operating margin of {operating_margin:.1f}% and net margin of {net_margin:.1f}% describe the profitability profile{gap_clause}."
+        )
+    elif operating_margin is not None:
+        sentences.append(
+            f"Operating margin of {operating_margin:.1f}% provides the clearest read on core profitability."
+        )
+    elif net_margin is not None:
+        sentences.append(
+            f"Net margin of {net_margin:.1f}% is the headline profitability signal, though non-operating items can distort the trend."
+        )
+
+    revenue = calculated_metrics.get("revenue") or calculated_metrics.get("total_revenue")
+    operating_cash_flow = calculated_metrics.get("operating_cash_flow")
+    free_cash_flow = calculated_metrics.get("free_cash_flow")
+    ocf_str = _format_dollar(operating_cash_flow) if operating_cash_flow is not None else None
+    fcf_str = _format_dollar(free_cash_flow) if free_cash_flow is not None else None
+    fcf_margin = None
+    if free_cash_flow is not None and revenue:
+        try:
+            fcf_margin = (free_cash_flow / revenue) * 100
         except Exception:
-            liquidity_ratio = None
+            fcf_margin = None
 
-    bits: List[str] = []
-
-    m_str = f"{margin:.1f}%" if margin is not None else None
-    nm_str = f"{net_margin:.1f}%" if net_margin is not None else None
-    if m_str and nm_str:
-        bits.append(
-            f"Profitability shows an operating margin of {m_str} versus net margin of {nm_str}, so focus on how much of earnings are recurring."
-        )
-    elif m_str:
-        bits.append(f"Profitability is anchored by an operating margin of {m_str}.")
-    elif nm_str:
-        bits.append(
-            f"Reported net margin is {nm_str}, but verify how much is driven by non-operating items."
-        )
-
-    ocf_str = _format_dollar(ocf) if ocf is not None else None
-    fcf_str = _format_dollar(fcf) if fcf is not None else None
     if ocf_str and fcf_str:
-        bits.append(
-            f"Cash generation includes operating cash flow of {ocf_str} and free cash flow of {fcf_str}."
-        )
-    elif ocf_str:
-        bits.append(
-            f"Operating cash flow of {ocf_str} supports reinvestment and resilience."
+        margin_clause = f" (FCF margin {fcf_margin:.1f}%)" if fcf_margin is not None else ""
+        sentences.append(
+            f"Operating cash flow of {ocf_str} translating to free cash flow of {fcf_str}{margin_clause} supports financial flexibility."
         )
     elif fcf_str:
-        bits.append(
-            f"Free cash flow of {fcf_str} supports flexibility for reinvestment or returns."
+        sentences.append(
+            f"Free cash flow of {fcf_str} provides an important buffer for reinvestment and resilience."
+        )
+    elif ocf_str:
+        sentences.append(
+            f"Operating cash flow of {ocf_str} supports reinvestment capacity and near-term resilience."
         )
 
+    cash = calculated_metrics.get("cash")
+    liabilities = calculated_metrics.get("total_liabilities")
     cash_str = _format_dollar(cash) if cash is not None else None
     liab_str = _format_dollar(liabilities) if liabilities is not None else None
     if cash_str and liab_str:
-        bits.append(
-            f"Balance sheet shows cash of {cash_str} against liabilities of {liab_str}, framing leverage risk."
+        leverage_clause = ""
+        if cash and liabilities:
+            if cash > liabilities:
+                leverage_clause = " The balance sheet reads net-cash overall."
+            elif liabilities > cash * 3:
+                leverage_clause = " Leverage remains elevated relative to cash."
+        sentences.append(
+            f"Cash of {cash_str} against liabilities of {liab_str} frames the leverage and refinancing risk.{leverage_clause}"
+        )
+    elif liab_str:
+        sentences.append(
+            f"Liabilities of {liab_str} are the main balance-sheet constraint and deserve close attention."
         )
     elif cash_str:
-        bits.append(f"Cash on hand of {cash_str} provides a liquidity cushion.")
-    elif liab_str:
-        bits.append(f"Liabilities of {liab_str} frame leverage and refinancing risk.")
-
-    if liquidity_ratio is not None:
-        bits.append(
-            f"Current ratio around {liquidity_ratio:.1f}x suggests near-term obligations are manageable."
+        sentences.append(
+            f"Cash on hand of {cash_str} provides a liquidity cushion against shocks."
         )
 
-    if not bits:
-        bits.append(
-            "Profitability, cash conversion, and leverage trends warrant monitoring to validate durability."
+    current_assets = calculated_metrics.get("current_assets")
+    current_liabilities = calculated_metrics.get("current_liabilities")
+    if current_assets and current_liabilities:
+        try:
+            current_ratio = (
+                current_assets / current_liabilities if current_liabilities != 0 else None
+            )
+        except Exception:
+            current_ratio = None
+        if current_ratio is not None:
+            sentences.append(
+                f"A current ratio around {current_ratio:.1f}x suggests near-term obligations are manageable."
+            )
+
+    if band == "Very Healthy":
+        sentences.append(
+            "Overall, the metrics support a Very Healthy profile provided cash conversion remains consistent."
+        )
+    elif band == "Healthy":
+        sentences.append(
+            "Overall, this lands in the Healthy range, with leverage and cash conversion determining whether the score drifts higher or lower."
+        )
+    elif band == "Watch":
+        sentences.append(
+            "Overall, this is a Watch profile: the fundamentals are workable, but the weaker inputs leave less room for error."
+        )
+    elif band == "At Risk":
+        sentences.append(
+            "Overall, this is an At Risk profile: the balance between cash generation and obligations looks tight and the margin for error is thin."
         )
 
-    risk_tail = (
-        "Key watchpoints include cost discipline and cash conversion consistency."
-        if not band or band.lower().startswith(("w", "a"))
-        else "Strengths stem from balanced margins and cash generation."
+    sentences.append(
+        "This health snapshot provides the balance-sheet backdrop for the operating analysis that follows."
     )
-    return " ".join(bits + [risk_tail])
+
+    if target_length and target_length < 500:
+        sentences = sentences[:5]
+
+    return " ".join(sentences).strip()
 
 
 def _prepare_filing_response(raw_filing: Dict[str, Any], settings) -> Filing:
@@ -4324,23 +4487,105 @@ def _build_local_document_path(storage_dir: Path, filing_id: str) -> Path:
     return storage_dir / f"{filing_id}.html"
 
 
+def _is_sec_document_url(url: str) -> bool:
+    """Return True only for SEC-hosted filing URLs (prevents downloading arbitrary HTML)."""
+    try:
+        parsed = urlparse(url)
+    except Exception:  # noqa: BLE001
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").lower()
+    return host.endswith("sec.gov")
+
+
+def _looks_like_cloud_run_console_page(text: str) -> bool:
+    """Heuristic to detect Google Cloud Console / Cloud Run pages mistakenly cached as filings."""
+    lowered = (text or "").lower()
+    if "console.cloud.google.com" in lowered:
+        return True
+    hits = sum(
+        token in lowered
+        for token in (
+            "revision tags",
+            "traffic",
+            "deployed",
+        )
+    )
+    return "revisions" in lowered and hits >= 2
+
+
+def _read_text_head(path: Path, max_chars: int = 60_000) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")[:max_chars]
+    except Exception:  # noqa: BLE001
+        try:
+            return path.read_text(errors="ignore")[:max_chars]
+        except Exception:  # noqa: BLE001
+            return ""
+
+
+def _persist_filing_field_updates(
+    context: Dict[str, Any], filing_id: str, updates: Dict[str, Any]
+) -> None:
+    """Best-effort persistence for Supabase-backed filings."""
+    if context.get("source") != "supabase":
+        return
+    if not filing_id or not updates:
+        return
+    try:
+        supabase = get_supabase_client()
+        supabase.table("filings").update(updates).eq("id", filing_id).execute()
+    except Exception as exc:  # noqa: BLE001
+        if is_supabase_table_missing_error(exc):
+            return
+        logger.debug("Unable to persist filing updates for %s: %s", filing_id, exc)
+
+
 def _ensure_local_document(context: Dict[str, Any], settings) -> Optional[Path]:
     filing = context["filing"]
     company = context["company"]
     storage_dir = _ensure_storage_dir(settings)
 
+    filing_id = filing.get("id")
+    filing_id_str = str(filing_id) if filing_id is not None else ""
+
     existing_path = filing.get("local_document_path")
     if existing_path:
         path_obj = Path(existing_path)
         if path_obj.exists():
-            return path_obj
+            head = _read_text_head(path_obj)
+            if _looks_like_cloud_run_console_page(head):
+                logger.warning(
+                    "Cached filing document for %s looks like a Cloud Console page; ignoring %s",
+                    filing_id_str or "<unknown>",
+                    path_obj,
+                )
+                filing.pop("local_document_path", None)
+                _persist_filing_field_updates(
+                    context, filing_id_str, {"local_document_path": None}
+                )
+            else:
+                return path_obj
+        else:
+            filing.pop("local_document_path", None)
+            _persist_filing_field_updates(
+                context, filing_id_str, {"local_document_path": None}
+            )
 
-    filing_id = filing.get("id")
-    filing_id_str = str(filing_id)
     filing_type = (filing.get("filing_type") or "").upper()
     filing_date = filing.get("filing_date")
 
     source_doc_url = filing.get("source_doc_url")
+    if source_doc_url and not _is_sec_document_url(str(source_doc_url)):
+        logger.warning(
+            "Ignoring non-SEC source_doc_url for filing %s: %s",
+            filing_id_str or "<unknown>",
+            source_doc_url,
+        )
+        filing.pop("source_doc_url", None)
+        _persist_filing_field_updates(context, filing_id_str, {"source_doc_url": None})
+        source_doc_url = None
 
     if not source_doc_url:
         cik_value = company.get("cik") if company else None
@@ -4361,6 +4606,12 @@ def _ensure_local_document(context: Dict[str, Any], settings) -> Optional[Path]:
                     ):
                         source_doc_url = candidate.get("url")
                         filing["source_doc_url"] = source_doc_url
+                        if source_doc_url:
+                            _persist_filing_field_updates(
+                                context,
+                                filing_id_str,
+                                {"source_doc_url": source_doc_url},
+                            )
                         break
             except Exception as sec_exc:  # noqa: BLE001
                 logger.warning(
@@ -4377,6 +4628,9 @@ def _ensure_local_document(context: Dict[str, Any], settings) -> Optional[Path]:
     try:
         if download_filing(source_doc_url, str(target_path)):
             filing["local_document_path"] = str(target_path)
+            _persist_filing_field_updates(
+                context, filing_id_str, {"local_document_path": str(target_path)}
+            )
             return target_path
     except Exception as download_exc:  # noqa: BLE001
         logger.warning(
@@ -4929,6 +5183,17 @@ async def get_filing_document(filing_id: str, raw: bool = False):
     local_document = _ensure_local_document(context, settings)
     local_exists = bool(local_document and local_document.exists())
     source_doc_url = filing.get("source_doc_url")
+    if source_doc_url and not _is_sec_document_url(str(source_doc_url)):
+        logger.warning(
+            "Ignoring non-SEC source_doc_url for filing document redirect %s: %s",
+            filing_id,
+            source_doc_url,
+        )
+        filing.pop("source_doc_url", None)
+        _persist_filing_field_updates(
+            context, str(filing.get("id") or ""), {"source_doc_url": None}
+        )
+        source_doc_url = None
 
     if not raw and local_exists:
         return RedirectResponse(
@@ -5137,7 +5402,7 @@ def generate_filing_summary(
         if usage_status.plan == "pro":
             reset_date = usage_status.period_end.date().isoformat() if usage_status.period_end else "the next cycle"
             detail = (
-                f"Monthly summary limit reached (1000/month). "
+                f"Monthly summary limit reached (100/month). "
                 f"Your limit resets on {reset_date}."
             )
         else:
@@ -5271,6 +5536,21 @@ def generate_filing_summary(
             raise HTTPException(status_code=400, detail="GEMINI_API_KEY not configured")
 
         gemini_client = get_gemini_client()
+        summary_request_id = uuid4().hex
+        set_usage_context = getattr(gemini_client, "set_usage_context", None)
+        if callable(set_usage_context):
+            try:
+                set_usage_context(
+                    {
+                        "request_id": summary_request_id,
+                        "request_type": "filing_summary",
+                        "user_id": user.id,
+                        "filing_id": str(filing_id),
+                        "company_id": str(company.get("id")) if company.get("id") else None,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Unable to set Gemini usage context: %s", exc)
 
         filing_type = filing.get("filing_type", "")
         filing_date = filing.get("filing_date", "")
@@ -5834,6 +6114,8 @@ Before you output anything, verify:
                 health_score_data or {},
                 calculated_metrics,
                 company_name,
+                health_rating_config=health_config,
+                target_length=target_length,
             )
             summary_text = _inject_health_drivers(
                 summary_text, calculated_metrics, health_score_data or {}
@@ -6043,6 +6325,10 @@ Before you output anything, verify:
                 "timeout_seconds": SUMMARY_TOTAL_TIMEOUT_SECONDS,
             },
         ) from timeout_exc
+
+    except HTTPException:
+        # Preserve intended FastAPI error responses (400/401/402/etc).
+        raise
 
     except Exception as unexpected_exc:
         # Fallback for truly unexpected errors
@@ -6414,6 +6700,20 @@ def _format_number_or_default(value: Optional[float]) -> str:
     return f"{value:,.2f}"
 
 
+_PERSONAL_VERDICT_RE = re.compile(
+    r"(?is)\b(?:"
+    r"i\s*(?:personally\s+)?would"
+    r"|i\s*['’]d"
+    r"|for\s+my\s+(?:own\s+)?portfolio"
+    r"|my\s+(?:call|stance|recommendation)\s*:?"
+    r")\b[\s\S]{0,160}\b(?:buy|hold|sell|wait|avoid|pass)\b"
+)
+
+
+def _contains_personal_verdict(text: str) -> bool:
+    return bool(text and _PERSONAL_VERDICT_RE.search(text))
+
+
 def _ensure_personal_verdict(
     closing_text: str,
     company_name: str,
@@ -6421,13 +6721,13 @@ def _ensure_personal_verdict(
     concerns: Optional[List[str]] = None,
 ) -> str:
     """
-    Append a clear first-person buy/hold/sell verdict when a persona is used.
-    If the text already contains 'I personally would', it is left unchanged.
+    Append a clear first-person verdict when a persona is used.
+    If the text already contains a personal verdict, it is left unchanged.
     """
     if not closing_text:
         return closing_text
 
-    if re.search(r"\bi\s+personally\s+would\b", closing_text, re.IGNORECASE):
+    if _contains_personal_verdict(closing_text):
         return closing_text
 
     strengths = strengths or []
@@ -6444,10 +6744,23 @@ def _ensure_personal_verdict(
     if closing and not closing.endswith((".", "!", "?")):
         closing += "."
     rng = random.Random(uuid4().int)
+    driver: Optional[str] = None
+    if verdict == "buy":
+        driver = strengths[0] if strengths else None
+    elif concerns:
+        driver = concerns[0]
+    elif strengths:
+        driver = strengths[0]
+    driver_clause = f" given {driver}" if driver else ""
     verdict_variants = [
-        f"I personally would {verdict} {company_name} here.",
-        f"For my own portfolio, I would {verdict} {company_name} at current levels.",
-        f"I personally would {verdict} {company_name} given these fundamentals.",
+        f"For my own portfolio, I'd {verdict} {company_name}{driver_clause}.",
+        f"If I had to act today, I'd {verdict} {company_name}{driver_clause}.",
+        f"On balance, I'd {verdict} {company_name}{driver_clause}.",
+        f"My call: {verdict.upper()} {company_name}{f' ({driver})' if driver else ''}.",
+        f"I'd {verdict} {company_name}{driver_clause}.",
+        f"Personally, I'd {verdict} {company_name}{driver_clause}.",
+        f"For me, it's a {verdict.upper()} on {company_name}{driver_clause}.",
+        f"Bottom line: {verdict.upper()} {company_name}{f' — {driver}' if driver else ''}.",
     ]
     closing += " " + rng.choice(verdict_variants)
     return closing
@@ -6708,10 +7021,25 @@ def _generate_persona_flavored_closing(
                 f"The risk-reward correlation favors a constructive stance, though position sizing should reflect broader macro uncertainties."
             )
         elif is_mixed:
-            return (
-                f"Where are we in the cycle? {company_name} presents {strengths[0] if strengths else 'some positives'} "
-                f"alongside {concerns[0] if concerns else 'risks'}. The correlation to macro factors warrants careful position sizing."
-            )
+            rng = random.Random(uuid4().int)
+            openers = [
+                "Cycle check: ",
+                "From a cycle standpoint, ",
+                "At this point in the cycle, ",
+                "On cycle positioning, ",
+                "Zooming out to the macro backdrop, ",
+            ]
+            setup_variants = [
+                f"{company_name} presents {strengths[0] if strengths else 'some positives'} alongside {concerns[0] if concerns else 'risks'}",
+                f"{company_name} has {strengths[0] if strengths else 'some positives'}, but {concerns[0] if concerns else 'risks'} keep the setup balanced",
+                f"{company_name} shows {strengths[0] if strengths else 'some positives'}, yet {concerns[0] if concerns else 'risks'} widen the distribution of outcomes",
+            ]
+            sizing_variants = [
+                "The correlation to macro factors argues for disciplined position sizing.",
+                "Macro sensitivity suggests careful sizing rather than a big bet.",
+                "Risk parity thinking says size this like a macro-linked asset, not a standalone story.",
+            ]
+            return f"{rng.choice(openers)}{rng.choice(setup_variants)}. {rng.choice(sizing_variants)}"
         else:
             return (
                 f"The economic machine suggests caution. {company_name} faces {concerns_str}, "
@@ -6780,10 +7108,25 @@ def _generate_persona_flavored_closing(
                 f"the risk-reward asymmetry appears favorable. The pendulum hasn't swung too far to optimism here."
             )
         elif is_mixed:
-            return (
-                f"Where are we in the cycle? {company_name} has {strengths[0] if strengths else 'positives'} but {concerns[0] if concerns else 'risks'}. "
-                f"Second-level thinking suggests waiting for the pendulum to swing further before committing capital."
-            )
+            rng = random.Random(uuid4().int)
+            openers = [
+                "Cycle positioning: ",
+                "A quick pendulum check: ",
+                "On where we are in the cycle, ",
+                "At this point in the cycle, ",
+                "Stepping back to the cycle, ",
+            ]
+            setup_variants = [
+                f"{company_name} has {strengths[0] if strengths else 'positives'} but {concerns[0] if concerns else 'risks'}.",
+                f"{company_name} offers {strengths[0] if strengths else 'positives'}, yet {concerns[0] if concerns else 'risks'} keep me from leaning in.",
+                f"{company_name} looks acceptable on the surface, but {concerns[0] if concerns else 'risks'} are easy for the market to underprice.",
+            ]
+            conclusion_variants = [
+                "Second-level thinking suggests patience until the pendulum swings further.",
+                "Second-level thinking pushes me to demand better asymmetry before committing capital.",
+                "I'd rather be early to caution than late to regret while the pendulum is still near the middle.",
+            ]
+            return f"{rng.choice(openers)}{rng.choice(setup_variants)} {rng.choice(conclusion_variants)}"
         else:
             return (
                 f"The risk here is not being adequately compensated. {company_name} shows {concerns_str}, "
@@ -6864,35 +7207,38 @@ def _ensure_required_sections(
 
     # 1. Financial Health Rating - only add if we have actual data
     if include_health_rating and not _section_present("Financial Health Rating"):
-        score_match = re.search(
-            r"Financial Health Rating[:\s]+(\d{1,3})", text, re.IGNORECASE
+        score_val = None
+        band_label = None
+
+        if health_score_data:
+            score_val = health_score_data.get("overall_score")
+            band_label = health_score_data.get("score_band")
+
+        if score_val is None:
+            score_match = re.search(
+                r"Financial Health Rating[:\s]+(\d{1,3})", text, re.IGNORECASE
+            )
+            if score_match:
+                score_val = float(score_match.group(1))
+            else:
+                score_val = _estimate_health_score(calculated_metrics)
+
+        if not band_label:
+            band_label = _get_score_label(float(score_val))
+
+        band_text = f" - {band_label}" if band_label else ""
+        score_line = (
+            f"{company_name} receives a Financial Health Rating of {float(score_val):.0f}/100{band_text} "
+            "based on profitability, cash conversion, and balance sheet resilience."
         )
-        if score_match:
-            health_score_val = float(score_match.group(1))
-        else:
-            health_score_val = _estimate_health_score(calculated_metrics)
 
-        label = _get_score_label(health_score_val)
-        fcf_str = _format_number_or_default(calculated_metrics.get("free_cash_flow"))
-        cash_str = _format_number_or_default(calculated_metrics.get("cash"))
-        liabilities_str = _format_number_or_default(
-            calculated_metrics.get("total_liabilities")
+        narrative = _build_health_narrative(
+            calculated_metrics,
+            health_score_data={"score_band": band_label} if band_label else None,
+            health_rating_config=health_rating_config,
         )
 
-        body = f"{company_name} receives a Financial Health Rating of {health_score_val:.0f}/100 - {label}."
-
-        supporting_facts = []
-        if _has_valid_data(fcf_str):
-            supporting_facts.append(f"free cash flow of {fcf_str}")
-        if _has_valid_data(cash_str):
-            supporting_facts.append(f"cash of {cash_str}")
-        if _has_valid_data(liabilities_str):
-            supporting_facts.append(f"total liabilities of {liabilities_str}")
-
-        if supporting_facts:
-            body += f" This rating reflects {', '.join(supporting_facts)}."
-
-        _append_section("Financial Health Rating", body)
+        _append_section("Financial Health Rating", f"{score_line}\n\n{narrative}".strip())
 
     def _synthesize_financial_performance() -> str:
         parts: List[str] = []
@@ -7020,9 +7366,7 @@ def _ensure_required_sections(
         existing_closing = closing_match.group(1).strip()
         existing_word_count = len(existing_closing.split())
         # If persona is selected but the closing lacks an explicit personal verdict, add one
-        if persona_name and not re.search(
-            r"\bi\s+personally\s+would\b", existing_closing, re.IGNORECASE
-        ):
+        if persona_name and not _contains_personal_verdict(existing_closing):
             # Determine buy/hold/sell based on actual metrics
             verdict_strengths = []
             verdict_concerns = []

@@ -4,7 +4,7 @@ import io
 import re
 from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from app.models.database import get_supabase_client
@@ -17,6 +17,7 @@ from app.models.schemas import (
 from app.tasks.analyze import analyze_company_task
 from app.config import get_settings
 from app.api.companies import _supabase_configured
+from app.api.auth import CurrentUser, get_current_user
 from app.services.summary_export import build_summary_docx, build_summary_pdf
 from app.services.analysis_fallback import (
     get_analysis as fallback_get_analysis,
@@ -44,7 +45,10 @@ class AnalysisExportRequest(BaseModel):
 
 
 @router.post("/run", response_model=AnalysisRunResponse)
-async def run_analysis(request: AnalysisRunRequest):
+async def run_analysis(
+    request: AnalysisRunRequest,
+    user: CurrentUser = Depends(get_current_user),
+):
     """
     Initiate background task to run financial analysis on a company.
     Returns analysis ID and task ID for tracking progress.
@@ -52,7 +56,7 @@ async def run_analysis(request: AnalysisRunRequest):
     settings = get_settings()
 
     if not _supabase_configured(settings):
-        return fallback_run_analysis(request)
+        return fallback_run_analysis(request, user_id=user.id)
 
     supabase = get_supabase_client()
     
@@ -65,7 +69,7 @@ async def run_analysis(request: AnalysisRunRequest):
         raise
     except Exception as e:
         if is_supabase_table_missing_error(e):
-            return fallback_run_analysis(request)
+            return fallback_run_analysis(request, user_id=user.id)
         raise HTTPException(status_code=500, detail=f"Error verifying company: {str(e)}")
     
     # Get filing IDs if not provided
@@ -90,7 +94,7 @@ async def run_analysis(request: AnalysisRunRequest):
             raise
         except Exception as e:
             if is_supabase_table_missing_error(e):
-                return fallback_run_analysis(request)
+                return fallback_run_analysis(request, user_id=user.id)
             raise HTTPException(status_code=500, detail=f"Error finding filings: {str(e)}")
     
     # Create analysis record
@@ -98,7 +102,8 @@ async def run_analysis(request: AnalysisRunRequest):
         analysis_data = {
             "company_id": str(request.company_id),
             "filing_ids": [str(fid) for fid in filing_ids],
-            "status": "pending"
+            "status": "pending",
+            "user_id": user.id,
         }
         
         analysis_response = supabase.table("analyses").insert(analysis_data).execute()
@@ -113,7 +118,7 @@ async def run_analysis(request: AnalysisRunRequest):
         raise
     except Exception as e:
         if is_supabase_table_missing_error(e):
-            return fallback_run_analysis(request)
+            return fallback_run_analysis(request, user_id=user.id)
         raise HTTPException(status_code=500, detail=f"Error creating analysis: {str(e)}")
     
     # Start analysis task
@@ -133,7 +138,8 @@ async def run_analysis(request: AnalysisRunRequest):
             filing_ids=[str(fid) for fid in filing_ids],
             include_personas=include_personas,
             target_length=target_length,
-            complexity=complexity
+            complexity=complexity,
+            user_id=user.id,
         )
         
         # Store task status
@@ -153,22 +159,31 @@ async def run_analysis(request: AnalysisRunRequest):
     
     except Exception as e:
         if is_supabase_table_missing_error(e):
-            return fallback_run_analysis(request)
+            return fallback_run_analysis(request, user_id=user.id)
         raise HTTPException(status_code=500, detail=f"Error starting analysis task: {str(e)}")
 
 
 @router.get("/{analysis_id}", response_model=Analysis)
-async def get_analysis(analysis_id: str):
+async def get_analysis(
+    analysis_id: str,
+    user: CurrentUser = Depends(get_current_user),
+):
     """Get analysis results by ID."""
     settings = get_settings()
 
     if not _supabase_configured(settings):
-        return fallback_get_analysis(analysis_id)
+        return fallback_get_analysis(analysis_id, user_id=user.id)
 
     supabase = get_supabase_client()
     
     try:
-        response = supabase.table("analyses").select("*").eq("id", analysis_id).execute()
+        response = (
+            supabase.table("analyses")
+            .select("*")
+            .eq("id", analysis_id)
+            .eq("user_id", user.id)
+            .execute()
+        )
         
         if not response.data:
             raise HTTPException(status_code=404, detail="Analysis not found")
@@ -179,22 +194,31 @@ async def get_analysis(analysis_id: str):
         raise
     except Exception as e:
         if is_supabase_table_missing_error(e):
-            return fallback_get_analysis(analysis_id)
+            return fallback_get_analysis(analysis_id, user_id=user.id)
         raise HTTPException(status_code=500, detail=f"Error retrieving analysis: {str(e)}")
 
 
 @router.get("/{analysis_id}/status")
-async def get_analysis_status(analysis_id: str):
+async def get_analysis_status(
+    analysis_id: str,
+    user: CurrentUser = Depends(get_current_user),
+):
     """Get analysis status and progress."""
     settings = get_settings()
 
     if not _supabase_configured(settings):
-        return fallback_get_analysis_status(analysis_id)
+        return fallback_get_analysis_status(analysis_id, user_id=user.id)
 
     supabase = get_supabase_client()
     
     try:
-        response = supabase.table("analyses").select("id, status, health_score, score_band").eq("id", analysis_id).execute()
+        response = (
+            supabase.table("analyses")
+            .select("id, status, health_score, score_band")
+            .eq("id", analysis_id)
+            .eq("user_id", user.id)
+            .execute()
+        )
         
         if not response.data:
             raise HTTPException(status_code=404, detail="Analysis not found")
@@ -205,7 +229,7 @@ async def get_analysis_status(analysis_id: str):
         raise
     except Exception as e:
         if is_supabase_table_missing_error(e):
-            return fallback_get_analysis_status(analysis_id)
+            return fallback_get_analysis_status(analysis_id, user_id=user.id)
         raise HTTPException(status_code=500, detail=f"Error retrieving analysis status: {str(e)}")
 
 
@@ -213,34 +237,41 @@ async def get_analysis_status(analysis_id: str):
 async def list_company_analyses(
     company_id: str,
     limit: int = 20,
-    offset: int = 0
+    offset: int = 0,
+    user: CurrentUser = Depends(get_current_user),
 ):
     """List analyses for a specific company."""
     settings = get_settings()
 
     if not _supabase_configured(settings):
-        return fallback_list_company_analyses(company_id, limit=limit, offset=offset)
+        return fallback_list_company_analyses(company_id, limit=limit, offset=offset, user_id=user.id)
 
     supabase = get_supabase_client()
     
     try:
-        response = supabase.table("analyses")\
-            .select("*")\
-            .eq("company_id", company_id)\
-            .order("analysis_date", desc=True)\
-            .range(offset, offset + limit - 1)\
+        response = (
+            supabase.table("analyses")
+            .select("*")
+            .eq("company_id", company_id)
+            .eq("user_id", user.id)
+            .order("analysis_date", desc=True)
+            .range(offset, offset + limit - 1)
             .execute()
+        )
         
         return [Analysis(**analysis) for analysis in response.data]
     
     except Exception as e:
         if is_supabase_table_missing_error(e):
-            return fallback_list_company_analyses(company_id, limit=limit, offset=offset)
+            return fallback_list_company_analyses(company_id, limit=limit, offset=offset, user_id=user.id)
         raise HTTPException(status_code=500, detail=f"Error listing analyses: {str(e)}")
 
 
 @router.get("/task/{task_id}", response_model=TaskStatus)
-async def get_task_status(task_id: str):
+async def get_task_status(
+    task_id: str,
+    user: CurrentUser = Depends(get_current_user),
+):
     """Get task status by task ID."""
     settings = get_settings()
 
@@ -325,7 +356,10 @@ async def export_analysis(
 
 
 @router.delete("/{analysis_id}", status_code=204)
-async def delete_analysis(analysis_id: str):
+async def delete_analysis(
+    analysis_id: str,
+    user: CurrentUser = Depends(get_current_user),
+):
     """Delete an analysis."""
     # If it's a client-side summary ID or not a UUID, just return success
     # as it doesn't exist in the backend analyses table.
@@ -336,18 +370,20 @@ async def delete_analysis(analysis_id: str):
 
     if not _supabase_configured(settings):
         if analysis_id in fallback_analysis_by_id:
-            analysis = fallback_analysis_by_id.pop(analysis_id)
-            company_id = analysis.get("company_id")
-            if company_id and company_id in fallback_analyses:
-                fallback_analyses[company_id] = [
-                    a for a in fallback_analyses[company_id] if a["id"] != analysis_id
-                ]
+            analysis = fallback_analysis_by_id.get(analysis_id)
+            if analysis and str(analysis.get("user_id") or "") == user.id:
+                fallback_analysis_by_id.pop(analysis_id, None)
+                company_id = analysis.get("company_id")
+                if company_id and company_id in fallback_analyses:
+                    fallback_analyses[company_id] = [
+                        a for a in fallback_analyses[company_id] if a["id"] != analysis_id
+                    ]
         return None
 
     supabase = get_supabase_client()
 
     try:
-        supabase.table("analyses").delete().eq("id", analysis_id).execute()
+        supabase.table("analyses").delete().eq("id", analysis_id).eq("user_id", user.id).execute()
     except Exception as e:
         # Ignore invalid input syntax for UUID errors, as it means the ID doesn't exist
         if "invalid input syntax for type uuid" in str(e):
@@ -356,5 +392,4 @@ async def delete_analysis(analysis_id: str):
         if is_supabase_table_missing_error(e):
             return None
         raise HTTPException(status_code=500, detail=f"Error deleting analysis: {str(e)}")
-
 

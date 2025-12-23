@@ -21,7 +21,7 @@ export default function BillingSuccessPage() {
   useEffect(() => {
     if (authLoading) return
     if (!user || !session) {
-      router.push('/signup')
+      router.push('/signin')
     }
   }, [authLoading, user, session, router])
 
@@ -75,7 +75,7 @@ export default function BillingSuccessPage() {
             Go to Dashboard
           </Link>
           <Link
-            href="/billing"
+            href={sessionId ? `/billing?session_id=${encodeURIComponent(sessionId)}` : '/billing'}
             className="inline-flex items-center justify-center rounded-xl bg-black px-5 py-3 text-sm font-semibold text-white"
           >
             Manage Billing

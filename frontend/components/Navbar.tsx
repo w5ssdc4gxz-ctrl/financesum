@@ -95,12 +95,24 @@ export default function Navbar({ variant = 'light' }: NavbarProps) {
                 </button>
               </>
             ) : (
-              <Link
-                href="/signup"
-                className="inline-flex items-center justify-center px-5 py-2 text-sm font-medium text-white bg-[#0015ff] rounded-full hover:bg-[#0012cc] transition-colors"
-              >
-                Get Started
-              </Link>
+              <>
+                <Link
+                  href="/signin"
+                  className={`text-sm font-medium transition-colors ${
+                    isDark
+                      ? 'text-white/70 hover:text-white'
+                      : 'text-muted-foreground hover:text-foreground'
+                  }`}
+                >
+                  Sign In
+                </Link>
+                <Link
+                  href="/signup"
+                  className="inline-flex items-center justify-center px-5 py-2 text-sm font-medium text-white bg-[#0015ff] rounded-full hover:bg-[#0012cc] transition-colors"
+                >
+                  Get Started
+                </Link>
+              </>
             )}
           </motion.div>
         </div>

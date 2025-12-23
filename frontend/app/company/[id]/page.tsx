@@ -11,7 +11,7 @@ import HealthScoreBadge from '@/components/HealthScoreBadge'
 import FinancialCharts from '@/components/FinancialCharts'
 import PersonaSelector from '@/components/PersonaSelector'
 import EnhancedSummary from '@/components/EnhancedSummary'
-import { companyApi, filingsApi, analysisApi, API_BASE_URL, FilingSummaryPreferencesPayload } from '@/lib/api-client'
+import { companyApi, filingsApi, analysisApi, FilingSummaryPreferencesPayload } from '@/lib/api-client'
 import DashboardStorage, { StoredAnalysisSnapshot, StoredSummaryPreferences } from '@/lib/dashboard-storage'
 import { buildSummaryPreview, scoreToRating } from '@/lib/analysis-insights'
 import { Button } from '@/components/base/buttons/button'
@@ -221,11 +221,6 @@ const buildPreferencePayload = (prefs: SummaryPreferenceFormState): FilingSummar
       }
       : undefined
 
-  // Force health score generation via prompt injection if enabled
-  const healthPromptInjection = isHealthEnabled
-    ? "\n\nIMPORTANT: You MUST calculate and provide a 'Financial Health Rating' (0-100) based on the analysis. Format it exactly as 'Financial Health Rating: X/100'."
-    : "";
-
   // Inject Persona Prompt if selected
   let personaPrompt = "";
   if (prefs.selectedPersona) {
@@ -235,7 +230,7 @@ const buildPreferencePayload = (prefs: SummaryPreferenceFormState): FilingSummar
     }
   }
 
-  const finalInvestorFocus = (prefs.investorFocus.trim() + healthPromptInjection + personaPrompt).trim();
+  const finalInvestorFocus = (prefs.investorFocus.trim() + personaPrompt).trim();
 
   return {
     mode: 'custom',
@@ -365,6 +360,7 @@ export default function CompanyPage() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const { user, loading } = useAuth()
+  const userId = user?.id ?? null
   const companyId = params?.id as string
   const [feedback, setFeedback] = useState<string | null>(null)
   const analysisIdParam = searchParams?.get('analysis_id')
@@ -432,19 +428,21 @@ export default function CompanyPage() {
   }, [loading, user, router])
 
   useEffect(() => {
-    const stored = DashboardStorage.loadSummaryPreferences()
+    if (!userId) return
+    const stored = DashboardStorage.loadSummaryPreferences(userId)
     if (stored) {
       const sanitized = sanitizeStoredPreferences(stored)
       setSummaryPreferences(sanitized)
       setCustomLengthInput(String(sanitized.targetLength))
     }
     preferencesHydratedRef.current = true
-  }, [])
+  }, [userId])
 
   useEffect(() => {
     if (!preferencesHydratedRef.current) return
-    DashboardStorage.saveSummaryPreferences(summaryPreferences)
-  }, [summaryPreferences])
+    if (!userId) return
+    DashboardStorage.saveSummaryPreferences(summaryPreferences, userId)
+  }, [summaryPreferences, userId])
 
   useEffect(() => {
     if (analysisIdParam && analysisIdParam !== currentAnalysisId) {
@@ -457,19 +455,23 @@ export default function CompanyPage() {
   }, [analysisIdParam, currentAnalysisId])
 
   useEffect(() => {
-    if (!currentAnalysisId || !isLocalAnalysisId) {
+    if (!currentAnalysisId || !isLocalAnalysisId || !userId) {
       setLocalAnalysisSnapshot(null)
       return
     }
-    const history = DashboardStorage.loadAnalysisHistory()
+    const history = DashboardStorage.loadAnalysisHistory(userId)
     const snapshot = history.find(item => item.analysisId === currentAnalysisId) ?? null
     setLocalAnalysisSnapshot(snapshot)
-  }, [currentAnalysisId, isLocalAnalysisId])
+  }, [currentAnalysisId, isLocalAnalysisId, userId])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
+    if (!userId) {
+      setDashboardSavedSummaries({})
+      return
+    }
     const syncSavedSummaries = () => {
-      const saved = DashboardStorage.loadAnalysisHistory().reduce<Record<string, boolean>>((acc, entry) => {
+      const saved = DashboardStorage.loadAnalysisHistory(userId).reduce<Record<string, boolean>>((acc, entry) => {
         if (entry.analysisId?.startsWith('summary-')) {
           acc[entry.analysisId.replace('summary-', '')] = true
         }
@@ -484,15 +486,23 @@ export default function CompanyPage() {
       window.removeEventListener('storage', syncSavedSummaries)
       window.removeEventListener('focus', syncSavedSummaries)
     }
-  }, [])
+  }, [userId])
 
   const resolveFilingUrl = (path?: string | null) => {
     if (!path) return '#'
-    try {
-      return new URL(path, API_BASE_URL).toString()
-    } catch (error) {
-      return path
+
+    const trimmed = path.trim()
+    if (!trimmed) return '#'
+
+    if (/^https?:\/\//i.test(trimmed)) {
+      return trimmed
     }
+
+    const proxyBase = (process.env.NEXT_PUBLIC_API_PROXY_BASE ?? '/api/backend').trim()
+    const normalizedProxyBase = (proxyBase || '/api/backend').replace(/\/+$/, '')
+    const normalizedPath = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
+
+    return `${normalizedProxyBase}${normalizedPath}`
   }
 
   const isMountedRef = useRef(true)
@@ -606,7 +616,7 @@ export default function CompanyPage() {
   }
 
   const handleAddSummaryToDashboard = (filingId: string) => {
-    if (!company) return
+    if (!company || !userId) return
     const summary = filingSummaries[filingId]
     if (!summary) return
     const filing = filings?.find((item: any) => item.id === filingId)
@@ -637,7 +647,7 @@ export default function CompanyPage() {
       filingDate: filing?.filing_date ?? null,
       source: 'summary',
       selectedPersona: summary.metadata?.selectedPersona ?? null,
-    } as any)
+    } as any, userId)
     setDashboardSavedSummaries(prev => ({ ...prev, [filingId]: true }))
     emitDashboardSync()
     setShowSavedPopup(true)
@@ -979,7 +989,7 @@ export default function CompanyPage() {
 
   const persistAnalysisSnapshot = useCallback(
     (analysis: any | null, overrideId?: string | null) => {
-      if (!analysis || !company?.id) return
+      if (!analysis || !company?.id || !userId) return
       const identifier = overrideId ?? analysis.id ?? analysis.analysisId
       if (!identifier) return
       const personaSignals = mapPersonaSignals(analysis.investor_persona_summaries)
@@ -1017,10 +1027,10 @@ export default function CompanyPage() {
           analysis.filingDate ??
           null,
         source: 'analysis',
-      })
+      }, userId)
       emitDashboardSync()
     },
-    [company],
+    [company, userId],
   )
 
   // Fetch filings mutation
@@ -1176,7 +1186,7 @@ export default function CompanyPage() {
   }, [currentAnalysis, latestAnalysis, analysisFromSnapshot, currentAnalysisId, persistAnalysisSnapshot])
 
   useEffect(() => {
-    if (!company?.id) return
+    if (!company?.id || !userId) return
     DashboardStorage.upsertRecentCompany({
       id: company.id,
       name: company.name,
@@ -1185,8 +1195,8 @@ export default function CompanyPage() {
       sector: company.sector,
       industry: company.industry,
       country: company.country,
-    })
-  }, [company])
+    }, userId)
+  }, [company, userId])
 
   useEffect(() => {
     if (!latestAnalysis) return
@@ -1257,7 +1267,7 @@ export default function CompanyPage() {
                 <div className="w-20 h-20 bg-white dark:bg-black border-2 border-black dark:border-white flex items-center justify-center shrink-0 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)]">
                   {company?.ticker ? (
                     <img
-                      src={`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/v1/companies/logo/${company.ticker}`}
+                      src={`/api/backend/api/v1/companies/logo/${company.ticker}`}
                       alt={`${company.name} logo`}
                       className="w-12 h-12 object-contain"
                       onError={(e) => {

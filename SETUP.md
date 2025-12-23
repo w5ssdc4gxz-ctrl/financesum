@@ -63,6 +63,19 @@ Run the Supabase migrations to create the database schema:
    - Enable Google provider
    - Add your OAuth credentials
 
+6. Configure email verification to use codes (OTP):
+   - Go to Authentication > Email Templates > **Confirm signup**
+   - Add `{{ .Token }}` somewhere in the email body (this is the 6-digit code users can type into the app)
+   - If you include a link/button, it must use `href="{{ .ConfirmationURL }}"` (the token is a code, not a URL)
+   - (Optional) Keep both a code and link as a fallback
+   - Example:
+     - `<p>Your verification code is: <strong>{{ .Token }}</strong></p>`
+     - `<p>Or confirm here: <a href="{{ .ConfirmationURL }}">Confirm email</a></p>`
+   - Go to Authentication > URL Configuration and ensure your app URLs are allowed (e.g. `http://localhost:3000/auth/callback` in dev)
+   - Important: Supabase’s built-in email service is **dev-only** and will not reliably deliver to arbitrary users.
+     - For most projects it only delivers to email addresses on your Supabase Organization → Team.
+     - To send emails to real users, enable **Custom SMTP** (Authentication → Emails → SMTP Settings) using a transactional provider like Resend, Postmark, or SendGrid.
+
 ### 3. Backend Setup
 
 ```bash
@@ -315,9 +328,6 @@ For issues or questions:
 ## License
 
 MIT License - See LICENSE file for details
-
-
-
 
 
 

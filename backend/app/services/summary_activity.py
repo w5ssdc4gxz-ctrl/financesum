@@ -302,6 +302,7 @@ def get_summary_generation_metrics(
     tz_offset_minutes: Optional[int] = None,
     days: int = SUMMARY_ACTIVITY_DAYS,
     supabase_client=None,
+    user_id: Optional[str] = None,
 ) -> Tuple[int, List[Dict[str, Any]]]:
     """
     Returns:
@@ -309,6 +310,10 @@ def get_summary_generation_metrics(
     activity_last_N_days is oldest->newest list of { date: 'YYYY-MM-DD', count: int }.
     """
     local_events = _load_local_events()
+    if user_id:
+        local_events = [
+            event for event in local_events if str(event.get("user_id") or "") == user_id
+        ]
 
     if supabase_client is None:
         settings = get_settings()
@@ -323,12 +328,10 @@ def get_summary_generation_metrics(
         return total, build_activity_buckets(local_events, tz_offset_minutes=tz_offset_minutes, days=days)
 
     try:
-        count_resp = (
-            supabase_client.table(SUMMARY_EVENTS_TABLE)
-            .select("id", count="exact")
-            .limit(1)
-            .execute()
-        )
+        count_query = supabase_client.table(SUMMARY_EVENTS_TABLE).select("id", count="exact").limit(1)
+        if user_id:
+            count_query = count_query.eq("user_id", user_id)
+        count_resp = count_query.execute()
         supabase_total = int(getattr(count_resp, "count", 0) or 0)
 
         client_tz = _resolve_client_timezone(tz_offset_minutes)
@@ -341,21 +344,23 @@ def get_summary_generation_metrics(
         page_size = 1000
         offset = 0
         while True:
-            page = (
+            events_query = (
                 supabase_client.table(SUMMARY_EVENTS_TABLE)
                 .select("created_at")
                 .gte("created_at", start_dt_utc.isoformat())
                 .order("created_at", desc=False)
                 .range(offset, offset + page_size - 1)
-                .execute()
             )
+            if user_id:
+                events_query = events_query.eq("user_id", user_id)
+            page = events_query.execute()
             rows = page.data or []
             events.extend(rows)
             if len(rows) < page_size:
                 break
             offset += page_size
     except Exception as exc:  # noqa: BLE001
-        if is_supabase_table_missing_error(exc):
+        if is_supabase_table_missing_error(exc) or (user_id and _looks_like_missing_user_id_column(exc)):
             total = len(local_events)
             return total, build_activity_buckets(local_events, tz_offset_minutes=tz_offset_minutes, days=days)
         raise
