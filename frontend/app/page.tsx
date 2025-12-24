@@ -179,7 +179,7 @@ export default function Home() {
                   sizes="(min-width: 768px) 320px, (min-width: 640px) 240px, 176px"
                   placeholder="blur"
                   blurDataURL={IMAGE_BLUR_DATA_URL}
-                  loading="eager"
+                  priority
                   className="w-full h-auto object-cover"
                 />
               </div>
@@ -203,7 +203,7 @@ export default function Home() {
                   sizes="(min-width: 768px) 352px, (min-width: 640px) 256px, 192px"
                   placeholder="blur"
                   blurDataURL={IMAGE_BLUR_DATA_URL}
-                  loading="eager"
+                  priority
                   className="w-full h-auto object-cover"
                 />
               </div>

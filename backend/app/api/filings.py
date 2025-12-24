@@ -1,5 +1,6 @@
 """Filings API endpoints."""
 
+import os
 import json
 import io
 import logging
@@ -8,6 +9,7 @@ import re
 import string
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
@@ -83,6 +85,145 @@ MAX_SUMMARY_ATTEMPTS = 2  # Faster: fewer full-summary retries
 # without relying on low-quality deterministic padding.
 MAX_REWRITE_ATTEMPTS = 2
 SUMMARY_TOTAL_TIMEOUT_SECONDS = 120  # Hard cap per-request generation time
+
+# ---------------------------------------------------------------------------
+# Cost / token budget guardrails
+# ---------------------------------------------------------------------------
+# Pro plan economics: $10 / 100 summaries => $0.10 budget per summary.
+#
+# Gemini pricing is typically quoted per 1K tokens. To keep a hard upper bound
+# on spend per summary, we estimate tokens from characters using a conservative
+# heuristic (1 token ~= 4 chars). This is not perfect tokenization, but it is
+# reliable enough for defensive budgeting.
+#
+# Configure via env if you want to tweak without code changes:
+#   - GEMINI_COST_PER_SUMMARY_USD (default 0.10)
+#   - GEMINI_COST_PER_1K_TOKENS_USD (default 0.002)
+#   - GEMINI_MAX_OUTPUT_TOKENS (default 9000)
+#   - GEMINI_SUMMARY_TOKEN_RESERVE (default 0)
+
+DEFAULT_SUMMARY_BUDGET_USD = 0.10
+DEFAULT_GEMINI_COST_PER_1K_TOKENS_USD = 0.002
+DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = 9000
+DEFAULT_SUMMARY_TOKEN_RESERVE = 0
+CHARS_PER_TOKEN_ESTIMATE = 4
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+@dataclass
+class TokenBudget:
+    """Best-effort token budget tracker (defensive cost control).
+
+    We track remaining tokens across multiple Gemini calls in a single summary
+    request. When the budget is insufficient, we skip additional LLM rewrites
+    and fall back to deterministic trimming/padding.
+    """
+
+    total_tokens: int
+    remaining_tokens: int
+
+    def estimate_tokens(self, text: Optional[str]) -> int:
+        if not text:
+            return 0
+        return max(1, int(len(text) / CHARS_PER_TOKEN_ESTIMATE))
+
+    def can_afford(self, prompt: str, expected_output_tokens: int) -> bool:
+        if self.remaining_tokens <= 0:
+            return False
+        prompt_tokens = self.estimate_tokens(prompt)
+        return (prompt_tokens + max(0, int(expected_output_tokens))) <= self.remaining_tokens
+
+    def charge(self, prompt: str, output: str) -> int:
+        used = self.estimate_tokens(prompt) + self.estimate_tokens(output)
+        self.remaining_tokens = max(0, self.remaining_tokens - used)
+        return used
+
+
+def _summary_token_budget() -> TokenBudget:
+    budget_usd = _float_env("GEMINI_COST_PER_SUMMARY_USD", DEFAULT_SUMMARY_BUDGET_USD)
+    cost_per_1k = _float_env(
+        "GEMINI_COST_PER_1K_TOKENS_USD", DEFAULT_GEMINI_COST_PER_1K_TOKENS_USD
+    )
+    reserve = _int_env("GEMINI_SUMMARY_TOKEN_RESERVE", DEFAULT_SUMMARY_TOKEN_RESERVE)
+
+    max_tokens = 0
+    if budget_usd > 0 and cost_per_1k > 0:
+        max_tokens = int((budget_usd / cost_per_1k) * 1000)
+        max_tokens = max(0, max_tokens - max(0, reserve))
+    return TokenBudget(total_tokens=max_tokens, remaining_tokens=max_tokens)
+
+
+def _summary_max_output_tokens() -> int:
+    return _int_env("GEMINI_MAX_OUTPUT_TOKENS", DEFAULT_GEMINI_MAX_OUTPUT_TOKENS)
+
+
+def _strip_large_context_block(prompt: str) -> str:
+    """Remove the large filing CONTEXT block from a prompt.
+
+    Used for rewrite attempts to avoid re-sending the full filing text, keeping
+    token usage bounded while preserving the instruction scaffold.
+    """
+
+    if not prompt:
+        return prompt
+
+    pattern = re.compile(
+        r"(\n\s*CONTEXT:\s*\n)(.*?)(\n\s*FINANCIAL SNAPSHOT\b)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    return pattern.sub(
+        r"\1[CONTEXT OMITTED FOR REWRITE TO SAVE TOKENS]\3",
+        prompt,
+        count=1,
+    )
+
+
+def _truncate_prompt_to_token_budget(
+    prompt: str,
+    *,
+    max_prompt_chars: int,
+    budget_note: str = "",
+) -> str:
+    """Truncate the CONTEXT block so the full prompt fits inside max_prompt_chars."""
+    if not prompt or max_prompt_chars <= 0:
+        return prompt
+    if len(prompt) <= max_prompt_chars:
+        return prompt
+
+    pattern = re.compile(
+        r"(\n\s*CONTEXT:\s*\n)(.*?)(\n\s*FINANCIAL SNAPSHOT\b)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    match = pattern.search(prompt)
+    if not match:
+        return prompt[:max_prompt_chars]
+
+    prefix = prompt[: match.start(2)]
+    suffix = prompt[match.end(2) :]
+    context = match.group(2)
+
+    allowance = max(0, max_prompt_chars - len(prefix) - len(suffix) - len(budget_note))
+    truncated_context = context[:allowance]
+    return prefix + truncated_context + budget_note + suffix
 
 DETAIL_LEVEL_PROMPTS: Dict[str, str] = {
     "snapshot": "Keep analysis concise (1–2 short paragraphs) and only cite headline metrics that prove the main point.",
@@ -419,6 +560,153 @@ def _count_words(text: str) -> int:
         if token:
             count += 1
     return count
+
+
+_MICRO_TRIM_SKIP_SECTIONS = {
+    "key metrics",
+    "key data appendix",
+    "financial health rating",
+}
+
+
+def _micro_trim_filler_words(text: str, max_remove: int) -> Tuple[str, int]:
+    """Remove low-information filler words to shave tiny overages without breaking sentences.
+
+    This is intentionally conservative and only used when we're *barely* outside the
+    user's strict word band (e.g., off by 1-3 words). It avoids heavy truncation that
+    could drop entire sentences/sections.
+
+    Returns (new_text, removed_count).
+    """
+    if not text or max_remove <= 0:
+        return text, 0
+
+    # Only remove words that rarely change meaning in finance memos.
+    # Keep this list small + boring to avoid semantic drift.
+    removable_words = [
+        "overall",
+        "notably",
+        "generally",
+        "typically",
+        "largely",
+        "mainly",
+        "primarily",
+        "effectively",
+        "essentially",
+        "basically",
+        "relatively",
+        "somewhat",
+        "quite",
+        "very",
+        "really",
+    ]
+
+    heading_re = re.compile(r"^\s*##\s*(.+?)\s*$")
+    current_section: Optional[str] = None
+    removed = 0
+    out_lines: List[str] = []
+
+    # Common discourse markers that can be removed *with their trailing comma*.
+    # (Each removes exactly 1 word.)
+    discourse_re = re.compile(
+        r"\b(?:Overall|Notably|Importantly)\s*,\s+", re.IGNORECASE
+    )
+
+    def _cleanup_spaces(s: str) -> str:
+        s = re.sub(r"[ \t]{2,}", " ", s)
+        s = re.sub(r"\s+([,.;:!?])", r"\1", s)
+        return s
+
+    for line in text.splitlines():
+        m = heading_re.match(line)
+        if m:
+            current_section = " ".join(m.group(1).lower().split())
+            out_lines.append(line)
+            continue
+
+        if removed >= max_remove:
+            out_lines.append(line)
+            continue
+
+        if current_section and any(
+            current_section.startswith(skip) for skip in _MICRO_TRIM_SKIP_SECTIONS
+        ):
+            out_lines.append(line)
+            continue
+
+        # Skip strict metric lines (arrow format) even outside Key Metrics.
+        if line.lstrip().startswith("→"):
+            out_lines.append(line)
+            continue
+
+        working = line
+        # 1) Remove discourse markers like "Overall," first.
+        if removed < max_remove:
+            working, n = discourse_re.subn("", working, count=1)
+            if n:
+                removed += 1
+
+        # 2) Remove standalone filler words.
+        # Remove one word per pass to keep edits minimal.
+        for w in removable_words:
+            if removed >= max_remove:
+                break
+            pattern = re.compile(rf"\b{re.escape(w)}\b\s+", re.IGNORECASE)
+            working, n = pattern.subn("", working, count=1)
+            if n:
+                removed += 1
+
+        out_lines.append(_cleanup_spaces(working))
+
+    return "\n".join(out_lines), removed
+
+
+def _enforce_whitespace_word_band(
+    text: str,
+    target_length: int,
+    tolerance: int = 10,
+    *,
+    allow_padding: bool = True,
+) -> str:
+    """Enforce the word band using raw whitespace token counts (UI/test counting).
+
+    The backend primarily uses `_count_words()` for MS-Word-ish counting, but some
+    surfaces (tests/UI) count via `len(text.split())`, which includes markdown tokens
+    like `##` and `-`. This final guard keeps the *user-visible* count inside ±tolerance.
+    """
+    if not text or target_length is None:
+        return text
+
+    lower = target_length - tolerance
+    upper = target_length + tolerance
+
+    for _ in range(5):
+        ws_count = len(text.split())
+        if lower <= ws_count <= upper:
+            return text
+
+        if ws_count > upper:
+            excess = ws_count - upper
+
+            # For tiny overages, prefer micro-trimming filler words over dropping sentences.
+            if excess <= 15:
+                micro, removed = _micro_trim_filler_words(text, excess)
+                if removed > 0 and len(micro.split()) < ws_count:
+                    text = micro
+                    continue
+
+            # Fall back: reduce the backend word count by the same excess.
+            target_words = max(lower, _count_words(text) - excess)
+            text = _trim_preserving_headings(text, target_words)
+            continue
+
+        # Under target by whitespace count.
+        deficit = lower - ws_count
+        if not allow_padding:
+            return text
+        text = _distribute_padding_across_sections(text, deficit)
+
+    return text
 
 
 def _call_gemini_client(
@@ -1710,6 +1998,9 @@ def _compress_summary_to_length(
     max_words: int,
     target_length: int,
     tolerance: int,
+    *,
+    token_budget: Optional[TokenBudget] = None,
+    max_output_tokens: int = DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
 ) -> Tuple[Optional[str], Optional[int]]:
     """
     Ask the model to compress the memo to fit within the band without truncating sections.
@@ -1727,7 +2018,16 @@ def _compress_summary_to_length(
         "MEMO TO COMPRESS:\n"
         f"{summary_text}"
     )
+    if token_budget and not token_budget.can_afford(compress_prompt, max_output_tokens):
+        logger.warning(
+            "Skipping compression rewrite due to token budget (remaining=%s tokens)",
+            token_budget.remaining_tokens,
+        )
+        return None, None
+
     raw_text = _call_gemini_client(gemini_client, compress_prompt)
+    if token_budget:
+        token_budget.charge(compress_prompt, raw_text)
     compressed_text, reported = _extract_word_count_control(raw_text)
     if not compressed_text:
         return None, None
@@ -1860,6 +2160,9 @@ def _rewrite_summary_to_length(
     target_length: int,
     quality_validators: Optional[List[Callable[[str], Optional[str]]]],
     current_words: Optional[int] = None,
+    *,
+    token_budget: Optional[TokenBudget] = None,
+    max_output_tokens: int = DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
 ) -> Tuple[str, Tuple[int, int]]:
     """
     Ask the model to rewrite an existing draft so it fits within the required length band
@@ -1949,8 +2252,9 @@ def _rewrite_summary_to_length(
             "4. EVERY sentence MUST end with proper punctuation. No cutting off with 'and the...', 'which is...', or incomplete numbers like '$1.'.\n"
             "5. ENSURE THE OUTPUT IS COMPLETE. Do not cut off the last section or the Closing Takeaway.\n"
             "6. After rewriting, append a final line formatted exactly as `WORD COUNT: ###` (replace ### with the true count)."
-            f"\n\nLENGTH TARGET:\nAim for {lower}–{upper} words. BUT if you must choose between hitting the word count OR completing sentences, "
-            f"ALWAYS complete your sentences. Going slightly over/under is acceptable; incomplete sentences are NOT."
+            f"\n\nLENGTH TARGET:\nAim for {lower}–{upper} words. You MUST land inside this range. "
+            f"If finishing a sentence would push you out of range, tighten earlier sentences to compensate. "
+            f"Incomplete sentences are NOT allowed."
         )
         if corrections:
             prompt += "\n\nADDITIONAL CORRECTIONS:\n" + "\n".join(corrections)
@@ -1969,7 +2273,16 @@ def _rewrite_summary_to_length(
             time.sleep(delay_seconds)
 
         prompt = _build_prompt()
+        if token_budget and not token_budget.can_afford(prompt, max_output_tokens):
+            logger.warning(
+                "Skipping rewrite attempt due to token budget (remaining=%s tokens)",
+                token_budget.remaining_tokens,
+            )
+            break
+
         raw_text = _call_gemini_client(gemini_client, prompt)
+        if token_budget:
+            token_budget.charge(prompt, raw_text)
         new_text, reported_count = _extract_word_count_control(raw_text)
         if not new_text.strip():
             corrections.append(
@@ -2026,6 +2339,9 @@ def _enforce_length_constraints(
     gemini_client,
     quality_validators: Optional[List[Callable[[str], Optional[str]]]],
     last_word_stats: Optional[Tuple[int, int]],
+    *,
+    token_budget: Optional[TokenBudget] = None,
+    max_output_tokens: int = DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
 ) -> str:
     """
     Ensure the final memo fits inside the required length band using rewrite attempts before trimming.
@@ -2049,6 +2365,8 @@ def _enforce_length_constraints(
         target_length,
         quality_validators,
         current_words=actual_words,
+        token_budget=token_budget,
+        max_output_tokens=max_output_tokens,
     )
     summary_text = rewritten_text
     actual_words, tolerance = rewrite_stats
@@ -2080,6 +2398,8 @@ def _enforce_length_constraints(
                 upper,
                 target_length,
                 tolerance,
+                token_budget=token_budget,
+                max_output_tokens=max_output_tokens,
             )
             if compressed and compressed_words and lower <= compressed_words <= upper:
                 logger.info(
@@ -2129,7 +2449,18 @@ def _enforce_length_constraints(
                 "MANDATORY: Append a final line 'WORD COUNT: ###' with the actual count after expansion.\n\n"
                 f"SUMMARY TO EXPAND:\n{summary_text}"
             )
+            if token_budget and not token_budget.can_afford(
+                emergency_prompt, max_output_tokens
+            ):
+                logger.warning(
+                    "Skipping emergency expansion due to token budget (remaining=%s tokens)",
+                    token_budget.remaining_tokens,
+                )
+                return _finalize_length_band(summary_text, target_length, tolerance)
+
             raw_text = _call_gemini_client(gemini_client, emergency_prompt)
+            if token_budget:
+                token_budget.charge(emergency_prompt, raw_text)
             expanded_text, reported_count = _extract_word_count_control(raw_text)
             expanded_words = _count_words(expanded_text)
 
@@ -2173,6 +2504,9 @@ def _generate_summary_with_quality_control(
     quality_validators: Optional[List[Callable[[str], Optional[str]]]],
     filing_id: Optional[str] = None,
     timeout_seconds: Optional[int] = None,
+    *,
+    token_budget: Optional[TokenBudget] = None,
+    max_output_tokens: int = DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
 ) -> str:
     """
     Call Gemini up to MAX_SUMMARY_ATTEMPTS times, tightening instructions if word count or quality drifts.
@@ -2199,6 +2533,10 @@ def _generate_summary_with_quality_control(
             else ""
         )
         combined = base_prompt
+        # For rewrite attempts, do NOT resend the entire filing context. This keeps
+        # token usage bounded and helps stay within per-summary cost budgets.
+        if previous_draft:
+            combined = _strip_large_context_block(combined)
         if correction_block:
             combined += "\n\n" + correction_block
         combined += previous_block
@@ -2212,6 +2550,13 @@ def _generate_summary_with_quality_control(
         if filing_id:
             progress_cache[str(filing_id)] = f"{attempt_label}... 0%"
 
+        if token_budget and not token_budget.can_afford(prompt, max_output_tokens):
+            logger.warning(
+                "Stopping summary attempts due to token budget (remaining=%s tokens)",
+                token_budget.remaining_tokens,
+            )
+            break
+
         raw_text = _call_gemini_client(
             gemini_client,
             prompt,
@@ -2220,6 +2565,8 @@ def _generate_summary_with_quality_control(
             stage_name=attempt_label if filing_id else "Generating",
             expected_tokens=target_length * 2 if target_length else 4000,
         )
+        if token_budget:
+            token_budget.charge(prompt, raw_text)
         summary_text, reported_count = _extract_word_count_control(raw_text)
         previous_draft = summary_text
 
@@ -2346,7 +2693,18 @@ def _generate_summary_with_quality_control(
                 f"SUMMARY TO EXPAND:\\n{summary_text}"
             )
 
+            if token_budget and not token_budget.can_afford(
+                final_expansion_prompt, max_output_tokens
+            ):
+                logger.warning(
+                    "Skipping final expansion due to token budget (remaining=%s tokens)",
+                    token_budget.remaining_tokens,
+                )
+                return _finalize_length_band(summary_text, target_length, tolerance)
+
             raw_text = _call_gemini_client(gemini_client, final_expansion_prompt)
+            if token_budget:
+                token_budget.charge(final_expansion_prompt, raw_text)
             expanded_text, _ = _extract_word_count_control(raw_text)
             expanded_count = _count_words(expanded_text)
 
@@ -2378,6 +2736,8 @@ def _generate_summary_with_quality_control(
             gemini_client,
             quality_validators,
             last_word_stats,
+            token_budget=token_budget,
+            max_output_tokens=max_output_tokens,
         )
         summary_text = _force_final_band(summary_text, target_length, tolerance=10)
 
@@ -5633,6 +5993,10 @@ def generate_filing_summary(
 
         progress_cache[str(filing_id)] = "Analyzing Risk Factors..."
         metrics_lines = _build_key_metrics_block(calculated_metrics)
+        token_budget: Optional[TokenBudget] = _summary_token_budget()
+        if token_budget.total_tokens <= 0:
+            token_budget = None
+        max_output_tokens = _summary_max_output_tokens()
         context_excerpt = (
             document_text
             if len(document_text) <= MAX_GEMINI_CONTEXT_CHARS
@@ -5938,10 +6302,10 @@ CRITICAL RULES:
 - **MD&A**: Do NOT say "Management discusses..." or "In the MD&A section...". Just state the facts found there.
 - USE TRANSITIONS: Connect sections logically. Each section should flow naturally from the previous one.
 
-=== #1 PRIORITY: SENTENCE COMPLETION (OVERRIDES WORD COUNT) ===
-THIS IS YOUR SINGLE MOST IMPORTANT RULE. IT TAKES PRIORITY OVER WORD COUNT.
+=== #1 PRIORITY: SENTENCE COMPLETION (WITHIN THE STRICT WORD BAND) ===
+THIS IS YOUR SINGLE MOST IMPORTANT RULE.
 
-FUNDAMENTAL PRINCIPLE: It is ALWAYS better to exceed the word count by 100 words than to cut off a single sentence.
+FUNDAMENTAL PRINCIPLE: You MAY use the full ±10-word tolerance to finish a sentence, but you MUST still land inside the required band.
 
 EVERY SENTENCE MUST BE COMPLETE. ZERO EXCEPTIONS. ZERO TOLERANCE.
 
@@ -5970,9 +6334,9 @@ REAL EXAMPLES OF CUT-OFFS TO AVOID:
    GOOD: "...the moat may not be as wide as I would prefer for a long-term holding."
 
 HOW TO HANDLE WORD COUNT VS COMPLETION:
-- If you're at 640 words and need to finish a sentence, FINISH IT (even if you go to 700 words)
-- If you're at the limit, DO NOT start a new thought you can't finish
-- Plan your sections so you have room to complete the Closing Takeaway fully
+- If you're near the limit and need a few words to finish a sentence, FINISH IT — then tighten earlier sentences so the TOTAL stays within ±10 words.
+- If you're at the limit, DO NOT start a new thought you can't finish.
+- Plan your sections so you have room to complete the Closing Takeaway fully.
 
 BEFORE SUBMITTING - MANDATORY CHECK:
 Read the LAST WORD of EVERY sentence. If it's an article, preposition, conjunction, pronoun, or incomplete number, REWRITE IT.
@@ -5996,6 +6360,19 @@ Before you output anything, verify:
 [ ] If you're over the word count, that's OK - incomplete sentences are NOT OK
 === END CHECKLIST ===
 """
+
+        # Enforce per-summary token budget by trimming the CONTEXT block (input)
+        # before we make any Gemini calls.
+        if token_budget:
+            max_prompt_tokens = max(0, token_budget.remaining_tokens - max_output_tokens)
+            max_prompt_chars = max_prompt_tokens * CHARS_PER_TOKEN_ESTIMATE
+            if max_prompt_chars > 0 and len(base_prompt) > max_prompt_chars:
+                base_prompt = _truncate_prompt_to_token_budget(
+                    base_prompt,
+                    max_prompt_chars=max_prompt_chars,
+                    budget_note="\n\nNote: Filing text truncated to fit per-summary token budget.",
+                )
+
         progress_cache[str(filing_id)] = "Synthesizing Investor Insights..."
         print("DEBUG: Calling _generate_summary_with_quality_control")
         summary_text = _generate_summary_with_quality_control(
@@ -6007,6 +6384,8 @@ Before you output anything, verify:
             ],
             filing_id=filing_id,
             timeout_seconds=SUMMARY_TOTAL_TIMEOUT_SECONDS,
+            token_budget=token_budget,
+            max_output_tokens=max_output_tokens,
         )
 
         progress_cache[str(filing_id)] = "Polishing Output..."
@@ -6180,6 +6559,12 @@ Before you output anything, verify:
                 summary_text = _force_final_band(
                     summary_text, target_length, tolerance=10, allow_padding=True
                 )
+
+        if target_length:
+            # Final user-visible word-count enforcement (UI/tests count raw whitespace tokens).
+            summary_text = _enforce_whitespace_word_band(
+                summary_text, target_length, tolerance=10, allow_padding=True
+            )
 
         # Final guard: ensure the document ends with punctuation for substantive outputs
         if (

@@ -111,6 +111,82 @@ def test_summary_uses_serialized_statements(monkeypatch):
         local_cache.fallback_filing_summaries.pop(filing_id, None)
 
 
+def test_prompt_truncates_to_token_budget(monkeypatch, tmp_path):
+    """Large filing text should be truncated so the prompt stays inside the token budget."""
+    settings = get_settings()
+    settings.gemini_api_key = "test-key"
+
+    # Configure a deterministic token budget: $0.10 @ $0.002 / 1K tokens => 50k tokens.
+    monkeypatch.setenv("GEMINI_COST_PER_SUMMARY_USD", "0.10")
+    monkeypatch.setenv("GEMINI_COST_PER_1K_TOKENS_USD", "0.002")
+    monkeypatch.setenv("GEMINI_SUMMARY_TOKEN_RESERVE", "0")
+    monkeypatch.setenv("GEMINI_MAX_OUTPUT_TOKENS", "9000")
+
+    filing_id = "budget-test-filing"
+    company_id = "budget-test-company"
+
+    local_cache.fallback_filings_by_id[filing_id] = {
+        "id": filing_id,
+        "company_id": company_id,
+        "filing_type": "10-K",
+        "filing_date": "2024-12-31",
+    }
+    local_cache.fallback_companies[company_id] = {
+        "id": company_id,
+        "ticker": "BUDG",
+        "name": "Budget Test Corp",
+    }
+    local_cache.fallback_financial_statements[filing_id] = {
+        "filing_id": filing_id,
+        "period_start": "2024-01-01",
+        "period_end": "2024-12-31",
+        "statements": {"income_statement": {"totalRevenue": {"2024-12-31": 123}}},
+    }
+
+    # Force the endpoint to use a local document + excerpt loader.
+    dummy_path = tmp_path / "filing.txt"
+    dummy_path.write_text("dummy", encoding="utf-8")
+    monkeypatch.setattr(filings_api, "_ensure_local_document", lambda _context, _settings: dummy_path)
+    monkeypatch.setattr(
+        filings_api,
+        "_load_document_excerpt",
+        lambda _path, limit=None: "X" * 400_000,
+    )
+
+    captured_prompts: list[str] = []
+
+    class DummyModel:
+        def generate_content(self, prompt: str):
+            captured_prompts.append(prompt)
+            return type("Resp", (), {"text": build_summary_with_word_count(200)})()
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.model = DummyModel()
+
+    monkeypatch.setattr(filings_api, "get_gemini_client", lambda: DummyClient())
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/filings/{filing_id}/summary",
+        json={"mode": "custom", "target_length": 200},
+    )
+
+    try:
+        assert response.status_code == 200
+        assert captured_prompts, "Expected at least one Gemini prompt"
+        prompt_len = len(captured_prompts[0])
+
+        max_tokens = int((0.10 / 0.002) * 1000)
+        max_prompt_chars = (max_tokens - 9000) * filings_api.CHARS_PER_TOKEN_ESTIMATE
+        assert prompt_len <= max_prompt_chars
+    finally:
+        local_cache.fallback_filings_by_id.pop(filing_id, None)
+        local_cache.fallback_companies.pop(company_id, None)
+        local_cache.fallback_financial_statements.pop(filing_id, None)
+        local_cache.fallback_filing_summaries.pop(filing_id, None)
+
+
 def test_custom_preferences_influence_prompt(monkeypatch):
     """Custom summary requests should embed investor preferences into the prompt and skip caching."""
     settings = get_settings()
