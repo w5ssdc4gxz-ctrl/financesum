@@ -683,6 +683,22 @@ def _enforce_whitespace_word_band(
     for _ in range(5):
         ws_count = len(text.split())
         if lower <= ws_count <= upper:
+            # Some surfaces (and a few tests) count words more like MS Word, i.e. they
+            # do NOT count markdown tokens like `##` as words. Ensure that count is
+            # also inside the band when we still have whitespace headroom.
+            word_count = _count_words(text)
+            if word_count < lower and allow_padding:
+                headroom = upper - ws_count
+                if headroom <= 0:
+                    return text
+                deficit = lower - word_count
+                # We request only the minimum additional words, but the padding
+                # generator may overshoot slightly with full sentences; headroom
+                # protects us from blowing past the whitespace band.
+                text = _distribute_padding_across_sections(
+                    text, min(deficit, max(1, headroom))
+                )
+                continue
             return text
 
         if ws_count > upper:
@@ -855,8 +871,12 @@ def _fix_inline_section_headers(text: str) -> str:
         # Pattern 2: Header appears mid-sentence without punctuation
         # e.g., "some text ## Executive Summary more text"
         # Only add period if the character before isn't already punctuation
+        # IMPORTANT: Only treat this as an *inline* header when it's on the SAME
+        # line. If we allow \s+ here, we may match across newlines and accidentally
+        # add periods to the end of the previous section (e.g., Key Metrics rows).
         pattern2 = re.compile(
-            rf"([^.!?\s\n])\s+(?:##?\s*)({re.escape(header)})\s+(\S)", re.IGNORECASE
+            rf"([^.!?\s\n])[ \t]+(?:##?\s*)({re.escape(header)})[ \t]+(\S)",
+            re.IGNORECASE,
         )
         result = pattern2.sub(
             lambda m: f"{m.group(1)}.\n\n## {header}\n\n{m.group(3)}", result
@@ -901,6 +921,8 @@ def _remove_filler_phrases(text: str) -> str:
         return text
 
     # Comprehensive filler patterns (regex to catch variations)
+    # NOTE: Prefer whitespace-tolerant patterns for short slogans because the model
+    # can introduce line breaks / non-breaking spaces between words.
     filler_patterns = [
         r"Additional detail covers?\s+[^.]*\.",
         r"Capital allocation remarks?\s+[^.]*\.",
@@ -926,15 +948,15 @@ def _remove_filler_phrases(text: str) -> str:
         r"(?:Additionally,?\s*)?\bTest\b[^.]*\.",
         r"(?:Additionally,?\s*)?\bBenchmark\b[^.]*\.",
         # Legacy padding slogans (users perceive these as low-quality/random filler)
-        r"\bEarnings quality is the key question\.",
-        r"\bDurability matters more than optics\.",
-        r"\bFocus on what is repeatable\.",
-        r"\bCash flow anchors the thesis\.",
-        r"\bMargins must hold through competition\.",
-        r"\bLeverage shapes downside risk\.",
-        r"\bScale must translate to profit\.",
-        r"\bUnit economics should improve with scale\.",
-        r"\bValuation should match durability\.",
+        r"\bEarnings[\s\u00A0]+quality[\s\u00A0]+is[\s\u00A0]+the[\s\u00A0]+key[\s\u00A0]+question\.",
+        r"\bDurability[\s\u00A0]+matters[\s\u00A0]+more[\s\u00A0]+than[\s\u00A0]+optics\.",
+        r"\bFocus[\s\u00A0]+on[\s\u00A0]+what[\s\u00A0]+is[\s\u00A0]+repeatable\.",
+        r"\bCash[\s\u00A0]+flow[\s\u00A0]+anchors[\s\u00A0]+the[\s\u00A0]+thesis\.",
+        r"\bMargins[\s\u00A0]+must[\s\u00A0]+hold[\s\u00A0]+through[\s\u00A0]+competition\.",
+        r"\bLeverage[\s\u00A0]+shapes[\s\u00A0]+downside[\s\u00A0]+risk\.",
+        r"\bScale[\s\u00A0]+must[\s\u00A0]+translate[\s\u00A0]+to[\s\u00A0]+profit\.",
+        r"\bUnit[\s\u00A0]+economics[\s\u00A0]+should[\s\u00A0]+improve[\s\u00A0]+with[\s\u00A0]+scale\.",
+        r"\bValuation[\s\u00A0]+should[\s\u00A0]+match[\s\u00A0]+durability\.",
         # Match "One-off" across hyphen variants (ASCII hyphen, non-breaking hyphen, en/em dashes)
         r"\bOne[-\u2010\u2011\u2013\u2014]?off gains should be discounted\.",
         # Catch partial sentences
@@ -958,10 +980,12 @@ def _remove_filler_phrases(text: str) -> str:
     if removed_count > 0:
         logger.info(f"Post-processing removed {removed_count} filler phrase(s)")
 
-    # Clean up double spaces or hanging punctuation
-    result = re.sub(r"\s{2,}", " ", result)
-    result = re.sub(r"\s+\.", ".", result)
+    # Clean up double spaces or hanging punctuation.
+    # IMPORTANT: Do NOT collapse newlines (markdown structure). Only collapse spaces/tabs.
+    result = re.sub(r"[ \t]{2,}", " ", result)
+    result = re.sub(r"[ \t]+\.", ".", result)
     result = re.sub(r"\.\s*\.", ".", result)
+    result = re.sub(r"\n{3,}", "\n\n", result)
 
     return result
 
@@ -1551,7 +1575,40 @@ def _build_padding_block(required_words: int) -> str:
         return ""
 
     padding_sentences = _generate_padding_sentences(required_words)
-    return " ".join(padding_sentences)
+    if not padding_sentences:
+        return ""
+
+    # Render as a clearly separated continuation block (NOT as micro-slogans and
+    # NOT as many markdown bullets). Bullets/extra markdown tokens inflate
+    # whitespace-token counts and can trigger over-trimming downstream.
+    padding_text = " ".join(padding_sentences).strip()
+    return "\n".join(
+        [
+            "<!--LENGTH_PADDING_START-->",
+            "Key underwriting questions: " + padding_text,
+            "<!--LENGTH_PADDING_END-->",
+        ]
+    ).strip()
+
+
+def _strip_length_padding_blocks(text: str) -> str:
+    """Remove any previously injected deterministic padding blocks.
+
+    Padding may be applied multiple times during iterative length clamps.
+    We mark our own padding with HTML comments so we can remove/replace it
+    idempotently.
+    """
+
+    if not text:
+        return text
+    pattern = re.compile(
+        r"<!--\s*LENGTH_PADDING_START\s*-->[\s\S]*?<!--\s*LENGTH_PADDING_END\s*-->"
+        r"|<!--LENGTH_PADDING_START-->[\s\S]*?<!--LENGTH_PADDING_END-->",
+        re.IGNORECASE,
+    )
+    cleaned = pattern.sub("", text)
+    cleaned = re.sub(r"\n{4,}", "\n\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _generate_padding_sentences(required_words: int) -> List[str]:
@@ -1563,13 +1620,53 @@ def _generate_padding_sentences(required_words: int) -> List[str]:
     # Padding is a LAST-RESORT safety net to satisfy strict word floors.
     # It must preserve narrative flow and NOT look like a stack of random slogans.
     # So we use a small set of cohesive, connective sentences (not 4–6 word fragments).
+    # NOTE: We keep a *large* pool of templates so that, even after sentence
+    # de-duplication passes, we can still add meaningful word count without
+    # repeating the same 2–3 lines (which users perceive as low quality).
+    #
+    # Also avoid common directive verbs (Monitor/Track/Watch/Compare/Evaluate/etc.)
+    # because downstream filler scrubbing treats those as low-signal imperatives.
     templates = [
+        "Cash conversion is the key bridge between earnings and intrinsic value.",
+        "Margin durability depends on pricing power and disciplined reinvestment.",
+        "Working-capital swings can overstate performance when demand is softening.",
+        "Capex intensity matters because it determines how much revenue converts to cash.",
+        "Leverage matters most when growth slows and refinancing windows tighten.",
+        "Guidance quality shows up in cash, not just adjusted EPS.",
+        "Returns on invested capital are the cleanest signal of moat durability.",
+        "Recurring adjustments reduce confidence in the true earnings base.",
+        "If costs rise faster than price, margins can compress quickly.",
+        "Inventory builds can foreshadow discounting and weaker cash conversion.",
         "That leaves the key question: do profits convert to durable free cash flow across a full cycle?",
-        "The underwriting hinge is earnings quality: discount one-offs and stress cash conversion through working-capital and capex needs.",
+        "The underwriting hinge is earnings quality: discount one-offs and stress cash conversion through working-capital timing and capex needs.",
         "Durability matters: pricing power and reinvestment discipline should support margins as competitive intensity and regulation evolve.",
         "The main bear path is margin pressure plus higher reinvestment, flattening free cash flow even if revenue holds up.",
         "Balance-sheet flexibility matters because it determines whether the company can keep investing through a downturn without dilution.",
         "If reported earnings outpace cash generation, working-capital timing and capex intensity deserve extra scrutiny before underwriting the run-rate.",
+        "It is worth separating organic operating momentum from accounting noise, especially when stock-based compensation, FX, or restructuring items swing earnings.",
+        "Cash conversion deserves a separate lens because working-capital timing can mask weaker demand or channel inventory adjustments.",
+        "If capex is rising, the question is whether incremental spend expands capacity efficiently or merely maintains competitive parity.",
+        "Margin resilience hinges on mix and pricing, so product and region shifts can matter more than headline growth when competition heats up.",
+        "When revenue growth slows, operating leverage becomes the tell; fixed-cost absorption can turn modest deceleration into outsized profit compression.",
+        "A robust thesis usually requires both balance-sheet resilience and a credible path to self-funded growth, not perpetual reliance on external capital.",
+        "If buybacks are present, the value creation depends on repurchases being funded by free cash flow and executed at prices below intrinsic value.",
+        "Debt capacity is only as good as covenant headroom and maturity timing; short-dated refinancing needs amplify downside in volatile rate environments.",
+        "Guidance credibility often shows up in cash flow, not adjusted EPS, because cash reveals the true cost of growth and customer acquisition.",
+        "Customer concentration and platform dependencies can be material even in strong growth stories, since a single contract loss can reset forward expectations.",
+        "Regulatory and litigation exposure often hits margins indirectly through compliance spend and product constraints rather than as clean one-time charges.",
+        "For cyclical end markets, the key is normalized earnings: results at peak demand can overstate mid-cycle margins and cash generation.",
+        "If inventory and receivables are swelling, it can signal weaker demand pull-through, looser credit terms, or channel stuffing that reverses later.",
+        "Share-based compensation and capitalized costs can flatter near-term profitability while shifting the economic cash cost into future periods.",
+        "If reported EPS beats but cash lags, the gap often sits in working capital, deferred revenue, or other timing items that unwind over quarters.",
+        "Operating margin stability should be judged against reinvestment needs; strong margins that require underinvestment are less durable.",
+        "In R&D-heavy businesses, the economic margin is the one left after sustaining innovation, not the one reported before investment.",
+        "Markets tend to reprice businesses on durability, so structural unit-economics deterioration matters more than a single strong growth quarter.",
+        "The upside case strengthens when incremental revenue carries higher contribution margin, lifting free cash flow margin without a commensurate balance-sheet build.",
+        "Acquisition-driven growth needs an integration lens; synergy targets are real only when they translate into margin and cash conversion, not pro forma adjustments.",
+        "If gross margin is volatile, the driver is usually mix, discounting, or input costs; persistent volatility reduces confidence in the earnings base.",
+        "When management highlights adjusted metrics, reconciliation quality matters; recurring adjustments are effectively part of the ongoing cost structure.",
+        "Tax-rate swings can distort net income; the thesis should rest on operating profits and cash generation that persist regardless of tax timing.",
+        "A durable moat often appears in stable returns on invested capital and pricing discipline, while erosion shows up first in rising customer-acquisition intensity.",
     ]
 
     candidates: List[Tuple[int, str]] = [(len(t.split()), t) for t in templates]
@@ -1612,6 +1709,37 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
     if required_words <= 0 or not summary_text:
         return summary_text
 
+    # If a padding block already exists, APPEND inside it rather than stripping and
+    # rebuilding. This avoids large overshoots for tiny deficits (e.g. +1–3 words)
+    # and prevents oscillation between padding + trimming.
+    existing_block_re = re.compile(
+        r"(<!--\s*LENGTH_PADDING_START\s*-->)([\s\S]*?)(<!--\s*LENGTH_PADDING_END\s*-->)",
+        re.IGNORECASE,
+    )
+    existing_match = existing_block_re.search(summary_text)
+    if existing_match:
+        extra = " ".join(_generate_padding_sentences(required_words)).strip()
+        if not extra:
+            return summary_text
+
+        current_body = (existing_match.group(2) or "").strip()
+        separator = " " if current_body else ""
+        new_body = f"{current_body}{separator}{extra}".strip()
+        replacement = (
+            f"{existing_match.group(1)}\n{new_body}\n{existing_match.group(3)}"
+        )
+        return (
+            summary_text[: existing_match.start()]
+            + replacement
+            + summary_text[existing_match.end() :]
+        )
+
+    # Normalize obvious inline header issues BEFORE we try to locate target sections.
+    # Without this, padding can accidentally land in the wrong section (and later
+    # be normalized into e.g. Financial Health Rating), which looks like "random"
+    # filler sentences inside the analysis.
+    summary_text = _fix_inline_section_headers(summary_text)
+
     # Be permissive about spacing after ## to avoid missing headings like "##Executive Summary".
     heading_regex = re.compile(r"^\s*##\s*.+")
     sections: List[Tuple[str, str]] = []
@@ -1631,57 +1759,42 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
         sections.append((current_heading, "\n".join(buffer).strip()))
 
     if not sections:
-        # Fall back to legacy padding at the end
+        # Fall back to adding a clearly separated padding block at the end.
         base = summary_text.rstrip()
         if base and not base.endswith((".", "!", "?")):
             base += "."
-        return f"{base} {_build_padding_block(required_words)}".strip()
+        padding_block = _build_padding_block(required_words)
+        return f"{base}\n\n{padding_block}".strip()
 
     # QUALITY FIX:
-    # Do NOT sprinkle short padding fragments across multiple sections.
-    # Users perceive this as "random sentences" injected into the memo.
-    # Instead, concentrate any deterministic padding into ONE analysis section
-    # (preferably MD&A), and append it as a cohesive continuation block.
-    def _is_padding_allowed(heading: str) -> bool:
-        lower = heading.lower()
-        if "financial health rating" in lower:
-            return False
-        if "key metrics" in lower or "key data appendix" in lower:
-            return False
-        if "closing takeaway" in lower:
-            return False
-        return True
+    # Never inject length-padding into multiple sections. Put it ONLY in the MD&A
+    # section (or create that section) and render it as a clearly separated checklist.
+    def _canon_heading(heading_line: str) -> str:
+        title = re.sub(r"^\s*##\s*", "", heading_line).strip().lower()
+        title = title.replace("&", "and")
+        title = re.sub(r"[^a-z0-9\s]", " ", title)
+        return " ".join(title.split())
 
-    priorities = [
-        "management discussion",
-        "financial performance",
-        "executive summary",
-    ]
-    target_idx: Optional[int] = None
-    for needle in priorities:
-        for i, (heading, _body) in enumerate(sections):
-            if _is_padding_allowed(heading) and needle in heading.lower():
-                target_idx = i
-                break
-        if target_idx is not None:
-            break
-    if target_idx is None:
-        for i, (heading, _body) in enumerate(sections):
-            if _is_padding_allowed(heading):
-                target_idx = i
-                break
-    if target_idx is None:
-        # Last resort: append at end.
-        base = summary_text.rstrip()
-        if base and not base.endswith((".", "!", "?")):
-            base += "."
-        return f"{base} {_build_padding_block(required_words)}".strip()
+    mdna_idx: Optional[int] = None
+    risk_idx: Optional[int] = None
+    for i, (heading, _body) in enumerate(sections):
+        canon = _canon_heading(heading)
+        if canon.startswith("management discussion"):
+            mdna_idx = i
+        if canon.startswith("risk factors"):
+            risk_idx = i
 
-    padding_block = " ".join(_generate_padding_sentences(required_words)).strip()
-    heading, body = sections[target_idx]
+    if mdna_idx is None:
+        insert_at = risk_idx if risk_idx is not None else len(sections)
+        sections.insert(insert_at, ("## Management Discussion & Analysis", ""))
+        mdna_idx = insert_at
+
+    padding_block = _build_padding_block(required_words)
     if padding_block:
-        separator = " " if body else ""
-        sections[target_idx] = (heading, f"{body}{separator}{padding_block}".strip())
+        heading, body = sections[mdna_idx]
+        body = body.strip()
+        separator = "\n\n" if body else ""
+        sections[mdna_idx] = (heading, f"{body}{separator}{padding_block}".strip())
 
     # Reassemble the memo
     rebuilt_sections: List[str] = []
