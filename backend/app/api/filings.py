@@ -925,6 +925,18 @@ def _remove_filler_phrases(text: str) -> str:
         r"(?:Additionally,?\s*)?\bEvaluate\b[^.]*\.",
         r"(?:Additionally,?\s*)?\bTest\b[^.]*\.",
         r"(?:Additionally,?\s*)?\bBenchmark\b[^.]*\.",
+        # Legacy padding slogans (users perceive these as low-quality/random filler)
+        r"\bEarnings quality is the key question\.",
+        r"\bDurability matters more than optics\.",
+        r"\bFocus on what is repeatable\.",
+        r"\bCash flow anchors the thesis\.",
+        r"\bMargins must hold through competition\.",
+        r"\bLeverage shapes downside risk\.",
+        r"\bScale must translate to profit\.",
+        r"\bUnit economics should improve with scale\.",
+        r"\bValuation should match durability\.",
+        # Match "One-off" across hyphen variants (ASCII hyphen, non-breaking hyphen, en/em dashes)
+        r"\bOne[-\u2010\u2011\u2013\u2014]?off gains should be discounted\.",
         # Catch partial sentences
         r"Additional detail covers?\.?\s*$",
         r"Further notes? address\.?\s*$",
@@ -1547,34 +1559,50 @@ def _generate_padding_sentences(required_words: int) -> List[str]:
     if required_words <= 0:
         return []
 
-    # These are short, neutral micro‑sentences used only as a last resort to
-    # satisfy strict word floors. They avoid introducing new checklist-y points.
+    # IMPORTANT:
+    # Padding is a LAST-RESORT safety net to satisfy strict word floors.
+    # It must preserve narrative flow and NOT look like a stack of random slogans.
+    # So we use a small set of cohesive, connective sentences (not 4–6 word fragments).
     templates = [
-        "Earnings quality is the key question.",
-        "Durability matters more than optics.",
-        "Focus on what is repeatable.",
-        "Cash flow anchors the thesis.",
-        "Margins must hold through competition.",
-        "Leverage shapes downside risk.",
-        "Scale must translate to profit.",
-        "One‑off gains should be discounted.",
-        "Unit economics should improve with scale.",
-        "Valuation should match durability.",
+        "That leaves the key question: do profits convert to durable free cash flow across a full cycle?",
+        "The underwriting hinge is earnings quality: discount one-offs and stress cash conversion through working-capital and capex needs.",
+        "Durability matters: pricing power and reinvestment discipline should support margins as competitive intensity and regulation evolve.",
+        "The main bear path is margin pressure plus higher reinvestment, flattening free cash flow even if revenue holds up.",
+        "Balance-sheet flexibility matters because it determines whether the company can keep investing through a downturn without dilution.",
+        "If reported earnings outpace cash generation, working-capital timing and capex intensity deserve extra scrutiny before underwriting the run-rate.",
     ]
 
-    sentences: List[str] = []
-    words_added = 0
-    idx = 0
+    candidates: List[Tuple[int, str]] = [(len(t.split()), t) for t in templates]
+    candidates.sort(key=lambda x: x[0])
 
-    while words_added < required_words:
-        sentence = templates[idx % len(templates)]
-        # Prefer variety; only repeat if we exhaust templates.
-        if sentence in sentences and len(sentences) < len(templates):
-            idx += 1
-            continue
+    sentences: List[str] = []
+    remaining = required_words
+    used: set[str] = set()
+
+    # Greedy: pick the smallest sentence that covers the remaining deficit.
+    # This minimizes overshoot and avoids triggering trimming elsewhere.
+    while remaining > 0:
+        choice: Optional[Tuple[int, str]] = None
+        for wc, t in candidates:
+            if t in used:
+                continue
+            if wc >= remaining:
+                choice = (wc, t)
+                break
+        if choice is None:
+            # If nothing is long enough, take the longest unused sentence.
+            for wc, t in reversed(candidates):
+                if t not in used:
+                    choice = (wc, t)
+                    break
+        if choice is None:
+            # As a last resort, allow repeats.
+            choice = candidates[-1]
+
+        wc, sentence = choice
         sentences.append(sentence)
-        words_added += len(sentence.split())
-        idx += 1
+        used.add(sentence)
+        remaining -= wc
 
     return sentences
 
@@ -1584,7 +1612,8 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
     if required_words <= 0 or not summary_text:
         return summary_text
 
-    heading_regex = re.compile(r"^\s*##\s+.+")
+    # Be permissive about spacing after ## to avoid missing headings like "##Executive Summary".
+    heading_regex = re.compile(r"^\s*##\s*.+")
     sections: List[Tuple[str, str]] = []
     current_heading: Optional[str] = None
     buffer: List[str] = []
@@ -1608,91 +1637,51 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
             base += "."
         return f"{base} {_build_padding_block(required_words)}".strip()
 
-    padding_sentences = _generate_padding_sentences(required_words)
-
-    # Weight distribution toward analysis-heavy sections; avoid padding Closing Takeaway by default.
-    weights: List[int] = []
-    for heading, _ in sections:
+    # QUALITY FIX:
+    # Do NOT sprinkle short padding fragments across multiple sections.
+    # Users perceive this as "random sentences" injected into the memo.
+    # Instead, concentrate any deterministic padding into ONE analysis section
+    # (preferably MD&A), and append it as a cohesive continuation block.
+    def _is_padding_allowed(heading: str) -> bool:
         lower = heading.lower()
+        if "financial health rating" in lower:
+            return False
+        if "key metrics" in lower or "key data appendix" in lower:
+            return False
         if "closing takeaway" in lower:
-            weights.append(0)  # keep verdict tight
-        elif "management discussion" in lower:
-            weights.append(3)  # primary expansion target
-        elif "financial performance" in lower:
-            weights.append(2)
-        elif "executive summary" in lower:
-            weights.append(1)
-        elif "risk factors" in lower or "strategic initiatives" in lower:
-            weights.append(1)
-        elif "financial health rating" in lower:
-            weights.append(
-                0
-            )  # NEVER pad health rating - it should be tightly written and quantitative
-        elif "key data appendix" in lower or "key metrics" in lower:
-            weights.append(0)  # keep metrics appendix factual/brief
-        else:
-            weights.append(1)
+            return False
+        return True
 
-    target_indices: List[int] = []
-    for idx, wt in enumerate(weights):
-        if wt > 0:
-            target_indices.extend([idx] * wt)
+    priorities = [
+        "management discussion",
+        "financial performance",
+        "executive summary",
+    ]
+    target_idx: Optional[int] = None
+    for needle in priorities:
+        for i, (heading, _body) in enumerate(sections):
+            if _is_padding_allowed(heading) and needle in heading.lower():
+                target_idx = i
+                break
+        if target_idx is not None:
+            break
+    if target_idx is None:
+        for i, (heading, _body) in enumerate(sections):
+            if _is_padding_allowed(heading):
+                target_idx = i
+                break
+    if target_idx is None:
+        # Last resort: append at end.
+        base = summary_text.rstrip()
+        if base and not base.endswith((".", "!", "?")):
+            base += "."
+        return f"{base} {_build_padding_block(required_words)}".strip()
 
-    # If all weights were zero (edge case), fall back to non-closing sections, then all sections
-    if not target_indices:
-        target_indices = [
-            i for i, h in enumerate(sections) if "closing takeaway" not in h[0].lower()
-        ]
-    if not target_indices:
-        target_indices = list(range(len(sections)))
-
-    # Spread sentences round-robin across weighted targets while limiting repetition within a section
-    words_added = 0
-    idx_cycle = 0
-    max_cycles = max(len(padding_sentences), 1) * max(len(target_indices), 1) * 2
-
-    while words_added < required_words and idx_cycle < max_cycles:
-        sentence = padding_sentences[idx_cycle % len(padding_sentences)]
-        target = target_indices[idx_cycle % len(target_indices)]
-        heading, body = sections[target]
-
-        # If the sentence is already present, skip for small deficits to avoid obvious filler.
-        # For unusually large deficits (should be rare in production), allow reuse to satisfy band.
-        if sentence in body and required_words <= 30:
-            idx_cycle += 1
-            continue
-
-        # Append inline to preserve flow (avoid obvious trailing "extra" paragraphs).
+    padding_block = " ".join(_generate_padding_sentences(required_words)).strip()
+    heading, body = sections[target_idx]
+    if padding_block:
         separator = " " if body else ""
-        sections[target] = (heading, f"{body}{separator}{sentence}".strip())
-        words_added += len(sentence.split())
-        idx_cycle += 1
-
-    # If still short, append a final non-duplicate padding line to the longest analysis section
-    if words_added < required_words and sections:
-        deficit = required_words - words_added
-        candidate_indices = (
-            [
-                idx
-                for idx, (heading, _) in enumerate(sections)
-                if "management discussion" in heading.lower()
-                or "financial performance" in heading.lower()
-                or "strategic initiatives" in heading.lower()
-            ]
-            or [
-                idx
-                for idx, (heading, _) in enumerate(sections)
-                if "key metrics" not in heading.lower()
-                and "closing takeaway" not in heading.lower()
-            ]
-            or list(range(len(sections)))
-        )
-        target = candidate_indices[0]
-        sentence = _generate_padding_sentences(deficit)[0]
-        heading, body = sections[target]
-        if sentence not in body or deficit > 30:
-            separator = " " if body else ""
-            sections[target] = (heading, f"{body}{separator}{sentence}".strip())
+        sections[target_idx] = (heading, f"{body}{separator}{padding_block}".strip())
 
     # Reassemble the memo
     rebuilt_sections: List[str] = []
