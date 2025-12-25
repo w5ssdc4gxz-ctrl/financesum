@@ -1578,37 +1578,85 @@ def _build_padding_block(required_words: int) -> str:
     if not padding_sentences:
         return ""
 
-    # Render as a clearly separated continuation block (NOT as micro-slogans and
-    # NOT as many markdown bullets). Bullets/extra markdown tokens inflate
-    # whitespace-token counts and can trigger over-trimming downstream.
+    # Render as a clearly separated continuation block.
+    # IMPORTANT: Do NOT use raw HTML comments as markers here — our markdown renderer
+    # can surface them to end users (confusing). Keep this as plain text.
     padding_text = " ".join(padding_sentences).strip()
-    return "\n".join(
-        [
-            "<!--LENGTH_PADDING_START-->",
-            "Key underwriting questions: " + padding_text,
-            "<!--LENGTH_PADDING_END-->",
-        ]
-    ).strip()
+    return f"Key underwriting questions: {padding_text}".strip()
 
 
-def _strip_length_padding_blocks(text: str) -> str:
-    """Remove any previously injected deterministic padding blocks.
+def _strip_length_padding_markers(text: str) -> str:
+    """Remove legacy length-padding *marker* lines that may leak into user output.
 
-    Padding may be applied multiple times during iterative length clamps.
-    We mark our own padding with HTML comments so we can remove/replace it
-    idempotently.
+    Older versions injected HTML comment markers like:
+      <!--LENGTH_PADDING_START--> / <!--LENGTH_PADDING_END-->
+
+    In some markdown renderers these show up as literal text, confusing users.
+    This function strips ONLY the marker lines (not the padding content).
     """
 
     if not text:
         return text
-    pattern = re.compile(
-        r"<!--\s*LENGTH_PADDING_START\s*-->[\s\S]*?<!--\s*LENGTH_PADDING_END\s*-->"
-        r"|<!--LENGTH_PADDING_START-->[\s\S]*?<!--LENGTH_PADDING_END-->",
+
+    cleaned = re.sub(
+        r"^\s*<!--\s*LENGTH_PADDING_START\s*-->\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    cleaned = re.sub(
+        r"^\s*<!--\s*LENGTH_PADDING_END\s*-->\s*$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _merge_underwriting_question_lines(text: str) -> str:
+    """Coalesce repeated 'Key underwriting questions:' lines into a single line.
+
+    Length enforcement can call padding multiple times. If we accidentally insert
+    multiple underwriting-question lines, merge them so users see one clean block.
+    """
+
+    if not text:
+        return text
+
+    prefix_re = re.compile(
+        r"^\s*Key\s+underwriting\s+questions\s*:\s*(.*)$",
         re.IGNORECASE,
     )
-    cleaned = pattern.sub("", text)
-    cleaned = re.sub(r"\n{4,}", "\n\n\n", cleaned)
-    return cleaned.strip()
+
+    merged_parts: List[str] = []
+    out_lines: List[str] = []
+    placeholder_idx: Optional[int] = None
+
+    for line in text.splitlines():
+        m = prefix_re.match(line)
+        if m:
+            content = (m.group(1) or "").strip()
+            if content:
+                merged_parts.append(content)
+            if placeholder_idx is None:
+                placeholder_idx = len(out_lines)
+                out_lines.append("__UNDERWRITING_PLACEHOLDER__")
+            # Skip subsequent underwriting lines.
+            continue
+        out_lines.append(line)
+
+    if placeholder_idx is None:
+        return text
+
+    merged_text = " ".join(part for part in merged_parts if part).strip()
+    out_lines[placeholder_idx] = (
+        f"Key underwriting questions: {merged_text}" if merged_text else ""
+    ).strip()
+
+    cleaned = "\n".join(out_lines).strip()
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned
 
 
 def _generate_padding_sentences(required_words: int) -> List[str]:
@@ -1709,30 +1757,43 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
     if required_words <= 0 or not summary_text:
         return summary_text
 
-    # If a padding block already exists, APPEND inside it rather than stripping and
-    # rebuilding. This avoids large overshoots for tiny deficits (e.g. +1–3 words)
-    # and prevents oscillation between padding + trimming.
-    existing_block_re = re.compile(
-        r"(<!--\s*LENGTH_PADDING_START\s*-->)([\s\S]*?)(<!--\s*LENGTH_PADDING_END\s*-->)",
-        re.IGNORECASE,
+    # Strip legacy HTML marker lines (older deploys) and coalesce repeated
+    # underwriting blocks, so padding remains clean and user-readable.
+    summary_text = _strip_length_padding_markers(summary_text)
+    summary_text = _merge_underwriting_question_lines(summary_text)
+
+    # If an underwriting-question padding line already exists, append to it instead
+    # of inserting a new one (prevents multiple blocks across retries).
+    existing_line_re = re.compile(
+        r"^(\s*Key\s+underwriting\s+questions\s*:\s*)(.*)$",
+        re.IGNORECASE | re.MULTILINE,
     )
-    existing_match = existing_block_re.search(summary_text)
+    existing_match = existing_line_re.search(summary_text)
     if existing_match:
-        extra = " ".join(_generate_padding_sentences(required_words)).strip()
-        if not extra:
+        extra_block = _build_padding_block(required_words)
+        if not extra_block:
+            return summary_text
+        # Extract only the appended sentence payload (drop the prefix).
+        extra_payload = re.sub(
+            r"^\s*Key\s+underwriting\s+questions\s*:\s*",
+            "",
+            extra_block,
+            flags=re.IGNORECASE,
+        ).strip()
+        if not extra_payload:
             return summary_text
 
-        current_body = (existing_match.group(2) or "").strip()
-        separator = " " if current_body else ""
-        new_body = f"{current_body}{separator}{extra}".strip()
-        replacement = (
-            f"{existing_match.group(1)}\n{new_body}\n{existing_match.group(3)}"
-        )
-        return (
+        current_prefix = existing_match.group(1)
+        current_payload = (existing_match.group(2) or "").strip()
+        spacer = " " if current_payload else ""
+        replacement_line = f"{current_prefix}{current_payload}{spacer}{extra_payload}".strip()
+        updated = (
             summary_text[: existing_match.start()]
-            + replacement
+            + replacement_line
             + summary_text[existing_match.end() :]
         )
+        # Coalesce again in case the document had multiple blocks.
+        return _merge_underwriting_question_lines(updated)
 
     # Normalize obvious inline header issues BEFORE we try to locate target sections.
     # Without this, padding can accidentally land in the wrong section (and later
@@ -1767,8 +1828,9 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
         return f"{base}\n\n{padding_block}".strip()
 
     # QUALITY FIX:
-    # Never inject length-padding into multiple sections. Put it ONLY in the MD&A
-    # section (or create that section) and render it as a clearly separated checklist.
+    # Never sprinkle padding fragments across multiple sections; it reads like random
+    # filler. Concentrate deterministic padding in ONE place (MD&A) as a single,
+    # clearly separated block.
     def _canon_heading(heading_line: str) -> str:
         title = re.sub(r"^\s*##\s*", "", heading_line).strip().lower()
         title = title.replace("&", "and")
@@ -2523,22 +2585,30 @@ def _enforce_length_constraints(
 
     # If still under length, force one more aggressive expansion
     if actual_words < lower:
-        # Prefer deterministic padding before an extra model call
-        padded = _distribute_padding_across_sections(summary_text, lower - actual_words)
-        padded_words = _count_words(padded)
-        if lower <= padded_words <= upper:
-            return _finalize_length_band(padded, target_length, tolerance)
+        shortfall = lower - actual_words
 
-        summary_text = padded
-        actual_words = padded_words
+        # IMPORTANT:
+        # Deterministic padding is a LAST resort. If we're materially short, we must
+        # expand the *real sections* (Exec Summary / Financial Performance / Risk Factors)
+        # via a rewrite, otherwise the memo becomes lopsided (e.g. all length stuffed
+        # into MD&A) and users perceive it as filler.
+        SMALL_PADDING_THRESHOLD = 25
 
-        if actual_words < lower:
+        if shortfall <= SMALL_PADDING_THRESHOLD:
+            padded = _distribute_padding_across_sections(summary_text, shortfall)
+            padded_words = _count_words(padded)
+            if lower <= padded_words <= upper:
+                return _finalize_length_band(padded, target_length, tolerance)
+            summary_text = padded
+            actual_words = padded_words
+            shortfall = lower - actual_words
+
+        if shortfall > 0:
             logger.warning(
                 "Summary is critically short (%s words; minimum %s). Forcing emergency expansion.",
                 actual_words,
                 lower,
             )
-            shortfall = lower - actual_words
             emergency_prompt = (
                 f"The following summary is {shortfall} words SHORT of the ABSOLUTE MINIMUM requirement of {lower} words.\n\n"
                 f"You MUST expand this summary by adding AT LEAST {int(shortfall * 1.2)} words of substantive analysis.\n\n"
@@ -2551,8 +2621,9 @@ def _enforce_length_constraints(
                 "MANDATORY: Append a final line 'WORD COUNT: ###' with the actual count after expansion.\n\n"
                 f"SUMMARY TO EXPAND:\n{summary_text}"
             )
+            expected_out_tokens = min(max_output_tokens, max(800, int(shortfall * 4)))
             if token_budget and not token_budget.can_afford(
-                emergency_prompt, max_output_tokens
+                emergency_prompt, expected_out_tokens
             ):
                 logger.warning(
                     "Skipping emergency expansion due to token budget (remaining=%s tokens)",
@@ -2560,7 +2631,9 @@ def _enforce_length_constraints(
                 )
                 return _finalize_length_band(summary_text, target_length, tolerance)
 
-            raw_text = _call_gemini_client(gemini_client, emergency_prompt)
+            raw_text = _call_gemini_client(
+                gemini_client, emergency_prompt, expected_tokens=expected_out_tokens
+            )
             if token_budget:
                 token_budget.charge(emergency_prompt, raw_text)
             expanded_text, reported_count = _extract_word_count_control(raw_text)
@@ -2652,7 +2725,12 @@ def _generate_summary_with_quality_control(
         if filing_id:
             progress_cache[str(filing_id)] = f"{attempt_label}... 0%"
 
-        if token_budget and not token_budget.can_afford(prompt, max_output_tokens):
+        expected_out_tokens = (
+            min(max_output_tokens, max(500, int(target_length * 2)))
+            if target_length
+            else min(max_output_tokens, 4000)
+        )
+        if token_budget and not token_budget.can_afford(prompt, expected_out_tokens):
             logger.warning(
                 "Stopping summary attempts due to token budget (remaining=%s tokens)",
                 token_budget.remaining_tokens,
@@ -2665,7 +2743,7 @@ def _generate_summary_with_quality_control(
             allow_stream=bool(filing_id),
             progress_callback=_progress_callback if filing_id else None,
             stage_name=attempt_label if filing_id else "Generating",
-            expected_tokens=target_length * 2 if target_length else 4000,
+            expected_tokens=expected_out_tokens,
         )
         if token_budget:
             token_budget.charge(prompt, raw_text)
@@ -2762,24 +2840,29 @@ def _generate_summary_with_quality_control(
                 minimum_acceptable,
             )
 
-            # Deterministic padding safety net for stubbornly short drafts
             shortfall = minimum_acceptable - final_word_count
-            # Add a small cushion to account for tokenizer/word-count discrepancies
-            pad_words = int(shortfall * 1.5) + 5
-            padded = _distribute_padding_across_sections(summary_text, pad_words)
-            padded_count = _count_words(padded)
-            if padded_count > final_word_count:
-                summary_text = padded
-                final_word_count = padded_count
 
-            shortfall = max(0, minimum_acceptable - final_word_count)
-            if shortfall == 0:
-                logger.info(
-                    "Deterministic padding lifted summary to %s words (minimum %s).",
-                    final_word_count,
-                    minimum_acceptable,
-                )
-                return _finalize_length_band(summary_text, target_length, tolerance)
+            # IMPORTANT:
+            # Do NOT paper over large deficits with deterministic padding. That creates
+            # visibly low-quality filler and can make one section (often MD&A) dominate.
+            # Use a final expansion call when the shortfall is material.
+            SMALL_PADDING_THRESHOLD = 25
+
+            if shortfall <= SMALL_PADDING_THRESHOLD:
+                padded = _distribute_padding_across_sections(summary_text, shortfall)
+                padded_count = _count_words(padded)
+                if padded_count > final_word_count:
+                    summary_text = padded
+                    final_word_count = padded_count
+
+                shortfall = max(0, minimum_acceptable - final_word_count)
+                if shortfall == 0:
+                    logger.info(
+                        "Deterministic padding lifted summary to %s words (minimum %s).",
+                        final_word_count,
+                        minimum_acceptable,
+                    )
+                    return _finalize_length_band(summary_text, target_length, tolerance)
 
             # One final, extremely forceful expansion attempt
             final_expansion_prompt = (
@@ -2795,8 +2878,9 @@ def _generate_summary_with_quality_control(
                 f"SUMMARY TO EXPAND:\\n{summary_text}"
             )
 
+            expected_out_tokens = min(max_output_tokens, max(800, int(shortfall * 4)))
             if token_budget and not token_budget.can_afford(
-                final_expansion_prompt, max_output_tokens
+                final_expansion_prompt, expected_out_tokens
             ):
                 logger.warning(
                     "Skipping final expansion due to token budget (remaining=%s tokens)",
@@ -2804,7 +2888,9 @@ def _generate_summary_with_quality_control(
                 )
                 return _finalize_length_band(summary_text, target_length, tolerance)
 
-            raw_text = _call_gemini_client(gemini_client, final_expansion_prompt)
+            raw_text = _call_gemini_client(
+                gemini_client, final_expansion_prompt, expected_tokens=expected_out_tokens
+            )
             if token_budget:
                 token_budget.charge(final_expansion_prompt, raw_text)
             expanded_text, _ = _extract_word_count_control(raw_text)
