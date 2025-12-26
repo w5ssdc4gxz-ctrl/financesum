@@ -1643,6 +1643,45 @@ def _dedupe_underwriting_payload_sentences(payload: str) -> str:
     return " ".join(unique).strip()
 
 
+def _trim_underwriting_payload(payload: str, *, max_words: int) -> str:
+    """Hard-cap an underwriting payload so it cannot dominate a section.
+
+    We keep whole sentences where possible; if the first sentence alone exceeds the
+    cap, we truncate by words and ensure terminal punctuation.
+    """
+
+    if not payload or max_words <= 0:
+        return ""
+
+    payload = payload.replace("\u00A0", " ").strip()
+    if len(payload.split()) <= max_words:
+        return payload
+
+    parts = re.split(r"(?<=[.!?])\s+", payload)
+    kept: List[str] = []
+    total = 0
+    for part in parts:
+        sent = (part or "").strip()
+        if not sent:
+            continue
+        wc = len(sent.split())
+        if total == 0 and wc > max_words:
+            words = sent.split()[:max_words]
+            truncated = " ".join(words).rstrip(" ,;:")
+            if truncated and not truncated.endswith((".", "!", "?")):
+                truncated += "."
+            return truncated
+        if total + wc > max_words:
+            break
+        kept.append(sent)
+        total += wc
+
+    trimmed = " ".join(kept).strip()
+    if trimmed and not trimmed.endswith((".", "!", "?")):
+        trimmed += "."
+    return trimmed
+
+
 def _normalize_underwriting_questions_formatting(text: str) -> str:
     """Ensure 'Key underwriting questions:' is a separate paragraph.
 
@@ -1718,6 +1757,8 @@ def _relocate_underwriting_questions_to_risk_factors(text: str) -> str:
         return text
 
     merged_payload = _dedupe_underwriting_payload_sentences(" ".join(payloads))
+    # Keep this block short so it never becomes the dominant part of the memo.
+    merged_payload = _trim_underwriting_payload(merged_payload, max_words=90)
     if not merged_payload:
         cleaned = "\n".join(cleaned_lines)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
@@ -1929,66 +1970,21 @@ def _generate_padding_sentences(
 
 
 def _distribute_padding_across_sections(summary_text: str, required_words: int) -> str:
-    """Spread deterministic padding across sections to hit strict word minimums."""
+    """Spread deterministic padding across the *shortest* narrative sections.
+
+    Goal: hit strict word bands without dumping all added words into one section.
+    """
     if required_words <= 0 or not summary_text:
         return summary_text
 
-    # Strip legacy HTML marker lines (older deploys) and coalesce repeated
-    # underwriting blocks, so padding remains clean and user-readable.
+    # Strip legacy markers and normalize any underwriting blocks so we don't amplify
+    # formatting issues during padding.
     summary_text = _strip_length_padding_markers(summary_text)
     summary_text = _normalize_underwriting_questions_formatting(summary_text)
     summary_text = _merge_underwriting_question_lines(summary_text)
     summary_text = _relocate_underwriting_questions_to_risk_factors(summary_text)
 
-    # If an underwriting-question padding line already exists, append to it instead
-    # of inserting a new one (prevents multiple blocks across retries).
-    existing_line_re = re.compile(
-        r"^(\s*Key\s+underwriting\s+questions\s*:\s*)(.*)$",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    existing_match = existing_line_re.search(summary_text)
-    if existing_match:
-        # Avoid repeatedly appending the same padding sentence across multiple
-        # band-enforcement passes (which would be deduped away and fail to add
-        # words, leaving the memo under-length).
-        current_payload = (existing_match.group(2) or "").replace("\u00A0", " ").strip()
-        exclude_norms: set[str] = set()
-        for sent in re.split(r"(?<=[.!?])\s+", current_payload):
-            norm = " ".join((sent or "").lower().split()).rstrip(".!?")
-            if norm:
-                exclude_norms.add(norm)
-
-        extra_block = _build_padding_block(required_words, exclude_norms=exclude_norms)
-        if not extra_block:
-            return summary_text
-        # Extract only the appended sentence payload (drop the prefix).
-        extra_payload = re.sub(
-            r"^\s*Key\s+underwriting\s+questions\s*:\s*",
-            "",
-            extra_block,
-            flags=re.IGNORECASE,
-        ).strip()
-        if not extra_payload:
-            return summary_text
-
-        current_prefix = existing_match.group(1)
-        current_payload = (existing_match.group(2) or "").strip()
-        spacer = " " if current_payload else ""
-        replacement_line = f"{current_prefix}{current_payload}{spacer}{extra_payload}".strip()
-        updated = (
-            summary_text[: existing_match.start()]
-            + replacement_line
-            + summary_text[existing_match.end() :]
-        )
-        # Normalize/coalesce again in case the document had multiple blocks.
-        updated = _normalize_underwriting_questions_formatting(updated)
-        updated = _merge_underwriting_question_lines(updated)
-        return _relocate_underwriting_questions_to_risk_factors(updated)
-
     # Normalize obvious inline header issues BEFORE we try to locate target sections.
-    # Without this, padding can accidentally land in the wrong section (and later
-    # be normalized into e.g. Financial Health Rating), which looks like "random"
-    # filler sentences inside the analysis.
     summary_text = _fix_inline_section_headers(summary_text)
 
     # Be permissive about spacing after ## to avoid missing headings like "##Executive Summary".
@@ -2009,53 +2005,73 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
     if current_heading is not None:
         sections.append((current_heading, "\n".join(buffer).strip()))
 
-    if not sections:
-        # Fall back to adding a clearly separated padding block at the end.
-        base = summary_text.rstrip()
-        if base and not base.endswith((".", "!", "?")):
-            base += "."
-        padding_block = _build_padding_block(required_words)
-        return f"{base}\n\n{padding_block}".strip()
-
-    # QUALITY FIX:
-    # Never sprinkle padding fragments across multiple sections; it reads like random
-    # filler. Concentrate deterministic padding in ONE place (Risk Factors) as a
-    # single, clearly separated block. This also prevents MD&A from becoming the
-    # dominant section when the memo needs extra words.
     def _canon_heading(heading_line: str) -> str:
         title = re.sub(r"^\s*##\s*", "", heading_line).strip().lower()
         title = title.replace("&", "and")
         title = re.sub(r"[^a-z0-9\s]", " ", title)
         return " ".join(title.split())
 
-    risk_idx: Optional[int] = None
-    key_metrics_idx: Optional[int] = None
-    for i, (heading, _body) in enumerate(sections):
+    if not sections:
+        # Fall back: no headings; append padding as a final paragraph.
+        base = summary_text.rstrip()
+        if base and not base.endswith((".", "!", "?")):
+            base += "."
+        padding_text = " ".join(_generate_padding_sentences(required_words)).strip()
+        return f"{base}\n\n{padding_text}".strip() if padding_text else base
+
+    # Candidate narrative sections to pad (exclude Health/Key Metrics/Closing).
+    candidate_order = {
+        "management discussion and analysis": 0,
+        "executive summary": 1,
+        "financial performance": 2,
+        "risk factors": 3,
+    }
+
+    candidates: List[Tuple[int, int, int]] = []  # (word_count, tie_break, section_idx)
+    for idx, (heading, body) in enumerate(sections):
         canon = _canon_heading(heading)
-        if canon.startswith("risk factors"):
-            risk_idx = i
-        if canon.startswith("key metrics") or canon.startswith("key data appendix"):
-            key_metrics_idx = i
+        for key, tie_break in candidate_order.items():
+            if canon.startswith(key):
+                candidates.append((len((body or "").split()), tie_break, idx))
+                break
 
-    # Prefer adding the padding block into Risk Factors. If missing, create it right
-    # before Key Metrics (or at end) so structure remains stable.
-    target_idx: Optional[int] = risk_idx
-    if target_idx is None:
-        insert_at = key_metrics_idx if key_metrics_idx is not None else len(sections)
-        sections.insert(insert_at, ("## Risk Factors", ""))
-        target_idx = insert_at
+    if not candidates:
+        base = summary_text.rstrip()
+        if base and not base.endswith((".", "!", "?")):
+            base += "."
+        padding_text = " ".join(_generate_padding_sentences(required_words)).strip()
+        return f"{base}\n\n{padding_text}".strip() if padding_text else base
 
-    padding_block = _build_padding_block(required_words)
-    if padding_block and target_idx is not None:
+    candidates.sort()
+
+    # Touch more than one section for non-trivial deficits to prevent any single
+    # section from becoming the "dumping ground".
+    n_targets = min(len(candidates), max(1, min(4, 1 + required_words // 20)))
+    target_section_idxs = [idx for _wc, _tb, idx in candidates[:n_targets]]
+
+    base_alloc = required_words // n_targets
+    remainder = required_words % n_targets
+    allocations = [base_alloc + (1 if i < remainder else 0) for i in range(n_targets)]
+
+    used_sentences: set[str] = set()
+    for alloc, target_idx in zip(allocations, target_section_idxs):
+        if alloc <= 0:
+            continue
+        pad_sentences = _generate_padding_sentences(alloc, exclude_norms=used_sentences)
+        if not pad_sentences:
+            continue
+        used_sentences.update(pad_sentences)
+        pad_text = " ".join(pad_sentences).strip()
+        if not pad_text:
+            continue
         heading, body = sections[target_idx]
-        body = body.strip()
+        body = (body or "").strip()
         separator = "\n\n" if body else ""
-        sections[target_idx] = (heading, f"{body}{separator}{padding_block}".strip())
+        sections[target_idx] = (heading, f"{body}{separator}{pad_text}".strip())
 
-    # Reassemble the memo
     rebuilt_sections: List[str] = []
     for heading, body in sections:
-        section_text = f"{heading}\n{body}".strip()
+        section_text = f"{heading}\n{(body or '').strip()}".strip()
         rebuilt_sections.append(section_text)
 
     rebuilt = "\n\n".join(rebuilt_sections).strip()
@@ -6963,6 +6979,7 @@ Before you output anything, verify:
                 company_name=company_name,
                 health_rating_config=health_config,
                 persona_name=selected_persona_name,
+                target_length=target_length,
             )
             summary_text = _finalize_length_band(
                 summary_text, target_length, tolerance=10
@@ -6988,6 +7005,7 @@ Before you output anything, verify:
                     company_name=company_name,
                     health_rating_config=health_config,
                     persona_name=selected_persona_name,
+                    target_length=target_length,
                 )
 
         # Final ellipsis cleanup after all length adjustments
@@ -7083,6 +7101,7 @@ Before you output anything, verify:
                 company_name=company_name,
                 health_rating_config=health_config,
                 persona_name=selected_persona_name,
+                target_length=target_length,
             )
             summary_text = _enforce_section_order(
                 summary_text, include_health_rating=include_health_rating
@@ -7444,23 +7463,53 @@ def _dedupe_consecutive_sentences(text: str) -> str:
 
     lines = text.splitlines()
     cleaned_lines: List[str] = []
-    prev_norm: Optional[str] = None
+
+    # Track the last sentence norm to avoid stutter inside paragraphs.
+    prev_sentence_norm: Optional[str] = None
+    # Track the last *content line* to remove duplicated paragraphs even if separated
+    # by a blank line.
+    prev_content_line_norm: Optional[str] = None
+
+    pending_blank_lines: List[str] = []
 
     for line in lines:
         stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            cleaned_lines.append(line)
-            prev_norm = None
+
+        if not stripped:
+            pending_blank_lines.append(line)
             continue
 
+        # Headings reset dedupe state.
+        if stripped.startswith("#"):
+            cleaned_lines.extend(pending_blank_lines)
+            pending_blank_lines = []
+            cleaned_lines.append(line)
+            prev_sentence_norm = None
+            prev_content_line_norm = None
+            continue
+
+        # Deduplicate consecutive sentences within the line.
         sentences = re.split(r"(?<=[.!?])\s+", stripped)
-        unique: List[str] = []
+        unique_sentences: List[str] = []
         for sent in sentences:
-            norm = " ".join(sent.lower().split())
-            if norm and norm != prev_norm:
-                unique.append(sent)
-            prev_norm = norm
-        cleaned_lines.append(" ".join(unique))
+            norm = " ".join((sent or "").lower().split())
+            if not norm:
+                continue
+            if norm != prev_sentence_norm:
+                unique_sentences.append(sent)
+            prev_sentence_norm = norm
+        rebuilt_line = " ".join(unique_sentences).strip()
+
+        # Deduplicate repeated paragraphs/lines, even when there's an empty line in between.
+        content_norm = " ".join(rebuilt_line.lower().split())
+        if content_norm and content_norm == prev_content_line_norm:
+            pending_blank_lines = []
+            continue
+
+        cleaned_lines.extend(pending_blank_lines)
+        pending_blank_lines = []
+        cleaned_lines.append(rebuilt_line)
+        prev_content_line_norm = content_norm
 
     return "\n".join(cleaned_lines).strip()
 
@@ -8093,6 +8142,7 @@ def _ensure_required_sections(
     company_name: str,
     health_rating_config: Optional[Dict[str, Any]] = None,
     persona_name: Optional[str] = None,
+    target_length: Optional[int] = None,
 ) -> str:
     """Ensure all required sections are present.
 
@@ -8456,21 +8506,98 @@ def _ensure_required_sections(
         return bool(re.search(r"\d", section_body))
 
     def _synthesize_mdna() -> str:
-        lines: List[str] = []
-        lines.append(
-            f"Management discussion should focus on how {company_name} is deploying capital and managing cost levers."
+        """Fallback MD&A content: concise, concrete, and metric-anchored (no placeholders)."""
+
+        is_persona = bool(persona_name)
+
+        revenue = calculated_metrics.get("revenue")
+        operating_income = calculated_metrics.get("operating_income")
+        operating_margin = calculated_metrics.get("operating_margin")
+        ocf = calculated_metrics.get("operating_cash_flow")
+        fcf = calculated_metrics.get("free_cash_flow")
+        cash = calculated_metrics.get("cash")
+        securities = calculated_metrics.get("marketable_securities")
+        liabilities = calculated_metrics.get("total_liabilities")
+
+        cash_total = None
+        if cash is not None:
+            cash_total = cash + (securities or 0)
+
+        rev_str = (
+            _format_metric_value_for_text("revenue", revenue)
+            if revenue is not None
+            else None
         )
-        if calculated_metrics.get("operating_cash_flow") is not None:
-            lines.append(
-                f"Reference operating cash flow of {_format_metric_value('operating_cash_flow', calculated_metrics.get('operating_cash_flow'))} to anchor guidance credibility."
+        op_inc_str = (
+            _format_metric_value_for_text("operating_income", operating_income)
+            if operating_income is not None
+            else None
+        )
+        ocf_str = (
+            _format_metric_value_for_text("operating_cash_flow", ocf)
+            if ocf is not None
+            else None
+        )
+        fcf_str = (
+            _format_metric_value_for_text("free_cash_flow", fcf)
+            if fcf is not None
+            else None
+        )
+        cash_total_str = (
+            _format_metric_value_for_text("cash", cash_total)
+            if cash_total is not None
+            else None
+        )
+        liabilities_str = (
+            _format_metric_value_for_text("total_liabilities", liabilities)
+            if liabilities is not None
+            else None
+        )
+
+        sentences: List[str] = []
+
+        sentences.append(
+            (
+                "In my view, management has to convert scale into durable operating leverage while keeping growth investments disciplined."
+                if is_persona
+                else "The management narrative is about converting scale into operating leverage while keeping growth investments disciplined."
             )
-        lines.append(
-            "Flag any gaps between stated strategy and the reported operating margin trajectory."
         )
-        lines.append(
-            "Call out liquidity and debt maturity profile if leverage is material."
+
+        if operating_margin is not None and rev_str and op_inc_str:
+            sentences.append(
+                f"With {rev_str} of revenue and operating income {op_inc_str}, the implied operating margin (~{operating_margin:.1f}%) puts the spotlight on pricing, incentive intensity, and cost discipline."
+            )
+        elif operating_margin is not None:
+            sentences.append(
+                f"With operating margin around {operating_margin:.1f}%, the key levers are pricing discipline, incentive intensity, and operating cost control."
+            )
+
+        if ocf_str and fcf_str:
+            sentences.append(
+                f"Cash generation (operating cash flow {ocf_str} and free cash flow {fcf_str}) creates optionality, but capital allocation choices determine whether value compounds or merely cycles."
+            )
+
+        if cash_total_str and liabilities_str:
+            sentences.append(
+                f"Balance-sheet context—{cash_total_str} cash and securities versus {liabilities_str} liabilities—frames how aggressive management can be on buybacks, M&A, or de-risking."
+            )
+
+        sentences.append(
+            "A strong MD&A reconciles KPI commentary with cash flow and makes the next margin and risk trade-offs explicit rather than relying on adjusted optics."
         )
-        return " ".join(lines)
+
+        return " ".join([s for s in sentences if s]).strip()
+
+    def _synthesize_mdna_addendum() -> str:
+        sentences: List[str] = []
+        sentences.append(
+            "What matters is whether operating leverage shows up in both margins and cash, not just adjusted metrics or one-time items."
+        )
+        sentences.append(
+            "Capital allocation that compounds value usually looks like reinvesting where returns are clear and keeping dilution and acquisition premiums contained."
+        )
+        return " ".join(sentences).strip()
 
     # Add minimal Financial Performance and MD&A sections if the model omitted them
     # 0. Executive Summary (rarely missing, but catastrophic when it is)
@@ -8512,6 +8639,33 @@ def _ensure_required_sections(
         new_body = f"{body}\n\n{addendum}".strip()
         text = pattern.sub(lambda _mm: f"## {title}\n{new_body}\n", text, count=1)
 
+    # Ensure MD&A exists before we try to balance section lengths.
+    if not _section_present("Management Discussion & Analysis"):
+        _append_section("Management Discussion & Analysis", _synthesize_mdna())
+    else:
+        # Replace low-quality MD&A stubs the model sometimes emits.
+        mdna_match = re.search(
+            r"##\s*Management\s+Discussion\s*(?:&|and)\s*Analysis\s*\n+([\s\S]*?)(?=\n##\s|\Z)",
+            text,
+            re.IGNORECASE,
+        )
+        if mdna_match:
+            body = (mdna_match.group(1) or "").strip()
+            if re.search(r"\bmanagement\s+discussion\s+should\s+focus\b", body, re.IGNORECASE) or re.search(
+                r"\breference\s+operating\s+cash\s+flow\b",
+                body,
+                re.IGNORECASE,
+            ):
+                replacement = _synthesize_mdna()
+                text = re.sub(
+                    r"##\s*Management\s+Discussion\s*(?:&|and)\s*Analysis\s*\n+[\s\S]*?(?=\n##\s|\Z)",
+                    lambda _m: f"## Management Discussion & Analysis\n{replacement}\n",
+                    text,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+
+    # Top up short narrative sections to keep distribution more even.
     _top_up_section_if_short(
         "Executive Summary",
         SUMMARY_SECTION_MIN_WORDS.get("Executive Summary", 80),
@@ -8523,13 +8677,15 @@ def _ensure_required_sections(
         _synthesize_financial_performance_addendum(),
     )
     _top_up_section_if_short(
+        "Management Discussion & Analysis",
+        SUMMARY_SECTION_MIN_WORDS.get("Management Discussion & Analysis", 140),
+        _synthesize_mdna_addendum(),
+    )
+    _top_up_section_if_short(
         "Risk Factors",
         SUMMARY_SECTION_MIN_WORDS.get("Risk Factors", 110),
         _synthesize_risk_factors_addendum(),
     )
-
-    if not _section_present("Management Discussion & Analysis"):
-        _append_section("Management Discussion & Analysis", _synthesize_mdna())
 
     # 6. Key Metrics - always useful to include a factual appendix
     if not _section_present("Key Metrics") and metrics_lines.strip():
@@ -8628,6 +8784,43 @@ def _ensure_required_sections(
             re.IGNORECASE,
         )
         text = km_pattern.sub(f"## Key Metrics\n{desired_body}\n", text)
+
+    # If the model produced a highly lopsided memo (e.g., a huge Risk Factors section
+    # but a stub MD&A), cap the *maximum* size of the core narrative sections based
+    # on the computed budgets. This makes distribution more consistent even when the
+    # model ignores instructions.
+    if target_length and target_length > 0:
+        budgets = _calculate_section_word_budgets(
+            target_length, include_health_rating=include_health_rating
+        )
+
+        def _cap_section_to_budget(title: str) -> None:
+            nonlocal text
+            budget = budgets.get(title)
+            if not budget:
+                return
+            min_words = int(SUMMARY_SECTION_MIN_WORDS.get(title, 25))
+            max_words = max(min_words, int(budget * 1.30))
+            pattern = re.compile(
+                rf"##\s*{re.escape(title)}\s*\n+([\s\S]*?)(?=\n##\s|\Z)",
+                re.IGNORECASE,
+            )
+            m = pattern.search(text)
+            if not m:
+                return
+            body = (m.group(1) or "").strip()
+            if _count_words(body) <= max_words:
+                return
+            trimmed = _truncate_text_to_word_limit(body, max_words)
+            text = pattern.sub(lambda _mm: f"## {title}\n{trimmed}\n", text, count=1)
+
+        for core_title in (
+            "Executive Summary",
+            "Financial Performance",
+            "Management Discussion & Analysis",
+            "Risk Factors",
+        ):
+            _cap_section_to_budget(core_title)
 
     return text
 

@@ -34,7 +34,7 @@ def test_padding_templates_avoid_legacy_micro_slogans() -> None:
         assert phrase not in padded
 
 
-def test_padding_is_concentrated_in_single_section() -> None:
+def test_padding_is_spread_across_shortest_sections() -> None:
     base = (
         "## Financial Health Rating\n"
         "ExampleCo receives a Financial Health Rating of 72/100 - Healthy based on margins, cash conversion, and leverage.\n\n"
@@ -55,16 +55,14 @@ def test_padding_is_concentrated_in_single_section() -> None:
 
     padded = filings_api._distribute_padding_across_sections(base, required_words=25)
 
-    # Padding should be concentrated into Risk Factors by design (keeps MD&A from
-    # becoming the overweight section when we need extra words).
+    # Padding should not be dumped into a single section. For this synthetic base,
+    # Risk Factors and MD&A are the shortest sections, so they should absorb the
+    # added words first.
     assert _get_section_body(padded, "Executive Summary") == _get_section_body(
         base, "Executive Summary"
     )
     assert _get_section_body(padded, "Financial Performance") == _get_section_body(
         base, "Financial Performance"
-    )
-    assert _get_section_body(padded, "Management Discussion & Analysis") == _get_section_body(
-        base, "Management Discussion & Analysis"
     )
     assert _get_section_body(padded, "Financial Health Rating") == _get_section_body(
         base, "Financial Health Rating"
@@ -74,6 +72,9 @@ def test_padding_is_concentrated_in_single_section() -> None:
         base, "Closing Takeaway"
     )
 
+    mdna_body = _get_section_body(padded, "Management Discussion & Analysis")
+    base_mdna = _get_section_body(base, "Management Discussion & Analysis")
+    assert len(mdna_body.split()) > len(base_mdna.split())
+
     risk_body = _get_section_body(padded, "Risk Factors")
     assert len(risk_body.split()) > len(_get_section_body(base, "Risk Factors").split())
-    assert "Key underwriting questions:" in risk_body
