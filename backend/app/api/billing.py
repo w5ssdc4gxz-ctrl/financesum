@@ -607,6 +607,9 @@ async def create_checkout_session(
     stripe_customer_id = await _resolve_stripe_customer_id_for_user(user, supabase=supabase)
     session_params: Dict[str, Any] = {
         "mode": "subscription",
+        # IMPORTANT: We are not collecting taxes right now.
+        # Always force automatic tax OFF so Stripe doesn't attempt to calculate/collect taxes.
+        "automatic_tax": {"enabled": False},
         "client_reference_id": user.id,
         "metadata": {"user_id": user.id, "plan": payload.plan},
         "subscription_data": {"metadata": {"user_id": user.id, "plan": payload.plan}},

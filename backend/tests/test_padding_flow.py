@@ -55,15 +55,16 @@ def test_padding_is_concentrated_in_single_section() -> None:
 
     padded = filings_api._distribute_padding_across_sections(base, required_words=25)
 
-    # Padding should be concentrated into MD&A by design.
+    # Padding should be concentrated into Risk Factors by design (keeps MD&A from
+    # becoming the overweight section when we need extra words).
     assert _get_section_body(padded, "Executive Summary") == _get_section_body(
         base, "Executive Summary"
     )
     assert _get_section_body(padded, "Financial Performance") == _get_section_body(
         base, "Financial Performance"
     )
-    assert _get_section_body(padded, "Risk Factors") == _get_section_body(
-        base, "Risk Factors"
+    assert _get_section_body(padded, "Management Discussion & Analysis") == _get_section_body(
+        base, "Management Discussion & Analysis"
     )
     assert _get_section_body(padded, "Financial Health Rating") == _get_section_body(
         base, "Financial Health Rating"
@@ -73,6 +74,6 @@ def test_padding_is_concentrated_in_single_section() -> None:
         base, "Closing Takeaway"
     )
 
-    assert len(_get_section_body(padded, "Management Discussion & Analysis").split()) > len(
-        _get_section_body(base, "Management Discussion & Analysis").split()
-    )
+    risk_body = _get_section_body(padded, "Risk Factors")
+    assert len(risk_body.split()) > len(_get_section_body(base, "Risk Factors").split())
+    assert "Key underwriting questions:" in risk_body

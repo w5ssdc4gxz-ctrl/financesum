@@ -1684,6 +1684,93 @@ def _normalize_underwriting_questions_formatting(text: str) -> str:
     return result.strip()
 
 
+def _relocate_underwriting_questions_to_risk_factors(text: str) -> str:
+    """Move any 'Key underwriting questions:' line(s) into the Risk Factors section.
+
+    Rationale: users read underwriting-style padding/questions as part of the narrative
+    section they appear in. If this lands in MD&A, that section becomes overweight.
+    By relocating into Risk Factors, the memo reads more evenly distributed.
+
+    This function is idempotent.
+    """
+
+    if not text:
+        return text
+
+    prefix_re = re.compile(
+        r"^\s*Key\s+underwriting\s+questions\s*:\s*(.*)$",
+        re.IGNORECASE,
+    )
+
+    lines = text.splitlines()
+    payloads: List[str] = []
+    cleaned_lines: List[str] = []
+    for line in lines:
+        m = prefix_re.match(line)
+        if m:
+            payload = (m.group(1) or "").strip()
+            if payload:
+                payloads.append(payload)
+            continue
+        cleaned_lines.append(line)
+
+    if not payloads:
+        return text
+
+    merged_payload = _dedupe_underwriting_payload_sentences(" ".join(payloads))
+    if not merged_payload:
+        cleaned = "\n".join(cleaned_lines)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    underwriting_line = f"Key underwriting questions: {merged_payload}".strip()
+
+    # Insert into the Risk Factors section (if present), otherwise place it right
+    # before Key Metrics (or at end) as a safe fallback.
+    is_heading = lambda l: bool(re.match(r"^\s*##\s+", l))
+    risk_idx: Optional[int] = None
+    key_metrics_idx: Optional[int] = None
+
+    for idx, line in enumerate(cleaned_lines):
+        if risk_idx is None and re.match(r"^\s*##\s*Risk\s+Factors\b", line, re.IGNORECASE):
+            risk_idx = idx
+        if key_metrics_idx is None and re.match(
+            r"^\s*##\s*(Key\s+Metrics|Key\s+Data\s+Appendix)\b",
+            line,
+            re.IGNORECASE,
+        ):
+            key_metrics_idx = idx
+
+    if risk_idx is None:
+        insert_at = key_metrics_idx if key_metrics_idx is not None else len(cleaned_lines)
+        # Ensure a clean paragraph break.
+        while insert_at > 0 and cleaned_lines[insert_at - 1].strip() == "":
+            insert_at -= 1
+        insertion = ["", underwriting_line, ""]
+        rebuilt_lines = cleaned_lines[:insert_at] + insertion + cleaned_lines[insert_at:]
+        rebuilt = "\n".join(rebuilt_lines)
+        rebuilt = re.sub(r"\n{3,}", "\n\n", rebuilt)
+        return rebuilt.strip()
+
+    # Find end of Risk Factors section.
+    end_idx = len(cleaned_lines)
+    for j in range(risk_idx + 1, len(cleaned_lines)):
+        if is_heading(cleaned_lines[j]):
+            end_idx = j
+            break
+
+    # Insert before end_idx, trimming trailing blank lines inside the section.
+    insert_at = end_idx
+    while insert_at > risk_idx + 1 and cleaned_lines[insert_at - 1].strip() == "":
+        insert_at -= 1
+
+    insertion = ["", underwriting_line, ""]
+    rebuilt_lines = cleaned_lines[:insert_at] + insertion + cleaned_lines[insert_at:]
+    rebuilt = "\n".join(rebuilt_lines)
+    rebuilt = re.sub(r"\n{3,}", "\n\n", rebuilt)
+    return rebuilt.strip()
+
+
 def _merge_underwriting_question_lines(text: str) -> str:
     """Coalesce repeated 'Key underwriting questions:' lines into a single line.
 
@@ -1851,6 +1938,7 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
     summary_text = _strip_length_padding_markers(summary_text)
     summary_text = _normalize_underwriting_questions_formatting(summary_text)
     summary_text = _merge_underwriting_question_lines(summary_text)
+    summary_text = _relocate_underwriting_questions_to_risk_factors(summary_text)
 
     # If an underwriting-question padding line already exists, append to it instead
     # of inserting a new one (prevents multiple blocks across retries).
@@ -1894,7 +1982,8 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
         )
         # Normalize/coalesce again in case the document had multiple blocks.
         updated = _normalize_underwriting_questions_formatting(updated)
-        return _merge_underwriting_question_lines(updated)
+        updated = _merge_underwriting_question_lines(updated)
+        return _relocate_underwriting_questions_to_risk_factors(updated)
 
     # Normalize obvious inline header issues BEFORE we try to locate target sections.
     # Without this, padding can accidentally land in the wrong section (and later
@@ -1930,34 +2019,38 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
 
     # QUALITY FIX:
     # Never sprinkle padding fragments across multiple sections; it reads like random
-    # filler. Concentrate deterministic padding in ONE place (MD&A) as a single,
-    # clearly separated block.
+    # filler. Concentrate deterministic padding in ONE place (Risk Factors) as a
+    # single, clearly separated block. This also prevents MD&A from becoming the
+    # dominant section when the memo needs extra words.
     def _canon_heading(heading_line: str) -> str:
         title = re.sub(r"^\s*##\s*", "", heading_line).strip().lower()
         title = title.replace("&", "and")
         title = re.sub(r"[^a-z0-9\s]", " ", title)
         return " ".join(title.split())
 
-    mdna_idx: Optional[int] = None
     risk_idx: Optional[int] = None
+    key_metrics_idx: Optional[int] = None
     for i, (heading, _body) in enumerate(sections):
         canon = _canon_heading(heading)
-        if canon.startswith("management discussion"):
-            mdna_idx = i
         if canon.startswith("risk factors"):
             risk_idx = i
+        if canon.startswith("key metrics") or canon.startswith("key data appendix"):
+            key_metrics_idx = i
 
-    if mdna_idx is None:
-        insert_at = risk_idx if risk_idx is not None else len(sections)
-        sections.insert(insert_at, ("## Management Discussion & Analysis", ""))
-        mdna_idx = insert_at
+    # Prefer adding the padding block into Risk Factors. If missing, create it right
+    # before Key Metrics (or at end) so structure remains stable.
+    target_idx: Optional[int] = risk_idx
+    if target_idx is None:
+        insert_at = key_metrics_idx if key_metrics_idx is not None else len(sections)
+        sections.insert(insert_at, ("## Risk Factors", ""))
+        target_idx = insert_at
 
     padding_block = _build_padding_block(required_words)
-    if padding_block:
-        heading, body = sections[mdna_idx]
+    if padding_block and target_idx is not None:
+        heading, body = sections[target_idx]
         body = body.strip()
         separator = "\n\n" if body else ""
-        sections[mdna_idx] = (heading, f"{body}{separator}{padding_block}".strip())
+        sections[target_idx] = (heading, f"{body}{separator}{padding_block}".strip())
 
     # Reassemble the memo
     rebuilt_sections: List[str] = []
@@ -1968,6 +2061,7 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
     rebuilt = "\n\n".join(rebuilt_sections).strip()
     rebuilt = _normalize_underwriting_questions_formatting(rebuilt)
     rebuilt = _merge_underwriting_question_lines(rebuilt)
+    rebuilt = _relocate_underwriting_questions_to_risk_factors(rebuilt)
     return rebuilt
 
 
@@ -3133,13 +3227,13 @@ def _validate_mdna_section(text: str) -> Optional[str]:
 
 SUMMARY_SECTION_REQUIREMENTS: List[Tuple[str, int]] = [
     ("Financial Health Rating", 40),
-    ("Executive Summary", 80),  # Tighter: faster read while keeping conviction
-    ("Financial Performance", 95),  # More depth on the numbers that matter
+    ("Executive Summary", 80),  # Verdict + framing (keep crisp)
+    ("Financial Performance", 95),  # Depth on the numbers that matter
     (
         "Management Discussion & Analysis",
-        160,
-    ),  # Increased - absorbs Strategic Initiatives content
-    ("Risk Factors", 100),  # Increased per user request
+        140,
+    ),  # Keep meaningful but do not let MD&A dominate the memo
+    ("Risk Factors", 110),  # Ensure risks are not underweight
     ("Key Metrics", 35),
     ("Closing Takeaway", 50),  # Concise verdict with personal buy/hold/sell opinion
 ]
@@ -3152,13 +3246,14 @@ SUMMARY_SECTION_MIN_WORDS = {
 # Sum = 100 (percentages)
 # Executive Summary is the HERO section - the premium insight users pay for
 SECTION_PROPORTIONAL_WEIGHTS: Dict[str, int] = {
-    "Financial Health Rating": 5,  # Keep concise but meaningful
-    "Executive Summary": 14,  # Tighter intro to free room for analysis
-    "Financial Performance": 18,  # Heavier emphasis on the numbers
-    "Management Discussion & Analysis": 30,  # Heavier emphasis on management context
-    "Risk Factors": 18,  # Increased to match Financial Performance
+    # Goal: more even distribution across the four core narrative sections.
+    "Financial Health Rating": 5,
+    "Executive Summary": 20,
+    "Financial Performance": 20,
+    "Management Discussion & Analysis": 20,
+    "Risk Factors": 20,
     "Key Metrics": 5,
-    "Closing Takeaway": 10,  # Sum = 100
+    "Closing Takeaway": 10,
 }
 
 
@@ -3174,25 +3269,93 @@ def _calculate_section_word_budgets(
     2. Remaining words are distributed proportionally
     3. The Closing Takeaway maintains adequate length (not over-shortened)
     """
+    if not target_length or target_length <= 0:
+        return {}
+
     # Determine which sections to include
     sections_to_use = list(SECTION_PROPORTIONAL_WEIGHTS.keys())
     if not include_health_rating:
-        sections_to_use = [s for s in sections_to_use if s != "Financial Health Rating"]
+        sections_to_use = [
+            s for s in sections_to_use if s != "Financial Health Rating"
+        ]
 
-    # Calculate total weight for active sections
-    total_weight = sum(SECTION_PROPORTIONAL_WEIGHTS.get(s, 10) for s in sections_to_use)
+    # Start from minimums.
+    mins: Dict[str, int] = {
+        section: int(SUMMARY_SECTION_MIN_WORDS.get(section, 25))
+        for section in sections_to_use
+    }
+    min_total = sum(mins.values())
 
-    # Calculate budgets
-    budgets: Dict[str, int] = {}
-    for section in sections_to_use:
-        weight = SECTION_PROPORTIONAL_WEIGHTS.get(section, 10)
-        min_words = SUMMARY_SECTION_MIN_WORDS.get(section, 25)
+    # If minimums alone exceed the target, scale them down proportionally.
+    # (This can happen for very short targets, e.g. 200 words.)
+    if min_total >= target_length and min_total > 0:
+        scale = target_length / min_total
+        scaled: Dict[str, int] = {
+            section: max(10, int(mins[section] * scale)) for section in sections_to_use
+        }
+        # Fix rounding drift to land exactly on target_length.
+        diff = target_length - sum(scaled.values())
+        if diff != 0:
+            # Adjust the highest-weight sections first.
+            order = sorted(
+                sections_to_use,
+                key=lambda s: SECTION_PROPORTIONAL_WEIGHTS.get(s, 10),
+                reverse=True,
+            )
+            step = 1 if diff > 0 else -1
+            remaining = abs(diff)
+            idx = 0
+            while remaining > 0 and order:
+                section = order[idx % len(order)]
+                next_val = scaled[section] + step
+                if next_val >= 10:
+                    scaled[section] = next_val
+                    remaining -= 1
+                idx += 1
+        return scaled
 
-        # Calculate proportional allocation
-        proportional_words = int((weight / total_weight) * target_length)
+    remaining_words = target_length - min_total
+    if remaining_words <= 0:
+        return mins
 
-        # Ensure minimum is respected
-        budgets[section] = max(proportional_words, min_words)
+    total_weight = sum(
+        SECTION_PROPORTIONAL_WEIGHTS.get(s, 10) for s in sections_to_use
+    ) or len(sections_to_use)
+
+    # Allocate remaining words proportionally by weights.
+    exacts = {
+        s: SECTION_PROPORTIONAL_WEIGHTS.get(s, 10) * remaining_words / total_weight
+        for s in sections_to_use
+    }
+    floors = {s: int(exacts[s]) for s in sections_to_use}
+    remainders = {s: exacts[s] - floors[s] for s in sections_to_use}
+    leftover = remaining_words - sum(floors.values())
+
+    if leftover > 0:
+        for s in sorted(remainders, key=remainders.get, reverse=True)[:leftover]:
+            floors[s] += 1
+
+    budgets = {s: mins[s] + floors[s] for s in sections_to_use}
+
+    # Final sanity: ensure exact sum.
+    drift = target_length - sum(budgets.values())
+    if drift != 0 and budgets:
+        # Apply drift to the highest-weight narrative sections first.
+        order = sorted(
+            sections_to_use,
+            key=lambda s: SECTION_PROPORTIONAL_WEIGHTS.get(s, 10),
+            reverse=True,
+        )
+        step = 1 if drift > 0 else -1
+        remaining = abs(drift)
+        idx = 0
+        while remaining > 0 and order:
+            section = order[idx % len(order)]
+            next_val = budgets[section] + step
+            if next_val >= 10:
+                budgets[section] = next_val
+                remaining -= 1
+            idx += 1
 
     return budgets
 
@@ -6933,6 +7096,7 @@ Before you output anything, verify:
         # (Do this before the last word-band pass so any removals can be compensated.)
         summary_text = _normalize_underwriting_questions_formatting(summary_text)
         summary_text = _merge_underwriting_question_lines(summary_text)
+        summary_text = _relocate_underwriting_questions_to_risk_factors(summary_text)
         summary_text = _remove_filler_phrases(summary_text)
         summary_text = _dedupe_consecutive_sentences(summary_text)
 
@@ -6944,6 +7108,7 @@ Before you output anything, verify:
 
         # Post-band formatting: safe (does not change token/word counts meaningfully).
         summary_text = _normalize_underwriting_questions_formatting(summary_text)
+        summary_text = _relocate_underwriting_questions_to_risk_factors(summary_text)
 
         # Final guard: ensure the document ends with punctuation for substantive outputs
         if (
@@ -8199,6 +8364,94 @@ def _ensure_required_sections(
 
         return " ".join([s for s in sentences if s]).strip()
 
+    def _synthesize_risk_factors_addendum() -> str:
+        """Add concrete risk scenarios when Risk Factors is too thin.
+
+        Goal: make Risk Factors feel like *underwriting*, not boilerplate.
+        We keep this metric-anchored so it reads substantive.
+        """
+
+        is_persona = bool(persona_name)
+        lead = "I worry that" if is_persona else "A key risk is that"
+
+        revenue = calculated_metrics.get("revenue")
+        operating_margin = calculated_metrics.get("operating_margin")
+        net_margin = calculated_metrics.get("net_margin")
+        ocf = calculated_metrics.get("operating_cash_flow")
+        fcf = calculated_metrics.get("free_cash_flow")
+        cash = calculated_metrics.get("cash")
+        liabilities = calculated_metrics.get("total_liabilities")
+
+        fcf_str = (
+            _format_metric_value_for_text("free_cash_flow", fcf) if fcf is not None else None
+        )
+        ocf_str = (
+            _format_metric_value_for_text("operating_cash_flow", ocf)
+            if ocf is not None
+            else None
+        )
+        cash_str = (
+            _format_metric_value_for_text("cash", cash) if cash is not None else None
+        )
+        liabilities_str = (
+            _format_metric_value_for_text("total_liabilities", liabilities)
+            if liabilities is not None
+            else None
+        )
+
+        fcf_margin_pct = None
+        if fcf is not None and revenue:
+            try:
+                fcf_margin_pct = (fcf / revenue) * 100
+            except Exception:
+                fcf_margin_pct = None
+
+        sentences: List[str] = []
+
+        # 1) Unit economics / cost shocks.
+        if operating_margin is not None:
+            sentences.append(
+                f"{lead} the current operating margin (~{operating_margin:.1f}%) leaves less cushion if incentives, insurance, or regulatory costs rise faster than pricing."
+            )
+        elif net_margin is not None:
+            sentences.append(
+                f"{lead} headline net margin ({net_margin:.1f}%) can be a noisy signal if below-the-line items fade or competitive spend re-accelerates."
+            )
+        else:
+            sentences.append(
+                f"{lead} competitive intensity can force higher incentive spend, compressing take rates and delaying durable profitability."
+            )
+
+        # 2) Cash conversion durability.
+        if ocf_str and fcf_str:
+            margin_clause = (
+                f" (~{fcf_margin_pct:.1f}% FCF margin)" if fcf_margin_pct is not None else ""
+            )
+            sentences.append(
+                f"With operating cash flow {ocf_str} and free cash flow {fcf_str}{margin_clause}, the risk is that cash conversion proves cyclical and normalizes lower if growth slows or working-capital timing reverses."
+            )
+        elif fcf_str:
+            sentences.append(
+                f"Free cash flow {fcf_str} is a strength, but the downside case is weaker cash conversion if competition forces higher spend or payments/working-capital terms worsen."
+            )
+
+        # 3) Balance-sheet flexibility / refinancing.
+        if cash_str and liabilities_str and cash and liabilities:
+            if liabilities > cash * 2:
+                sentences.append(
+                    f"Balance-sheet flexibility matters: {liabilities_str} of liabilities versus {cash_str} cash can constrain optionality if credit spreads widen or refinancing windows tighten."
+                )
+            else:
+                sentences.append(
+                    f"Liquidity appears workable today ({cash_str} cash against {liabilities_str} liabilities), but a sharper downturn could still tighten flexibility if funding costs rise."
+                )
+
+        sentences.append(
+            "The underwriting question is whether profitability and cash generation remain durable after adjusting for one-offs and normalizing incentive intensity."
+        )
+
+        return " ".join([s for s in sentences if s]).strip()
+
     def _has_numeric_content(section_body: str) -> bool:
         return bool(re.search(r"\d", section_body))
 
@@ -8268,6 +8521,11 @@ def _ensure_required_sections(
         "Financial Performance",
         SUMMARY_SECTION_MIN_WORDS.get("Financial Performance", 95),
         _synthesize_financial_performance_addendum(),
+    )
+    _top_up_section_if_short(
+        "Risk Factors",
+        SUMMARY_SECTION_MIN_WORDS.get("Risk Factors", 110),
+        _synthesize_risk_factors_addendum(),
     )
 
     if not _section_present("Management Discussion & Analysis"):
