@@ -1569,12 +1569,14 @@ def _truncate_text_to_word_limit(text: str, max_words: int) -> str:
     return truncated
 
 
-def _build_padding_block(required_words: int) -> str:
+def _build_padding_block(
+    required_words: int, *, exclude_norms: Optional[set[str]] = None
+) -> str:
     """Deterministic, finance-relevant padding to safely reach strict word floors."""
     if required_words <= 0:
         return ""
 
-    padding_sentences = _generate_padding_sentences(required_words)
+    padding_sentences = _generate_padding_sentences(required_words, exclude_norms=exclude_norms)
     if not padding_sentences:
         return ""
 
@@ -1614,6 +1616,74 @@ def _strip_length_padding_markers(text: str) -> str:
     return cleaned.strip()
 
 
+def _dedupe_underwriting_payload_sentences(payload: str) -> str:
+    """Deduplicate sentences inside a 'Key underwriting questions' payload.
+
+    Padding/length enforcement can run multiple times; if we accidentally append the
+    same template sentence more than once, this keeps the block clean.
+    """
+
+    if not payload:
+        return ""
+
+    payload = payload.replace("\u00A0", " ").strip()
+    parts = re.split(r"(?<=[.!?])\s+", payload)
+    seen: set[str] = set()
+    unique: List[str] = []
+    for part in parts:
+        sent = (part or "").strip()
+        if not sent:
+            continue
+        # Normalize for comparison.
+        norm = " ".join(sent.lower().split())
+        norm = norm.rstrip(".!?")
+        if norm and norm not in seen:
+            seen.add(norm)
+            unique.append(sent)
+    return " ".join(unique).strip()
+
+
+def _normalize_underwriting_questions_formatting(text: str) -> str:
+    """Ensure 'Key underwriting questions:' is a separate paragraph.
+
+    Without a blank line before it, markdown renders this line *inline* with the
+    previous paragraph, which looks like random low-quality filler inside analysis.
+    """
+
+    if not text:
+        return text
+
+    result = text
+
+    # If the label appears inline (mid-line), force it to start a new paragraph.
+    result = re.sub(
+        r"([^\n])\s*(Key\s+underwriting\s+questions\s*:)",
+        r"\1\n\nKey underwriting questions:",
+        result,
+        flags=re.IGNORECASE,
+    )
+
+    # Normalize casing/spacing to a canonical prefix.
+    result = re.sub(
+        r"^\s*Key\s+underwriting\s+questions\s*:\s*",
+        "Key underwriting questions: ",
+        result,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+
+    # Ensure there is a blank line BEFORE the underwriting questions line.
+    result = re.sub(
+        r"([^\n])\n(Key underwriting questions:\s*)",
+        r"\1\n\n\2",
+        result,
+        flags=re.IGNORECASE,
+    )
+
+    # Collapse excessive newlines.
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
+
+
 def _merge_underwriting_question_lines(text: str) -> str:
     """Coalesce repeated 'Key underwriting questions:' lines into a single line.
 
@@ -1650,6 +1720,7 @@ def _merge_underwriting_question_lines(text: str) -> str:
         return text
 
     merged_text = " ".join(part for part in merged_parts if part).strip()
+    merged_text = _dedupe_underwriting_payload_sentences(merged_text)
     out_lines[placeholder_idx] = (
         f"Key underwriting questions: {merged_text}" if merged_text else ""
     ).strip()
@@ -1659,7 +1730,9 @@ def _merge_underwriting_question_lines(text: str) -> str:
     return cleaned
 
 
-def _generate_padding_sentences(required_words: int) -> List[str]:
+def _generate_padding_sentences(
+    required_words: int, *, exclude_norms: Optional[set[str]] = None
+) -> List[str]:
     """Generate concise, finance-relevant padding sentences to reach required word counts."""
     if required_words <= 0:
         return []
@@ -1717,7 +1790,23 @@ def _generate_padding_sentences(required_words: int) -> List[str]:
         "A durable moat often appears in stable returns on invested capital and pricing discipline, while erosion shows up first in rising customer-acquisition intensity.",
     ]
 
-    candidates: List[Tuple[int, str]] = [(len(t.split()), t) for t in templates]
+    def _norm_sentence(s: str) -> str:
+        s = (s or "").replace("\u00A0", " ")
+        s = " ".join(s.lower().split())
+        return s.rstrip(".!?")
+
+    excluded = {(_norm_sentence(s)) for s in (exclude_norms or set()) if s}
+
+    candidates: List[Tuple[int, str]] = []
+    for t in templates:
+        if excluded and _norm_sentence(t) in excluded:
+            continue
+        candidates.append((len(t.split()), t))
+
+    if not candidates:
+        # If everything was excluded, fall back to allowing repeats so we can still
+        # satisfy strict length bands.
+        candidates = [(len(t.split()), t) for t in templates]
     candidates.sort(key=lambda x: x[0])
 
     sentences: List[str] = []
@@ -1760,6 +1849,7 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
     # Strip legacy HTML marker lines (older deploys) and coalesce repeated
     # underwriting blocks, so padding remains clean and user-readable.
     summary_text = _strip_length_padding_markers(summary_text)
+    summary_text = _normalize_underwriting_questions_formatting(summary_text)
     summary_text = _merge_underwriting_question_lines(summary_text)
 
     # If an underwriting-question padding line already exists, append to it instead
@@ -1770,7 +1860,17 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
     )
     existing_match = existing_line_re.search(summary_text)
     if existing_match:
-        extra_block = _build_padding_block(required_words)
+        # Avoid repeatedly appending the same padding sentence across multiple
+        # band-enforcement passes (which would be deduped away and fail to add
+        # words, leaving the memo under-length).
+        current_payload = (existing_match.group(2) or "").replace("\u00A0", " ").strip()
+        exclude_norms: set[str] = set()
+        for sent in re.split(r"(?<=[.!?])\s+", current_payload):
+            norm = " ".join((sent or "").lower().split()).rstrip(".!?")
+            if norm:
+                exclude_norms.add(norm)
+
+        extra_block = _build_padding_block(required_words, exclude_norms=exclude_norms)
         if not extra_block:
             return summary_text
         # Extract only the appended sentence payload (drop the prefix).
@@ -1792,7 +1892,8 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
             + replacement_line
             + summary_text[existing_match.end() :]
         )
-        # Coalesce again in case the document had multiple blocks.
+        # Normalize/coalesce again in case the document had multiple blocks.
+        updated = _normalize_underwriting_questions_formatting(updated)
         return _merge_underwriting_question_lines(updated)
 
     # Normalize obvious inline header issues BEFORE we try to locate target sections.
@@ -1864,7 +1965,10 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
         section_text = f"{heading}\n{body}".strip()
         rebuilt_sections.append(section_text)
 
-    return "\n\n".join(rebuilt_sections).strip()
+    rebuilt = "\n\n".join(rebuilt_sections).strip()
+    rebuilt = _normalize_underwriting_questions_formatting(rebuilt)
+    rebuilt = _merge_underwriting_question_lines(rebuilt)
+    return rebuilt
 
 
 def _clamp_to_band(
@@ -1998,6 +2102,13 @@ def _deduplicate_sentences(text: str) -> str:
         for sentence in sentences:
             # Normalize for comparison (lowercase, strip extra whitespace)
             normalized = " ".join(sentence.lower().split())
+            # Treat the deterministic padding label as non-substantive so repeated
+            # underwriting-question sentences can be deduplicated cleanly.
+            normalized = re.sub(
+                r"^key\s+underwriting\s+questions\s*:\s*",
+                "",
+                normalized,
+            )
             if normalized and normalized not in seen_sentences:
                 seen_sentences.add(normalized)
                 unique_sentences.append(sentence)
@@ -2023,6 +2134,42 @@ def _trim_appendix_preserving_rows(body: str, max_words: int) -> str:
         trimmed.append(line)
         words += line_words
     return "\n".join(trimmed).strip()
+
+
+def _canonicalize_section_title(title: str) -> str:
+    """Normalize section titles for matching regardless of punctuation/casing."""
+
+    if not title:
+        return ""
+    cleaned = title.lower().replace("&", "and")
+    cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned)
+    return " ".join(cleaned.split()).strip()
+
+
+def _standard_section_name_from_heading(heading_line: str) -> str:
+    """Map a markdown heading line (e.g. '## Key Data Appendix') to our canonical section names."""
+
+    title = re.sub(r"^\s*##\s*", "", heading_line or "").strip()
+    canon = _canonicalize_section_title(title)
+
+    if canon.startswith("key data appendix") or canon.startswith("key metrics"):
+        return "Key Metrics"
+    if canon.startswith("management discussion"):
+        return "Management Discussion & Analysis"
+    if canon.startswith("strategic initiatives"):
+        return "Management Discussion & Analysis"
+    if canon.startswith("financial health rating"):
+        return "Financial Health Rating"
+    if canon.startswith("executive summary"):
+        return "Executive Summary"
+    if canon.startswith("financial performance"):
+        return "Financial Performance"
+    if canon.startswith("risk factors"):
+        return "Risk Factors"
+    if canon.startswith("closing takeaway"):
+        return "Closing Takeaway"
+    # Unknown/extra section
+    return title or "Section"
 
 
 def _trim_preserving_headings(text: str, max_words: int) -> str:
@@ -2062,88 +2209,102 @@ def _trim_preserving_headings(text: str, max_words: int) -> str:
     if not sections:
         return _truncate_text_to_word_limit(text, max_words)
 
-    # Keep each section reasonably substantive to avoid fragmenting the summary when trimming
-    min_words_per_section = max(25, min(60, max_words // max(1, len(sections))))
-    section_word_counts = [
-        max(min_words_per_section, _count_words(body)) for _, body in sections
-    ]
-    total_words = sum(section_word_counts)
-    if total_words == 0:
-        return _truncate_text_to_word_limit(text, max_words)
-
-    appendix_index = next(
-        (
-            i
-            for i, (h, _) in enumerate(sections)
-            if ("key metrics" in h.lower() or "key data appendix" in h.lower())
-        ),
-        None,
+    # Account for preamble + heading titles when allocating body word budgets.
+    # (UI/tests count title tokens too.)
+    preamble_words = _count_words(preamble_text)
+    heading_title_words = sum(
+        _count_words(re.sub(r"^\s*##\s*", "", h).strip()) for h, _ in sections
     )
-    protected_words = (
-        section_word_counts[appendix_index] if appendix_index is not None else 0
-    )
+    available_body_words = max(0, max_words - preamble_words - heading_title_words)
 
-    # Allocate budget prioritizing Key Metrics if present
-    allocations = [0] * len(sections)
-    remaining_budget = max_words
+    if available_body_words <= 0:
+        # Edge case: extremely small max_words. Keep a truncated preamble only.
+        return _truncate_text_to_word_limit(preamble_text or text, max_words)
 
-    if appendix_index is not None:
-        allocations[appendix_index] = protected_words
-        remaining_budget -= protected_words
+    section_keys = [_standard_section_name_from_heading(h) for h, _ in sections]
+    current_body_counts = [_count_words(body) for _, body in sections]
 
-    flexible_indices = [i for i in range(len(sections)) if i != appendix_index]
-    flexible_total = sum(section_word_counts[i] for i in flexible_indices)
+    # Scale per-section minimums if the user requested an unusually short memo.
+    base_mins = [SUMMARY_SECTION_MIN_WORDS.get(key, 25) for key in section_keys]
+    min_total = sum(base_mins)
+    scaled_mins = base_mins[:]
+    if min_total > available_body_words and min_total > 0:
+        scale = available_body_words / min_total
+        scaled_mins = [max(10, int(m * scale)) for m in base_mins]
+        # Fix rounding overflow
+        overflow = sum(scaled_mins) - available_body_words
+        if overflow > 0:
+            # Reduce from the largest mins first
+            for idx in sorted(range(len(scaled_mins)), key=lambda i: scaled_mins[i], reverse=True):
+                if overflow <= 0:
+                    break
+                reducible = scaled_mins[idx] - 10
+                if reducible <= 0:
+                    continue
+                delta = min(reducible, overflow)
+                scaled_mins[idx] -= delta
+                overflow -= delta
 
-    if (
-        flexible_total == 0
-        and appendix_index is not None
-        and allocations[appendix_index] > max_words
-    ):
-        # Trim appendix itself if it's the only section and too long
-        allocations[appendix_index] = max_words
-    elif flexible_total > 0:
-        flex_scale = (
-            min(1.0, max(0, remaining_budget) / flexible_total)
-            if remaining_budget > 0
-            else 0
-        )
-        for i in flexible_indices:
-            allocations[i] = max(
-                min_words_per_section, int(section_word_counts[i] * flex_scale)
-            )
+    # Allocate target body words per section using the same proportional weights we
+    # communicate to the model. This prevents the trim step from crushing Executive
+    # Summary / Financial Performance (a common quality regression).
+    weights = [SECTION_PROPORTIONAL_WEIGHTS.get(key, 10) for key in section_keys]
+    weight_sum = sum(weights) or len(weights)
 
-    allocated_total = sum(allocations)
-    # Adjust if we over- or under-allocated
-    if allocated_total > max_words:
-        overflow = allocated_total - max_words
-        # Reduce from flexible sections first, leaving the appendix untouched if possible
-        adjustable = [
-            i for i in flexible_indices if allocations[i] > min_words_per_section
+    exacts = [w * available_body_words / weight_sum for w in weights]
+    floors = [int(x) for x in exacts]
+    remainders = [x - int(x) for x in exacts]
+
+    remaining = available_body_words - sum(floors)
+    if remaining > 0:
+        for idx in sorted(range(len(floors)), key=lambda i: remainders[i], reverse=True)[:remaining]:
+            floors[idx] += 1
+
+    targets = [max(floors[i], scaled_mins[i]) for i in range(len(floors))]
+    overflow = sum(targets) - available_body_words
+    if overflow > 0:
+        # Reduce from sections with the most slack above their scaled minimum.
+        slack = [targets[i] - scaled_mins[i] for i in range(len(targets))]
+        for idx in sorted(range(len(targets)), key=lambda i: slack[i], reverse=True):
+            if overflow <= 0:
+                break
+            reducible = targets[idx] - scaled_mins[idx]
+            if reducible <= 0:
+                continue
+            delta = min(reducible, overflow)
+            targets[idx] -= delta
+            overflow -= delta
+
+    # Convert targets into per-section allowed word counts (can't exceed existing body).
+    allocations = [min(current_body_counts[i], targets[i]) for i in range(len(sections))]
+
+    # If some sections are shorter than their target, redistribute the remaining
+    # budget to other sections that still have content above their allocation.
+    remaining_budget = available_body_words - sum(allocations)
+    if remaining_budget > 0:
+        expandable = [
+            i for i in range(len(sections)) if current_body_counts[i] > allocations[i]
         ]
-        while overflow > 0 and adjustable:
-            idx = adjustable[0]
-            allocations[idx] -= 1
-            overflow -= 1
-            if allocations[idx] <= min_words_per_section:
-                adjustable.pop(0)
-    elif allocated_total < max_words and allocations:
-        remaining = max_words - allocated_total
-        idx = 0
-        while remaining > 0:
-            target_idx = (
-                flexible_indices[idx % len(flexible_indices)]
-                if flexible_indices
-                else idx % len(allocations)
-            )
-            allocations[target_idx] += 1
-            remaining -= 1
-            idx += 1
+        # Prefer allocating back to higher-weight sections first.
+        expandable.sort(key=lambda i: weights[i], reverse=True)
+        while remaining_budget > 0 and expandable:
+            progressed = False
+            for idx in expandable:
+                if remaining_budget <= 0:
+                    break
+                if allocations[idx] < current_body_counts[idx]:
+                    allocations[idx] += 1
+                    remaining_budget -= 1
+                    progressed = True
+            if not progressed:
+                break
 
-    trimmed_sections = []
-    for idx, ((heading, body), allowed) in enumerate(zip(sections, allocations)):
+    trimmed_sections: List[str] = []
+    for idx, (heading, body) in enumerate(sections):
+        allowed = allocations[idx]
         if allowed <= 0:
             continue
-        if appendix_index is not None and idx == appendix_index:
+        if "key metrics" in section_keys[idx].lower() or "key data appendix" in section_keys[idx].lower():
             trimmed_body = _trim_appendix_preserving_rows(body, allowed)
         else:
             trimmed_body = _truncate_text_to_word_limit(body, allowed)
@@ -4751,6 +4912,25 @@ def _ensure_health_rating_section(
     if needs_rebuild:
         narrative_text = narrative
 
+    # Normalize narrative formatting inside the Health Rating section.
+    # Users sometimes see awkward extra blank lines (or a dangling one-liner)
+    # that reads low-quality. Collapse internal newlines and remove redundant
+    # trailing phrasing.
+    narrative_text = re.sub(r"\s*\n\s*", " ", (narrative_text or "").strip())
+    narrative_text = re.sub(r"\s{2,}", " ", narrative_text).strip()
+    # Remove the low-quality dangling sentence if the model emits it (often as its own paragraph).
+    narrative_text = re.sub(
+        r"\s*Leverage\s+remains\s+elevated\s+relative\s+to\s+cash\.?\s*",
+        " ",
+        narrative_text,
+        flags=re.IGNORECASE,
+    )
+    narrative_text = re.sub(r"\s{2,}", " ", narrative_text).strip()
+    narrative_text = re.sub(r"[ \t]+\.", ".", narrative_text)
+    narrative_text = re.sub(r"\.\s*\.", ".", narrative_text)
+    if narrative_text and not narrative_text.endswith((".", "!", "?")):
+        narrative_text += "."
+
     rebuilt_section_lines: List[str] = [score_line, "", narrative_text.strip()]
     if pillar_lines:
         rebuilt_section_lines.extend(["", *pillar_lines])
@@ -4854,11 +5034,11 @@ def _build_health_narrative(
         leverage_clause = ""
         if cash and liabilities:
             if cash > liabilities:
-                leverage_clause = " The balance sheet reads net-cash overall."
+                leverage_clause = ", leaving the balance sheet net-cash overall"
             elif liabilities > cash * 3:
-                leverage_clause = " Leverage remains elevated relative to cash."
+                leverage_clause = ", with liabilities more than 3x cash and higher refinancing risk"
         sentences.append(
-            f"Cash of {cash_str} against liabilities of {liab_str} frames the leverage and refinancing risk.{leverage_clause}"
+            f"Cash of {cash_str} against liabilities of {liab_str} frames the leverage and refinancing risk{leverage_clause}."
         )
     elif liab_str:
         sentences.append(
@@ -6534,6 +6714,7 @@ Read the LAST WORD of EVERY sentence. If it's an article, preposition, conjuncti
 NARRATIVE QUALITY:
 - Start each section with a clear topic sentence that states the key insight.
 - End each section with a forward-looking implication or action item that is COMPLETE.
+- Do NOT end sections with a string of short generic one-liners ("staccato" filler). If you need words, expand with a cohesive paragraph tied to the specific metrics above.
 - Avoid starting consecutive sentences with the same word.
 - Vary sentence length and structure for readability.
 - THE LAST SENTENCE OF EACH SECTION MUST BE A COMPLETE THOUGHT ending in a period, question mark, or exclamation point.
@@ -6748,11 +6929,21 @@ Before you output anything, verify:
                     summary_text, target_length, tolerance=10, allow_padding=True
                 )
 
+        # Final quality cleanup before enforcing the user-visible band.
+        # (Do this before the last word-band pass so any removals can be compensated.)
+        summary_text = _normalize_underwriting_questions_formatting(summary_text)
+        summary_text = _merge_underwriting_question_lines(summary_text)
+        summary_text = _remove_filler_phrases(summary_text)
+        summary_text = _dedupe_consecutive_sentences(summary_text)
+
         if target_length:
             # Final user-visible word-count enforcement (UI/tests count raw whitespace tokens).
             summary_text = _enforce_whitespace_word_band(
                 summary_text, target_length, tolerance=10, allow_padding=True
             )
+
+        # Post-band formatting: safe (does not change token/word counts meaningfully).
+        summary_text = _normalize_underwriting_questions_formatting(summary_text)
 
         # Final guard: ensure the document ends with punctuation for substantive outputs
         if (
@@ -7867,6 +8058,147 @@ def _ensure_required_sections(
         )
         return " ".join(parts)
 
+    def _synthesize_executive_summary_addendum() -> str:
+        """Add a short, metric-anchored paragraph to strengthen a too-brief Exec Summary."""
+
+        is_persona = bool(persona_name)
+
+        revenue = calculated_metrics.get("revenue")
+        operating_income = calculated_metrics.get("operating_income")
+        net_income = calculated_metrics.get("net_income")
+        operating_margin = calculated_metrics.get("operating_margin")
+        net_margin = calculated_metrics.get("net_margin")
+        ocf = calculated_metrics.get("operating_cash_flow")
+        fcf = calculated_metrics.get("free_cash_flow")
+        capex = calculated_metrics.get("capital_expenditures")
+        cash = calculated_metrics.get("cash")
+        securities = calculated_metrics.get("marketable_securities")
+        liabilities = calculated_metrics.get("total_liabilities")
+
+        cash_total = None
+        if cash is not None:
+            cash_total = cash + (securities or 0)
+
+        rev_str = _format_metric_value_for_text("revenue", revenue) if revenue is not None else None
+        op_inc_str = (
+            _format_metric_value_for_text("operating_income", operating_income)
+            if operating_income is not None
+            else None
+        )
+        net_inc_str = (
+            _format_metric_value_for_text("net_income", net_income)
+            if net_income is not None
+            else None
+        )
+        ocf_str = _format_metric_value_for_text("operating_cash_flow", ocf) if ocf is not None else None
+        fcf_str = _format_metric_value_for_text("free_cash_flow", fcf) if fcf is not None else None
+        capex_str = _format_metric_value_for_text("capital_expenditures", capex) if capex is not None else None
+        cash_total_str = _format_metric_value_for_text("cash", cash_total) if cash_total is not None else None
+        liabilities_str = _format_metric_value_for_text("total_liabilities", liabilities) if liabilities is not None else None
+
+        fcf_margin_pct = None
+        if fcf is not None and revenue:
+            try:
+                fcf_margin_pct = (fcf / revenue) * 100
+            except Exception:
+                fcf_margin_pct = None
+
+        intro = "In my view," if is_persona else "The key question is whether"
+
+        sentences: List[str] = []
+        if rev_str and op_inc_str:
+            sentences.append(
+                f"{intro} {company_name}'s {rev_str} revenue base can translate into durable operating earnings (operating income {op_inc_str}) without relying on one-off items."
+            )
+        elif rev_str:
+            sentences.append(
+                f"{intro} {company_name}'s {rev_str} revenue base can translate into durable operating profitability as the business scales."
+            )
+
+        if operating_margin is not None and net_margin is not None:
+            sentences.append(
+                f"With operating margin at {operating_margin:.1f}% versus net margin at {net_margin:.1f}%, earnings quality matters as much as the headline profit figure."
+            )
+
+        if ocf_str and fcf_str:
+            margin_clause = f" (~{fcf_margin_pct:.1f}% FCF margin)" if fcf_margin_pct is not None else ""
+            capex_clause = f" after capex of {capex_str}" if capex_str else ""
+            sentences.append(
+                f"Cash conversion is the anchor: operating cash flow {ocf_str} converts to free cash flow {fcf_str}{margin_clause}{capex_clause}."
+            )
+
+        if cash_total_str and liabilities_str:
+            sentences.append(
+                f"Balance-sheet flexibility is {cash_total_str} cash and securities against {liabilities_str} liabilities, which keeps refinancing and downside scenarios in view."
+            )
+
+        if not sentences:
+            return (
+                f"In my view, the investment case hinges on whether operating profitability and cash conversion can compound without margin fragility or balance-sheet stress."
+                if is_persona
+                else "The investment case hinges on whether operating profitability and cash conversion can compound without margin fragility or balance-sheet stress."
+            )
+
+        return " ".join(sentences).strip()
+
+    def _synthesize_financial_performance_addendum() -> str:
+        """Add a short, concrete extension when the Financial Performance section is too thin."""
+
+        is_persona = bool(persona_name)
+
+        revenue = calculated_metrics.get("revenue")
+        operating_income = calculated_metrics.get("operating_income")
+        net_income = calculated_metrics.get("net_income")
+        operating_margin = calculated_metrics.get("operating_margin")
+        net_margin = calculated_metrics.get("net_margin")
+        ocf = calculated_metrics.get("operating_cash_flow")
+        capex = calculated_metrics.get("capital_expenditures")
+        fcf = calculated_metrics.get("free_cash_flow")
+
+        rev_str = _format_metric_value_for_text("revenue", revenue) if revenue is not None else None
+        op_inc_str = (
+            _format_metric_value_for_text("operating_income", operating_income)
+            if operating_income is not None
+            else None
+        )
+        net_inc_str = (
+            _format_metric_value_for_text("net_income", net_income)
+            if net_income is not None
+            else None
+        )
+        ocf_str = _format_metric_value_for_text("operating_cash_flow", ocf) if ocf is not None else None
+        capex_str = _format_metric_value_for_text("capital_expenditures", capex) if capex is not None else None
+        fcf_str = _format_metric_value_for_text("free_cash_flow", fcf) if fcf is not None else None
+
+        sentences: List[str] = []
+        lead = "I focus on" if is_persona else "Focus on"
+
+        if rev_str and op_inc_str and operating_margin is not None:
+            sentences.append(
+                f"{lead} the run-rate engine: {rev_str} of revenue with operating income {op_inc_str} implies an operating margin of {operating_margin:.1f}%."
+            )
+
+        if net_inc_str and net_margin is not None and operating_margin is not None:
+            gap = net_margin - operating_margin
+            if abs(gap) >= 5:
+                sentences.append(
+                    f"The spread to net income {net_inc_str} (net margin {net_margin:.1f}%) signals meaningful below-the-line items, so I discount net margin when underwriting durability."
+                    if is_persona
+                    else f"The spread to net income {net_inc_str} (net margin {net_margin:.1f}%) signals meaningful below-the-line items, so net margin should be treated cautiously when underwriting durability."
+                )
+
+        if ocf_str and fcf_str:
+            capex_clause = f" after capex of {capex_str}" if capex_str else ""
+            sentences.append(
+                f"Operating cash flow {ocf_str} converts to free cash flow {fcf_str}{capex_clause}, which is the cash that can fund reinvestment, buybacks, or balance-sheet de-risking."
+            )
+
+        sentences.append(
+            "Watch whether unit economics improve via pricing discipline and efficiency, or compress under incentives, insurance, and regulatory costs."
+        )
+
+        return " ".join([s for s in sentences if s]).strip()
+
     def _has_numeric_content(section_body: str) -> bool:
         return bool(re.search(r"\d", section_body))
 
@@ -7888,6 +8220,10 @@ def _ensure_required_sections(
         return " ".join(lines)
 
     # Add minimal Financial Performance and MD&A sections if the model omitted them
+    # 0. Executive Summary (rarely missing, but catastrophic when it is)
+    if not _section_present("Executive Summary"):
+        _append_section("Executive Summary", _synthesize_executive_summary_addendum())
+
     if not _section_present("Financial Performance"):
         _append_section("Financial Performance", _synthesize_financial_performance())
     else:
@@ -7905,6 +8241,34 @@ def _ensure_required_sections(
                     fp_match.group(0),
                     f"## Financial Performance\n{body}\n\n{supplement}\n",
                 )
+
+    # If Executive Summary / Financial Performance are present but too short, top them up.
+    def _top_up_section_if_short(title: str, min_words: int, addendum: str) -> None:
+        nonlocal text
+        pattern = re.compile(
+            rf"##\s*{re.escape(title)}\s*\n+([\s\S]*?)(?=\n##\s|\Z)",
+            re.IGNORECASE,
+        )
+        m = pattern.search(text)
+        if not m:
+            return
+        body = (m.group(1) or "").strip()
+        if _count_words(body) >= min_words:
+            return
+        # Append addendum as a new paragraph.
+        new_body = f"{body}\n\n{addendum}".strip()
+        text = pattern.sub(lambda _mm: f"## {title}\n{new_body}\n", text, count=1)
+
+    _top_up_section_if_short(
+        "Executive Summary",
+        SUMMARY_SECTION_MIN_WORDS.get("Executive Summary", 80),
+        _synthesize_executive_summary_addendum(),
+    )
+    _top_up_section_if_short(
+        "Financial Performance",
+        SUMMARY_SECTION_MIN_WORDS.get("Financial Performance", 95),
+        _synthesize_financial_performance_addendum(),
+    )
 
     if not _section_present("Management Discussion & Analysis"):
         _append_section("Management Discussion & Analysis", _synthesize_mdna())
