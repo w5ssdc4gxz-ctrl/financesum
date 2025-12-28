@@ -39,7 +39,7 @@ def test_ensure_health_rating_section_strips_inline_score_lines():
     assert result.startswith("## Financial Health Rating")
     assert "Financial Health Rating:" not in result
     assert "TestCo receives a Financial Health Rating of 72/100 - Watch" in result
-    assert "Under a value-investor lens" in result
+    assert "The score weights profitability and margin quality most heavily" in result
     assert "profitability and margin quality" in result
     assert "This health snapshot provides the balance-sheet backdrop" in result
     assert "## Executive Summary" in result

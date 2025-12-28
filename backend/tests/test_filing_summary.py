@@ -187,6 +187,41 @@ def test_prompt_truncates_to_token_budget(monkeypatch, tmp_path):
         local_cache.fallback_filing_summaries.pop(filing_id, None)
 
 
+def test_risk_factor_headlines_are_rewritten_with_company_theme() -> None:
+    summary_text = (
+        "## Executive Summary\n"
+        "Alphabet has a resilient profit engine, but the underwriting hinges on ads durability and reinvestment pacing.\n\n"
+        "## Risk Factors\n"
+        "**Regulatory and Antitrust Scrutiny**: Alphabet faces significant and escalating regulatory pressure globally, particularly around antitrust and data privacy enforcement. "
+        "Adverse outcomes could include fines, remedies, or changes that reduce monetization efficiency.\n\n"
+        "**Margin Compression Risk**: The current operating margin leaves less cushion if incentives, insurance, or compliance costs rise faster than pricing. "
+        "If growth slows at the same time, modest cost inflation can translate into outsized profit compression.\n\n"
+        "## Key Metrics\n"
+        "→ Revenue: $1.0B | Operating Income: $0.3B | Net Income: $0.2B\n\n"
+        "## Closing Takeaway\n"
+        "Overall, valuation hinges on whether cash conversion stays durable as reinvestment rises."
+    )
+
+    rewritten = filings_api._ensure_required_sections(
+        summary_text,
+        include_health_rating=False,
+        metrics_lines="→ Revenue: $1.0B",
+        calculated_metrics={"operating_margin": 30.5},
+        health_score_data=None,
+        company_name="Alphabet Inc.",
+        risk_factors_excerpt=(
+            "ITEM 1A. RISK FACTORS\n"
+            "Our advertising business depends on search and other monetization surfaces. "
+            "We are subject to antitrust scrutiny and privacy regulation in multiple jurisdictions."
+        ),
+    )
+
+    assert "Regulatory and Antitrust Scrutiny" not in rewritten
+    assert "Margin Compression Risk" not in rewritten
+    assert "Enforcement Risk" in rewritten
+    assert "Margin / Reinvestment Risk" in rewritten
+
+
 def test_custom_preferences_influence_prompt(monkeypatch):
     """Custom summary requests should embed investor preferences into the prompt and skip caching."""
     settings = get_settings()
@@ -711,7 +746,11 @@ def test_final_output_clamped_to_target_band(monkeypatch):
 
     monkeypatch.setattr(filings_api, "_supabase_configured", lambda _settings: False)
     # Skip section completeness validation to focus purely on length enforcement
-    monkeypatch.setattr(filings_api, "_make_section_completeness_validator", lambda include: (lambda _txt: None))
+    monkeypatch.setattr(
+        filings_api,
+        "_make_section_completeness_validator",
+        lambda *args, **kwargs: (lambda _txt: None),
+    )
 
     class DummyModel:
         def __init__(self) -> None:
@@ -784,7 +823,11 @@ def test_overlong_output_is_trimmed_but_complete(monkeypatch):
 
     monkeypatch.setattr(filings_api, "_supabase_configured", lambda _settings: False)
     # Skip section completeness validation to isolate band enforcement
-    monkeypatch.setattr(filings_api, "_make_section_completeness_validator", lambda include: (lambda _txt: None))
+    monkeypatch.setattr(
+        filings_api,
+        "_make_section_completeness_validator",
+        lambda *args, **kwargs: (lambda _txt: None),
+    )
 
     class DummyModel:
         def __init__(self) -> None:

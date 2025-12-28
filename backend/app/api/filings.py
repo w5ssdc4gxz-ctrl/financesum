@@ -3,6 +3,7 @@
 import os
 import json
 import io
+import hashlib
 import logging
 import random
 import re
@@ -13,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Callable, Literal
+from typing import Any, Dict, List, Optional, Tuple, Callable, Literal, Set
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Body, HTTPException, Depends
@@ -80,10 +81,12 @@ logger = logging.getLogger(__name__)
 
 # Gemini 2.0 Flash Lite supports up to ~1M tokens. Cap context to keep requests fast.
 MAX_GEMINI_CONTEXT_CHARS = 200_000
-MAX_SUMMARY_ATTEMPTS = 2  # Faster: fewer full-summary retries
+# Summary quality can degrade quickly when we fall back to deterministic padding.
+# Give the model an extra attempt to satisfy section minimums + length constraints.
+MAX_SUMMARY_ATTEMPTS = 3
 # Allow a couple of rewrite passes so we hit the strict word band
 # without relying on low-quality deterministic padding.
-MAX_REWRITE_ATTEMPTS = 2
+MAX_REWRITE_ATTEMPTS = 3
 SUMMARY_TOTAL_TIMEOUT_SECONDS = 120  # Hard cap per-request generation time
 
 # ---------------------------------------------------------------------------
@@ -232,7 +235,12 @@ DETAIL_LEVEL_PROMPTS: Dict[str, str] = {
 }
 
 OUTPUT_STYLE_PROMPTS: Dict[str, str] = {
-    "narrative": "Write in cohesive paragraphs with strong topic sentences and transitions. Avoid bullet lists except where explicitly required by the base template.",
+    "narrative": (
+        "Write in cohesive, human-sounding paragraphs with strong topic sentences and transitions. "
+        "Aim for a clear narrative arc (setup → evidence → tension → resolution) so the memo reads smoothly end-to-end. "
+        "Use one bridge sentence at the end of each narrative section to foreshadow the next. "
+        "Keep numbers purposeful: outside of the required data blocks/labels, use only 1–2 anchor figures per section and never stack metrics."
+    ),
     "bullets": "Favor bullet lists and short sentences. Each bullet should start with a bolded label followed by insights.",
     "mixed": "Open each section with a short paragraph, then follow with a bulleted list of the most actionable takeaways.",
 }
@@ -344,7 +352,11 @@ def _extract_persona_name(investor_focus: Optional[str]) -> Optional[str]:
 
 
 def _build_closing_takeaway_description(
-    persona_name: Optional[str], company_name: str
+    persona_name: Optional[str],
+    company_name: str,
+    *,
+    target_length: Optional[int] = None,
+    persona_requested: bool = False,
 ) -> Tuple[str, str]:
     """Build a dynamic Closing Takeaway section description based on the selected persona.
 
@@ -353,13 +365,24 @@ def _build_closing_takeaway_description(
     """
     title = "Closing Takeaway"
 
+    if target_length and target_length < 350:
+        length_guidance = "3-4 COMPLETE sentences (~45-70 words)."
+    elif target_length and target_length < 500:
+        length_guidance = "4-5 COMPLETE sentences (~70-95 words)."
+    else:
+        length_guidance = "4-6 COMPLETE sentences (~80-110 words)."
+
     common_requirements = (
-        "Include a concise Closing Takeaway. Keep this balanced with other sections.\n"
-        "2-4 COMPLETE sentences (~50-70 words). This is your FINAL INVESTMENT VERDICT.\n\n"
+        "Include a substantive Closing Takeaway. Keep this balanced with other sections.\n"
+        f"{length_guidance} This is your FINAL INVESTMENT VERDICT.\n"
+        "Write as ONE cohesive paragraph (avoid one-sentence throwaways).\n"
+        "Do NOT introduce brand-new facts here; synthesize the narrative built in prior sections so the verdict feels inevitable.\n"
+        "Anchor the verdict with 1-2 concrete metrics or operating drivers.\n"
+        "FORBIDDEN: single-sentence or one-line closings.\n\n"
         "=== SUPPORTING ELEMENTS (BRIEF) ===\n"
-        "- Quality assessment: High-quality, average, or poor business (1 phrase)\n"
-        "- Key driver: The #1 factor behind your decision (1 phrase)\n"
-        "- Trigger: What would change your mind (optional if hitting word limit)\n\n"
+        "- Quality assessment: High-quality, average, or poor business (1 sentence)\n"
+        "- Key driver: The #1 factor behind your decision (1 sentence)\n"
+        "- Trigger: What would change the stance (1 sentence)\n\n"
     )
 
     persona_verdict_requirement = (
@@ -387,7 +410,7 @@ def _build_closing_takeaway_description(
 
     completion_requirements = "\nEnsure sentences are complete and punctuated. Avoid trailing off or ellipses.\n"
 
-    if persona_name and persona_name in PERSONA_CLOSING_INSTRUCTIONS:
+    if persona_requested and persona_name and persona_name in PERSONA_CLOSING_INSTRUCTIONS:
         # Persona-specific instructions
         persona_instructions = PERSONA_CLOSING_INSTRUCTIONS[persona_name]
         description = (
@@ -401,6 +424,23 @@ def _build_closing_takeaway_description(
             f"The reader should immediately recognize this as {persona_name}'s voice.\n"
             + completion_requirements
             + f"This section MUST provide CLOSURE as {persona_name} giving their final verdict on {company_name}."
+        )
+    elif persona_requested:
+        # Generic persona instructions (user provided a custom persona prompt)
+        description = (
+            common_requirements
+            + persona_verdict_requirement
+            + "=== CUSTOM PERSONA MODE (USER-PROVIDED) ===\n"
+            "CRITICAL: The user provided a custom investor persona/viewpoint above. You MUST adopt it fully.\n\n"
+            "REQUIRED:\n"
+            "- Write in FIRST PERSON throughout ('I', 'my view', 'I would').\n"
+            "- Anchor the recommendation in 1-2 specific metrics or operating drivers from this memo.\n"
+            "- End with a clear first-person BUY/HOLD/SELL sentence that mentions the company.\n\n"
+            "FORBIDDEN:\n"
+            "- Do NOT suddenly switch to third-person research tone.\n"
+            "- Do NOT imitate a famous investor unless the user explicitly asked for that voice.\n"
+            + completion_requirements
+            + f"This section MUST provide CLOSURE as the selected persona giving a final verdict on {company_name}."
         )
     else:
         # Generic instructions (no persona selected) - HIGH QUALITY OBJECTIVE ANALYSIS
@@ -566,6 +606,7 @@ _MICRO_TRIM_SKIP_SECTIONS = {
     "key metrics",
     "key data appendix",
     "financial health rating",
+    "closing takeaway",
 }
 
 
@@ -668,11 +709,11 @@ def _enforce_whitespace_word_band(
     *,
     allow_padding: bool = True,
 ) -> str:
-    """Enforce the word band using raw whitespace token counts (UI/test counting).
+    """Enforce the word band using user-visible whitespace token counting.
 
-    The backend primarily uses `_count_words()` for MS-Word-ish counting, but some
-    surfaces (tests/UI) count via `len(text.split())`, which includes markdown tokens
-    like `##` and `-`. This final guard keeps the *user-visible* count inside ±tolerance.
+    This intentionally ignores pure-markup tokens like `##` by using `_count_words()`
+    (whitespace split + punctuation stripping), which matches test/UI expectations
+    better than `len(text.split())`.
     """
     if not text or target_length is None:
         return text
@@ -681,24 +722,8 @@ def _enforce_whitespace_word_band(
     upper = target_length + tolerance
 
     for _ in range(5):
-        ws_count = len(text.split())
+        ws_count = _count_words(text)
         if lower <= ws_count <= upper:
-            # Some surfaces (and a few tests) count words more like MS Word, i.e. they
-            # do NOT count markdown tokens like `##` as words. Ensure that count is
-            # also inside the band when we still have whitespace headroom.
-            word_count = _count_words(text)
-            if word_count < lower and allow_padding:
-                headroom = upper - ws_count
-                if headroom <= 0:
-                    return text
-                deficit = lower - word_count
-                # We request only the minimum additional words, but the padding
-                # generator may overshoot slightly with full sentences; headroom
-                # protects us from blowing past the whitespace band.
-                text = _distribute_padding_across_sections(
-                    text, min(deficit, max(1, headroom))
-                )
-                continue
             return text
 
         if ws_count > upper:
@@ -722,7 +747,11 @@ def _enforce_whitespace_word_band(
             return text
         text = _distribute_padding_across_sections(text, deficit)
 
-    return text
+    # Final safety: deterministic clamp if the iterative pass didn't converge.
+    final_count = _count_words(text)
+    if lower <= final_count <= upper:
+        return text
+    return _clamp_to_band(text, lower, upper, allow_padding=allow_padding)
 
 
 def _call_gemini_client(
@@ -988,6 +1017,129 @@ def _remove_filler_phrases(text: str) -> str:
     result = re.sub(r"\n{3,}", "\n\n", result)
 
     return result
+
+
+_GENERIC_HEURISTIC_SENTENCES = [
+    # These phrases are commonly produced as standalone “finance advice” one-liners.
+    # When they appear as isolated paragraphs, users perceive them as low-quality and
+    # disconnected from the section narrative.
+    "If reported EPS beats but cash lags, the gap often sits in working capital, deferred revenue, or other timing items that unwind over quarters.",
+    "Margin durability depends on pricing power and disciplined reinvestment.",
+    "Working-capital swings can overstate performance when demand is softening.",
+    "Capex intensity matters because it determines how much revenue converts to cash.",
+    "Leverage matters most when growth slows and refinancing windows tighten.",
+    "A durable moat often appears in stable returns on invested capital and pricing discipline, while erosion shows up first in rising customer-acquisition intensity.",
+    "Acquisition-driven growth needs an integration lens; synergy targets are real only when they translate into margin and cash conversion, not pro forma adjustments.",
+    "It is worth separating organic operating momentum from accounting noise, especially when stock-based compensation, FX, or restructuring items swing earnings.",
+    "The main bear path is margin pressure plus higher reinvestment, flattening free cash flow even if revenue holds up.",
+    "Margin resilience hinges on mix and pricing, so product and region shifts can matter more than headline growth when competition heats up.",
+    "What matters is whether operating leverage shows up in both margins and cash, not just adjusted metrics or one-time items.",
+    "Capital allocation that compounds value usually looks like reinvesting where returns are clear and keeping dilution and acquisition premiums contained.",
+]
+
+
+def _remove_generic_heuristic_paragraphs(text: str) -> str:
+    """Remove generic heuristic sentences that read like disconnected filler.
+
+    These phrases are common “finance advice” boilerplate. If they appear as
+    standalone one-liners (or as tacked-on sentences), users perceive them as
+    low-quality and disconnected from the section narrative.
+    """
+    if not text:
+        return text
+
+    def _norm_sentence(s: str) -> str:
+        s = (s or "").replace("\u00A0", " ")
+        s = " ".join(s.split())
+        return s.lower().rstrip(".!?")
+
+    banned = {_norm_sentence(s) for s in _GENERIC_HEURISTIC_SENTENCES if s}
+    if not banned:
+        return text
+
+    heading_regex = re.compile(r"^\s*##\s+.+", re.MULTILINE)
+    sections: List[Tuple[str, str]] = []
+    current_heading: Optional[str] = None
+    buffer: List[str] = []
+    preamble: List[str] = []
+    first_heading_seen = False
+
+    for line in (text or "").splitlines():
+        if heading_regex.match(line):
+            if not first_heading_seen and buffer:
+                preamble = buffer[:]
+                buffer = []
+            first_heading_seen = True
+            if current_heading is not None:
+                sections.append((current_heading, "\n".join(buffer).rstrip()))
+            current_heading = line.strip()
+            buffer = []
+        elif current_heading is not None:
+            buffer.append(line)
+        else:
+            preamble.append(line)
+
+    preamble_text = "\n".join(preamble).rstrip()
+    if current_heading is not None:
+        sections.append((current_heading, "\n".join(buffer).rstrip()))
+
+    if not sections:
+        return text
+
+    target_sections = {
+        "Executive Summary",
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Risk Factors",
+        "Closing Takeaway",
+    }
+
+    def _is_structured_paragraph(paragraph: str) -> bool:
+        stripped = (paragraph or "").lstrip()
+        return bool(
+            stripped.startswith(("→", "- ", "* ", "• "))
+            or stripped.startswith("**")
+        )
+
+    rebuilt_sections: List[str] = []
+    for heading, body in sections:
+        section_name = _standard_section_name_from_heading(heading)
+        raw_body = (body or "").strip()
+
+        if section_name not in target_sections or not raw_body:
+            section_text = f"{heading}\n\n{raw_body}".strip() if raw_body else heading.strip()
+            rebuilt_sections.append(section_text)
+            continue
+
+        paragraphs = [p.strip() for p in re.split(r"\n{2,}", raw_body) if p.strip()]
+        kept: List[str] = []
+        for paragraph in paragraphs:
+            if _is_structured_paragraph(paragraph):
+                kept.append(paragraph)
+                continue
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", paragraph) if s.strip()]
+            norms = [_norm_sentence(s) for s in sentences if s.strip()]
+            if not norms:
+                kept.append(paragraph)
+                continue
+
+            # Drop banned heuristic sentences even when they are appended to
+            # an otherwise good paragraph. If the paragraph becomes empty,
+            # drop the paragraph entirely.
+            filtered: List[str] = [
+                s for s, n in zip(sentences, norms) if n and n not in banned
+            ]
+            if not filtered:
+                continue
+            kept.append(" ".join(filtered).strip())
+
+        rebuilt_body = "\n\n".join(kept).strip()
+        section_text = f"{heading}\n\n{rebuilt_body}".strip() if rebuilt_body else heading.strip()
+        rebuilt_sections.append(section_text)
+
+    rebuilt = "\n\n".join([s for s in ([preamble_text] if preamble_text else []) + rebuilt_sections if s]).strip()
+    rebuilt = re.sub(r"\n{3,}", "\n\n", rebuilt)
+    return rebuilt
 
 
 def _fix_trailing_ellipsis(text: str) -> str:
@@ -1394,6 +1546,8 @@ def _validate_complete_sentences(text: str) -> str:
     incomplete_patterns = [
         # Number without unit at end: "revenue of $3." or "cash flow of $13.47"
         r"\$\d+(?:\.\d+)?\.?\s*$",
+        # Dangling dash / hyphen at end (e.g., "68/100 -" or "Risk -" )
+        r"[-\u2013\u2014]\s*$",
         # Trailing "of" or "at" with nothing after (not followed by ellipsis)
         r"\s+(?:of|at|to|for|with)\s*[,]?\s*$",
         # Sentence ending with just comma or colon (not ellipsis)
@@ -1402,6 +1556,8 @@ def _validate_complete_sentences(text: str) -> str:
         r"(?:of|at|to)\s*,",
         # Ends with articles without noun
         r"\s+(?:the|a|an)\s*$",
+        # Common model cut-off: "..., a 1" (started a phrase like "a 10% margin" but got truncated)
+        r"\b(?:a|an)\s+\d+\s*$",
         # Ends with conjunctions without completion
         r"\s+(?:and|but|or|while|although|however|which)\s*$",
         # Ends with possessive without noun (e.g., "NVIDIA's")
@@ -1414,6 +1570,9 @@ def _validate_complete_sentences(text: str) -> str:
 
     # Completions for various trailing patterns
     trailing_completions = {
+        # Strip common truncations cleanly instead of appending generic filler
+        r",?\s+\b(?:a|an)\s+\d+\s*$": ".",
+        r"\s*[-\u2013\u2014]\s*$": ".",
         r"\s+the\s*$": " the implications for investors.",
         r"\s+a\s*$": " a key consideration.",
         r"\s+an\s*$": " an important factor.",
@@ -1428,6 +1587,21 @@ def _validate_complete_sentences(text: str) -> str:
         r"[A-Za-z]+['']s\s*$": "'s strategic positioning.",
     }
 
+    def _last_sentence_end_idx(line: str) -> int:
+        """Return index of last true sentence-ending punctuation, ignoring decimals/abbreviations."""
+        sentence_endings: List[int] = []
+        for idx, char in enumerate(line or ""):
+            if char not in ".!?":
+                continue
+            # Ignore decimal points in numbers like "$1.35" or "3.5%"
+            if idx + 1 < len(line) and line[idx + 1].isdigit():
+                continue
+            # Ignore periods that are not followed by whitespace/end (abbrev/URL)
+            if idx + 1 < len(line) and line[idx + 1] not in " \n\t\"'":
+                continue
+            sentence_endings.append(idx)
+        return sentence_endings[-1] if sentence_endings else -1
+
     for line in lines:
         # Skip empty lines or section headers
         if not line.strip() or line.strip().startswith("#"):
@@ -1436,6 +1610,10 @@ def _validate_complete_sentences(text: str) -> str:
 
         # Skip bullet points that might intentionally be brief
         if line.strip().startswith("- ") or line.strip().startswith("→"):
+            validated_lines.append(line)
+            continue
+        # Skip structured labels that are not full sentences.
+        if re.match(r"^\s*Health\s+Score\s+Drivers?\s*:?\s*$", line, re.IGNORECASE):
             validated_lines.append(line)
             continue
 
@@ -1460,7 +1638,7 @@ def _validate_complete_sentences(text: str) -> str:
             if re.search(pattern, line, re.IGNORECASE):
                 is_incomplete = True
                 # Try to fix by finding last complete sentence
-                last_punct = max(line.rfind("."), line.rfind("!"), line.rfind("?"))
+                last_punct = _last_sentence_end_idx(line)
                 if last_punct > len(line) * 0.5:  # Only cut if we keep at least 50%
                     line = line[: last_punct + 1]
                     is_incomplete = False
@@ -1723,12 +1901,11 @@ def _normalize_underwriting_questions_formatting(text: str) -> str:
     return result.strip()
 
 
-def _relocate_underwriting_questions_to_risk_factors(text: str) -> str:
-    """Move any 'Key underwriting questions:' line(s) into the Risk Factors section.
+def _relocate_underwriting_questions_to_mdna(text: str) -> str:
+    """Move any 'Key underwriting questions:' line(s) into the MD&A section.
 
-    Rationale: users read underwriting-style padding/questions as part of the narrative
-    section they appear in. If this lands in MD&A, that section becomes overweight.
-    By relocating into Risk Factors, the memo reads more evenly distributed.
+    Rationale: underwriting-style prompts read like strategy/earnings-quality commentary.
+    The user prefers Risk Factors to stay concise while MD&A carries more narrative weight.
 
     This function is idempotent.
     """
@@ -1766,13 +1943,20 @@ def _relocate_underwriting_questions_to_risk_factors(text: str) -> str:
 
     underwriting_line = f"Key underwriting questions: {merged_payload}".strip()
 
-    # Insert into the Risk Factors section (if present), otherwise place it right
-    # before Key Metrics (or at end) as a safe fallback.
+    # Insert into the MD&A section (if present), otherwise place it before Risk Factors,
+    # then before Key Metrics, then at end as a last resort.
     is_heading = lambda l: bool(re.match(r"^\s*##\s+", l))
+    mdna_idx: Optional[int] = None
     risk_idx: Optional[int] = None
     key_metrics_idx: Optional[int] = None
 
     for idx, line in enumerate(cleaned_lines):
+        if mdna_idx is None and re.match(
+            r"^\s*##\s*Management\s+Discussion\s*(?:&|and)\s*Analysis\b",
+            line,
+            re.IGNORECASE,
+        ):
+            mdna_idx = idx
         if risk_idx is None and re.match(r"^\s*##\s*Risk\s+Factors\b", line, re.IGNORECASE):
             risk_idx = idx
         if key_metrics_idx is None and re.match(
@@ -1782,8 +1966,12 @@ def _relocate_underwriting_questions_to_risk_factors(text: str) -> str:
         ):
             key_metrics_idx = idx
 
-    if risk_idx is None:
-        insert_at = key_metrics_idx if key_metrics_idx is not None else len(cleaned_lines)
+    if mdna_idx is None:
+        insert_at = (
+            risk_idx
+            if risk_idx is not None
+            else (key_metrics_idx if key_metrics_idx is not None else len(cleaned_lines))
+        )
         # Ensure a clean paragraph break.
         while insert_at > 0 and cleaned_lines[insert_at - 1].strip() == "":
             insert_at -= 1
@@ -1793,16 +1981,16 @@ def _relocate_underwriting_questions_to_risk_factors(text: str) -> str:
         rebuilt = re.sub(r"\n{3,}", "\n\n", rebuilt)
         return rebuilt.strip()
 
-    # Find end of Risk Factors section.
+    # Find end of MD&A section.
     end_idx = len(cleaned_lines)
-    for j in range(risk_idx + 1, len(cleaned_lines)):
+    for j in range(mdna_idx + 1, len(cleaned_lines)):
         if is_heading(cleaned_lines[j]):
             end_idx = j
             break
 
     # Insert before end_idx, trimming trailing blank lines inside the section.
     insert_at = end_idx
-    while insert_at > risk_idx + 1 and cleaned_lines[insert_at - 1].strip() == "":
+    while insert_at > mdna_idx + 1 and cleaned_lines[insert_at - 1].strip() == "":
         insert_at -= 1
 
     insertion = ["", underwriting_line, ""]
@@ -1859,7 +2047,12 @@ def _merge_underwriting_question_lines(text: str) -> str:
 
 
 def _generate_padding_sentences(
-    required_words: int, *, exclude_norms: Optional[set[str]] = None
+    required_words: int,
+    *,
+    exclude_norms: Optional[set[str]] = None,
+    section: Optional[str] = None,
+    is_persona: bool = False,
+    exclude_risk_names: Optional[set[str]] = None,
 ) -> List[str]:
     """Generate concise, finance-relevant padding sentences to reach required word counts."""
     if required_words <= 0:
@@ -1867,56 +2060,102 @@ def _generate_padding_sentences(
 
     # IMPORTANT:
     # Padding is a LAST-RESORT safety net to satisfy strict word floors.
-    # It must preserve narrative flow and NOT look like a stack of random slogans.
-    # So we use a small set of cohesive, connective sentences (not 4–6 word fragments).
-    # NOTE: We keep a *large* pool of templates so that, even after sentence
-    # de-duplication passes, we can still add meaningful word count without
-    # repeating the same 2–3 lines (which users perceive as low quality).
+    # It must preserve narrative flow and match the document voice (persona vs neutral).
     #
-    # Also avoid common directive verbs (Monitor/Track/Watch/Compare/Evaluate/etc.)
-    # because downstream filler scrubbing treats those as low-signal imperatives.
-    templates = [
-        "Cash conversion is the key bridge between earnings and intrinsic value.",
-        "Margin durability depends on pricing power and disciplined reinvestment.",
-        "Working-capital swings can overstate performance when demand is softening.",
-        "Capex intensity matters because it determines how much revenue converts to cash.",
-        "Leverage matters most when growth slows and refinancing windows tighten.",
-        "Guidance quality shows up in cash, not just adjusted EPS.",
-        "Returns on invested capital are the cleanest signal of moat durability.",
-        "Recurring adjustments reduce confidence in the true earnings base.",
-        "If costs rise faster than price, margins can compress quickly.",
-        "Inventory builds can foreshadow discounting and weaker cash conversion.",
-        "That leaves the key question: do profits convert to durable free cash flow across a full cycle?",
-        "The underwriting hinge is earnings quality: discount one-offs and stress cash conversion through working-capital timing and capex needs.",
-        "Durability matters: pricing power and reinvestment discipline should support margins as competitive intensity and regulation evolve.",
-        "The main bear path is margin pressure plus higher reinvestment, flattening free cash flow even if revenue holds up.",
-        "Balance-sheet flexibility matters because it determines whether the company can keep investing through a downturn without dilution.",
-        "If reported earnings outpace cash generation, working-capital timing and capex intensity deserve extra scrutiny before underwriting the run-rate.",
-        "It is worth separating organic operating momentum from accounting noise, especially when stock-based compensation, FX, or restructuring items swing earnings.",
-        "Cash conversion deserves a separate lens because working-capital timing can mask weaker demand or channel inventory adjustments.",
-        "If capex is rising, the question is whether incremental spend expands capacity efficiently or merely maintains competitive parity.",
-        "Margin resilience hinges on mix and pricing, so product and region shifts can matter more than headline growth when competition heats up.",
-        "When revenue growth slows, operating leverage becomes the tell; fixed-cost absorption can turn modest deceleration into outsized profit compression.",
-        "A robust thesis usually requires both balance-sheet resilience and a credible path to self-funded growth, not perpetual reliance on external capital.",
-        "If buybacks are present, the value creation depends on repurchases being funded by free cash flow and executed at prices below intrinsic value.",
-        "Debt capacity is only as good as covenant headroom and maturity timing; short-dated refinancing needs amplify downside in volatile rate environments.",
-        "Guidance credibility often shows up in cash flow, not adjusted EPS, because cash reveals the true cost of growth and customer acquisition.",
-        "Customer concentration and platform dependencies can be material even in strong growth stories, since a single contract loss can reset forward expectations.",
-        "Regulatory and litigation exposure often hits margins indirectly through compliance spend and product constraints rather than as clean one-time charges.",
-        "For cyclical end markets, the key is normalized earnings: results at peak demand can overstate mid-cycle margins and cash generation.",
-        "If inventory and receivables are swelling, it can signal weaker demand pull-through, looser credit terms, or channel stuffing that reverses later.",
-        "Share-based compensation and capitalized costs can flatter near-term profitability while shifting the economic cash cost into future periods.",
-        "If reported EPS beats but cash lags, the gap often sits in working capital, deferred revenue, or other timing items that unwind over quarters.",
-        "Operating margin stability should be judged against reinvestment needs; strong margins that require underinvestment are less durable.",
-        "In R&D-heavy businesses, the economic margin is the one left after sustaining innovation, not the one reported before investment.",
-        "Markets tend to reprice businesses on durability, so structural unit-economics deterioration matters more than a single strong growth quarter.",
-        "The upside case strengthens when incremental revenue carries higher contribution margin, lifting free cash flow margin without a commensurate balance-sheet build.",
-        "Acquisition-driven growth needs an integration lens; synergy targets are real only when they translate into margin and cash conversion, not pro forma adjustments.",
-        "If gross margin is volatile, the driver is usually mix, discounting, or input costs; persistent volatility reduces confidence in the earnings base.",
-        "When management highlights adjusted metrics, reconciliation quality matters; recurring adjustments are effectively part of the ongoing cost structure.",
-        "Tax-rate swings can distort net income; the thesis should rest on operating profits and cash generation that persist regardless of tax timing.",
-        "A durable moat often appears in stable returns on invested capital and pricing discipline, while erosion shows up first in rising customer-acquisition intensity.",
+    # Design goals:
+    # - Avoid dumping standalone generic one-liners as separate paragraphs.
+    # - Avoid repetitive, boilerplate “template” finance slogans users notice.
+    # - Prefer section-aware connective sentences that can be appended seamlessly.
+
+    canon_section = (section or "").strip().lower()
+
+    def _voice(persona: str, neutral: str) -> str:
+        return persona if is_persona else neutral
+
+    def _normalize_risk_name(name: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+
+    def _risk_name_from_template(sentence: str) -> Optional[str]:
+        match = re.match(r"\*\*(.+?)\*\*\s*:", sentence or "")
+        if match:
+            return _normalize_risk_name(match.group(1))
+        return None
+
+    section_templates: Dict[str, List[str]] = {
+        "executive summary": [
+            _voice(
+                "From my perspective, the underwriting swing factor is whether unit economics translate into repeatable cash conversion as growth investments normalize.",
+                "The underwriting swing factor is whether unit economics translate into repeatable cash conversion as growth investments normalize.",
+            ),
+            _voice(
+                "I care most about durability: the thesis improves if incremental margins expand without relying on one-offs or aggressive accounting.",
+                "Durability improves when incremental margins expand without relying on one-offs or aggressive accounting.",
+            ),
+            _voice(
+                "For me, balance-sheet flexibility matters because it determines how aggressively the company can invest through a downturn without compromising optionality.",
+                "Balance-sheet flexibility matters because it determines how aggressively the company can invest through a downturn without compromising optionality.",
+            ),
+        ],
+        "financial performance": [
+            _voice(
+                "I focus on the bridge from operating profit to free cash flow, because that is where working-capital timing and capex show up in earnings quality.",
+                "The bridge from operating profit to free cash flow is where working-capital timing and capex show up in earnings quality.",
+            ),
+            _voice(
+                "If profitability moved, I want to know whether mix and pricing drove it, or whether incentives and cost timing are masking pressure.",
+                "If profitability moved, the key question is whether mix and pricing drove it, or whether incentives and cost timing are masking pressure.",
+            ),
+            _voice(
+                "When revenue, margins, and cash tell the same story, the signal is durable; when they diverge, the sustainability question gets louder.",
+                "When revenue, margins, and cash tell the same story, the signal is durable; when they diverge, the sustainability question gets louder.",
+            ),
+        ],
+        "management discussion and analysis": [
+            _voice(
+                "What I want to see is disciplined reinvestment that shows up in operating leverage, not a spend curve that outpaces the margin profile.",
+                "The key is disciplined reinvestment that shows up in operating leverage, not a spend curve that outpaces the margin profile.",
+            ),
+            _voice(
+                "I read capital allocation as a proxy for confidence: self-funded growth and measured buybacks tend to signal durability better than adjusted narratives.",
+                "Capital allocation is a proxy for confidence: self-funded growth and measured buybacks tend to signal durability better than adjusted narratives.",
+            ),
+            _voice(
+                "The check is whether management’s commentary reconciles cleanly to operating margin and cash flow without leaning on recurring adjustments.",
+                "The check is whether management’s commentary reconciles cleanly to operating margin and cash flow without leaning on recurring adjustments.",
+            ),
+        ],
+        "risk factors": [
+            _voice(
+                "**Earnings Quality Risk**: I worry that reported profitability can look steadier than the cash profile when working capital or capex timing shifts. If cash conversion weakens for multiple quarters, valuation support can erode even if revenue holds up.",
+                "**Earnings Quality Risk**: Reported profitability can look steadier than the cash profile when working capital or capex timing shifts. If cash conversion weakens for multiple quarters, valuation support can erode even if revenue holds up.",
+            ),
+            _voice(
+                "**Margin Compression Risk**: I worry that competitive intensity forces higher incentives or reinvestment, limiting operating leverage. If growth slows at the same time, small cost inflation can translate into outsized profit pressure.",
+                "**Margin Compression Risk**: Competitive intensity can force higher incentives or reinvestment, limiting operating leverage. If growth slows at the same time, small cost inflation can translate into outsized profit pressure.",
+            ),
+        ],
+    }
+
+    fallback_templates = [
+        _voice(
+            "For me, the thread to pull is durability: repeatable cash conversion is more informative than a single strong quarter.",
+            "The thread to pull is durability: repeatable cash conversion is more informative than a single strong quarter.",
+        ),
+        _voice(
+            "I prefer to underwrite the business off operating profitability and cash, because below-the-line items can be noisy quarter to quarter.",
+            "The business is best underwritten off operating profitability and cash, because below-the-line items can be noisy quarter to quarter.",
+        ),
+        _voice(
+            "The risk-reward tends to shift when cash conversion and balance-sheet flexibility move in the same direction as margins.",
+            "The risk-reward tends to shift when cash conversion and balance-sheet flexibility move in the same direction as margins.",
+        ),
     ]
+
+    templates: List[str] = []
+    if canon_section in section_templates:
+        templates.extend(section_templates[canon_section])
+    else:
+        templates.extend(fallback_templates)
 
     def _norm_sentence(s: str) -> str:
         s = (s or "").replace("\u00A0", " ")
@@ -1925,10 +2164,20 @@ def _generate_padding_sentences(
 
     excluded = {(_norm_sentence(s)) for s in (exclude_norms or set()) if s}
 
+    risk_name_blacklist = {
+        _normalize_risk_name(name)
+        for name in (exclude_risk_names or set())
+        if name
+    }
+
     candidates: List[Tuple[int, str]] = []
     for t in templates:
         if excluded and _norm_sentence(t) in excluded:
             continue
+        if canon_section == "risk factors" and risk_name_blacklist:
+            risk_name = _risk_name_from_template(t)
+            if risk_name and risk_name in risk_name_blacklist:
+                continue
         candidates.append((len(t.split()), t))
 
     if not candidates:
@@ -1941,22 +2190,33 @@ def _generate_padding_sentences(
     remaining = required_words
     used: set[str] = set()
 
+    def _stable_pick(options: List[Tuple[int, str]], key: str) -> Tuple[int, str]:
+        if len(options) == 1:
+            return options[0]
+        digest = hashlib.sha256(key.encode("utf-8")).digest()
+        idx = int.from_bytes(digest[:2], "big") % len(options)
+        return options[idx]
+
     # Greedy: pick the smallest sentence that covers the remaining deficit.
-    # This minimizes overshoot and avoids triggering trimming elsewhere.
+    # To avoid repetitive "always the same shortest template", rotate among
+    # same-length candidates using a stable hash.
     while remaining > 0:
+        eligible = [(wc, t) for wc, t in candidates if t not in used and wc >= remaining]
         choice: Optional[Tuple[int, str]] = None
-        for wc, t in candidates:
-            if t in used:
-                continue
-            if wc >= remaining:
-                choice = (wc, t)
-                break
+        if eligible:
+            min_wc = min(wc for wc, _t in eligible)
+            same_size = [(wc, t) for wc, t in eligible if wc == min_wc]
+            choice = _stable_pick(
+                same_size, f"{canon_section}:{is_persona}:{remaining}:{len(used)}"
+            )
         if choice is None:
-            # If nothing is long enough, take the longest unused sentence.
-            for wc, t in reversed(candidates):
-                if t not in used:
-                    choice = (wc, t)
-                    break
+            unused = [(wc, t) for wc, t in candidates if t not in used]
+            if unused:
+                max_wc = max(wc for wc, _t in unused)
+                same_size = [(wc, t) for wc, t in unused if wc == max_wc]
+                choice = _stable_pick(
+                    same_size, f"{canon_section}:{is_persona}:longest:{len(used)}"
+                )
         if choice is None:
             # As a last resort, allow repeats.
             choice = candidates[-1]
@@ -1982,7 +2242,7 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
     summary_text = _strip_length_padding_markers(summary_text)
     summary_text = _normalize_underwriting_questions_formatting(summary_text)
     summary_text = _merge_underwriting_question_lines(summary_text)
-    summary_text = _relocate_underwriting_questions_to_risk_factors(summary_text)
+    summary_text = _relocate_underwriting_questions_to_mdna(summary_text)
 
     # Normalize obvious inline header issues BEFORE we try to locate target sections.
     summary_text = _fix_inline_section_headers(summary_text)
@@ -2016,15 +2276,20 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
         base = summary_text.rstrip()
         if base and not base.endswith((".", "!", "?")):
             base += "."
-        padding_text = " ".join(_generate_padding_sentences(required_words)).strip()
+        is_persona = bool(re.search(r"\b(?:I|my|I'm|I’m)\b", summary_text))
+        padding_text = " ".join(
+            _generate_padding_sentences(
+                required_words, section=None, is_persona=is_persona
+            )
+        ).strip()
         return f"{base}\n\n{padding_text}".strip() if padding_text else base
 
-    # Candidate narrative sections to pad (exclude Health/Key Metrics/Closing).
+    # Candidate narrative sections to pad (exclude Health/Exec Summary/Risk/Key Metrics/Closing).
+    # Padding is a last-resort safety net; avoid stuffing generic sentences into
+    # the hero (Executive Summary) or risk list, where it reads low-quality.
     candidate_order = {
         "management discussion and analysis": 0,
-        "executive summary": 1,
-        "financial performance": 2,
-        "risk factors": 3,
+        "financial performance": 1,
     }
 
     candidates: List[Tuple[int, int, int]] = []  # (word_count, tie_break, section_idx)
@@ -2039,7 +2304,12 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
         base = summary_text.rstrip()
         if base and not base.endswith((".", "!", "?")):
             base += "."
-        padding_text = " ".join(_generate_padding_sentences(required_words)).strip()
+        is_persona = bool(re.search(r"\b(?:I|my|I'm|I’m)\b", summary_text))
+        padding_text = " ".join(
+            _generate_padding_sentences(
+                required_words, section=None, is_persona=is_persona
+            )
+        ).strip()
         return f"{base}\n\n{padding_text}".strip() if padding_text else base
 
     candidates.sort()
@@ -2053,21 +2323,71 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
     remainder = required_words % n_targets
     allocations = [base_alloc + (1 if i < remainder else 0) for i in range(n_targets)]
 
+    # Seed exclusions with existing sentences so repeated padding passes don't
+    # re-insert the same templates (a major perceived-quality regression).
     used_sentences: set[str] = set()
+    for line in summary_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#") or stripped.startswith("→") or stripped.startswith("- "):
+            continue
+        for sent in re.split(r"(?<=[.!?])\s+", stripped):
+            sent = (sent or "").strip()
+            if len(sent.split()) < 5:
+                continue
+            used_sentences.add(sent)
+
+    is_persona = bool(re.search(r"\b(?:I|my|I'm|I’m)\b", summary_text))
+
+    def _extract_risk_names(body: str) -> set[str]:
+        names: set[str] = set()
+        for match in re.finditer(r"\*\*(.+?)\*\*\s*:", body or ""):
+            name = re.sub(r"[^a-z0-9]+", " ", match.group(1).lower()).strip()
+            if name:
+                names.add(name)
+        return names
+
+    def _append_padding_into_body(body: str, pad_text: str, section_name: str) -> str:
+        body = (body or "").strip()
+        pad_text = (pad_text or "").strip()
+        if not pad_text:
+            return body
+        if not body:
+            return pad_text
+        if section_name == "Risk Factors":
+            # Preserve the expected risk-item formatting by keeping a paragraph break.
+            return f"{body}\n\n{pad_text}".strip()
+        cleaned = body.rstrip()
+        # Avoid ending on a dangling dash from earlier formatting mistakes.
+        cleaned = re.sub(r"[-\u2013\u2014]+\s*$", "", cleaned).rstrip()
+        if cleaned and not cleaned.endswith((".", "!", "?")):
+            cleaned += "."
+        return f"{cleaned} {pad_text}".strip()
+
     for alloc, target_idx in zip(allocations, target_section_idxs):
         if alloc <= 0:
             continue
-        pad_sentences = _generate_padding_sentences(alloc, exclude_norms=used_sentences)
+        heading, body = sections[target_idx]
+        canon_title = _standard_section_name_from_heading(heading)
+        risk_name_exclusions = (
+            _extract_risk_names(body) if canon_title == "Risk Factors" else None
+        )
+        pad_sentences = _generate_padding_sentences(
+            alloc,
+            exclude_norms=used_sentences,
+            section=canon_title,
+            is_persona=is_persona,
+            exclude_risk_names=risk_name_exclusions,
+        )
         if not pad_sentences:
             continue
         used_sentences.update(pad_sentences)
         pad_text = " ".join(pad_sentences).strip()
         if not pad_text:
             continue
-        heading, body = sections[target_idx]
-        body = (body or "").strip()
-        separator = "\n\n" if body else ""
-        sections[target_idx] = (heading, f"{body}{separator}{pad_text}".strip())
+        body = _append_padding_into_body(body, pad_text, canon_title)
+        sections[target_idx] = (heading, body.strip())
 
     rebuilt_sections: List[str] = []
     for heading, body in sections:
@@ -2077,7 +2397,7 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
     rebuilt = "\n\n".join(rebuilt_sections).strip()
     rebuilt = _normalize_underwriting_questions_formatting(rebuilt)
     rebuilt = _merge_underwriting_question_lines(rebuilt)
-    rebuilt = _relocate_underwriting_questions_to_risk_factors(rebuilt)
+    rebuilt = _relocate_underwriting_questions_to_mdna(rebuilt)
     return rebuilt
 
 
@@ -2335,25 +2655,49 @@ def _trim_preserving_headings(text: str, max_words: int) -> str:
     current_body_counts = [_count_words(body) for _, body in sections]
 
     # Scale per-section minimums if the user requested an unusually short memo.
-    base_mins = [SUMMARY_SECTION_MIN_WORDS.get(key, 25) for key in section_keys]
-    min_total = sum(base_mins)
-    scaled_mins = base_mins[:]
-    if min_total > available_body_words and min_total > 0:
-        scale = available_body_words / min_total
-        scaled_mins = [max(10, int(m * scale)) for m in base_mins]
-        # Fix rounding overflow
-        overflow = sum(scaled_mins) - available_body_words
-        if overflow > 0:
-            # Reduce from the largest mins first
-            for idx in sorted(range(len(scaled_mins)), key=lambda i: scaled_mins[i], reverse=True):
-                if overflow <= 0:
-                    break
-                reducible = scaled_mins[idx] - 10
-                if reducible <= 0:
-                    continue
-                delta = min(reducible, overflow)
-                scaled_mins[idx] -= delta
-                overflow -= delta
+    # CRITICAL: Protect the "bookends" (Risk Factors + Closing Takeaway) from collapsing
+    # into one-liners during deterministic trimming.
+    include_health_rating = "Financial Health Rating" in section_keys
+    target_mins = _calculate_section_min_words_for_target(
+        available_body_words, include_health_rating=include_health_rating
+    )
+    default_min = max(1, min(10, available_body_words // max(1, len(sections))))
+    scaled_mins = [
+        int(target_mins.get(key, default_min)) for key in section_keys
+    ]
+
+    overflow = sum(scaled_mins) - available_body_words
+    if overflow > 0:
+        # Prefer shrinking unknown/extra sections first.
+        for idx in reversed(range(len(scaled_mins))):
+            if overflow <= 0:
+                break
+            key = section_keys[idx]
+            if key in target_mins:
+                continue
+            reducible = scaled_mins[idx] - 1
+            if reducible <= 0:
+                continue
+            delta = min(reducible, overflow)
+            scaled_mins[idx] -= delta
+            overflow -= delta
+    if overflow > 0:
+        # Last resort: scale all mins proportionally while keeping at least 1 word.
+        total = sum(scaled_mins) or 1
+        scale = available_body_words / total
+        scaled_mins = [max(1, int(m * scale)) for m in scaled_mins]
+        drift = available_body_words - sum(scaled_mins)
+        if drift != 0 and scaled_mins:
+            step = 1 if drift > 0 else -1
+            remaining = abs(drift)
+            idx = 0
+            while remaining > 0 and idx < 10_000:
+                i = idx % len(scaled_mins)
+                next_val = scaled_mins[i] + step
+                if next_val >= 1:
+                    scaled_mins[i] = next_val
+                    remaining -= 1
+                idx += 1
 
     # Allocate target body words per section using the same proportional weights we
     # communicate to the model. This prevents the trim step from crushing Executive
@@ -2649,8 +2993,8 @@ def _rewrite_summary_to_length(
                 f"{health_cut_line}"
                 "   - Executive Summary: ~15% of cuts\n"
                 "   - Financial Performance: ~20% of cuts\n"
-                "   - Management Discussion & Analysis: ~20% of cuts\n"
-                "   - Risk Factors: ~15% of cuts\n"
+                "   - Management Discussion & Analysis: ~30% of cuts\n"
+                "   - Risk Factors: ~8% of cuts\n"
                 "   - Key Metrics: ~5% of cuts\n"
                 "   - Closing Takeaway: ~10% of cuts (KEEP AT LEAST 50 words)\n"
                 "3. DO NOT take all cuts from one section (especially Closing Takeaway).\n"
@@ -2665,9 +3009,9 @@ def _rewrite_summary_to_length(
                 f"ACTION: EXPAND the content NOW. You MUST add AT LEAST {int(words_needed * 1.3)} words.\n\n"
                 f"MANDATORY EXPANSION (add exactly these words per section):\n"
                 f"- Financial Performance: Add {max(5, int(words_needed * 0.30))} words (deeper margin analysis, YoY comparisons)\n"
-                f"- Management Discussion & Analysis: Add {max(5, int(words_needed * 0.35))} words (strategy, capital allocation, execution risks)\n"
-                f"- Risk Factors: Add {max(5, int(words_needed * 0.20))} words (specific scenarios with probability/impact)\n"
-                f"- Executive Summary: Add {max(3, int(words_needed * 0.10))} words (conviction rationale)\n"
+                f"- Management Discussion & Analysis: Add {max(5, int(words_needed * 0.45))} words (strategy, capital allocation, earnings-quality reconciliation)\n"
+                f"- Risk Factors: Add {max(5, int(words_needed * 0.10))} words (only the 2-3 most material risks)\n"
+                f"- Executive Summary: Add {max(3, int(words_needed * 0.15))} words (conviction rationale)\n"
                 "DO NOT add narrative to Key Metrics; keep it a scannable data block.\n\n"
                 f"DO NOT use generic filler sentences. Add SUBSTANTIVE analysis with specific data points.\n"
                 f"You MUST reach at least {lower} words. Count your words before finishing."
@@ -2863,6 +3207,8 @@ def _enforce_length_constraints(
         # expand the *real sections* (Exec Summary / Financial Performance / Risk Factors)
         # via a rewrite, otherwise the memo becomes lopsided (e.g. all length stuffed
         # into MD&A) and users perceive it as filler.
+        # For very small shortfalls, deterministic padding is acceptable as a last resort.
+        # (We keep the padding templates intentionally neutral to avoid out-of-context lines.)
         SMALL_PADDING_THRESHOLD = 25
 
         if shortfall <= SMALL_PADDING_THRESHOLD:
@@ -3117,6 +3463,8 @@ def _generate_summary_with_quality_control(
             # Do NOT paper over large deficits with deterministic padding. That creates
             # visibly low-quality filler and can make one section (often MD&A) dominate.
             # Use a final expansion call when the shortfall is material.
+            # For very small shortfalls, deterministic padding is acceptable as a last resort.
+            # (We keep the padding templates intentionally neutral to avoid out-of-context lines.)
             SMALL_PADDING_THRESHOLD = 25
 
             if shortfall <= SMALL_PADDING_THRESHOLD:
@@ -3198,6 +3546,8 @@ def _generate_summary_with_quality_control(
             token_budget=token_budget,
             max_output_tokens=max_output_tokens,
         )
+        # Final deterministic guardrail to land in the strict band.
+        # NOTE: Padding is only used if we're short; templates are intentionally neutral.
         summary_text = _force_final_band(summary_text, target_length, tolerance=10)
 
     return summary_text
@@ -3242,16 +3592,19 @@ def _validate_mdna_section(text: str) -> Optional[str]:
 
 
 SUMMARY_SECTION_REQUIREMENTS: List[Tuple[str, int]] = [
-    ("Financial Health Rating", 40),
-    ("Executive Summary", 80),  # Verdict + framing (keep crisp)
-    ("Financial Performance", 95),  # Depth on the numbers that matter
+    # Higher-quality flow requires a slightly longer opening health context and
+    # a longer, more reasoned closing verdict. Keep total base mins aligned with
+    # the default target length (currently ~550 words).
+    ("Financial Health Rating", 65),
+    ("Executive Summary", 90),  # Verdict + framing (keep crisp, avoid bloat)
+    ("Financial Performance", 100),  # Depth on the numbers that matter
     (
         "Management Discussion & Analysis",
-        140,
-    ),  # Keep meaningful but do not let MD&A dominate the memo
-    ("Risk Factors", 110),  # Ensure risks are not underweight
-    ("Key Metrics", 35),
-    ("Closing Takeaway", 50),  # Concise verdict with personal buy/hold/sell opinion
+        125,
+    ),  # Expanded MD&A to reflect management strategy and capital allocation
+    ("Risk Factors", 65),  # Specific risks, but avoid generic one-liners
+    ("Key Metrics", 30),
+    ("Closing Takeaway", 75),  # Longer, reasoned verdict and what changes the view
 ]
 SUMMARY_SECTION_MIN_WORDS = {
     title: minimum for title, minimum in SUMMARY_SECTION_REQUIREMENTS
@@ -3262,14 +3615,16 @@ SUMMARY_SECTION_MIN_WORDS = {
 # Sum = 100 (percentages)
 # Executive Summary is the HERO section - the premium insight users pay for
 SECTION_PROPORTIONAL_WEIGHTS: Dict[str, int] = {
-    # Goal: more even distribution across the four core narrative sections.
-    "Financial Health Rating": 5,
-    "Executive Summary": 20,
-    "Financial Performance": 20,
+    # Goal: strong narrative flow with a substantive opening health context and a
+    # complete closing verdict. Keep MD&A the largest section but avoid starving
+    # the bookends (Health + Closing) under strict length bands.
+    "Financial Health Rating": 12,
+    "Executive Summary": 17,
+    "Financial Performance": 17,
     "Management Discussion & Analysis": 20,
-    "Risk Factors": 20,
-    "Key Metrics": 5,
-    "Closing Takeaway": 10,
+    "Risk Factors": 11,
+    "Key Metrics": 8,
+    "Closing Takeaway": 15,
 }
 
 
@@ -3294,6 +3649,10 @@ def _calculate_section_word_budgets(
         sections_to_use = [
             s for s in sections_to_use if s != "Financial Health Rating"
         ]
+    section_count = max(1, len(sections_to_use))
+    # Minimum words per section must adapt to very short targets (schema allows >=50).
+    # If we hard-floor at 10 words/section we can exceed the target and deadlock drift fixes.
+    min_per_section = max(1, min(10, target_length // section_count))
 
     # Start from minimums.
     mins: Dict[str, int] = {
@@ -3302,12 +3661,79 @@ def _calculate_section_word_budgets(
     }
     min_total = sum(mins.values())
 
-    # If minimums alone exceed the target, scale them down proportionally.
-    # (This can happen for very short targets, e.g. 200 words.)
+    # If minimums alone exceed the target, scale them down.
+    # For short memos, protect the bookends (Risk Factors + Closing Takeaway) so they
+    # don't collapse into one-liners, which users perceive as low quality.
     if min_total >= target_length and min_total > 0:
+        if target_length <= 450:
+            protected: Dict[str, int] = {}
+
+            def _floor(value: int) -> int:
+                return max(min_per_section, int(value))
+
+            if "Risk Factors" in sections_to_use:
+                protected["Risk Factors"] = _floor(max(45, int(target_length * 0.18)))
+            if "Closing Takeaway" in sections_to_use:
+                protected["Closing Takeaway"] = _floor(
+                    max(45, int(target_length * 0.18))
+                )
+            if "Key Metrics" in sections_to_use:
+                protected["Key Metrics"] = _floor(max(10, int(target_length * 0.06)))
+
+            remaining_words = target_length - sum(protected.values())
+            if remaining_words > 0:
+                remaining_sections = [
+                    s for s in sections_to_use if s not in protected
+                ]
+                remaining_min_total = sum(mins[s] for s in remaining_sections) or len(
+                    remaining_sections
+                )
+                scaled: Dict[str, int] = dict(protected)
+                for section in remaining_sections:
+                    # Scale remaining sections proportionally to their baseline mins.
+                    scaled[section] = _floor(
+                        int(mins[section] * remaining_words / remaining_min_total)
+                    )
+
+                diff = target_length - sum(scaled.values())
+                if diff != 0:
+                    # Adjust non-protected sections first, then protected if needed.
+                    adjustment_order = [
+                        s
+                        for s in sorted(
+                            remaining_sections,
+                            key=lambda s: SECTION_PROPORTIONAL_WEIGHTS.get(s, 10),
+                            reverse=True,
+                        )
+                        if s in scaled
+                    ] + [s for s in sections_to_use if s in protected]
+
+                    step = 1 if diff > 0 else -1
+                    remaining = abs(diff)
+                    idx = 0
+                    stagnant = 0
+                    while remaining > 0 and adjustment_order and stagnant < len(
+                        adjustment_order
+                    ):
+                        section = adjustment_order[idx % len(adjustment_order)]
+                        next_val = scaled.get(section, 0) + step
+                        if next_val >= min_per_section:
+                            scaled[section] = next_val
+                            remaining -= 1
+                            stagnant = 0
+                        else:
+                            stagnant += 1
+                        idx += 1
+
+                # Final guard: ensure exact sum (best-effort without violating floors).
+                if sum(scaled.values()) == target_length:
+                    return scaled
+
+        # Default behavior: scale all sections uniformly.
         scale = target_length / min_total
         scaled: Dict[str, int] = {
-            section: max(10, int(mins[section] * scale)) for section in sections_to_use
+            section: max(min_per_section, int(mins[section] * scale))
+            for section in sections_to_use
         }
         # Fix rounding drift to land exactly on target_length.
         diff = target_length - sum(scaled.values())
@@ -3321,12 +3747,16 @@ def _calculate_section_word_budgets(
             step = 1 if diff > 0 else -1
             remaining = abs(diff)
             idx = 0
-            while remaining > 0 and order:
+            stagnant = 0
+            while remaining > 0 and order and stagnant < len(order):
                 section = order[idx % len(order)]
                 next_val = scaled[section] + step
-                if next_val >= 10:
+                if next_val >= min_per_section:
                     scaled[section] = next_val
                     remaining -= 1
+                    stagnant = 0
+                else:
+                    stagnant += 1
                 idx += 1
         return scaled
 
@@ -3376,6 +3806,63 @@ def _calculate_section_word_budgets(
     return budgets
 
 
+def _calculate_section_min_words_for_target(
+    target_length: Optional[int],
+    *,
+    include_health_rating: bool,
+) -> Dict[str, int]:
+    """
+    Compute target-aware per-section *minimum* word counts.
+
+    Why: The backend supports short targets (frontend defaults to ~300 words). If we
+    enforce static minimums (built for longer memos), generation becomes unsatisfiable
+    and post-processing ends up trimming/padding in ways that drop sections (often
+    Risk Factors) or create lopsided length distribution.
+    """
+    base_mins = dict(SUMMARY_SECTION_MIN_WORDS)
+    if not include_health_rating:
+        base_mins.pop("Financial Health Rating", None)
+
+    if not target_length or target_length <= 0:
+        return base_mins
+
+    budgets = _calculate_section_word_budgets(
+        target_length, include_health_rating=include_health_rating
+    )
+    if not budgets:
+        return base_mins
+
+    mins: Dict[str, int] = {}
+    for section, raw_budget in budgets.items():
+        budget = int(raw_budget or 0)
+        if budget <= 0:
+            continue
+
+        base_min = int(base_mins.get(section, 25))
+
+        if section == "Key Metrics":
+            ratio_min = max(3, int(budget * 0.40))
+        elif section in {"Risk Factors", "Closing Takeaway"}:
+            # These are the "bookends" users remember; keep them substantive even
+            # for short targets where other sections must compress.
+            ratio_min = max(10, int(budget * 0.85))
+        elif section == "Financial Health Rating":
+            ratio_min = max(3, int(budget * 0.50))
+        else:
+            ratio_min = max(3, int(budget * 0.50))
+
+        if budget < base_min:
+            mins[section] = max(3, min(budget, ratio_min))
+        else:
+            mins[section] = max(base_min, ratio_min)
+
+    # Ensure every expected section has some minimum (fallback to base mins).
+    for section, base_min in base_mins.items():
+        mins.setdefault(section, int(base_min))
+
+    return mins
+
+
 def _format_section_word_budgets(
     target_length: int,
     include_health_rating: bool = True,
@@ -3405,6 +3892,7 @@ def _format_section_word_budgets(
             "IMPORTANT:",
             "- These are TARGET budgets, not hard limits",
             "- If you need to reduce length, reduce EACH section proportionally",
+            "- Protect Key Metrics and the Closing Takeaway; trim longer narrative sections first if needed",
             "- The Closing Takeaway should be a COMPLETE verdict (50-80 words typical)",
             "- Do NOT sacrifice one section to make room for another",
             "=== END SECTION WORD BUDGETS ===",
@@ -3425,7 +3913,9 @@ RATING_SCALE = [
 ]
 
 
-def _make_section_completeness_validator(include_health_rating: bool):
+def _make_section_completeness_validator(
+    include_health_rating: bool, target_length: Optional[int] = None
+):
     required_titles: List[Tuple[str, int]] = [
         (title, minimum)
         for title, minimum in SUMMARY_SECTION_REQUIREMENTS
@@ -3435,6 +3925,17 @@ def _make_section_completeness_validator(include_health_rating: bool):
         required_titles = SUMMARY_SECTION_REQUIREMENTS
 
     ordered_titles = [title for title, _ in required_titles]
+    min_words_by_section: Dict[str, int] = {
+        title: int(SUMMARY_SECTION_MIN_WORDS.get(title, 25)) for title in ordered_titles
+    }
+    if target_length and target_length > 0:
+        scaled_mins = _calculate_section_min_words_for_target(
+            target_length, include_health_rating=include_health_rating
+        )
+        min_words_by_section = {
+            title: int(scaled_mins.get(title, min_words_by_section.get(title, 25)))
+            for title in ordered_titles
+        }
 
     def _validator(text: str) -> Optional[str]:
         lower_text = text.lower()
@@ -3456,13 +3957,239 @@ def _make_section_completeness_validator(include_health_rating: bool):
                     break
             section_body = text[section_start:next_section_index].strip()
             word_count = len(re.findall(r"\b\w+\b", section_body))
-            min_words = SUMMARY_SECTION_MIN_WORDS.get(title, 25)
+            min_words = int(min_words_by_section.get(title, 25))
             if word_count < min_words:
                 return (
                     f"The '{title}' section is too brief ({word_count} words). Expand it to at least {min_words} words "
                     "and ensure it concludes on a full sentence."
                 )
             search_start = section_start
+        return None
+
+    return _validator
+
+
+def _make_section_balance_validator(include_health_rating: bool, target_length: int):
+    """
+    Validate that section lengths are reasonably proportional to the target budgets.
+
+    This protects against a common failure mode: the model spends too many words early,
+    then compresses or drops later sections (especially Risk Factors) to satisfy the
+    strict total word band.
+    """
+    budgets = _calculate_section_word_budgets(
+        target_length, include_health_rating=include_health_rating
+    )
+    lower = target_length - 10
+    upper = target_length + 10
+
+    required_titles: List[Tuple[str, int]] = [
+        (title, minimum)
+        for title, minimum in SUMMARY_SECTION_REQUIREMENTS
+        if title != "Financial Health Rating"
+    ]
+    if include_health_rating:
+        required_titles = SUMMARY_SECTION_REQUIREMENTS
+
+    ordered_titles = [title for title, _ in required_titles]
+
+    def _validator(text: str) -> Optional[str]:
+        lower_text = text.lower()
+        search_start = 0
+
+        for idx, title in enumerate(ordered_titles):
+            heading_token = f"## {title.lower()}"
+            match_index = lower_text.find(heading_token, search_start)
+            if match_index == -1:
+                # Let the completeness validator produce the canonical error message,
+                # but return something sensible if called standalone.
+                return f"Missing the heading '## {title}'."
+
+            section_start = match_index + len(heading_token)
+            next_section_index = len(text)
+            for future_title in ordered_titles[idx + 1 :]:
+                future_pos = lower_text.find(f"## {future_title.lower()}", section_start)
+                if future_pos != -1:
+                    next_section_index = future_pos
+                    break
+
+            section_body = text[section_start:next_section_index].strip()
+            word_count = len(re.findall(r"\b\w+\b", section_body))
+
+            expected = int(budgets.get(title, 0) or 0)
+            if expected <= 0:
+                search_start = section_start
+                continue
+
+            # Wide bounds to avoid excessive retries, but still catch lopsided drafts.
+            if title in {"Key Metrics", "Financial Health Rating"}:
+                min_allowed = max(3, int(expected * 0.30))
+                max_allowed = max(min_allowed, int(expected * 2.50))
+            else:
+                min_allowed = max(3, int(expected * 0.55))
+                max_allowed = max(min_allowed, int(expected * 1.75))
+
+            if word_count < min_allowed:
+                return (
+                    f"Section balance issue: '{title}' is underweight ({word_count} words vs ~{expected}). "
+                    f"Expand it and shorten other sections proportionally so the memo stays within {lower}-{upper} words."
+                )
+            if word_count > max_allowed:
+                return (
+                    f"Section balance issue: '{title}' is overweight ({word_count} words vs ~{expected}). "
+                    f"Tighten it and reallocate words to the shorter sections (especially Risk Factors), "
+                    f"while staying within {lower}-{upper} words."
+                )
+
+            search_start = section_start
+
+        return None
+
+    return _validator
+
+
+def _extract_markdown_section_body(text: str, title: str) -> Optional[str]:
+    if not text or not title:
+        return None
+    pattern = re.compile(
+        rf"^\s*##\s*{re.escape(title)}\s*\n+(.*?)(?=^\s*##\s|\Z)",
+        re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    match = pattern.search(text)
+    return match.group(1).strip() if match else None
+
+
+def _count_numeric_tokens(text: str) -> int:
+    if not text:
+        return 0
+    # Tokens that contain at least one digit (captures FY24, 10-K, $9.2B, 1.5x, 36.2%, etc.)
+    return len(re.findall(r"\b[\w$€£]*\d[\w%/.\-]*\b", text))
+
+
+def _make_numbers_discipline_validator(target_length: Optional[int]) -> Callable[[str], Optional[str]]:
+    max_exec = 8 if (target_length or 0) >= 600 else 6
+    max_closing = 4 if (target_length or 0) >= 600 else 3
+
+    def _validator(text: str) -> Optional[str]:
+        exec_body = _extract_markdown_section_body(text, "Executive Summary")
+        if exec_body:
+            exec_nums = _count_numeric_tokens(exec_body)
+            if exec_nums > max_exec:
+                return (
+                    f"Numbers discipline: Executive Summary is too numeric ({exec_nums} numeric tokens). "
+                    "Keep it mostly qualitative with only 1-2 anchor figures; move dense metrics to Financial Performance / Key Metrics."
+                )
+
+        closing_body = _extract_markdown_section_body(text, "Closing Takeaway")
+        if closing_body:
+            closing_nums = _count_numeric_tokens(closing_body)
+            if closing_nums > max_closing:
+                return (
+                    f"Numbers discipline: Closing Takeaway is too numeric ({closing_nums} numeric tokens). "
+                    "Synthesize the narrative and keep numbers minimal; focus on verdict + what would change the view."
+                )
+
+        return None
+
+    return _validator
+
+
+def _make_closing_recommendation_validator(
+    *, persona_requested: bool, company_name: str
+) -> Callable[[str], Optional[str]]:
+    def _validator(text: str) -> Optional[str]:
+        closing_body = _extract_markdown_section_body(text, "Closing Takeaway")
+        if not closing_body:
+            return None
+        if not re.search(r"\b(buy|hold|sell)\b", closing_body, re.IGNORECASE):
+            voice = "first-person" if persona_requested else "third-person"
+            return (
+                "Closing Takeaway is missing an explicit Buy/Hold/Sell recommendation. "
+                f"Add a clear {voice} recommendation sentence that mentions {company_name}."
+            )
+        return None
+
+    return _validator
+
+
+def _make_risk_specificity_validator(
+    *, risk_factors_excerpt: Optional[str]
+) -> Callable[[str], Optional[str]]:
+    excerpt_raw = risk_factors_excerpt or ""
+    excerpt_norm = " ".join(excerpt_raw.split()).lower()
+
+    def _norm_for_search(value: str) -> str:
+        cleaned = re.sub(r"[^a-z0-9]+", " ", (value or "").lower())
+        return " ".join(cleaned.split())
+
+    excerpt_search = _norm_for_search(excerpt_raw)
+
+    risk_item_pattern = re.compile(
+        r"\*\*(?P<name>[^*]{2,120})\*\*\s*:\s*(?P<body>.+?)(?=(?:\n\s*\*\*[^*]+\*\*\s*:)|\Z)",
+        re.DOTALL,
+    )
+
+    quote_pattern = re.compile(r"[\"“](.+?)[\"”]")
+
+    def _has_grounded_quote(body: str) -> bool:
+        if not excerpt_norm:
+            return True
+        if not body:
+            return False
+        for match in quote_pattern.finditer(body):
+            quote = " ".join((match.group(1) or "").split())
+            if not quote:
+                continue
+            word_count = len(quote.split())
+            if word_count < 4 or word_count > 12:
+                continue
+            quote_search = _norm_for_search(quote)
+            if quote_search and quote_search in excerpt_search:
+                return True
+        return False
+
+    def _validator(text: str) -> Optional[str]:
+        risk_body = _extract_markdown_section_body(text, "Risk Factors")
+        if not risk_body:
+            return None
+
+        items = list(risk_item_pattern.finditer(risk_body))
+        if len(items) < 2:
+            return (
+                "Risk Factors are not in the required format. Provide 2-3 risks using: "
+                "**Risk Name**: 2-3 sentences with company-specific mechanisms."
+            )
+
+        seen_names: set[str] = set()
+        grounded_quotes = 0
+
+        for match in items:
+            name = (match.group("name") or "").strip()
+            body = (match.group("body") or "").strip()
+            canon = _canonicalize_section_title(name)
+            if canon in seen_names:
+                return "Risk Factors contain duplicate risk names. Use distinct, non-overlapping drivers."
+            seen_names.add(canon)
+
+            if len(body.split()) < 18:
+                return (
+                    f"Risk Factors are too thin under '{name}'. Expand each risk to 2-3 substantive sentences with a clear mechanism."
+                )
+
+            if not re.search(r"\d", body):
+                return (
+                    f"Risk Factors under '{name}' must include at least one numeric anchor from this memo (%, $, ratio) to quantify impact."
+                )
+
+            if excerpt_norm and _has_grounded_quote(body):
+                grounded_quotes += 1
+
+        if excerpt_norm and grounded_quotes < min(2, len(items)):
+            return (
+                "Risk Factors are too generic relative to the filing text. "
+                "For at least two risks, include a short verbatim quote (4-10 words) from the provided RISK FACTORS excerpt in quotation marks."
+            )
+
         return None
 
     return _validator
@@ -3654,6 +4381,7 @@ CRITICAL COMPLETENESS INSTRUCTION:
         """
 === FLOW AND QUALITY REQUIREMENTS ===
 - Ensure each section transitions naturally to the next. The summary should read as a cohesive document.
+- Avoid one-sentence paragraphs in narrative sections (Health/Exec/Financial Performance/MD&A/Closing). Use 2-4 sentence paragraphs for flow.
 - NEVER repeat the same sentence or phrase anywhere in the summary. Each point should be made ONCE.
 - Vary your sentence structure and openings to maintain reader engagement.
 - The Financial Health Rating section should flow naturally into the Executive Summary.
@@ -3855,7 +4583,7 @@ def _build_health_rating_instructions(
                 f"CORRECT FORMAT EXAMPLE:",
                 f"'{company_name} receives a Financial Health Rating of 78/100 - Healthy. The score reflects strong profitability ",
                 f"with a 56% net margin and robust free cash flow generation of $22B. The balance sheet is conservatively managed ",
-                f"with minimal debt relative to cash holdings. However, under a value-investor lens, customer concentration and cyclical demand patterns could ",
+	                f"with minimal debt relative to cash holdings. However, the score stays conservative because customer concentration and cyclical demand patterns could ",
                 f"pressure durability and justify some caution. The score would be higher if those risks were lower and cash conversion remained consistently strong.'",
                 "",
                 "FORBIDDEN: Just writing '{company_name} receives a Financial Health Rating of 78/100 - Healthy.' and stopping.",
@@ -4297,6 +5025,33 @@ def _load_document_excerpt(path: Path, limit: Optional[int] = None) -> str:
         )
 
     return "\n\n".join(sections)
+
+
+def _extract_labeled_excerpt(
+    document_text: str, label: str, *, max_chars: int = 15_000
+) -> Optional[str]:
+    """Extract a labeled section from `_load_document_excerpt()` output.
+
+    The excerpt loader joins blocks like:
+      "RISK FACTORS\\n...\\n\\nMANAGEMENT DISCUSSION & ANALYSIS\\n..."
+
+    This helper pulls the requested block and truncates it to `max_chars`.
+    """
+    if not document_text or not label:
+        return None
+
+    pattern = re.compile(
+        rf"(?ms)^\s*{re.escape(label)}\s*\n([\s\S]*?)(?=\n\n[A-Z][A-Z &]+\n|\Z)"
+    )
+    match = pattern.search(document_text)
+    if not match:
+        return None
+    excerpt = (match.group(1) or "").strip()
+    if not excerpt:
+        return None
+    if max_chars and max_chars > 0 and len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars].rstrip()
+    return excerpt
 
 
 def _extract_latest_numeric(line_item: Any) -> Optional[float]:
@@ -4964,6 +5719,71 @@ def _inject_health_drivers(
     return "\n".join(lines).strip()
 
 
+def _build_health_score_line(
+    company_name: str,
+    score: float,
+    band_label: Optional[str],
+    calculated_metrics: Dict[str, Any],
+    *,
+    health_rating_config: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build the health score opener with specific driver context when available."""
+    band_text = f" - {band_label}" if band_label else ""
+    reasons: List[str] = []
+
+    operating_margin = calculated_metrics.get("operating_margin")
+    net_margin = calculated_metrics.get("net_margin")
+    free_cash_flow = calculated_metrics.get("free_cash_flow")
+    operating_cash_flow = calculated_metrics.get("operating_cash_flow")
+    cash = calculated_metrics.get("cash")
+    liabilities = calculated_metrics.get("total_liabilities")
+
+    if operating_margin is not None:
+        reasons.append(f"operating margin of {operating_margin:.1f}%")
+    elif net_margin is not None:
+        reasons.append(f"net margin of {net_margin:.1f}%")
+
+    if free_cash_flow is not None:
+        fcf_str = _format_dollar(free_cash_flow)
+        if fcf_str:
+            reasons.append(f"free cash flow of {fcf_str}")
+    elif operating_cash_flow is not None:
+        ocf_str = _format_dollar(operating_cash_flow)
+        if ocf_str:
+            reasons.append(f"operating cash flow of {ocf_str}")
+
+    cash_str = _format_dollar(cash) if cash is not None else None
+    liab_str = _format_dollar(liabilities) if liabilities is not None else None
+    if cash_str and liab_str:
+        if cash and liabilities and cash > liabilities:
+            reasons.append(
+                f"net cash position ({cash_str} cash vs {liab_str} liabilities)"
+            )
+        else:
+            reasons.append(f"{liab_str} liabilities against {cash_str} cash")
+    elif liab_str:
+        reasons.append(f"{liab_str} liabilities")
+    elif cash_str:
+        reasons.append(f"{cash_str} cash on hand")
+
+    if reasons:
+        if len(reasons) >= 3:
+            reasons_text = ", ".join(reasons[:2]) + f", and {reasons[2]}"
+        elif len(reasons) == 2:
+            reasons_text = " and ".join(reasons)
+        else:
+            reasons_text = reasons[0]
+        return (
+            f"{company_name} receives a Financial Health Rating of {score:.0f}/100{band_text} "
+            f"because {reasons_text}."
+        )
+
+    return (
+        f"{company_name} receives a Financial Health Rating of {score:.0f}/100{band_text} "
+        "based on profitability, cash conversion, and balance sheet resilience."
+    )
+
+
 def _ensure_health_rating_section(
     summary_text: str,
     health_score_data: Dict[str, Any],
@@ -4982,6 +5802,19 @@ def _ensure_health_rating_section(
     if score is None:
         return summary_text
 
+    def _score_to_band(score_val: float) -> str:
+        for threshold, _abbr, label in RATING_SCALE:
+            if score_val >= threshold:
+                return label
+        return "At Risk"
+
+    band_label = (band or "").strip()
+    if not band_label:
+        try:
+            band_label = _score_to_band(float(score))
+        except Exception:
+            band_label = ""
+
     heading_pattern = re.compile(
         r"^\s*##\s*Financial Health Rating\b", re.IGNORECASE | re.MULTILINE
     )
@@ -4990,14 +5823,19 @@ def _ensure_health_rating_section(
         re.IGNORECASE,
     )
 
-    band_text = f" - {band}" if band else ""
-    score_line = (
-        f"{company_name} receives a Financial Health Rating of {score:.0f}/100{band_text} "
-        "based on profitability, cash conversion, and balance sheet resilience."
+    score_line = _build_health_score_line(
+        company_name,
+        float(score),
+        band_label,
+        calculated_metrics,
+        health_rating_config=health_rating_config,
     )
+    health_data_for_narrative = dict(health_score_data or {})
+    if band_label:
+        health_data_for_narrative["score_band"] = band_label
     narrative = _build_health_narrative(
         calculated_metrics,
-        health_score_data=health_score_data,
+        health_score_data=health_data_for_narrative,
         health_rating_config=health_rating_config,
         target_length=target_length,
     )
@@ -5081,12 +5919,34 @@ def _ensure_health_rating_section(
     narrative_lines = [line for line in filtered_body[1:] if not pillar_re.match(line)]
     narrative_text = "\n".join(narrative_lines).strip()
 
-    min_narrative_words = 50 if (target_length and target_length >= 600) else 45
+    if target_length and target_length >= 550:
+        min_narrative_words = 80
+    elif target_length and target_length >= 450:
+        min_narrative_words = 65
+    else:
+        min_narrative_words = 45
+    has_reasoning = bool(
+        re.search(
+            r"\b(because|driven|reflects|due to|offset|tempered|supported by)\b",
+            narrative_text,
+            re.IGNORECASE,
+        )
+    )
+    has_tradeoff = bool(
+        re.search(
+            r"\b(however|but|risk|concern|pressure|offset|tempered)\b",
+            narrative_text,
+            re.IGNORECASE,
+        )
+    )
     needs_rebuild = (
         _count_words(narrative_text) < min_narrative_words
         or narrative_text.count(".") + narrative_text.count("!") + narrative_text.count("?") < 2
         or not re.search(r"\d", narrative_text)
         or re.search(r"Health\s+Score\s+Drivers", narrative_text, re.IGNORECASE)
+        # The model often repeats this stock phrase; rebuild so the section reads fresh.
+        or re.search(r"Under\s+a\s+value[-\s]investor\s+lens", narrative_text, re.IGNORECASE)
+        or not (has_reasoning and has_tradeoff)
     )
     if needs_rebuild:
         narrative_text = narrative
@@ -5097,6 +5957,22 @@ def _ensure_health_rating_section(
     # trailing phrasing.
     narrative_text = re.sub(r"\s*\n\s*", " ", (narrative_text or "").strip())
     narrative_text = re.sub(r"\s{2,}", " ", narrative_text).strip()
+    # Avoid repetitive boilerplate phrasing the model tends to reuse.
+    narrative_text = re.sub(
+        r"(?i)Under\s+a\s+value[-\s]investor\s+lens,\s*the\s+score",
+        "The score",
+        narrative_text,
+    )
+    narrative_text = re.sub(
+        r"(?i)\bUnder\s+a\s+value[-\s]investor\s+lens,\s*",
+        "",
+        narrative_text,
+    )
+    narrative_text = narrative_text.strip()
+    if narrative_text:
+        first_char = narrative_text[0]
+        if first_char.isalpha():
+            narrative_text = first_char.upper() + narrative_text[1:]
     # Remove the low-quality dangling sentence if the model emits it (often as its own paragraph).
     narrative_text = re.sub(
         r"\s*Leverage\s+remains\s+elevated\s+relative\s+to\s+cash\.?\s*",
@@ -5151,13 +6027,40 @@ def _build_health_narrative(
     sentences: List[str] = []
     lens = framework_labels.get(framework)
     focus = weighting_labels.get(weighting)
-    if lens and focus:
-        sentences.append(f"Under {lens}, the score is weighted most toward {focus}.")
-    elif focus:
-        sentences.append(f"The score places the most weight on {focus}.")
+    if focus:
+        # Avoid repeating the literal phrase "under a value-investor lens" across memos.
+        # If the user selected a non-default framework, acknowledge it once; otherwise
+        # explain the weighting in plain English.
+        if lens and framework and framework != "value_investor_default":
+            sentences.append(
+                f"Using {lens}, the score weights {focus} most heavily because it best captures durability in this setup."
+            )
+        else:
+            sentences.append(
+                f"The score weights {focus} most heavily because it best captures durability in this setup."
+            )
 
     operating_margin = calculated_metrics.get("operating_margin")
     net_margin = calculated_metrics.get("net_margin")
+    revenue = calculated_metrics.get("revenue") or calculated_metrics.get("total_revenue")
+    operating_cash_flow = calculated_metrics.get("operating_cash_flow")
+    free_cash_flow = calculated_metrics.get("free_cash_flow")
+    ocf_str = (
+        _format_dollar(operating_cash_flow) if operating_cash_flow is not None else None
+    )
+    fcf_str = _format_dollar(free_cash_flow) if free_cash_flow is not None else None
+    fcf_margin = None
+    if free_cash_flow is not None and revenue:
+        try:
+            fcf_margin = (free_cash_flow / revenue) * 100
+        except Exception:
+            fcf_margin = None
+
+    cash = calculated_metrics.get("cash")
+    liabilities = calculated_metrics.get("total_liabilities")
+    cash_str = _format_dollar(cash) if cash is not None else None
+    liab_str = _format_dollar(liabilities) if liabilities is not None else None
+
     if operating_margin is not None and net_margin is not None:
         gap = net_margin - operating_margin
         gap_clause = ""
@@ -5179,18 +6082,6 @@ def _build_health_narrative(
             f"Net margin of {net_margin:.1f}% is the headline profitability signal, though non-operating items can distort the trend."
         )
 
-    revenue = calculated_metrics.get("revenue") or calculated_metrics.get("total_revenue")
-    operating_cash_flow = calculated_metrics.get("operating_cash_flow")
-    free_cash_flow = calculated_metrics.get("free_cash_flow")
-    ocf_str = _format_dollar(operating_cash_flow) if operating_cash_flow is not None else None
-    fcf_str = _format_dollar(free_cash_flow) if free_cash_flow is not None else None
-    fcf_margin = None
-    if free_cash_flow is not None and revenue:
-        try:
-            fcf_margin = (free_cash_flow / revenue) * 100
-        except Exception:
-            fcf_margin = None
-
     if ocf_str and fcf_str:
         margin_clause = f" (FCF margin {fcf_margin:.1f}%)" if fcf_margin is not None else ""
         sentences.append(
@@ -5205,10 +6096,6 @@ def _build_health_narrative(
             f"Operating cash flow of {ocf_str} supports reinvestment capacity and near-term resilience."
         )
 
-    cash = calculated_metrics.get("cash")
-    liabilities = calculated_metrics.get("total_liabilities")
-    cash_str = _format_dollar(cash) if cash is not None else None
-    liab_str = _format_dollar(liabilities) if liabilities is not None else None
     if cash_str and liab_str:
         leverage_clause = ""
         if cash and liabilities:
@@ -5242,6 +6129,16 @@ def _build_health_narrative(
                 f"A current ratio around {current_ratio:.1f}x suggests near-term obligations are manageable."
             )
 
+    # Add a forward-looking, underwriting-style linkage so this section doesn't read like
+    # a disconnected list of metrics.
+    if operating_margin is not None and net_margin is not None and abs(net_margin - operating_margin) >= 5:
+        sentences.append(
+            "Because net margin can be flattered by non-operating items, the health signal should be underwritten off operating profitability and cash conversion."
+        )
+    sentences.append(
+        "The score tends to move with sustained free cash flow conversion and balance-sheet flexibility because those inputs determine resilience; margin compression or rising leverage would pull it lower."
+    )
+
     if band == "Very Healthy":
         sentences.append(
             "Overall, the metrics support a Very Healthy profile provided cash conversion remains consistent."
@@ -5257,6 +6154,15 @@ def _build_health_narrative(
     elif band == "At Risk":
         sentences.append(
             "Overall, this is an At Risk profile: the balance between cash generation and obligations looks tight and the margin for error is thin."
+        )
+
+    if band:
+        sentences.append(
+            f"Taken together, these drivers explain why the score sits in the {band} range rather than a materially higher rating."
+        )
+    else:
+        sentences.append(
+            "Taken together, these drivers explain why the score sits where it does rather than a materially higher rating."
         )
 
     sentences.append(
@@ -6554,6 +7460,14 @@ def generate_filing_summary(
             if len(context_excerpt) == len(document_text)
             else "\n\nNote: Filing text truncated to fit model context."
         )
+        risk_factors_excerpt = _extract_labeled_excerpt(
+            document_text, "RISK FACTORS", max_chars=15_000
+        )
+        risk_factors_block = (
+            f"\n\nRISK FACTORS (FILING EXCERPT - USE THIS FOR THE 'Risk Factors' SECTION):\n{risk_factors_excerpt}\n"
+            if risk_factors_excerpt
+            else ""
+        )
         company_label = company.get("name") or company.get("ticker") or "the company"
         preference_block = _build_preference_instructions(preferences, company_label)
 
@@ -6609,7 +7523,11 @@ def generate_filing_summary(
                     f"2. DO NOT write 1/100, 62/100, or ANY other score - ONLY {pre_calculated_score:.0f}/100\n"
                     f"3. The band is '{pre_calculated_band}' - use this EXACT label\n"
                     f"4. Start the section with: '{pre_calculated_score:.0f}/100 - {pre_calculated_band}. ...'\n"
-                    f"5. Then EXPLAIN why this score was assigned based on the metrics.\n\n"
+                    f"5. Then EXPLAIN why this score was assigned based on the metrics.\n"
+                    f"   - Write a cohesive paragraph of 6-8 sentences (~90-130 words).\n"
+                    f"   - Use specific figures (margins, cash flow, leverage/liquidity).\n"
+                    f"   - Avoid one-sentence paragraphs and disconnected one-liners.\n"
+                    f"   - End with one sentence that sets up the operating analysis that follows.\n\n"
                     f"FORBIDDEN: Calculating your own score. The score {pre_calculated_score:.1f} is mathematically computed from actual financial ratios.\n"
                     f"NO letter grades (A, B, C, D). Use the numeric score and band label only."
                 )
@@ -6618,7 +7536,12 @@ def generate_filing_summary(
                     "Provide the 0-100 score with descriptive label (Very Healthy 85-100, Healthy 70-84, Watch 50-69, At Risk 0-49). "
                     "NO letter grades (A, B, C, D). Format: '72/100 - Healthy'. "
                     "Explain why the score landed there with specific metrics: margins, cash flow, leverage, liquidity. "
-                    "A company with 60%+ margins should score 70+ unless there are severe balance sheet issues."
+                    "A company with 60%+ margins should score 70+ unless there are severe balance sheet issues.\n\n"
+                    "STRUCTURE (FLOW IS MANDATORY):\n"
+                    "- After the score line, write 6-8 sentences (~90-130 words) as one cohesive paragraph.\n"
+                    "- Use at least 3 concrete figures (%, $ amounts, ratios).\n"
+                    "- Avoid one-sentence paragraphs and disconnected one-liners.\n"
+                    "- End with one sentence that sets up the operating analysis that follows."
                 )
             section_descriptions.append(
                 ("Financial Health Rating", health_rating_description)
@@ -6627,7 +7550,14 @@ def generate_filing_summary(
             [
                 (
                     "Executive Summary",
-                    "THIS IS THE HERO SECTION - the premium insight users pay for. KEEP IT TIGHT (70-100 WORDS).\n\n"
+                    "THIS IS THE HERO SECTION - the premium insight users pay for. KEEP IT TIGHT (80-110 WORDS).\n\n"
+                    "STRUCTURE (FLOW IS MANDATORY):\n"
+                    "- Write 2 cohesive paragraphs (2-4 sentences each).\n"
+                    "- Avoid one-sentence paragraphs and staccato one-liners.\n"
+                    "- End with a sentence that sets up the Financial Performance section.\n\n"
+                    "NUMBERS DISCIPLINE (MANDATORY):\n"
+                    "- Keep this section mostly qualitative. Use at most 1-2 anchor figures total.\n"
+                    "- Do NOT stack multiple metrics in a single sentence; save density for Financial Performance / Key Metrics.\n\n"
                     "Write a compelling, substantive investment thesis that:\n"
                     "1. OPENS with your conviction level and stance (bullish/bearish/neutral with HIGH/MEDIUM/LOW conviction)\n"
                     "2. SYNTHESIZES the investment case - why does this company matter RIGHT NOW?\n"
@@ -6643,31 +7573,44 @@ def generate_filing_summary(
                 ),
                 (
                     "Financial Performance",
-                    "Quantitative analysis (110-150 words). Cover KEY metrics:\n"
+                    "Quantitative analysis (100-135 words). Cover KEY metrics:\n"
                     "- Revenue with YoY% change and mix shifts (e.g., Mobility vs Delivery)\n"
                     "- Margin bridge: revenue growth → operating margin → net margin gap (explain drivers)\n"
                     "- Cash conversion: OCF to FCF, QoQ changes, capex context\n\n"
+                    "STRUCTURE (FLOW IS MANDATORY):\n"
+                    "- Write 2 paragraphs (no bullets in the body).\n"
+                    "- Paragraph 1: revenue + margins + the operating vs net bridge.\n"
+                    "- Paragraph 2: cash conversion + earnings quality + sustainability.\n\n"
                     "FLOW: Connect numbers: 'Revenue grew X% but margins compressed Y% due to Z; cash conversion improved/eroded because...'.\n"
+                    "NUMBERS DISCIPLINE: Do not list more than 2 metrics in any single sentence; tie each figure to a cause-and-effect interpretation.\n"
                     "Explain what numbers mean for sustainability and earnings quality.\n\n"
                     "FORBIDDEN: 'Additional detail covers...', 'Capital allocation remarks...' - write real analysis.",
                 ),
                 (
                     "Management Discussion & Analysis",
-                    "Critical management assessment (110-150 words). Focus on:\n"
-                    "1. Forward guidance and capital deployment priorities (with figures where possible)\n"
-                    "2. Alignment check: Do claims MATCH operating margin trajectory and cash conversion?\n"
-                    "3. Underpriced/overstated elements: what the market may be missing about cash durability or leverage.\n\n"
+                    "Expanded management assessment (125-175 words). Focus on:\n"
+                    "1. Strategy and capital deployment priorities (R&D, incentives, capex, buybacks/M&A)\n"
+                    "2. Alignment check: do the claims MATCH operating margin trajectory and cash conversion?\n"
+                    "3. Earnings quality: reconcile operating income vs net income and call out one-offs\n\n"
+                    "STRUCTURE (FLOW IS MANDATORY):\n"
+                    "- Write 2 cohesive paragraphs.\n"
+                    "- Avoid slogan-y one-liners; integrate conclusions into the paragraph.\n"
+                    "- End with a sentence that naturally leads into the Risk Factors section.\n\n"
                     "FLOW: 'Management stated X → results show Y → this implies Z for margins/cash/investment pacing.'\n\n"
-                    "FORBIDDEN: 'Further notes address...', 'The analysis outlines...' - write real critique.",
+                    "CRITICAL: This must read like a real filing summary, not disconnected sentences.",
                 ),
                 (
                     "Risk Factors",
-                    "3-5 MATERIAL, company-specific risks. Each MUST:\n"
-                    "1. Have a clear name (e.g., 'Margin Compression Risk')\n"
-                    "2. Be 2-3 sentences with quantified impact where possible\n"
-                    "3. Be specific to THIS business model and industry\n"
+                    "2-3 MATERIAL, company-specific risks (concise but substantive). Each MUST:\n"
+                    "1. Have a clear name that includes the *specific driver* (segment/product/platform/regulation). Avoid generic labels like 'Margin Compression Risk' unless you tie it to a named driver (e.g., TAC, capex, incentives, insurance).\n"
+                    "2. Be 2-3 sentences with concrete mechanisms and quantified impact where possible\n"
+                    "3. Be specific to THIS business model (not generic macro filler)\n"
+                    "4. Be distinct: no duplicate names or overlapping drivers\n"
+                    "5. Be grounded in the filing's RISK FACTORS excerpt in the prompt (do not invent risks)\n"
+                    "6. For EACH risk, cite (a) a filing-specific driver from the excerpt and (b) at least one numeric metric from this memo (margins, OCF→FCF, capex, cash vs liabilities).\n"
+                    "7. If a RISK FACTORS excerpt is provided above, include a SHORT verbatim quote (4-10 words) from that excerpt in quotation marks inside EACH risk to prove grounding.\n"
                     "Format: **Risk Name**: Explanation with specifics.\n"
-                    "Skip generic macro/regulatory risks unless they are directly tied to this company.",
+                    "Skip generic macro risks unless the filing clearly makes them company-specific.",
                 ),
                 (
                     "Key Metrics",
@@ -6684,7 +7627,10 @@ def generate_filing_summary(
                     "This section should be purely a scannable data block.",
                 ),
                 _build_closing_takeaway_description(
-                    selected_persona_name, company_name
+                    selected_persona_name,
+                    company_name,
+                    target_length=target_length,
+                    persona_requested=bool(investor_focus),
                 ),
             ]
         )
@@ -6696,8 +7642,8 @@ def generate_filing_summary(
         detail_level = preferences.detail_level or "comprehensive"
         output_style = preferences.output_style or "paragraph"
 
-        # Build no-persona block for objective analysis when no persona is selected
-        if selected_persona_name:
+        # Build no-persona block for objective analysis only when the user did NOT provide any persona.
+        if investor_focus:
             no_persona_block = ""
         else:
             no_persona_block = """
@@ -6734,6 +7680,10 @@ EXAMPLE INCORRECT PHRASING (DO NOT USE):
             identity_block = f"""You are a senior analyst at a top-tier hedge fund writing a high-conviction briefing for portfolio managers.
 You are adopting the persona of {selected_persona_name}. Write as if you ARE {selected_persona_name}.
 Your goal is to provide actionable, differentiated insight, not just a summary of facts."""
+        elif investor_focus:
+            identity_block = """You are a senior analyst writing a high-conviction briefing for portfolio managers.
+You are adopting the investor persona described in the user customization requirements above. Write as if you ARE that persona.
+Your goal is to provide actionable, differentiated insight, not just a summary of facts."""
         else:
             identity_block = """=== CRITICAL: NO PERSONA MODE ===
 YOU ARE A NEUTRAL, OBJECTIVE FINANCIAL ANALYST. 
@@ -6766,9 +7716,27 @@ Your goal is to provide actionable, differentiated insight, not just a summary o
             else ""
         )
 
+        company_profile_lines: List[str] = []
+        if company.get("ticker"):
+            company_profile_lines.append(f"- Ticker: {company.get('ticker')}")
+        if company.get("exchange"):
+            company_profile_lines.append(f"- Exchange: {company.get('exchange')}")
+        if company.get("sector"):
+            company_profile_lines.append(f"- Sector: {company.get('sector')}")
+        if company.get("industry"):
+            company_profile_lines.append(f"- Industry: {company.get('industry')}")
+        if company.get("country"):
+            company_profile_lines.append(f"- Country: {company.get('country')}")
+        company_profile_block = (
+            f"\nCOMPANY PROFILE (Reference):\n{chr(10).join(company_profile_lines)}\n"
+            if company_profile_lines
+            else ""
+        )
+
         base_prompt = f"""
 {identity_block}
 Analyze the following filing for {company_name} ({filing_type}, {filing_date}).
+{company_profile_block}
 
 CONTEXT:
 {context_excerpt}{truncated_note}
@@ -6778,6 +7746,7 @@ FINANCIAL SNAPSHOT (Reference only):
 
 KEY METRICS (Use these for calculations and evidence):
 {metrics_lines}
+{risk_factors_block}
 
 INSTRUCTIONS:
 1. Tone: {tone.title()} (Professional, Insightful, Direct)
@@ -6837,17 +7806,17 @@ health score configuration), these OVERRIDE default behavior. Your output MUST:
 Failure to follow user customizations = INVALID OUTPUT. Re-read the preference block above if unsure.
 === END USER CUSTOMIZATION PRIORITY ===
 {no_persona_block}
-CRITICAL RULES:
-- MAINTAIN CONSISTENT TONE throughout the entire document. Do NOT switch tones mid-document.
-- Do NOT use markdown bolding (**) within the text body. Only use it for section headers if needed.
-- Ensure every claim is backed by the provided text or metrics.
-- If data is missing, omit that data point rather than saying "not disclosed" or "not available".
-- SYNTHESIZE, DO NOT SUMMARIZE. Tell us what the numbers mean, not just what they are.
-- SPECIFY TIME PERIODS: Always label figures with their time period (FY24, Q3 FY25, TTM, etc.).
-- NO REDUNDANCY: Each number should appear in only ONE section. Executive Summary = qualitative view. Financial Performance = all numbers.
-- **SUSTAINABILITY**: Do NOT mention sustainability or ESG efforts unless they are a primary revenue driver (e.g., for a solar company). For most companies, this is fluff.
-- **MD&A**: Do NOT say "Management discusses..." or "In the MD&A section...". Just state the facts found there.
-- USE TRANSITIONS: Connect sections logically. Each section should flow naturally from the previous one.
+ CRITICAL RULES:
+ - MAINTAIN CONSISTENT TONE throughout the entire document. Do NOT switch tones mid-document.
+ - Do NOT use markdown bolding (**) within the narrative body except where explicitly required (e.g., Risk Factors labels).
+ - Ensure every claim is backed by the provided text or metrics.
+ - If data is missing, omit that data point rather than saying "not disclosed" or "not available".
+ - SYNTHESIZE, DO NOT SUMMARIZE. Tell us what the numbers mean, not just what they are.
+ - SPECIFY TIME PERIODS: Always label figures with their time period (FY24, Q3 FY25, TTM, etc.).
+ - NO REDUNDANCY: Avoid repeating the same metric across multiple sections. Executive Summary should be mostly qualitative; keep dense figures in Financial Performance / Key Metrics.
+ - **SUSTAINABILITY**: Do NOT mention sustainability or ESG efforts unless they are a primary revenue driver (e.g., for a solar company). For most companies, this is fluff.
+ - **MD&A**: Do NOT say "Management discusses..." or "In the MD&A section...". Just state the facts found there.
+ - USE TRANSITIONS: Connect sections logically. Each section should flow naturally from the previous one.
 
 === #1 PRIORITY: SENTENCE COMPLETION (WITHIN THE STRICT WORD BAND) ===
 THIS IS YOUR SINGLE MOST IMPORTANT RULE.
@@ -6922,14 +7891,30 @@ Before you output anything, verify:
                 )
 
         progress_cache[str(filing_id)] = "Synthesizing Investor Insights..."
-        print("DEBUG: Calling _generate_summary_with_quality_control")
+        quality_validators: List[Callable[[str], Optional[str]]] = [
+            _make_section_completeness_validator(
+                include_health_rating, target_length=target_length
+            )
+        ]
+        quality_validators.append(
+            _make_risk_specificity_validator(risk_factors_excerpt=risk_factors_excerpt)
+        )
+        quality_validators.append(_make_numbers_discipline_validator(target_length))
+        quality_validators.append(
+            _make_closing_recommendation_validator(
+                persona_requested=bool(investor_focus), company_name=company_name
+            )
+        )
+        if target_length:
+            quality_validators.append(
+                _make_section_balance_validator(include_health_rating, target_length)
+            )
+
         summary_text = _generate_summary_with_quality_control(
             gemini_client,
             base_prompt,
             target_length=target_length,
-            quality_validators=[
-                _make_section_completeness_validator(include_health_rating)
-            ],
+            quality_validators=quality_validators,
             filing_id=filing_id,
             timeout_seconds=SUMMARY_TOTAL_TIMEOUT_SECONDS,
             token_budget=token_budget,
@@ -6951,11 +7936,13 @@ Before you output anything, verify:
         summary_text = _remove_filler_phrases(
             summary_text
         )  # Remove filler phrases that slipped through
+        summary_text = _remove_generic_heuristic_paragraphs(summary_text)
         summary_text = _normalize_casing(
             summary_text
         )  # Convert shouty/all-caps body text to sentence case
         summary_text = _strip_directive_lines(summary_text)
         summary_text = _dedupe_consecutive_sentences(summary_text)
+        summary_text = _merge_staccato_paragraphs(summary_text)
         # NOTE: _ensure_required_sections() moved to end to avoid duplicate Closing Takeaway
         if target_length:
             summary_text = _finalize_length_band(
@@ -6977,8 +7964,10 @@ Before you output anything, verify:
                 calculated_metrics=calculated_metrics,
                 health_score_data=pre_calculated_health,
                 company_name=company_name,
+                risk_factors_excerpt=risk_factors_excerpt,
                 health_rating_config=health_config,
                 persona_name=selected_persona_name,
+                persona_requested=bool(investor_focus),
                 target_length=target_length,
             )
             summary_text = _finalize_length_band(
@@ -7003,17 +7992,21 @@ Before you output anything, verify:
                     calculated_metrics=calculated_metrics,
                     health_score_data=pre_calculated_health,
                     company_name=company_name,
+                    risk_factors_excerpt=risk_factors_excerpt,
                     health_rating_config=health_config,
                     persona_name=selected_persona_name,
+                    persona_requested=bool(investor_focus),
                     target_length=target_length,
                 )
 
         # Final ellipsis cleanup after all length adjustments
         summary_text = _fix_trailing_ellipsis(summary_text)
         summary_text = _remove_filler_phrases(summary_text)  # Final filler removal
+        summary_text = _remove_generic_heuristic_paragraphs(summary_text)
         summary_text = _normalize_casing(summary_text)
         summary_text = _strip_directive_lines(summary_text)
         summary_text = _dedupe_consecutive_sentences(summary_text)
+        summary_text = _merge_staccato_paragraphs(summary_text)
 
         # Fix health score if AI generated a different score than pre-calculated
         if pre_calculated_score is not None and pre_calculated_band:
@@ -7055,6 +8048,7 @@ Before you output anything, verify:
         summary_text = _strip_directive_lines(summary_text)
         summary_text = _dedupe_consecutive_sentences(summary_text)
         summary_text = _normalize_casing(summary_text)
+        summary_text = _merge_staccato_paragraphs(summary_text)
         if target_length:
             # Re-enforce strict word band after cleanup; padding uses substantive templates
             summary_text = _force_final_band(
@@ -7099,8 +8093,10 @@ Before you output anything, verify:
                 calculated_metrics=calculated_metrics,
                 health_score_data=pre_calculated_health,
                 company_name=company_name,
+                risk_factors_excerpt=risk_factors_excerpt,
                 health_rating_config=health_config,
                 persona_name=selected_persona_name,
+                persona_requested=bool(investor_focus),
                 target_length=target_length,
             )
             summary_text = _enforce_section_order(
@@ -7115,9 +8111,66 @@ Before you output anything, verify:
         # (Do this before the last word-band pass so any removals can be compensated.)
         summary_text = _normalize_underwriting_questions_formatting(summary_text)
         summary_text = _merge_underwriting_question_lines(summary_text)
-        summary_text = _relocate_underwriting_questions_to_risk_factors(summary_text)
+        summary_text = _relocate_underwriting_questions_to_mdna(summary_text)
         summary_text = _remove_filler_phrases(summary_text)
+        summary_text = _remove_generic_heuristic_paragraphs(summary_text)
         summary_text = _dedupe_consecutive_sentences(summary_text)
+        summary_text = _merge_staccato_paragraphs(summary_text)
+
+        # Final health-rating normalization (prevents dangling "68/100 -" lines and
+        # keeps the section readable after trims/padding).
+        if include_health_rating:
+            # Even if the scorer failed (health_score_data empty), we should still fix
+            # common formatting issues like "64/100 -" by inferring the band from the score.
+            health_fix_data: Dict[str, Any] = dict(health_score_data or {})
+
+            if health_fix_data.get("overall_score") is None and pre_calculated_score is not None:
+                health_fix_data["overall_score"] = pre_calculated_score
+            if (
+                (health_fix_data.get("score_band") is None or str(health_fix_data.get("score_band") or "").strip() == "")
+                and pre_calculated_band
+            ):
+                health_fix_data["score_band"] = pre_calculated_band
+
+            if health_fix_data.get("overall_score") is None:
+                m = re.search(
+                    r"(?is)##\s*Financial\s+Health\s+Rating\b[\s\S]*?(\d{1,3})(?:\.\d+)?/100",
+                    summary_text or "",
+                )
+                if m:
+                    try:
+                        health_fix_data["overall_score"] = float(m.group(1))
+                    except Exception:
+                        pass
+
+            if (
+                (health_fix_data.get("score_band") is None or str(health_fix_data.get("score_band") or "").strip() == "")
+                and health_fix_data.get("overall_score") is not None
+            ):
+                try:
+                    score_val = float(health_fix_data.get("overall_score"))
+                    inferred = None
+                    for threshold, _abbr, label in RATING_SCALE:
+                        if score_val >= threshold:
+                            inferred = label
+                            break
+                    health_fix_data["score_band"] = inferred or "At Risk"
+                except Exception:
+                    pass
+
+            if health_fix_data.get("overall_score") is not None:
+                summary_text = _ensure_health_rating_section(
+                    summary_text,
+                    health_fix_data,
+                    calculated_metrics,
+                    company_name,
+                    health_rating_config=health_config,
+                    target_length=target_length,
+                )
+                summary_text = _inject_health_drivers(
+                    summary_text, calculated_metrics, health_fix_data
+                )
+                summary_text = _merge_staccato_paragraphs(summary_text)
 
         if target_length:
             # Final user-visible word-count enforcement (UI/tests count raw whitespace tokens).
@@ -7125,9 +8178,34 @@ Before you output anything, verify:
                 summary_text, target_length, tolerance=10, allow_padding=True
             )
 
+        # Final backfill AFTER the last band clamp to prevent short/low-quality
+        # Risk Factors or Closing Takeaway from surviving trims.
+        if target_length or re.search(r"^\s*##\s", summary_text or "", re.MULTILINE):
+            summary_text = _ensure_required_sections(
+                summary_text,
+                include_health_rating=include_health_rating,
+                metrics_lines=metrics_lines,
+                calculated_metrics=calculated_metrics,
+                health_score_data=pre_calculated_health,
+                company_name=company_name,
+                risk_factors_excerpt=risk_factors_excerpt,
+                health_rating_config=health_config,
+                persona_name=selected_persona_name,
+                persona_requested=bool(investor_focus),
+                target_length=target_length,
+            )
+            summary_text = _enforce_section_order(
+                summary_text, include_health_rating=include_health_rating
+            )
+            if target_length:
+                summary_text = _enforce_whitespace_word_band(
+                    summary_text, target_length, tolerance=10, allow_padding=True
+                )
+
         # Post-band formatting: safe (does not change token/word counts meaningfully).
         summary_text = _normalize_underwriting_questions_formatting(summary_text)
-        summary_text = _relocate_underwriting_questions_to_risk_factors(summary_text)
+        summary_text = _relocate_underwriting_questions_to_mdna(summary_text)
+        summary_text = _merge_staccato_paragraphs(summary_text)
 
         # Final guard: ensure the document ends with punctuation for substantive outputs
         if (
@@ -7514,6 +8592,110 @@ def _dedupe_consecutive_sentences(text: str) -> str:
     return "\n".join(cleaned_lines).strip()
 
 
+def _merge_staccato_paragraphs(summary_text: str) -> str:
+    """Reduce one-line / staccato paragraphs inside narrative sections for better flow.
+
+    This is a deterministic readability pass. It does not change word count, only
+    paragraph breaks, by merging very short single-sentence paragraphs into the
+    prior paragraph within the same section.
+    """
+    if not summary_text:
+        return summary_text
+
+    heading_regex = re.compile(r"^\s*##\s+.+")
+    sections: List[Tuple[str, str]] = []
+    current_heading: Optional[str] = None
+    buffer: List[str] = []
+    preamble: List[str] = []
+    first_heading_seen = False
+
+    for line in summary_text.splitlines():
+        if heading_regex.match(line):
+            if not first_heading_seen and buffer:
+                preamble = buffer[:]
+                buffer = []
+            first_heading_seen = True
+            if current_heading is not None:
+                sections.append((current_heading, "\n".join(buffer).rstrip()))
+            current_heading = line.strip()
+            buffer = []
+        elif current_heading is not None:
+            buffer.append(line)
+        else:
+            preamble.append(line)
+
+    preamble_text = "\n".join(preamble).rstrip()
+    if current_heading is not None:
+        sections.append((current_heading, "\n".join(buffer).rstrip()))
+
+    if not sections:
+        return summary_text
+
+    target_sections = {
+        "Financial Health Rating",
+        "Executive Summary",
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Closing Takeaway",
+    }
+
+    def _sentence_count(paragraph: str) -> int:
+        # Approximate sentence count; good enough to detect single-sentence throwaways.
+        return len(re.findall(r"[.!?](?:\s|$)", paragraph or ""))
+
+    def _is_structured_line(paragraph: str) -> bool:
+        stripped = (paragraph or "").lstrip()
+        return bool(
+            stripped.startswith(("→", "- ", "* ", "• "))
+            or stripped.startswith("**")
+        )
+
+    rebuilt_sections: List[str] = []
+    for heading, body in sections:
+        section_name = _standard_section_name_from_heading(heading)
+        if section_name not in target_sections:
+            body_text = (body or "").strip()
+            section_text = (
+                f"{heading}\n\n{body_text}".strip() if body_text else heading.strip()
+            )
+            rebuilt_sections.append(section_text)
+            continue
+
+        raw_body = (body or "").strip()
+        if not raw_body:
+            section_text = heading.strip()
+            rebuilt_sections.append(section_text)
+            continue
+
+        paragraphs = [p.strip() for p in re.split(r"\n{2,}", raw_body) if p.strip()]
+        merged: List[str] = []
+        for paragraph in paragraphs:
+            if not merged:
+                merged.append(paragraph)
+                continue
+
+            if _is_structured_line(paragraph):
+                merged.append(paragraph)
+                continue
+
+            words = _count_words(paragraph)
+            sentences = _sentence_count(paragraph)
+            is_staccato = sentences <= 1 and words <= 22
+
+            if is_staccato and not _is_structured_line(merged[-1]):
+                merged[-1] = f"{merged[-1].rstrip()} {paragraph.lstrip()}".strip()
+            else:
+                merged.append(paragraph)
+
+        body_text = "\n\n".join(merged).strip()
+        section_text = f"{heading}\n\n{body_text}".strip()
+        rebuilt_sections.append(section_text)
+
+    rebuilt = "\n\n".join([s for s in ([preamble_text] if preamble_text else []) + rebuilt_sections if s]).strip()
+    rebuilt = re.sub(r"\n{3,}", "\n\n", rebuilt)
+    return rebuilt
+
+
 def _normalize_section_headings(text: str, include_health_rating: bool) -> str:
     """Ensure each required section begins with the expected markdown heading on its own line.
 
@@ -7522,6 +8704,14 @@ def _normalize_section_headings(text: str, include_health_rating: bool) -> str:
     2. Headers are missing the ## prefix
     3. Headers have extra whitespace or formatting issues
     """
+    # Normalize legacy alias headings up-front so downstream logic can stay
+    # opinionated about canonical section names.
+    text = re.sub(
+        r"(?im)^\s*(?:##\s*)?Key\s+Data\s+Appendix\s*$",
+        "## Key Metrics",
+        text or "",
+    )
+
     required_titles = [
         title
         for title, _ in SUMMARY_SECTION_REQUIREMENTS
@@ -7609,13 +8799,6 @@ def _normalize_section_headings(text: str, include_health_rating: bool) -> str:
 
         normalized_text = header_spacing_pattern.sub(ensure_spacing, normalized_text)
 
-    # Final cleanup: ensure no header is followed immediately by another header without content
-    normalized_text = re.sub(
-        r"(## [^\n]+)\n\n(## )",
-        r"\1\n\n[Section content pending]\n\n\2",
-        normalized_text,
-    )
-
     return normalized_text.strip()
 
 
@@ -7692,6 +8875,74 @@ def _contains_personal_verdict(text: str) -> bool:
     return bool(text and _PERSONAL_VERDICT_RE.search(text))
 
 
+_OBJECTIVE_RECOMMENDATION_RE = re.compile(
+    r"(?is)\b(?:buy|hold|sell)\b\s+(?:rating|recommendation|stance)\b"
+    r"|\b(?:rating|recommendation|stance)\b[\s:]{0,12}(?:is\s+)?(?:a\s+)?\b(?:buy|hold|sell)\b"
+)
+
+
+def _contains_objective_recommendation(text: str) -> bool:
+    """Return True if the text contains an explicit Buy/Hold/Sell recommendation in third person."""
+    if not text:
+        return False
+    lowered = text.lower()
+    # Buy/sell are rarely used in neutral prose outside of an explicit stance.
+    if re.search(r"\bbuy\b", lowered) or re.search(r"\bsell\b", lowered):
+        return True
+    # "hold" can be used as a verb; require it to show up as a stance.
+    return bool(_OBJECTIVE_RECOMMENDATION_RE.search(lowered))
+
+
+def _ensure_objective_recommendation(
+    closing_text: str,
+    company_name: str,
+    strengths: Optional[List[str]] = None,
+    concerns: Optional[List[str]] = None,
+) -> str:
+    """Append a clear third-person Buy/Hold/Sell sentence when no persona is used."""
+    if not closing_text:
+        return closing_text
+    if _contains_objective_recommendation(closing_text):
+        return closing_text
+
+    strengths = strengths or []
+    concerns = concerns or []
+
+    if strengths and not concerns:
+        verdict = "buy"
+    elif concerns and not strengths:
+        verdict = "sell"
+    else:
+        verdict = "hold"
+
+    verdict_word = verdict.title()
+    closing = closing_text.rstrip()
+    if closing and not closing.endswith((".", "!", "?")):
+        closing += "."
+
+    driver: Optional[str] = None
+    if verdict == "buy":
+        driver = strengths[0] if strengths else None
+    elif verdict == "sell":
+        driver = concerns[0] if concerns else None
+    else:
+        driver = concerns[0] if concerns else (strengths[0] if strengths else None)
+
+    driver_clause = f" given {driver}" if driver else ""
+    seed_material = f"{company_name}|{verdict_word}|{closing}|{driver_clause}"
+    digest = hashlib.sha256(seed_material.encode("utf-8")).digest()
+    rng = random.Random(int.from_bytes(digest[:8], "big"))
+    variants = [
+        f"A {verdict_word} rating appears warranted for {company_name}{driver_clause}.",
+        f"The appropriate stance is {verdict_word} on {company_name}{driver_clause}.",
+        f"A {verdict_word} recommendation is justified for {company_name}{driver_clause}.",
+        f"{company_name} screens as a {verdict_word} at current levels{driver_clause}.",
+        f"On balance, a {verdict_word} rating is appropriate for {company_name}{driver_clause}.",
+    ]
+    closing += " " + rng.choice(variants)
+    return closing
+
+
 def _ensure_personal_verdict(
     closing_text: str,
     company_name: str,
@@ -7713,15 +8964,16 @@ def _ensure_personal_verdict(
 
     if strengths and not concerns:
         verdict = "buy"
-    elif strengths and concerns:
-        verdict = "hold"
+    elif concerns and not strengths:
+        verdict = "sell"
     else:
         verdict = "hold"
+
+    verdict_word = verdict.upper()
 
     closing = closing_text.rstrip()
     if closing and not closing.endswith((".", "!", "?")):
         closing += "."
-    rng = random.Random(uuid4().int)
     driver: Optional[str] = None
     if verdict == "buy":
         driver = strengths[0] if strengths else None
@@ -7730,15 +8982,18 @@ def _ensure_personal_verdict(
     elif strengths:
         driver = strengths[0]
     driver_clause = f" given {driver}" if driver else ""
+    seed_material = f"{company_name}|{verdict_word}|{closing}|{driver_clause}"
+    digest = hashlib.sha256(seed_material.encode("utf-8")).digest()
+    rng = random.Random(int.from_bytes(digest[:8], "big"))
     verdict_variants = [
-        f"For my own portfolio, I'd {verdict} {company_name}{driver_clause}.",
-        f"If I had to act today, I'd {verdict} {company_name}{driver_clause}.",
-        f"On balance, I'd {verdict} {company_name}{driver_clause}.",
-        f"My call: {verdict.upper()} {company_name}{f' ({driver})' if driver else ''}.",
-        f"I'd {verdict} {company_name}{driver_clause}.",
-        f"Personally, I'd {verdict} {company_name}{driver_clause}.",
-        f"For me, it's a {verdict.upper()} on {company_name}{driver_clause}.",
-        f"Bottom line: {verdict.upper()} {company_name}{f' — {driver}' if driver else ''}.",
+        f"For my own portfolio, I'd {verdict_word} {company_name}{driver_clause}.",
+        f"If I had to act today, I'd {verdict_word} {company_name}{driver_clause}.",
+        f"On balance, I'd {verdict_word} {company_name}{driver_clause}.",
+        f"My call: {verdict_word} {company_name}{f' ({driver})' if driver else ''}.",
+        f"I'd {verdict_word} {company_name}{driver_clause}.",
+        f"Personally, I'd {verdict_word} {company_name}{driver_clause}.",
+        f"For me, it's a {verdict_word} on {company_name}{driver_clause}.",
+        f"Bottom line: {verdict_word} {company_name}{driver_clause}.",
     ]
     closing += " " + rng.choice(verdict_variants)
     return closing
@@ -7748,6 +9003,8 @@ def _generate_fallback_closing_takeaway(
     company_name: str,
     calculated_metrics: Dict[str, Any],
     persona_name: Optional[str] = None,
+    *,
+    persona_requested: bool = False,
 ) -> str:
     """Generate a substantive closing takeaway from available financial metrics.
 
@@ -7816,7 +9073,7 @@ def _generate_fallback_closing_takeaway(
         is_mixed = False
 
     # Persona-specific closing templates
-    if persona_name and persona_name in PERSONA_CLOSING_INSTRUCTIONS:
+    if persona_requested and persona_name and persona_name in PERSONA_CLOSING_INSTRUCTIONS:
         closing = _generate_persona_flavored_closing(
             persona_name,
             company_name,
@@ -7828,10 +9085,118 @@ def _generate_fallback_closing_takeaway(
             revenue,
             operating_margin,
         )
+
+        # Add an explicit "what changes my view" trigger so persona closings don't
+        # collapse into a punchline without underwriting closure.
+        trigger_parts: List[str] = []
+        if operating_margin is not None and operating_margin < 8:
+            trigger_parts.append("sustained operating margin improvement")
+        elif operating_margin is not None and operating_margin >= 8:
+            trigger_parts.append("margin durability through a softer period")
+
+        if free_cash_flow is not None:
+            trigger_parts.append("repeatable free cash flow conversion")
+
+        if cash is not None and total_debt is not None and total_debt > cash * 3:
+            trigger_parts.append("better balance-sheet flexibility")
+
+        trigger = " and ".join(trigger_parts[:2]) if trigger_parts else "durable cash conversion"
+        trigger_sentence = (
+            f"My view would change with clearer evidence of {trigger}, or if the weak areas worsen and compress the margin for error."
+        )
+
+        closing = f"{closing} {trigger_sentence}".strip()
         return _ensure_personal_verdict(closing, company_name, strengths, concerns)
 
-    # Generic fallback (no persona selected) - concise but complete (~40-50 words)
-    rng = random.Random(uuid4().int)
+    # Generic persona (custom prompt): first-person, no famous investor mimicry.
+    if persona_requested:
+        seed_material = "|".join(
+            [
+                company_name or "",
+                str(operating_margin),
+                str(net_margin),
+                str(free_cash_flow),
+                str(cash),
+                str(total_debt),
+                str(revenue),
+                quality,
+                "persona",
+            ]
+        )
+        digest = hashlib.sha256(seed_material.encode("utf-8")).digest()
+        rng = random.Random(int.from_bytes(digest[:8], "big"))
+
+        strengths_str = " and ".join(strengths[:2]) if strengths else "limited visibility"
+        concerns_str = " and ".join(concerns[:2]) if concerns else "no obvious red flags"
+        rev_str = _format_dollar(revenue) if revenue else None
+
+        if strengths and not concerns:
+            variants = [
+                [
+                    f"My takeaway is that {company_name} looks {quality} on the numbers, led by {strengths_str}{' on ' + rev_str + ' of revenue' if rev_str else ''}.",
+                    "The durability test is whether cash conversion stays tight as reinvestment needs normalize.",
+                    "If margins hold through a softer period, the earnings base should be more repeatable than the market may be assuming.",
+                    "My view would change if operating margins compress materially or free cash flow conversion weakens for multiple quarters.",
+                ],
+                [
+                    f"From my perspective, {company_name} screens as a {quality} business with {strengths_str}{' on ' + rev_str + ' of revenue' if rev_str else ''}.",
+                    "What matters next is whether operating leverage translates into durable free cash flow after capex and working-capital swings.",
+                    "If management keeps capital allocation disciplined, downside scenarios remain more manageable.",
+                    "I would revisit the stance quickly if cash conversion diverges from reported earnings.",
+                ],
+            ]
+            sentences = rng.choice(variants)
+        elif concerns and not strengths:
+            variants = [
+                [
+                    f"In my view, {company_name} is constrained by {concerns_str}{' on ' + rev_str + ' of revenue' if rev_str else ''}.",
+                    "In this setup, I care more about cash conversion and balance-sheet flexibility than headline revenue growth.",
+                    "I would need to see sustained stabilization in operating margins and free cash flow before underwriting upside.",
+                    "My view would improve after clearer evidence the weak inputs are repairing rather than being masked by timing.",
+                ],
+                [
+                    f"My read is cautious on {company_name}: {concerns_str}{' on ' + rev_str + ' of revenue' if rev_str else ''}.",
+                    "If cash lags earnings for multiple quarters, valuation support tends to erode quickly.",
+                    "I would want proof of repeatable free cash flow and cleaner earnings quality before changing posture.",
+                    "My view would change with sustained margin recovery and better cash conversion.",
+                ],
+            ]
+            sentences = rng.choice(variants)
+        else:
+            variants = [
+                [
+                    f"My takeaway on {company_name} is mixed: {strengths[0] if strengths else 'some strengths'} offset by {concerns[0] if concerns else 'meaningful uncertainties'}{' on ' + rev_str + ' of revenue' if rev_str else ''}.",
+                    "The underwriting hinge is whether the weaker input is temporary (timing/cycle) or structural (unit economics and competitive intensity).",
+                    "I would stay patient until the business proves profitability converts to durable free cash flow without balance-sheet strain.",
+                    "My view would improve on clearer cash conversion and margin durability, or on a meaningfully better entry price.",
+                ],
+                [
+                    f"{company_name} has real positives, but I keep coming back to {concerns[0] if concerns else 'the uncertainty around durability'}{' on ' + rev_str + ' of revenue' if rev_str else ''}.",
+                    "In this posture, I want confirmation that cash generation tracks reported profitability after normalizing capex and working capital.",
+                    "I would revisit quickly if the next filing shows an inflection in the weak area.",
+                    "My view would turn more cautious if leverage rises or if cash conversion keeps slipping.",
+                ],
+            ]
+            sentences = rng.choice(variants)
+
+        closing = " ".join(sentences).strip()
+        return _ensure_personal_verdict(closing, company_name, strengths, concerns)
+
+    # Generic fallback (no persona selected) - longer and reasoned (~80-110 words)
+    seed_material = "|".join(
+        [
+            company_name or "",
+            str(operating_margin),
+            str(net_margin),
+            str(free_cash_flow),
+            str(cash),
+            str(total_debt),
+            str(revenue),
+            quality,
+        ]
+    )
+    digest = hashlib.sha256(seed_material.encode("utf-8")).digest()
+    rng = random.Random(int.from_bytes(digest[:8], "big"))
     strengths_str = (
         " and ".join(strengths[:2])
         if strengths
@@ -7843,54 +9208,70 @@ def _generate_fallback_closing_takeaway(
     if strengths and not concerns:
         variants = [
             [
-                f"{company_name} demonstrates {quality} fundamentals, led by {strengths_str}.",
-                "The setup supports a constructive long-term view.",
-                "Add only at a sensible valuation.",
+                f"{company_name} demonstrates {quality} fundamentals, led by {strengths_str}{' on ' + rev_str + ' of revenue' if rev_str else ''}.",
+                "The earnings base looks supported by operating profitability and free-cash-flow generation rather than purely accounting outcomes.",
+                "Balance-sheet flexibility should remain a differentiator if demand softens or reinvestment needs rise.",
+                "A Buy rating is reasonable if valuation is not embedding peak margins and the cash conversion holds through a normalizing cycle.",
+                "The stance would change if operating margins compress materially or free cash flow conversion weakens for multiple quarters.",
             ],
             [
-                f"{company_name} shows {quality} financial strength with {strengths_str}.",
-                "If these drivers persist, the compounding case improves.",
-                "Positions make the most sense on pullbacks.",
+                f"{company_name} shows {quality} financial strength with {strengths_str}{' on ' + rev_str + ' of revenue' if rev_str else ''}.",
+                "What matters for durability is whether cash flow tracks reported earnings after normalizing working capital and capex.",
+                "If capital allocation stays disciplined, the business can compound without forcing balance-sheet leverage.",
+                "A Buy recommendation is justified when the market is not overpaying for near-term strength.",
+                "Revisit the view if margins erode faster than revenue growth can offset.",
             ],
         ]
         sentences = rng.choice(variants)
     elif concerns and not strengths:
         variants = [
             [
-                f"{company_name} faces headwinds from {concerns_str}, which weakens earnings durability.",
-                "A cautious stance is warranted until core margins recover.",
-                "Wait for cleaner cash conversion before stepping in.",
+                f"{company_name} faces headwinds from {concerns_str}{' on ' + rev_str + ' of revenue' if rev_str else ''}, which weakens earnings durability.",
+                "In that setup, cash conversion and balance-sheet flexibility matter more than headline revenue growth because downside scenarios tighten quickly.",
+                "A Sell rating is justified if the business is relying on one-offs or funding flexibility to sustain operations.",
+                "A Hold stance can be reasonable only if there is clear evidence of stabilization in operating margins and free cash flow.",
+                "The recommendation would improve after sustained margin recovery and cleaner cash conversion through working-capital normalization.",
             ],
             [
-                f"{company_name} is constrained by {concerns_str}.",
-                "That makes the current earnings power hard to trust.",
-                "Stay on the sidelines until fundamentals stabilize.",
+                f"{company_name} is constrained by {concerns_str}{' on ' + rev_str + ' of revenue' if rev_str else ''}.",
+                "That makes near-term earnings power harder to trust, especially if cash generation is lagging reported profits.",
+                "A Sell recommendation is appropriate until operating performance improves and liquidity risk is clearly reduced.",
+                "The key confirmation is sustained free cash flow after capex, not a single-quarter profit print.",
+                "Re-rate the stance once margins stabilize and cash conversion becomes repeatable.",
             ],
         ]
         sentences = rng.choice(variants)
     elif strengths and concerns:
         variants = [
             [
-                f"{company_name} presents a mixed picture: {strengths[0]} offset by {concerns[0]}.",
-                "Neutral positioning is reasonable for now.",
-                "Look for a clear inflection in the weak area.",
+                f"{company_name} presents a mixed picture: {strengths[0]} offset by {concerns[0]}{' on ' + rev_str + ' of revenue' if rev_str else ''}.",
+                "The underwriting hinge is whether the weaker input is temporary (cycle/timing) or structural (unit economics and competitive intensity).",
+                "A Hold rating is appropriate while the business proves that profitability converts to durable free cash flow without balance-sheet strain.",
+                "The clearest upgrade trigger is improving cash conversion alongside stable operating margins.",
+                "The view would turn more cautious if leverage rises or if the margin gap is being closed only through non-operating items.",
             ],
             [
-                f"{company_name} has real positives, but {concerns[0]} tempers the upside.",
-                "The risk-reward feels balanced today.",
-                "I'd wait for either better fundamentals or a better price.",
+                f"{company_name} has real positives, but {concerns[0]} tempers the upside{' on ' + rev_str + ' of revenue' if rev_str else ''}.",
+                "In this posture, the market needs to see improving earnings quality and cash conversion, not just top-line momentum.",
+                "A Hold recommendation is justified until the weak area shows a clear inflection.",
+                "The risk-reward improves either on better fundamentals or a materially better entry price.",
+                "Revisit after the next filing confirms margin durability and repeatable cash generation.",
             ],
         ]
         sentences = rng.choice(variants)
     else:
         variants = [
             [
-                f"{company_name} requires deeper due diligence to form a definitive view.",
-                "Focus on core profitability and cash generation trends.",
+                f"{company_name} requires deeper due diligence to form a definitive view{', especially around earnings quality and cash conversion' if rev_str else ''}.",
+                "The near-term signal to underwrite is operating profitability and whether it converts to free cash flow after capex and working capital.",
+                "A Hold stance is the most defensible recommendation until the durability of margins and cash generation is clearer.",
+                "Upgrade the view after consistent cash conversion and improved balance-sheet flexibility are visible in reported results.",
             ],
             [
                 f"{company_name}{', with ' + rev_str + ' in revenue' if rev_str else ''}, needs more context to judge durability.",
-                "Revisit after clearer margin and cash flow direction.",
+                "The key unknown is whether reported profitability is repeatable once one-offs and timing effects normalize.",
+                "A Hold recommendation is appropriate until margin direction and free cash flow conversion are clearly improving.",
+                "The stance would improve after evidence of sustained operating leverage and cleaner cash generation.",
             ],
         ]
         sentences = rng.choice(variants)
@@ -7999,7 +9380,17 @@ def _generate_persona_flavored_closing(
                 f"The risk-reward correlation favors a constructive stance, though position sizing should reflect broader macro uncertainties."
             )
         elif is_mixed:
-            rng = random.Random(uuid4().int)
+            seed_material = "|".join(
+                [
+                    persona_name,
+                    company_name,
+                    quality,
+                    strengths_str,
+                    concerns_str,
+                ]
+            )
+            digest = hashlib.sha256(seed_material.encode("utf-8")).digest()
+            rng = random.Random(int.from_bytes(digest[:8], "big"))
             openers = [
                 "Cycle check: ",
                 "From a cycle standpoint, ",
@@ -8086,7 +9477,17 @@ def _generate_persona_flavored_closing(
                 f"the risk-reward asymmetry appears favorable. The pendulum hasn't swung too far to optimism here."
             )
         elif is_mixed:
-            rng = random.Random(uuid4().int)
+            seed_material = "|".join(
+                [
+                    persona_name,
+                    company_name,
+                    quality,
+                    strengths_str,
+                    concerns_str,
+                ]
+            )
+            digest = hashlib.sha256(seed_material.encode("utf-8")).digest()
+            rng = random.Random(int.from_bytes(digest[:8], "big"))
             openers = [
                 "Cycle positioning: ",
                 "A quick pendulum check: ",
@@ -8140,8 +9541,10 @@ def _ensure_required_sections(
     calculated_metrics: Dict[str, Any],
     health_score_data: Optional[Dict[str, Any]] = None,
     company_name: str,
+    risk_factors_excerpt: Optional[str] = None,
     health_rating_config: Optional[Dict[str, Any]] = None,
     persona_name: Optional[str] = None,
+    persona_requested: bool = False,
     target_length: Optional[int] = None,
 ) -> str:
     """Ensure all required sections are present.
@@ -8155,14 +9558,266 @@ def _ensure_required_sections(
     The goal is NO placeholders in the final output.
     """
     text = summary_text
+    persona_mode = bool(persona_requested) or bool(persona_name)
+
+    def _short_company_label(name: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9& ]+", " ", (name or "")).strip()
+        parts = [p for p in cleaned.split() if p]
+        if not parts:
+            return "Company"
+        suffixes = {
+            "inc",
+            "incorporated",
+            "corp",
+            "corporation",
+            "co",
+            "company",
+            "ltd",
+            "limited",
+            "plc",
+            "group",
+            "holdings",
+            "holding",
+            "sa",
+            "ag",
+            "nv",
+            "llc",
+            "lp",
+        }
+        filtered = [p for p in parts if p.lower().rstrip(".") not in suffixes]
+        parts = filtered or parts
+        return parts[0][:24]
+
+    def _derive_risk_theme_label(excerpt: Optional[str]) -> str:
+        base = _short_company_label(company_name)
+        if not excerpt:
+            return base
+
+        company_tokens = set(
+            t
+            for t in re.findall(r"[a-z0-9]+", company_name.lower())
+            if t
+        )
+        company_tokens.discard("the")
+
+        generic = {
+            "company",
+            "companies",
+            "business",
+            "operations",
+            "operating",
+            "financial",
+            "results",
+            "factors",
+            "factor",
+            "risk",
+            "risks",
+            "may",
+            "might",
+            "could",
+            "would",
+            "including",
+            "include",
+            "includes",
+            "also",
+            "such",
+            "subject",
+            "material",
+            "materially",
+            "adverse",
+            "adversely",
+            "impact",
+            "affect",
+            "affects",
+            "future",
+            "forward",
+            "looking",
+            "statements",
+            "item",
+            "items",
+            "section",
+        }
+
+        deprioritized = {
+            "regulatory",
+            "regulation",
+            "antitrust",
+            "privacy",
+            "security",
+            "cyber",
+            "cybersecurity",
+            "litigation",
+            "lawsuit",
+            "competition",
+            "competitive",
+            "macro",
+            "economic",
+            "economy",
+            "geopolitical",
+            "data",
+        }
+
+        aliases = {
+            "advertising": "Ads",
+            "advertiser": "Ads",
+            "advertisers": "Ads",
+            "ads": "Ads",
+            "search": "Search",
+            "cloud": "Cloud",
+            "youtube": "YouTube",
+            "android": "Android",
+            "subscription": "Subscriptions",
+            "subscriptions": "Subscriptions",
+            "device": "Devices",
+            "devices": "Devices",
+            "semiconductor": "Semis",
+            "semiconductors": "Semis",
+            "chip": "Chips",
+            "chips": "Chips",
+            "gpu": "GPU",
+            "gpus": "GPU",
+            "loan": "Loans",
+            "loans": "Loans",
+            "deposit": "Deposits",
+            "deposits": "Deposits",
+            "oil": "Oil",
+            "gas": "Gas",
+            "fda": "FDA",
+            "gdpr": "GDPR",
+            "dma": "DMA",
+            "doj": "DOJ",
+            "ftc": "FTC",
+            "tac": "TAC",
+            "capex": "Capex",
+            "ai": "AI",
+        }
+
+        words = re.findall(r"[a-z][a-z0-9]{2,}", excerpt.lower())
+        freqs: Dict[str, int] = {}
+        for w in words:
+            if w in generic or w in company_tokens:
+                continue
+            freqs[w] = freqs.get(w, 0) + 1
+        if not freqs:
+            return base
+
+        ranked = sorted(freqs.items(), key=lambda kv: kv[1], reverse=True)
+
+        def _pick_terms(allow_deprioritized: bool) -> List[str]:
+            picked: List[str] = []
+            for w, _count in ranked:
+                if not allow_deprioritized and w in deprioritized:
+                    continue
+                label = aliases.get(w, w.title())
+                if label.lower() == base.lower():
+                    continue
+                if label in picked:
+                    continue
+                picked.append(label)
+                if len(picked) >= 2:
+                    break
+            return picked
+
+        terms = _pick_terms(allow_deprioritized=False) or _pick_terms(
+            allow_deprioritized=True
+        )
+        if not terms:
+            return base
+        theme = "/".join(terms)[:28]
+        return theme or base
+
+    def _regulatory_driver_label(excerpt: Optional[str]) -> Optional[str]:
+        if not excerpt:
+            return None
+        acronyms = {
+            a
+            for a in re.findall(r"\b[A-Z]{2,6}\b", excerpt)
+            if a not in {"ITEM", "SEC", "GAAP", "IFRS", "USA", "U.S", "US"}
+        }
+        lower = excerpt.lower()
+        if "dma" in lower and "EU" in acronyms:
+            return "EU DMA"
+        if "gdpr" in lower or "GDPR" in acronyms:
+            return "GDPR"
+        if "DOJ" in acronyms and "FTC" in acronyms:
+            return "DOJ/FTC"
+        if "DOJ" in acronyms:
+            return "DOJ"
+        if "FTC" in acronyms:
+            return "FTC"
+        if "FDA" in acronyms:
+            return "FDA"
+        if "OFAC" in acronyms:
+            return "OFAC"
+        if "antitrust" in lower:
+            return "Antitrust"
+        if "privacy" in lower:
+            return "Privacy"
+        if "regulat" in lower:
+            return "Regulatory"
+        return None
+
+    def _rewrite_generic_risk_name(name: str) -> str:
+        theme = _derive_risk_theme_label(risk_factors_excerpt)
+        reg_driver = _regulatory_driver_label(risk_factors_excerpt)
+        norm = _normalize_risk_name(name)
+
+        def _themed(base: str) -> str:
+            if theme and theme.lower() not in {"company"}:
+                return f"{theme} {base}".strip()
+            return base
+
+        if norm in {"margin compression risk"}:
+            return _themed("Margin / Reinvestment Risk")
+        if norm in {
+            "cash conversion risk",
+            "cash conversion reversal risk",
+            "cash flow visibility risk",
+        }:
+            return _themed("Cash Conversion / Capex Risk")
+        if norm in {
+            "balance sheet flexibility risk",
+            "liquidity tightening risk",
+        }:
+            return _themed("Liquidity / Funding Risk")
+        if norm in {"earnings quality risk"}:
+            return _themed("Earnings Quality / Normalization Risk")
+        if norm in {"competitive spend risk"}:
+            return _themed("Pricing / Competitive Spend Risk")
+        if norm in {"regulatory and antitrust scrutiny"} or (
+            ("regulatory" in norm or "regulation" in norm)
+            and "antitrust" in norm
+            and any(
+                k in norm
+                for k in {
+                    "scrutiny",
+                    "pressure",
+                    "enforcement",
+                    "remedy",
+                    "remedies",
+                    "investigation",
+                }
+            )
+            and not any(k in norm for k in {"dma", "gdpr", "doj", "ftc", "eu"})
+        ):
+            driver = reg_driver or "Regulatory"
+            # Avoid "Regulatory Regulatory" style repeats.
+            if driver.lower() in theme.lower():
+                return f"{theme} Enforcement Risk".strip()
+            return f"{driver} / {theme} Enforcement Risk".strip(" /")
+        return name
 
     def _section_present(title: str) -> bool:
-        # Check for exact match first
-        if f"## {title}" in text:
+        # Detect section headings robustly (case-insensitive, whitespace-tolerant, heading-anchored).
+        # Avoid false positives from body text mentioning "Risk Factors" etc.
+        pattern = re.compile(rf"(?im)^\s*##\s*{re.escape(title)}\b")
+        if pattern.search(text or ""):
             return True
         # Backwards-compatible aliasing for older headings
         if title.lower() == "key metrics":
-            return "## key data appendix" in text.lower()
+            return bool(
+                re.search(r"(?im)^\s*##\s*Key\s+Data\s+Appendix\b", text or "")
+            )
         return False
 
     def _append_section(title: str, body: str) -> None:
@@ -8183,6 +9838,194 @@ def _ensure_required_sections(
             return "Watch"
         else:
             return "At Risk"
+
+    # Target-aware minimums so short requested lengths don't force over-expansion.
+    min_words_by_section = _calculate_section_min_words_for_target(
+        target_length, include_health_rating=include_health_rating
+    )
+
+    def _count_sentences(body: str) -> int:
+        return len(re.findall(r"[.!?](?:\s|$)", body or ""))
+
+    def _normalize_risk_name(name: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+
+    def _extract_risk_entries(body: str) -> List[Tuple[str, str]]:
+        entries: List[Tuple[str, str]] = []
+        cleaned_body = (body or "").strip()
+        if not cleaned_body:
+            return entries
+
+        pattern = re.compile(
+            r"\*\*(.+?)\*\*\s*:\s*([\s\S]*?)(?=\n\s*\*\*.+?\*\*\s*:|\Z)"
+        )
+        for match in pattern.finditer(cleaned_body):
+            name = match.group(1).strip()
+            desc = " ".join((match.group(2) or "").split())
+            if name and desc:
+                entries.append((name, desc))
+
+        if entries:
+            return entries
+
+        # Fallback: handle one-line entries without blank-line separators.
+        for line in cleaned_body.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            line = re.sub(r"^[\-\*]\s*", "", line)
+            match = re.match(r"\*\*(.+?)\*\*\s*:\s*(.+)", line)
+            if not match:
+                continue
+            name = match.group(1).strip()
+            desc = match.group(2).strip()
+            if name and desc:
+                entries.append((name, desc))
+        return entries
+
+    def _risk_desc_tokens(desc: str) -> Set[str]:
+        stopwords = {
+            "the",
+            "and",
+            "or",
+            "of",
+            "to",
+            "a",
+            "an",
+            "in",
+            "on",
+            "for",
+            "if",
+            "with",
+            "as",
+            "by",
+            "at",
+            "is",
+            "are",
+            "be",
+            "can",
+            "could",
+            "may",
+            "might",
+            "this",
+            "that",
+            "these",
+            "those",
+            "from",
+            "than",
+            "then",
+            "into",
+            "over",
+            "their",
+            "its",
+            "it",
+            "they",
+            "them",
+        }
+        cleaned = re.sub(r"[^a-z0-9]+", " ", (desc or "").lower())
+        tokens = [t for t in cleaned.split() if t not in stopwords and len(t) > 2]
+        return set(tokens)
+
+    def _is_desc_duplicate(tokens: Set[str], seen_tokens: List[Set[str]]) -> bool:
+        if not tokens:
+            return False
+        for prior in seen_tokens:
+            if not prior:
+                continue
+            overlap = len(tokens & prior)
+            denom = max(len(tokens), len(prior))
+            if denom and (overlap / denom) >= 0.85:
+                return True
+        return False
+
+    def _normalize_risk_factors_section() -> None:
+        nonlocal text
+        pattern = re.compile(
+            r"##\s*Risk Factors\s*\n+([\s\S]*?)(?=\n##\s|\Z)",
+            re.IGNORECASE,
+        )
+        match = pattern.search(text or "")
+        if not match:
+            return
+        body = (match.group(1) or "").strip()
+        if not body:
+            replacement = _synthesize_risk_factors_addendum()
+            if replacement:
+                text = pattern.sub(
+                    lambda _m: f"## Risk Factors\n{replacement}\n",
+                    text,
+                    count=1,
+                )
+            return
+
+        entries = _extract_risk_entries(body)
+        cleaned_entries: List[Tuple[str, str]] = []
+        seen_names: Set[str] = set()
+        seen_desc_norms: Set[str] = set()
+        seen_desc_tokens: List[Set[str]] = []
+        for name, desc in entries:
+            name = _rewrite_generic_risk_name(name)
+            name_norm = _normalize_risk_name(name)
+            desc_norm = " ".join(
+                re.sub(r"[^a-z0-9]+", " ", desc.lower()).split()
+            )
+            desc_tokens = _risk_desc_tokens(desc)
+            if not name_norm or name_norm in seen_names:
+                continue
+            if desc_norm and desc_norm in seen_desc_norms:
+                continue
+            if desc_tokens and _is_desc_duplicate(desc_tokens, seen_desc_tokens):
+                continue
+            if _count_words(desc) < 18:
+                continue
+            cleaned_entries.append((name, desc))
+            seen_names.add(name_norm)
+            if desc_norm:
+                seen_desc_norms.add(desc_norm)
+            if desc_tokens:
+                seen_desc_tokens.append(desc_tokens)
+
+        # Do NOT force generic padding risks when the model already produced
+        # multiple company-specific items. Only backfill if we lack a second
+        # substantive risk entry.
+        if len(cleaned_entries) < 2:
+            fallback_entries = _extract_risk_entries(
+                _synthesize_risk_factors_addendum()
+            )
+            for name, desc in fallback_entries:
+                name = _rewrite_generic_risk_name(name)
+                name_norm = _normalize_risk_name(name)
+                desc_norm = " ".join(
+                    re.sub(r"[^a-z0-9]+", " ", desc.lower()).split()
+                )
+                desc_tokens = _risk_desc_tokens(desc)
+                if not name_norm or name_norm in seen_names:
+                    continue
+                if desc_norm and desc_norm in seen_desc_norms:
+                    continue
+                if desc_tokens and _is_desc_duplicate(desc_tokens, seen_desc_tokens):
+                    continue
+                if _count_words(desc) < 18:
+                    continue
+                cleaned_entries.append((name, desc))
+                seen_names.add(name_norm)
+                if desc_norm:
+                    seen_desc_norms.add(desc_norm)
+                if desc_tokens:
+                    seen_desc_tokens.append(desc_tokens)
+                if len(cleaned_entries) >= 2:
+                    break
+
+        if not cleaned_entries:
+            return
+
+        cleaned_entries = cleaned_entries[:3]
+        rebuilt_body = "\n\n".join(
+            f"**{name}**: {desc}" for name, desc in cleaned_entries
+        )
+        text = pattern.sub(
+            lambda _m: f"## Risk Factors\n{rebuilt_body}\n", text, count=1
+        )
 
     # 1. Financial Health Rating - only add if we have actual data
     if include_health_rating and not _section_present("Financial Health Rating"):
@@ -8205,10 +10048,12 @@ def _ensure_required_sections(
         if not band_label:
             band_label = _get_score_label(float(score_val))
 
-        band_text = f" - {band_label}" if band_label else ""
-        score_line = (
-            f"{company_name} receives a Financial Health Rating of {float(score_val):.0f}/100{band_text} "
-            "based on profitability, cash conversion, and balance sheet resilience."
+        score_line = _build_health_score_line(
+            company_name,
+            float(score_val),
+            band_label,
+            calculated_metrics,
+            health_rating_config=health_rating_config,
         )
 
         narrative = _build_health_narrative(
@@ -8276,7 +10121,7 @@ def _ensure_required_sections(
     def _synthesize_executive_summary_addendum() -> str:
         """Add a short, metric-anchored paragraph to strengthen a too-brief Exec Summary."""
 
-        is_persona = bool(persona_name)
+        is_persona = persona_mode
 
         revenue = calculated_metrics.get("revenue")
         operating_income = calculated_metrics.get("operating_income")
@@ -8359,7 +10204,7 @@ def _ensure_required_sections(
     def _synthesize_financial_performance_addendum() -> str:
         """Add a short, concrete extension when the Financial Performance section is too thin."""
 
-        is_persona = bool(persona_name)
+        is_persona = persona_mode
 
         revenue = calculated_metrics.get("revenue")
         operating_income = calculated_metrics.get("operating_income")
@@ -8421,14 +10266,18 @@ def _ensure_required_sections(
         We keep this metric-anchored so it reads substantive.
         """
 
-        is_persona = bool(persona_name)
+        is_persona = persona_mode
         lead = "I worry that" if is_persona else "A key risk is that"
+
+        excerpt_lower = (risk_factors_excerpt or "").lower()
+        reg_driver = _regulatory_driver_label(risk_factors_excerpt)
 
         revenue = calculated_metrics.get("revenue")
         operating_margin = calculated_metrics.get("operating_margin")
         net_margin = calculated_metrics.get("net_margin")
         ocf = calculated_metrics.get("operating_cash_flow")
         fcf = calculated_metrics.get("free_cash_flow")
+        capex = calculated_metrics.get("capital_expenditures")
         cash = calculated_metrics.get("cash")
         liabilities = calculated_metrics.get("total_liabilities")
 
@@ -8448,6 +10297,11 @@ def _ensure_required_sections(
             if liabilities is not None
             else None
         )
+        capex_str = (
+            _format_metric_value_for_text("capital_expenditures", capex)
+            if capex is not None
+            else None
+        )
 
         fcf_margin_pct = None
         if fcf is not None and revenue:
@@ -8456,51 +10310,119 @@ def _ensure_required_sections(
             except Exception:
                 fcf_margin_pct = None
 
-        sentences: List[str] = []
+        risks: List[str] = []
+
+        def _business_driver_hint() -> Optional[str]:
+            if not excerpt_lower:
+                return None
+            if "advertis" in excerpt_lower or re.search(r"\bads?\b", excerpt_lower):
+                return "advertising and monetization surfaces"
+            if "search" in excerpt_lower:
+                return "search distribution and traffic acquisition dynamics"
+            if "cloud" in excerpt_lower:
+                return "cloud competition and pricing"
+            if "subscription" in excerpt_lower:
+                return "subscription retention and churn"
+            if "semiconductor" in excerpt_lower or "chip" in excerpt_lower:
+                return "chip supply constraints and customer demand timing"
+            if "loan" in excerpt_lower or "credit" in excerpt_lower:
+                return "credit performance and funding costs"
+            return None
+
+        driver_hint = _business_driver_hint()
+
+        # 0) Regulatory / enforcement when the filing flags it.
+        if reg_driver:
+            risk_name = _rewrite_generic_risk_name("Regulatory and Antitrust Scrutiny")
+            margin_clause = (
+                f" With operating margin around {operating_margin:.1f}%, even modest monetization friction can matter."
+                if operating_margin is not None
+                else ""
+            )
+            risks.append(
+                f"**{risk_name}**: {lead} the filing's emphasis on {reg_driver.lower()} exposure translates into remedies, fines, or product changes that reduce monetization efficiency."
+                f"{margin_clause} If enforcement forces changes to data use, distribution, or bundling, the impact often shows up first as slower pricing power and higher compliance cost."
+            )
 
         # 1) Unit economics / cost shocks.
         if operating_margin is not None:
-            sentences.append(
-                f"{lead} the current operating margin (~{operating_margin:.1f}%) leaves less cushion if incentives, insurance, or regulatory costs rise faster than pricing."
+            risk_name = _rewrite_generic_risk_name("Margin Compression Risk")
+            driver_clause = (
+                f" This is most relevant given the business' dependence on {driver_hint}."
+                if driver_hint
+                else ""
+            )
+            risks.append(
+                f"**{risk_name}**: {lead} the current operating margin (~{operating_margin:.1f}%) leaves less cushion if reinvestment, incentives, insurance, or compliance costs rise faster than pricing. "
+                f"If growth slows at the same time, modest cost inflation can translate into outsized profit compression.{driver_clause}"
             )
         elif net_margin is not None:
-            sentences.append(
-                f"{lead} headline net margin ({net_margin:.1f}%) can be a noisy signal if below-the-line items fade or competitive spend re-accelerates."
+            risk_name = _rewrite_generic_risk_name("Earnings Quality Risk")
+            risks.append(
+                f"**{risk_name}**: {lead} headline net margin ({net_margin:.1f}%) can be a noisy signal if below-the-line items fade or competitive spend re-accelerates. "
+                "If profitability is being supported by one-offs, the market can reprice quickly when operating income normalizes."
             )
         else:
-            sentences.append(
-                f"{lead} competitive intensity can force higher incentive spend, compressing take rates and delaying durable profitability."
+            risk_name = _rewrite_generic_risk_name("Competitive Spend Risk")
+            risks.append(
+                f"**{risk_name}**: {lead} competitive intensity can force higher incentive spend, compressing unit economics and delaying durable profitability. "
+                "If the company cannot hold price, the path to operating leverage becomes more fragile."
             )
 
         # 2) Cash conversion durability.
         if ocf_str and fcf_str:
+            risk_name = _rewrite_generic_risk_name("Cash Conversion Reversal Risk")
             margin_clause = (
-                f" (~{fcf_margin_pct:.1f}% FCF margin)" if fcf_margin_pct is not None else ""
+                f" (~{fcf_margin_pct:.1f}% FCF margin)"
+                if fcf_margin_pct is not None
+                else ""
             )
-            sentences.append(
-                f"With operating cash flow {ocf_str} and free cash flow {fcf_str}{margin_clause}, the risk is that cash conversion proves cyclical and normalizes lower if growth slows or working-capital timing reverses."
+            capex_clause = ""
+            if capex_str:
+                capex_clause = f" The OCF→FCF bridge implies heavy reinvestment (capex {capex_str})."
+            elif ocf is not None and fcf is not None:
+                implied = ocf - fcf
+                implied_str = _format_metric_value_for_text("capital_expenditures", implied)
+                if implied_str:
+                    capex_clause = f" The OCF→FCF bridge implies material reinvestment (implied capex ~{implied_str})."
+            risks.append(
+                f"**{risk_name}**: With operating cash flow {ocf_str} and free cash flow {fcf_str}{margin_clause}, the risk is that cash conversion proves cyclical and normalizes lower if growth slows. "
+                f"Working-capital timing and capex cycles can make a strong quarter look repeatable when it is not.{capex_clause}"
             )
         elif fcf_str:
-            sentences.append(
-                f"Free cash flow {fcf_str} is a strength, but the downside case is weaker cash conversion if competition forces higher spend or payments/working-capital terms worsen."
+            risk_name = _rewrite_generic_risk_name("Cash Conversion Risk")
+            risks.append(
+                f"**{risk_name}**: Free cash flow {fcf_str} is a strength, but the downside case is weaker cash conversion if competition forces higher spend or payments/working-capital terms worsen. "
+                "If cash lags earnings for multiple quarters, valuation support can erode even if reported EPS holds up."
+            )
+        else:
+            risk_name = _rewrite_generic_risk_name("Cash Flow Visibility Risk")
+            risks.append(
+                f"**{risk_name}**: {lead} reported profitability may not translate into free cash flow if working capital and capex are moving against the company. "
+                "Without durable cash conversion, headline earnings become harder to underwrite."
             )
 
         # 3) Balance-sheet flexibility / refinancing.
         if cash_str and liabilities_str and cash and liabilities:
             if liabilities > cash * 2:
-                sentences.append(
-                    f"Balance-sheet flexibility matters: {liabilities_str} of liabilities versus {cash_str} cash can constrain optionality if credit spreads widen or refinancing windows tighten."
+                risk_name = _rewrite_generic_risk_name("Balance-Sheet Flexibility Risk")
+                reg_clause = (
+                    " If enforcement outcomes drive fines, settlements, or higher ongoing compliance spend, liquidity can tighten faster than expected."
+                    if reg_driver
+                    else ""
+                )
+                risks.append(
+                    f"**{risk_name}**: {liabilities_str} of liabilities versus {cash_str} cash can constrain optionality if credit spreads widen or refinancing windows tighten. "
+                    f"In a downside scenario, management may be forced to prioritize de-risking over growth investment.{reg_clause}"
                 )
             else:
-                sentences.append(
-                    f"Liquidity appears workable today ({cash_str} cash against {liabilities_str} liabilities), but a sharper downturn could still tighten flexibility if funding costs rise."
+                risk_name = _rewrite_generic_risk_name("Liquidity Tightening Risk")
+                risks.append(
+                    f"**{risk_name}**: Liquidity appears workable today ({cash_str} cash against {liabilities_str} liabilities), but a sharper downturn could still tighten flexibility if funding costs rise. "
+                    "If leverage increases from here, the risk-reward can deteriorate quickly."
                 )
 
-        sentences.append(
-            "The underwriting question is whether profitability and cash generation remain durable after adjusting for one-offs and normalizing incentive intensity."
-        )
-
-        return " ".join([s for s in sentences if s]).strip()
+        return "\n".join([r for r in risks if r]).strip()
 
     def _has_numeric_content(section_body: str) -> bool:
         return bool(re.search(r"\d", section_body))
@@ -8508,7 +10430,7 @@ def _ensure_required_sections(
     def _synthesize_mdna() -> str:
         """Fallback MD&A content: concise, concrete, and metric-anchored (no placeholders)."""
 
-        is_persona = bool(persona_name)
+        is_persona = persona_mode
 
         revenue = calculated_metrics.get("revenue")
         operating_income = calculated_metrics.get("operating_income")
@@ -8590,14 +10512,63 @@ def _ensure_required_sections(
         return " ".join([s for s in sentences if s]).strip()
 
     def _synthesize_mdna_addendum() -> str:
+        """Add a short, metric-anchored continuation to strengthen MD&A flow."""
+
+        is_persona = persona_mode
+        lead = "I want to see" if is_persona else "The key check is"
+
+        operating_margin = calculated_metrics.get("operating_margin")
+        ocf = calculated_metrics.get("operating_cash_flow")
+        fcf = calculated_metrics.get("free_cash_flow")
+        cash = calculated_metrics.get("cash")
+        securities = calculated_metrics.get("marketable_securities")
+        liabilities = calculated_metrics.get("total_liabilities")
+
+        cash_total = None
+        if cash is not None:
+            cash_total = cash + (securities or 0)
+
+        ocf_str = (
+            _format_metric_value_for_text("operating_cash_flow", ocf)
+            if ocf is not None
+            else None
+        )
+        fcf_str = (
+            _format_metric_value_for_text("free_cash_flow", fcf) if fcf is not None else None
+        )
+        cash_total_str = (
+            _format_metric_value_for_text("cash", cash_total)
+            if cash_total is not None
+            else None
+        )
+        liabilities_str = (
+            _format_metric_value_for_text("total_liabilities", liabilities)
+            if liabilities is not None
+            else None
+        )
+
         sentences: List[str] = []
-        sentences.append(
-            "What matters is whether operating leverage shows up in both margins and cash, not just adjusted metrics or one-time items."
-        )
-        sentences.append(
-            "Capital allocation that compounds value usually looks like reinvesting where returns are clear and keeping dilution and acquisition premiums contained."
-        )
-        return " ".join(sentences).strip()
+
+        if operating_margin is not None:
+            sentences.append(
+                f"{lead} operating leverage stay visible in the reported operating margin (~{operating_margin:.1f}%) without relying on one-offs or short-term timing benefits."
+            )
+
+        if ocf_str and fcf_str:
+            sentences.append(
+                f"With operating cash flow {ocf_str} and free cash flow {fcf_str}, the durability test is whether conversion holds as reinvestment and working-capital needs normalize."
+            )
+
+        if cash_total_str and liabilities_str:
+            sentences.append(
+                f"Against {liabilities_str} of liabilities, {cash_total_str} of cash and securities supports flexibility—but buybacks and M&A only compound if they do not raise refinancing risk or dilute the core margin profile."
+            )
+        else:
+            sentences.append(
+                "Capital allocation compounds best when reinvestment returns are clear and leverage stays contained."
+            )
+
+        return " ".join([s for s in sentences if s]).strip()
 
     # Add minimal Financial Performance and MD&A sections if the model omitted them
     # 0. Executive Summary (rarely missing, but catastrophic when it is)
@@ -8635,8 +10606,15 @@ def _ensure_required_sections(
         body = (m.group(1) or "").strip()
         if _count_words(body) >= min_words:
             return
-        # Append addendum as a new paragraph.
-        new_body = f"{body}\n\n{addendum}".strip()
+        # Append as a continuation to preserve flow (avoid orphan "one-liner" paragraphs).
+        if title == "Risk Factors":
+            joiner = "\n\n"
+        else:
+            cleaned = body.rstrip()
+            cleaned = re.sub(r"[-\u2013\u2014]+\s*$", "", cleaned).rstrip()
+            joiner = " " if cleaned.endswith((".", "!", "?")) else ". "
+            body = cleaned
+        new_body = f"{body}{joiner}{addendum}".strip()
         text = pattern.sub(lambda _mm: f"## {title}\n{new_body}\n", text, count=1)
 
     # Ensure MD&A exists before we try to balance section lengths.
@@ -8665,27 +10643,29 @@ def _ensure_required_sections(
                     flags=re.IGNORECASE,
                 )
 
+    # Ensure Risk Factors exists before we try to balance section lengths.
+    # If the model omitted it (often due to length pressure), synthesize a concrete,
+    # underwriting-style risks paragraph rather than leaving the memo incomplete.
+    if not _section_present("Risk Factors"):
+        _append_section("Risk Factors", _synthesize_risk_factors_addendum())
+
     # Top up short narrative sections to keep distribution more even.
     _top_up_section_if_short(
         "Executive Summary",
-        SUMMARY_SECTION_MIN_WORDS.get("Executive Summary", 80),
+        min_words_by_section.get("Executive Summary", 80),
         _synthesize_executive_summary_addendum(),
     )
     _top_up_section_if_short(
         "Financial Performance",
-        SUMMARY_SECTION_MIN_WORDS.get("Financial Performance", 95),
+        min_words_by_section.get("Financial Performance", 95),
         _synthesize_financial_performance_addendum(),
     )
     _top_up_section_if_short(
         "Management Discussion & Analysis",
-        SUMMARY_SECTION_MIN_WORDS.get("Management Discussion & Analysis", 140),
+        min_words_by_section.get("Management Discussion & Analysis", 140),
         _synthesize_mdna_addendum(),
     )
-    _top_up_section_if_short(
-        "Risk Factors",
-        SUMMARY_SECTION_MIN_WORDS.get("Risk Factors", 110),
-        _synthesize_risk_factors_addendum(),
-    )
+    _normalize_risk_factors_section()
 
     # 6. Key Metrics - always useful to include a factual appendix
     if not _section_present("Key Metrics") and metrics_lines.strip():
@@ -8706,7 +10686,46 @@ def _ensure_required_sections(
     # Generate a data-driven closing takeaway if the AI failed to include one
     # Also replace if the existing one is under the minimum word count
     # Pass persona_name to maintain persona voice in fallback
-    min_closing_words = SUMMARY_SECTION_MIN_WORDS.get("Closing Takeaway", 75)
+    def _min_closing_words() -> int:
+        base_min = int(min_words_by_section.get("Closing Takeaway", 50))
+        if not target_length or target_length <= 0:
+            return max(base_min, 60)
+        if target_length >= 500:
+            floor = max(60, int(target_length * 0.12))
+        elif target_length >= 350:
+            floor = max(50, int(target_length * 0.12))
+        else:
+            floor = max(35, int(target_length * 0.15))
+        return max(base_min, floor)
+
+    def _min_closing_sentences() -> int:
+        if not target_length or target_length >= 500:
+            return 4
+        if target_length >= 350:
+            return 3
+        return 3
+
+    def _closing_has_reasoned_takeaway(text: str) -> bool:
+        if not text:
+            return False
+        has_reason = bool(
+            re.search(
+                r"\b(because|driven|reflects|due to|given|supported by)\b",
+                text,
+                re.IGNORECASE,
+            )
+        ) or bool(re.search(r"\d", text))
+        has_change = bool(
+            re.search(
+                r"\b(if|unless|would change|upgrade|downgrade|revisit|re-rate|improve|deteriorate)\b",
+                text,
+                re.IGNORECASE,
+            )
+        )
+        return has_reason and has_change
+
+    min_closing_words = _min_closing_words()
+    min_closing_sentences = _min_closing_sentences()
 
     # Check if closing takeaway exists and count its words
     existing_closing = None
@@ -8715,26 +10734,80 @@ def _ensure_required_sections(
     )
     if closing_match:
         existing_closing = closing_match.group(1).strip()
-        existing_word_count = len(existing_closing.split())
-        # If persona is selected but the closing lacks an explicit personal verdict, add one
-        if persona_name and not _contains_personal_verdict(existing_closing):
-            # Determine buy/hold/sell based on actual metrics
-            verdict_strengths = []
-            verdict_concerns = []
-            if calculated_metrics:
-                op_margin = calculated_metrics.get("operating_margin", 0)
-                net_margin = calculated_metrics.get("net_margin", 0)
-                fcf = calculated_metrics.get("free_cash_flow", 0)
-                if op_margin and op_margin > 15:
-                    verdict_strengths.append("strong operating margin")
-                if net_margin and net_margin > 10:
-                    verdict_strengths.append("healthy profitability")
-                if fcf and fcf > 0:
-                    verdict_strengths.append("positive free cash flow")
-                if op_margin and op_margin < 5:
-                    verdict_concerns.append("thin margins")
-                if net_margin and net_margin < 0:
-                    verdict_concerns.append("net losses")
+        existing_word_count = _count_words(existing_closing)
+        existing_sentence_count = _count_sentences(existing_closing)
+
+        verdict_strengths: List[str] = []
+        verdict_concerns: List[str] = []
+        if calculated_metrics:
+            op_margin = calculated_metrics.get("operating_margin", 0)
+            net_margin = calculated_metrics.get("net_margin", 0)
+            fcf = calculated_metrics.get("free_cash_flow", 0)
+            revenue = calculated_metrics.get("revenue") or calculated_metrics.get(
+                "total_revenue"
+            )
+            cash = calculated_metrics.get("cash")
+            securities = calculated_metrics.get("marketable_securities") or 0
+            total_liabilities = calculated_metrics.get("total_liabilities")
+            total_assets = calculated_metrics.get("total_assets")
+            current_ratio = calculated_metrics.get("current_ratio")
+            interest_coverage = calculated_metrics.get("interest_coverage")
+
+            cash_total = None
+            if cash is not None:
+                cash_total = cash + (securities or 0)
+
+            fcf_margin_pct = None
+            if fcf and revenue:
+                try:
+                    fcf_margin_pct = (fcf / revenue) * 100
+                except Exception:
+                    fcf_margin_pct = None
+
+            if op_margin and op_margin > 20:
+                verdict_strengths.append("strong operating margin")
+            if net_margin and net_margin > 10:
+                verdict_strengths.append("healthy profitability")
+            if fcf and fcf > 0 and fcf_margin_pct is not None and fcf_margin_pct >= 10:
+                verdict_strengths.append("strong free cash flow conversion")
+            elif fcf and fcf > 0:
+                verdict_strengths.append("positive free cash flow")
+
+            if op_margin and op_margin < 5:
+                verdict_concerns.append("thin margins")
+            if net_margin and net_margin < 0:
+                verdict_concerns.append("net losses")
+            if fcf is not None and fcf <= 0:
+                verdict_concerns.append("negative free cash flow")
+            if fcf_margin_pct is not None and fcf_margin_pct < 8:
+                verdict_concerns.append("low free-cash-flow margin")
+
+            if cash_total is not None and total_liabilities is not None:
+                if cash_total > total_liabilities:
+                    verdict_strengths.append("net cash balance sheet")
+                elif total_liabilities > cash_total * 2:
+                    verdict_concerns.append("large liability load versus cash")
+
+            if total_liabilities and total_assets:
+                try:
+                    leverage = total_liabilities / total_assets
+                except Exception:
+                    leverage = None
+                if leverage is not None and leverage > 0.8:
+                    verdict_concerns.append("elevated leverage")
+
+            if current_ratio is not None and current_ratio >= 1.5:
+                verdict_strengths.append("solid liquidity")
+            elif current_ratio is not None and current_ratio < 1.0:
+                verdict_concerns.append("tight liquidity")
+
+            if interest_coverage is not None and interest_coverage >= 8:
+                verdict_strengths.append("strong interest coverage")
+            elif interest_coverage is not None and interest_coverage < 2:
+                verdict_concerns.append("thin interest coverage")
+
+        # If persona is requested but the closing lacks an explicit personal verdict, add one.
+        if persona_mode and not _contains_personal_verdict(existing_closing):
             patched = _ensure_personal_verdict(
                 existing_closing,
                 company_name,
@@ -8749,19 +10822,52 @@ def _ensure_required_sections(
                 flags=re.IGNORECASE,
             )
             existing_closing = patched
-            existing_word_count = len(existing_closing.split())
+            existing_word_count = _count_words(existing_closing)
+            existing_sentence_count = _count_sentences(existing_closing)
+        elif (not persona_mode) and not _contains_objective_recommendation(existing_closing):
+            patched = _ensure_objective_recommendation(
+                existing_closing,
+                company_name,
+                strengths=verdict_strengths,
+                concerns=verdict_concerns,
+            )
+            text = re.sub(
+                r"##\s*Closing\s+Takeaway\s*\n+[\s\S]*?(?=\n##\s|\Z)",
+                lambda _m: f"## Closing Takeaway\n{patched}\n",
+                text,
+                flags=re.IGNORECASE,
+            )
+            existing_closing = patched
+            existing_word_count = _count_words(existing_closing)
+            existing_sentence_count = _count_sentences(existing_closing)
     else:
         existing_word_count = 0
+        existing_sentence_count = 0
 
-    if (
+    needs_closing_rebuild = (
         not _section_present("Closing Takeaway")
         or existing_word_count < min_closing_words
-    ):
-        closing_body = _generate_fallback_closing_takeaway(
-            company_name, calculated_metrics, persona_name
+        or existing_sentence_count < min_closing_sentences
+        or not _closing_has_reasoned_takeaway(existing_closing or "")
+        or (
+            persona_mode
+            and not _contains_personal_verdict(existing_closing or "")
         )
-        if existing_closing and existing_word_count < min_closing_words:
-            # Remove the short closing takeaway and replace it
+        or (
+            (not persona_mode)
+            and not _contains_objective_recommendation(existing_closing or "")
+        )
+    )
+
+    if needs_closing_rebuild:
+        closing_body = _generate_fallback_closing_takeaway(
+            company_name,
+            calculated_metrics,
+            persona_name,
+            persona_requested=persona_mode,
+        )
+        if existing_closing:
+            # Remove the existing closing takeaway and replace it
             text = re.sub(
                 r"##\s*Closing\s+Takeaway\s*\n+[\s\S]*?(?=\n##\s|\Z)",
                 "",
@@ -8799,7 +10905,7 @@ def _ensure_required_sections(
             budget = budgets.get(title)
             if not budget:
                 return
-            min_words = int(SUMMARY_SECTION_MIN_WORDS.get(title, 25))
+            min_words = int(min_words_by_section.get(title, 25))
             max_words = max(min_words, int(budget * 1.30))
             pattern = re.compile(
                 rf"##\s*{re.escape(title)}\s*\n+([\s\S]*?)(?=\n##\s|\Z)",

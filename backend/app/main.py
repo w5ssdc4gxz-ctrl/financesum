@@ -1,4 +1,6 @@
 """Main FastAPI application."""
+import os
+
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -51,7 +53,11 @@ async def root():
 @app.get("/health")
 async def health():
     """Health check endpoint."""
-    return {"status": "healthy"}
+    return {
+        "status": "healthy",
+        "service": os.getenv("K_SERVICE"),
+        "revision": os.getenv("K_REVISION"),
+    }
 
 
 @app.get("/favicon.ico")
