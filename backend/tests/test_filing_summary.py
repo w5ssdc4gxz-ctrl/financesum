@@ -219,7 +219,7 @@ def test_risk_factor_headlines_are_rewritten_with_company_theme() -> None:
     assert "Regulatory and Antitrust Scrutiny" not in rewritten
     assert "Margin Compression Risk" not in rewritten
     assert "Enforcement Risk" in rewritten
-    assert "Margin / Reinvestment Risk" in rewritten
+    assert "Cost Base Risk" in rewritten
 
 
 def test_custom_preferences_influence_prompt(monkeypatch):
@@ -485,7 +485,6 @@ def test_summary_enforces_word_length(monkeypatch):
     monkeypatch.setattr(filings_api, "get_gemini_client", lambda: DummyClient())
 
     client = TestClient(app)
-    tolerance = max(5, int(target_length * 0.05))
     response = client.post(
         f"/api/v1/filings/{filing_id}/summary",
         json={"mode": "custom", "target_length": target_length},
@@ -497,8 +496,8 @@ def test_summary_enforces_word_length(monkeypatch):
                 f.write(f"Status: {response.status_code}\nBody: {response.text}")
         assert response.status_code == 200
         summary = response.json()["summary"]
-        word_count = len(summary.split())
-        assert target_length - tolerance <= word_count <= target_length + tolerance
+        word_count = _backend_word_count(summary)
+        assert target_length - 10 <= word_count <= target_length + 10
     finally:
         local_cache.fallback_filings_by_id.pop(filing_id, None)
         local_cache.fallback_companies.pop(company_id, None)
@@ -552,7 +551,6 @@ def test_summary_trims_when_model_refuses(monkeypatch):
 
     client = TestClient(app)
     target_length = 500
-    tolerance = max(5, int(target_length * 0.05))
     response = client.post(
         f"/api/v1/filings/{filing_id}/summary",
         json={"mode": "custom", "target_length": target_length},
@@ -561,8 +559,8 @@ def test_summary_trims_when_model_refuses(monkeypatch):
     try:
         assert response.status_code == 200
         summary = response.json()["summary"]
-        word_count = len(summary.split())
-        assert word_count <= target_length + tolerance
+        word_count = _backend_word_count(summary)
+        assert word_count <= target_length + 10
         assert word_count < 900  # Confirm it was trimmed
         assert summary.rstrip().endswith((".", "!", "?"))
         assert dummy_model_holder["model"].calls == filings_api.MAX_SUMMARY_ATTEMPTS + filings_api.MAX_REWRITE_ATTEMPTS
@@ -622,7 +620,6 @@ def test_summary_rewrite_produces_compact_output(monkeypatch):
 
     client = TestClient(app)
     target_length = 500
-    tolerance = max(5, int(target_length * 0.05))
     response = client.post(
         f"/api/v1/filings/{filing_id}/summary",
         json={"mode": "custom", "target_length": target_length},
@@ -631,8 +628,8 @@ def test_summary_rewrite_produces_compact_output(monkeypatch):
     try:
         assert response.status_code == 200
         summary = response.json()["summary"]
-        word_count = len(summary.split())
-        assert target_length - tolerance <= word_count <= target_length + tolerance
+        word_count = _backend_word_count(summary)
+        assert target_length - 10 <= word_count <= target_length + 10
         assert "Executive Summary" in summary
         assert "Management Discussion" in summary
         assert filings_api.MAX_SUMMARY_ATTEMPTS < dummy_model_holder["model"].calls <= (
