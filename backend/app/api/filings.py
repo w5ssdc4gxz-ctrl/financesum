@@ -732,8 +732,7 @@ def _enforce_whitespace_word_band(
             # For tiny overages, prefer micro-trimming filler words over dropping sentences.
             if excess <= 15:
                 micro, removed = _micro_trim_filler_words(text, excess)
-                micro_count = _count_words(micro)
-                if removed > 0 and micro_count < ws_count:
+                if removed > 0 and len(micro.split()) < ws_count:
                     text = micro
                     continue
 
@@ -3622,8 +3621,8 @@ SECTION_PROPORTIONAL_WEIGHTS: Dict[str, int] = {
     "Financial Health Rating": 12,
     "Executive Summary": 17,
     "Financial Performance": 17,
-    "Management Discussion & Analysis": 18,
-    "Risk Factors": 13,
+    "Management Discussion & Analysis": 20,
+    "Risk Factors": 11,
     "Key Metrics": 8,
     "Closing Takeaway": 15,
 }
@@ -4114,7 +4113,7 @@ def _make_closing_recommendation_validator(
 
 
 def _make_risk_specificity_validator(
-    *, risk_factors_excerpt: Optional[str], company_name: str, target_length: Optional[int]
+    *, risk_factors_excerpt: Optional[str]
 ) -> Callable[[str], Optional[str]]:
     excerpt_raw = risk_factors_excerpt or ""
     excerpt_norm = " ".join(excerpt_raw.split()).lower()
@@ -4124,88 +4123,6 @@ def _make_risk_specificity_validator(
         return " ".join(cleaned.split())
 
     excerpt_search = _norm_for_search(excerpt_raw)
-
-    suffix_tokens = {
-        "the",
-        "inc",
-        "incorporated",
-        "corp",
-        "corporation",
-        "co",
-        "company",
-        "ltd",
-        "limited",
-        "plc",
-        "group",
-        "holdings",
-        "holding",
-        "sa",
-        "ag",
-        "nv",
-        "llc",
-        "lp",
-        "adr",
-        "common",
-        "stock",
-        "ordinary",
-        "shares",
-        "class",
-    }
-    company_tokens = {
-        t
-        for t in re.findall(r"[a-z0-9]+", (company_name or "").lower())
-        if t and t not in suffix_tokens
-    }
-
-    generic_name_tokens = {
-        "risk",
-        "risks",
-        "margin",
-        "reinvestment",
-        "compression",
-        "cash",
-        "burn",
-        "dilution",
-        "liquidity",
-        "funding",
-        "refinancing",
-        "balance",
-        "sheet",
-        "flexibility",
-        "tightening",
-        "cashflow",
-        "cash",
-        "flow",
-        "conversion",
-        "capex",
-        "earnings",
-        "quality",
-        "normalization",
-        "competition",
-        "competitive",
-        "pricing",
-        "spend",
-        "regulatory",
-        "regulation",
-        "antitrust",
-        "privacy",
-        "security",
-        "cyber",
-        "cybersecurity",
-        "macroeconomic",
-        "macro",
-        "geopolitical",
-        "cyclical",
-        "demand",
-        "execution",
-    }
-
-    def _name_has_specific_driver(name: str) -> bool:
-        canon = _canonicalize_section_title(name)
-        tokens = {t for t in canon.split() if t}
-        tokens -= company_tokens
-        tokens -= generic_name_tokens
-        return bool(tokens)
 
     risk_item_pattern = re.compile(
         r"\*\*(?P<name>[^*]{2,120})\*\*\s*:\s*(?P<body>.+?)(?=(?:\n\s*\*\*[^*]+\*\*\s*:)|\Z)",
@@ -4237,16 +4154,14 @@ def _make_risk_specificity_validator(
             return None
 
         items = list(risk_item_pattern.finditer(risk_body))
-        min_items = 3 if (target_length or 0) >= 500 else 2
-        if len(items) < min_items:
+        if len(items) < 2:
             return (
-                f"Risk Factors must include at least {min_items} risks in this format: "
-                "**Risk Name**: 2-4 sentences with company-specific mechanisms."
+                "Risk Factors are not in the required format. Provide 2-3 risks using: "
+                "**Risk Name**: 2-3 sentences with company-specific mechanisms."
             )
 
         seen_names: set[str] = set()
         grounded_quotes = 0
-        min_words_per_risk = 30 if (target_length or 0) >= 500 else 18
 
         for match in items:
             name = (match.group("name") or "").strip()
@@ -4256,24 +4171,9 @@ def _make_risk_specificity_validator(
                 return "Risk Factors contain duplicate risk names. Use distinct, non-overlapping drivers."
             seen_names.add(canon)
 
-            if not _name_has_specific_driver(name):
+            if len(body.split()) < 18:
                 return (
-                    f"Risk name '{name}' is too generic. Rename it to include the specific driver "
-                    "(product/segment/customer/regime), not just generic labels like margin/cash/regulation."
-                )
-
-            sentence_count = len(
-                [s for s in re.split(r"(?<=[.!?])\s+", body) if s.strip()]
-            )
-            if sentence_count < 2:
-                return (
-                    f"Risk Factors under '{name}' are too shallow. Write 2-4 complete sentences including an if-then scenario "
-                    "and a leading indicator to watch."
-                )
-
-            if _count_words(body) < min_words_per_risk:
-                return (
-                    f"Risk Factors are too thin under '{name}'. Expand each risk to 2-4 substantive sentences with a clear mechanism."
+                    f"Risk Factors are too thin under '{name}'. Expand each risk to 2-3 substantive sentences with a clear mechanism."
                 )
 
             if not re.search(r"\d", body):
@@ -7688,7 +7588,7 @@ def generate_filing_summary(
                 ),
                 (
                     "Management Discussion & Analysis",
-                    "Expanded management assessment (115-165 words). Focus on:\n"
+                    "Expanded management assessment (125-175 words). Focus on:\n"
                     "1. Strategy and capital deployment priorities (R&D, incentives, capex, buybacks/M&A)\n"
                     "2. Alignment check: do the claims MATCH operating margin trajectory and cash conversion?\n"
                     "3. Earnings quality: reconcile operating income vs net income and call out one-offs\n\n"
@@ -7703,14 +7603,12 @@ def generate_filing_summary(
                     "Risk Factors",
                     "2-3 MATERIAL, company-specific risks (concise but substantive). Each MUST:\n"
                     "1. Have a clear name that includes the *specific driver* (segment/product/platform/regulation). Avoid generic labels like 'Margin Compression Risk' unless you tie it to a named driver (e.g., TAC, capex, incentives, insurance).\n"
-                    "2. Be 2-4 sentences with concrete mechanisms and quantified impact where possible (not one-liners)\n"
+                    "2. Be 2-3 sentences with concrete mechanisms and quantified impact where possible\n"
                     "3. Be specific to THIS business model (not generic macro filler)\n"
                     "4. Be distinct: no duplicate names or overlapping drivers\n"
                     "5. Be grounded in the filing's RISK FACTORS excerpt in the prompt (do not invent risks)\n"
                     "6. For EACH risk, cite (a) a filing-specific driver from the excerpt and (b) at least one numeric metric from this memo (margins, OCF→FCF, capex, cash vs liabilities).\n"
                     "7. If a RISK FACTORS excerpt is provided above, include a SHORT verbatim quote (4-10 words) from that excerpt in quotation marks inside EACH risk to prove grounding.\n"
-                    "8. AVOID REUSED TEMPLATES: Do not recycle the same risk names across companies (e.g., 'Cash Burn and Dilution Risk', 'Margin / Reinvestment Risk'). Name the real driver (product adoption, customer concentration, OEM/design-win timing, pricing model, contract structure, supply chain constraint, export controls, reimbursement, etc.).\n"
-                    "9. Add an if-then scenario + leading indicator to watch in EACH risk (1 sentence).\n"
                     "Format: **Risk Name**: Explanation with specifics.\n"
                     "Skip generic macro risks unless the filing clearly makes them company-specific.",
                 ),
@@ -7999,11 +7897,7 @@ Before you output anything, verify:
             )
         ]
         quality_validators.append(
-            _make_risk_specificity_validator(
-                risk_factors_excerpt=risk_factors_excerpt,
-                company_name=company_name,
-                target_length=target_length,
-            )
+            _make_risk_specificity_validator(risk_factors_excerpt=risk_factors_excerpt)
         )
         quality_validators.append(_make_numbers_discipline_validator(target_length))
         quality_validators.append(
@@ -9697,17 +9591,7 @@ def _ensure_required_sections(
     def _derive_risk_theme_label(excerpt: Optional[str]) -> str:
         base = _short_company_label(company_name)
         if not excerpt:
-            # Fall back to the memo itself (especially Executive Summary) so risk
-            # headlines can still be business-specific even when the filing excerpt
-            # is missing (e.g., statement-only inputs).
-            memo = text or ""
-            m = re.search(
-                r"(?is)^\s*##\s*Executive Summary\s*\n+([\s\S]*?)(?=^\s*##\s|\Z)",
-                memo,
-            )
-            excerpt = (m.group(1) if m else memo)[:12_000]
-            if not excerpt:
-                return base
+            return base
 
         company_tokens = set(
             t
@@ -9884,28 +9768,18 @@ def _ensure_required_sections(
             return base
 
         if norm in {"margin compression risk"}:
-            operating_margin = calculated_metrics.get("operating_margin")
-            if operating_margin is not None and operating_margin < 0:
-                return _themed("Opex Leverage / Cost Discipline Risk")
-            return _themed("Pricing Power / Cost Base Risk")
-        if norm in {
-            "cash burn and dilution risk",
-            "cash burn risk",
-            "financing and dilution risk",
-            "funding and dilution risk",
-        }:
-            return _themed("Cash Runway / Dilution Risk")
+            return _themed("Margin / Reinvestment Risk")
         if norm in {
             "cash conversion risk",
             "cash conversion reversal risk",
             "cash flow visibility risk",
         }:
-            return _themed("Cash Conversion / Working-Capital Risk")
+            return _themed("Cash Conversion / Capex Risk")
         if norm in {
             "balance sheet flexibility risk",
             "liquidity tightening risk",
         }:
-            return _themed("Liquidity / Funding Access Risk")
+            return _themed("Liquidity / Funding Risk")
         if norm in {"earnings quality risk"}:
             return _themed("Earnings Quality / Normalization Risk")
         if norm in {"competitive spend risk"}:
@@ -10447,10 +10321,6 @@ def _ensure_required_sections(
                 return "search distribution and traffic acquisition dynamics"
             if "cloud" in excerpt_lower:
                 return "cloud competition and pricing"
-            if "lidar" in excerpt_lower or "li-dar" in excerpt_lower:
-                return "LiDAR adoption, design-win timing, and sensor unit economics"
-            if "autonom" in excerpt_lower:
-                return "autonomy adoption timing and OEM/program concentration"
             if "subscription" in excerpt_lower:
                 return "subscription retention and churn"
             if "semiconductor" in excerpt_lower or "chip" in excerpt_lower:
