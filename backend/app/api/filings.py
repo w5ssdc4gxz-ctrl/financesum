@@ -724,6 +724,11 @@ def _enforce_whitespace_word_band(
     for _ in range(5):
         ws_count = _count_words(text)
         if lower <= ws_count <= upper:
+            cleaned = _dedupe_consecutive_sentences(text)
+            cleaned = _deduplicate_sentences(cleaned)
+            if cleaned != text:
+                text = cleaned
+                continue
             return text
 
         if ws_count > upper:
@@ -2181,9 +2186,18 @@ def _generate_padding_sentences(
         candidates.append((len(t.split()), t))
 
     if not candidates:
-        # If everything was excluded, fall back to allowing repeats so we can still
+        # If the section already contains all of its padding templates, broaden to the
+        # generic pool first to avoid inserting duplicate sentences into the same memo.
+        if canon_section in section_templates:
+            for t in fallback_templates:
+                if excluded and _norm_sentence(t) in excluded:
+                    continue
+                candidates.append((len(t.split()), t))
+
+        # If everything was still excluded, fall back to allowing repeats so we can
         # satisfy strict length bands.
-        candidates = [(len(t.split()), t) for t in templates]
+        if not candidates:
+            candidates = [(len(t.split()), t) for t in templates]
     candidates.sort(key=lambda x: x[0])
 
     sentences: List[str] = []
@@ -5729,7 +5743,7 @@ def _build_health_score_line(
 ) -> str:
     """Build the health score opener with specific driver context when available."""
     band_text = f" - {band_label}" if band_label else ""
-    reasons: List[str] = []
+    clauses: List[str] = []
 
     operating_margin = calculated_metrics.get("operating_margin")
     net_margin = calculated_metrics.get("net_margin")
@@ -5739,48 +5753,53 @@ def _build_health_score_line(
     liabilities = calculated_metrics.get("total_liabilities")
 
     if operating_margin is not None:
-        reasons.append(f"operating margin of {operating_margin:.1f}%")
+        clauses.append(
+            f"operating margin of {operating_margin:.1f}% supports the earnings base"
+        )
     elif net_margin is not None:
-        reasons.append(f"net margin of {net_margin:.1f}%")
+        clauses.append(f"net margin of {net_margin:.1f}% supports the earnings base")
 
     if free_cash_flow is not None:
         fcf_str = _format_dollar(free_cash_flow)
         if fcf_str:
-            reasons.append(f"free cash flow of {fcf_str}")
+            if free_cash_flow < 0:
+                clauses.append(f"negative free cash flow ({fcf_str}) limits flexibility")
+            else:
+                clauses.append(f"free cash flow of {fcf_str} funds reinvestment")
     elif operating_cash_flow is not None:
         ocf_str = _format_dollar(operating_cash_flow)
         if ocf_str:
-            reasons.append(f"operating cash flow of {ocf_str}")
+            clauses.append(f"operating cash flow of {ocf_str} underwrites liquidity")
 
     cash_str = _format_dollar(cash) if cash is not None else None
     liab_str = _format_dollar(liabilities) if liabilities is not None else None
     if cash_str and liab_str:
         if cash and liabilities and cash > liabilities:
-            reasons.append(
-                f"net cash position ({cash_str} cash vs {liab_str} liabilities)"
+            clauses.append(f"net cash ({cash_str} vs {liab_str}) adds balance-sheet cushion")
+        else:
+            clauses.append(
+                f"{liab_str} liabilities against {cash_str} cash frames the margin for error"
             )
-        else:
-            reasons.append(f"{liab_str} liabilities against {cash_str} cash")
     elif liab_str:
-        reasons.append(f"{liab_str} liabilities")
+        clauses.append(f"{liab_str} of liabilities shapes the balance-sheet buffer")
     elif cash_str:
-        reasons.append(f"{cash_str} cash on hand")
+        clauses.append(f"{cash_str} of cash on hand supports near-term flexibility")
 
-    if reasons:
-        if len(reasons) >= 3:
-            reasons_text = ", ".join(reasons[:2]) + f", and {reasons[2]}"
-        elif len(reasons) == 2:
-            reasons_text = " and ".join(reasons)
+    if clauses:
+        if len(clauses) >= 3:
+            clauses_text = ", ".join(clauses[:2]) + f", and {clauses[2]}"
+        elif len(clauses) == 2:
+            clauses_text = " and ".join(clauses)
         else:
-            reasons_text = reasons[0]
+            clauses_text = clauses[0]
         return (
             f"{company_name} receives a Financial Health Rating of {score:.0f}/100{band_text} "
-            f"because {reasons_text}."
+            f"because {clauses_text}."
         )
 
     return (
         f"{company_name} receives a Financial Health Rating of {score:.0f}/100{band_text} "
-        "based on profitability, cash conversion, and balance sheet resilience."
+        "because profitability, cash conversion, and balance-sheet resilience all feed into the score."
     )
 
 
@@ -9101,9 +9120,16 @@ def _generate_fallback_closing_takeaway(
             trigger_parts.append("better balance-sheet flexibility")
 
         trigger = " and ".join(trigger_parts[:2]) if trigger_parts else "durable cash conversion"
-        trigger_sentence = (
-            f"My view would change with clearer evidence of {trigger}, or if the weak areas worsen and compress the margin for error."
-        )
+        primary_concern = concerns[0] if concerns else "the weak spots"
+        seed_material = "|".join([persona_name, company_name, quality, trigger, primary_concern])
+        digest = hashlib.sha256(seed_material.encode("utf-8")).digest()
+        rng = random.Random(int.from_bytes(digest[:8], "big"))
+        trigger_variants = [
+            f"I'd get more constructive with clearer evidence of {trigger}; I'd get more cautious if {primary_concern} worsens and the margin for error shrinks.",
+            f"I would revisit my stance if {trigger} shows up consistently, or if {primary_concern} deteriorates and the cushion narrows.",
+            f"What changes my view: {trigger} on the upside, or a worsening in {primary_concern} that tightens the margin for error.",
+        ]
+        trigger_sentence = rng.choice(trigger_variants)
 
         closing = f"{closing} {trigger_sentence}".strip()
         return _ensure_personal_verdict(closing, company_name, strengths, concerns)
@@ -9422,10 +9448,30 @@ def _generate_persona_flavored_closing(
                 f"the S-curve adoption could drive exponential growth. By 2030, I see significant upside if the innovation thesis plays out."
             )
         elif is_mixed:
-            return (
-                f"{company_name} has innovation potential, but {concerns[0] if concerns else 'execution risk'} creates uncertainty. "
-                f"I am watching for Wright's Law dynamics to emerge before increasing conviction."
+            seed_material = "|".join(
+                [
+                    persona_name,
+                    company_name,
+                    quality,
+                    strengths_str,
+                    concerns_str,
+                ]
             )
+            digest = hashlib.sha256(seed_material.encode("utf-8")).digest()
+            rng = random.Random(int.from_bytes(digest[:8], "big"))
+            concern = concerns[0] if concerns else "execution risk"
+
+            setup_variants = [
+                f"{company_name} has innovation potential, but {concern} keeps the setup balanced.",
+                f"I like the innovation ambition at {company_name}, but {concern} widens the range of outcomes.",
+                f"{company_name} could still surprise to the upside, yet {concern} makes timing and scaling less obvious.",
+            ]
+            followups = [
+                "I want to see evidence the business is moving up an S-curve—improving unit economics and scaling free cash flow—before I raise conviction.",
+                "Conviction goes up when Wright's Law shows up in the numbers: costs down, adoption up, and cash flow starting to compound.",
+                "I need clearer proof that disruption is translating into operating leverage and cash generation, not just narrative momentum.",
+            ]
+            return f"{rng.choice(setup_variants)} {rng.choice(followups)}"
         else:
             return (
                 f"{company_name} faces {concerns_str}, which constrains its ability to invest in disruptive innovation. "
@@ -10606,6 +10652,32 @@ def _ensure_required_sections(
         body = (m.group(1) or "").strip()
         if _count_words(body) >= min_words:
             return
+
+        def _norm_sentence(sentence: str) -> str:
+            sentence = (sentence or "").replace("\u00A0", " ")
+            sentence = " ".join(sentence.lower().split())
+            return sentence.rstrip(".!?")
+
+        def _split_sentences(blob: str) -> List[str]:
+            blob = (blob or "").strip()
+            if not blob:
+                return []
+            return [s.strip() for s in re.split(r"(?<=[.!?])\s+", blob) if s.strip()]
+
+        # Avoid introducing duplicates when the addendum overlaps with what the model
+        # already wrote (a common repetition pattern users notice).
+        body_norms = {_norm_sentence(s) for s in _split_sentences(body)}
+        filtered_addendum_sentences: List[str] = []
+        for sentence in _split_sentences(addendum):
+            norm = _norm_sentence(sentence)
+            if not norm or norm in body_norms:
+                continue
+            filtered_addendum_sentences.append(sentence)
+            body_norms.add(norm)
+        addendum = " ".join(filtered_addendum_sentences).strip()
+        if not addendum:
+            return
+
         # Append as a continuation to preserve flow (avoid orphan "one-liner" paragraphs).
         if title == "Risk Factors":
             joiner = "\n\n"
@@ -10927,6 +10999,11 @@ def _ensure_required_sections(
             "Risk Factors",
         ):
             _cap_section_to_budget(core_title)
+
+    # Final repetition cleanup: this function can append addenda and padding that
+    # occasionally overlaps with model output, so remove duplicates deterministically.
+    text = _dedupe_consecutive_sentences(text)
+    text = _deduplicate_sentences(text)
 
     return text
 
