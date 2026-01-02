@@ -711,9 +711,12 @@ def _enforce_whitespace_word_band(
 ) -> str:
     """Enforce the word band using user-visible whitespace token counting.
 
-    This intentionally ignores pure-markup tokens like `##` by using `_count_words()`
-    (whitespace split + punctuation stripping), which matches test/UI expectations
-    better than `len(text.split())`.
+    This enforces BOTH:
+    - raw whitespace token count (`len(text.split())`, which counts markdown markers like `##`)
+    - punctuation-stripped count (`_count_words`, closer to MS Word)
+
+    Reason: the codebase and UI/tests use both styles in different places, so we
+    keep the output safely inside the band under either interpretation.
     """
     if not text or target_length is None:
         return text
@@ -722,8 +725,10 @@ def _enforce_whitespace_word_band(
     upper = target_length + tolerance
 
     for _ in range(5):
-        ws_count = _count_words(text)
-        if lower <= ws_count <= upper:
+        split_count = len(text.split())
+        stripped_count = _count_words(text)
+
+        if lower <= split_count <= upper and lower <= stripped_count <= upper:
             cleaned = _dedupe_consecutive_sentences(text)
             cleaned = _deduplicate_sentences(cleaned)
             if cleaned != text:
@@ -731,13 +736,16 @@ def _enforce_whitespace_word_band(
                 continue
             return text
 
-        if ws_count > upper:
-            excess = ws_count - upper
+        if split_count > upper or stripped_count > upper:
+            excess = max(split_count - upper, stripped_count - upper)
 
             # For tiny overages, prefer micro-trimming filler words over dropping sentences.
             if excess <= 15:
                 micro, removed = _micro_trim_filler_words(text, excess)
-                if removed > 0 and len(micro.split()) < ws_count:
+                if removed > 0 and (
+                    len(micro.split()) < split_count
+                    or _count_words(micro) < stripped_count
+                ):
                     text = micro
                     continue
 
@@ -747,14 +755,15 @@ def _enforce_whitespace_word_band(
             continue
 
         # Under target by whitespace count.
-        deficit = lower - ws_count
+        deficit = max(lower - split_count, lower - stripped_count)
         if not allow_padding:
             return text
         text = _distribute_padding_across_sections(text, deficit)
 
     # Final safety: deterministic clamp if the iterative pass didn't converge.
-    final_count = _count_words(text)
-    if lower <= final_count <= upper:
+    final_split = len(text.split())
+    final_stripped = _count_words(text)
+    if lower <= final_split <= upper and lower <= final_stripped <= upper:
         return text
     return _clamp_to_band(text, lower, upper, allow_padding=allow_padding)
 
@@ -2101,6 +2110,16 @@ def _generate_padding_sentences(
                 "Balance-sheet flexibility matters because it determines how aggressively the company can invest through a downturn without compromising optionality.",
             ),
         ],
+        "closing takeaway": [
+            _voice(
+                "What changes my view is clearer evidence that margins can hold through a softer period and that free cash flow conversion improves as reinvestment intensity normalizes.",
+                "What changes the view is clearer evidence that margins can hold through a softer period and that free cash flow conversion improves as reinvestment intensity normalizes.",
+            ),
+            _voice(
+                "I would get more constructive if management proves it can fund growth and still compound cash; I would get more cautious if leverage rises or working-capital swings start to consume cash.",
+                "Conviction improves if management proves it can fund growth and still compound cash; caution rises if leverage increases or working-capital swings start to consume cash.",
+            ),
+        ],
         "financial performance": [
             _voice(
                 "I focus on the bridge from operating profit to free cash flow, because that is where working-capital timing and capex show up in earnings quality.",
@@ -2298,12 +2317,16 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
         ).strip()
         return f"{base}\n\n{padding_text}".strip() if padding_text else base
 
-    # Candidate narrative sections to pad (exclude Health/Exec Summary/Risk/Key Metrics/Closing).
-    # Padding is a last-resort safety net; avoid stuffing generic sentences into
-    # the hero (Executive Summary) or risk list, where it reads low-quality.
+    # Candidate sections to pad (exclude Health/Key Metrics/Closing).
+    #
+    # IMPORTANT: If we exclude Executive Summary / Risk Factors, the padding step becomes
+    # a dumping ground for Financial Performance / MD&A, which makes the memo feel
+    # lopsided (users perceive this as "80% MD&A/Financials").
     candidate_order = {
-        "management discussion and analysis": 0,
-        "financial performance": 1,
+        "risk factors": 0,
+        "executive summary": 1,
+        "financial performance": 2,
+        "management discussion and analysis": 3,
     }
 
     candidates: List[Tuple[int, int, int]] = []  # (word_count, tie_break, section_idx)
@@ -3007,10 +3030,10 @@ def _rewrite_summary_to_length(
                 f"{health_cut_line}"
                 "   - Executive Summary: ~15% of cuts\n"
                 "   - Financial Performance: ~20% of cuts\n"
-                "   - Management Discussion & Analysis: ~30% of cuts\n"
-                "   - Risk Factors: ~8% of cuts\n"
-                "   - Key Metrics: ~5% of cuts\n"
-                "   - Closing Takeaway: ~10% of cuts (KEEP AT LEAST 50 words)\n"
+                "   - Management Discussion & Analysis: ~20% of cuts\n"
+                "   - Risk Factors: ~15% of cuts\n"
+                "   - Key Metrics: ~10% of cuts\n"
+                "   - Closing Takeaway: ~10% of cuts (KEEP A COMPLETE VERDICT; do not collapse to a one-liner)\n"
                 "3. DO NOT take all cuts from one section (especially Closing Takeaway).\n"
                 "4. Remove adjectives, adverbs, and filler words. Merge sentences.\n"
                 "5. Keep 'Key Metrics' compact but complete.\n"
@@ -3022,11 +3045,13 @@ def _rewrite_summary_to_length(
                 f"You are {abs_diff} words SHORT of the MINIMUM requirement ({lower} words). \n"
                 f"ACTION: EXPAND the content NOW. You MUST add AT LEAST {int(words_needed * 1.3)} words.\n\n"
                 f"MANDATORY EXPANSION (add exactly these words per section):\n"
-                f"- Financial Performance: Add {max(5, int(words_needed * 0.30))} words (deeper margin analysis, YoY comparisons)\n"
-                f"- Management Discussion & Analysis: Add {max(5, int(words_needed * 0.45))} words (strategy, capital allocation, earnings-quality reconciliation)\n"
-                f"- Risk Factors: Add {max(5, int(words_needed * 0.10))} words (only the 2-3 most material risks)\n"
-                f"- Executive Summary: Add {max(3, int(words_needed * 0.15))} words (conviction rationale)\n"
-                "DO NOT add narrative to Key Metrics; keep it a scannable data block.\n\n"
+                f"- Financial Health Rating: Add {max(2, int(words_needed * 0.10))} words (link score to 1-2 key drivers)\n"
+                f"- Executive Summary: Add {max(3, int(words_needed * 0.15))} words (thesis + swing factor)\n"
+                f"- Financial Performance: Add {max(5, int(words_needed * 0.20))} words (margin bridge, cash conversion, YoY context)\n"
+                f"- Management Discussion & Analysis: Add {max(5, int(words_needed * 0.20))} words (strategy, capital allocation, execution)\n"
+                f"- Risk Factors: Add {max(4, int(words_needed * 0.15))} words (only the most material, filing-grounded risks)\n"
+                f"- Key Metrics: Add {max(2, int(words_needed * 0.10))} words by adding MORE arrow-line metric rows (NO prose paragraphs)\n"
+                f"- Closing Takeaway: Add {max(3, int(words_needed * 0.10))} words (clear verdict + what changes the view)\n\n"
                 f"DO NOT use generic filler sentences. Add SUBSTANTIVE analysis with specific data points.\n"
                 f"You MUST reach at least {lower} words. Count your words before finishing."
             )
@@ -3606,19 +3631,21 @@ def _validate_mdna_section(text: str) -> Optional[str]:
 
 
 SUMMARY_SECTION_REQUIREMENTS: List[Tuple[str, int]] = [
-    # Higher-quality flow requires a slightly longer opening health context and
-    # a longer, more reasoned closing verdict. Keep total base mins aligned with
-    # the default target length (currently ~550 words).
-    ("Financial Health Rating", 65),
-    ("Executive Summary", 90),  # Verdict + framing (keep crisp, avoid bloat)
-    ("Financial Performance", 100),  # Depth on the numbers that matter
+    # Users strongly prefer a memo that feels balanced across headings (rather
+    # than spending most of the budget in Financial Performance / MD&A).
+    #
+    # Keep total base mins aligned with the default target length (currently ~550 words)
+    # so budgets are stable for the common path.
+    ("Financial Health Rating", 70),
+    ("Executive Summary", 95),  # Verdict + framing (keep crisp, avoid bloat)
+    ("Financial Performance", 85),  # Depth on the numbers that matter
     (
         "Management Discussion & Analysis",
-        125,
-    ),  # Expanded MD&A to reflect management strategy and capital allocation
-    ("Risk Factors", 65),  # Specific risks, but avoid generic one-liners
+        95,
+    ),  # Strategy + capital allocation without dominating total length
+    ("Risk Factors", 85),  # Keep concrete risks; avoid generic one-liners
     ("Key Metrics", 30),
-    ("Closing Takeaway", 75),  # Longer, reasoned verdict and what changes the view
+    ("Closing Takeaway", 90),  # Reasoned verdict and what changes the view
 ]
 SUMMARY_SECTION_MIN_WORDS = {
     title: minimum for title, minimum in SUMMARY_SECTION_REQUIREMENTS
@@ -3629,16 +3656,25 @@ SUMMARY_SECTION_MIN_WORDS = {
 # Sum = 100 (percentages)
 # Executive Summary is the HERO section - the premium insight users pay for
 SECTION_PROPORTIONAL_WEIGHTS: Dict[str, int] = {
-    # Goal: strong narrative flow with a substantive opening health context and a
-    # complete closing verdict. Keep MD&A the largest section but avoid starving
-    # the bookends (Health + Closing) under strict length bands.
-    "Financial Health Rating": 12,
-    "Executive Summary": 17,
-    "Financial Performance": 17,
+    # CRITICAL PRODUCT REQUIREMENT:
+    # The section-length distribution must stay FIXED regardless of the user's
+    # requested total length.
+    #
+    # Target distribution (sum = 100):
+    #   - Financial Health Rating: 10%
+    #   - Executive Summary: 15%
+    #   - Financial Performance: 20%
+    #   - Management Discussion & Analysis: 20%
+    #   - Risk Factors: 15%
+    #   - Key Metrics: 10%
+    #   - Closing Takeaway: 10%
+    "Financial Health Rating": 10,
+    "Executive Summary": 15,
+    "Financial Performance": 20,
     "Management Discussion & Analysis": 20,
-    "Risk Factors": 11,
-    "Key Metrics": 8,
-    "Closing Takeaway": 15,
+    "Risk Factors": 15,
+    "Key Metrics": 10,
+    "Closing Takeaway": 10,
 }
 
 
@@ -3647,175 +3683,78 @@ def _calculate_section_word_budgets(
     include_health_rating: bool = True,
 ) -> Dict[str, int]:
     """
-    Calculate proportional word budgets for each section based on target length.
+    Calculate per-section *body* word budgets using a fixed percentage distribution.
 
-    Distributes words across sections using weights, ensuring:
-    1. Each section gets at least its minimum word count
-    2. Remaining words are distributed proportionally
-    3. The Closing Takeaway maintains adequate length (not over-shortened)
+    IMPORTANT: These budgets are for SECTION BODY WORDS (excluding the heading titles).
+    This aligns with:
+      - our validators (which count section bodies), and
+      - trimming logic that subtracts heading-title words.
+
+    The distribution MUST remain constant regardless of target_length.
     """
     if not target_length or target_length <= 0:
         return {}
 
-    # Determine which sections to include
+    # Determine which sections to include.
     sections_to_use = list(SECTION_PROPORTIONAL_WEIGHTS.keys())
     if not include_health_rating:
-        sections_to_use = [
-            s for s in sections_to_use if s != "Financial Health Rating"
-        ]
-    section_count = max(1, len(sections_to_use))
-    # Minimum words per section must adapt to very short targets (schema allows >=50).
-    # If we hard-floor at 10 words/section we can exceed the target and deadlock drift fixes.
-    min_per_section = max(1, min(10, target_length // section_count))
+        sections_to_use = [s for s in sections_to_use if s != "Financial Health Rating"]
+    if not sections_to_use:
+        return {}
 
-    # Start from minimums.
-    mins: Dict[str, int] = {
-        section: int(SUMMARY_SECTION_MIN_WORDS.get(section, 25))
-        for section in sections_to_use
-    }
-    min_total = sum(mins.values())
+    # Budgets are for SECTION BODY words (headings are counted separately in our
+    # validators / trimming), so subtract heading-title words from the total.
+    heading_words = sum(
+        len(re.findall(r"\b\w+\b", section)) for section in sections_to_use
+    )
+    body_target = max(0, int(target_length) - int(heading_words))
+    if body_target <= 0:
+        # Degenerate case: user requested a length so small the headings alone don't fit.
+        # Fall back to treating target_length as body budget so downstream logic doesn't
+        # divide-by-zero.
+        body_target = int(target_length)
 
-    # If minimums alone exceed the target, scale them down.
-    # For short memos, protect the bookends (Risk Factors + Closing Takeaway) so they
-    # don't collapse into one-liners, which users perceive as low quality.
-    if min_total >= target_length and min_total > 0:
-        if target_length <= 450:
-            protected: Dict[str, int] = {}
+    total_weight = sum(SECTION_PROPORTIONAL_WEIGHTS.get(s, 0) for s in sections_to_use)
+    if total_weight <= 0:
+        total_weight = len(sections_to_use)
 
-            def _floor(value: int) -> int:
-                return max(min_per_section, int(value))
-
-            if "Risk Factors" in sections_to_use:
-                protected["Risk Factors"] = _floor(max(45, int(target_length * 0.18)))
-            if "Closing Takeaway" in sections_to_use:
-                protected["Closing Takeaway"] = _floor(
-                    max(45, int(target_length * 0.18))
-                )
-            if "Key Metrics" in sections_to_use:
-                protected["Key Metrics"] = _floor(max(10, int(target_length * 0.06)))
-
-            remaining_words = target_length - sum(protected.values())
-            if remaining_words > 0:
-                remaining_sections = [
-                    s for s in sections_to_use if s not in protected
-                ]
-                remaining_min_total = sum(mins[s] for s in remaining_sections) or len(
-                    remaining_sections
-                )
-                scaled: Dict[str, int] = dict(protected)
-                for section in remaining_sections:
-                    # Scale remaining sections proportionally to their baseline mins.
-                    scaled[section] = _floor(
-                        int(mins[section] * remaining_words / remaining_min_total)
-                    )
-
-                diff = target_length - sum(scaled.values())
-                if diff != 0:
-                    # Adjust non-protected sections first, then protected if needed.
-                    adjustment_order = [
-                        s
-                        for s in sorted(
-                            remaining_sections,
-                            key=lambda s: SECTION_PROPORTIONAL_WEIGHTS.get(s, 10),
-                            reverse=True,
-                        )
-                        if s in scaled
-                    ] + [s for s in sections_to_use if s in protected]
-
-                    step = 1 if diff > 0 else -1
-                    remaining = abs(diff)
-                    idx = 0
-                    stagnant = 0
-                    while remaining > 0 and adjustment_order and stagnant < len(
-                        adjustment_order
-                    ):
-                        section = adjustment_order[idx % len(adjustment_order)]
-                        next_val = scaled.get(section, 0) + step
-                        if next_val >= min_per_section:
-                            scaled[section] = next_val
-                            remaining -= 1
-                            stagnant = 0
-                        else:
-                            stagnant += 1
-                        idx += 1
-
-                # Final guard: ensure exact sum (best-effort without violating floors).
-                if sum(scaled.values()) == target_length:
-                    return scaled
-
-        # Default behavior: scale all sections uniformly.
-        scale = target_length / min_total
-        scaled: Dict[str, int] = {
-            section: max(min_per_section, int(mins[section] * scale))
-            for section in sections_to_use
-        }
-        # Fix rounding drift to land exactly on target_length.
-        diff = target_length - sum(scaled.values())
-        if diff != 0:
-            # Adjust the highest-weight sections first.
-            order = sorted(
-                sections_to_use,
-                key=lambda s: SECTION_PROPORTIONAL_WEIGHTS.get(s, 10),
-                reverse=True,
-            )
-            step = 1 if diff > 0 else -1
-            remaining = abs(diff)
-            idx = 0
-            stagnant = 0
-            while remaining > 0 and order and stagnant < len(order):
-                section = order[idx % len(order)]
-                next_val = scaled[section] + step
-                if next_val >= min_per_section:
-                    scaled[section] = next_val
-                    remaining -= 1
-                    stagnant = 0
-                else:
-                    stagnant += 1
-                idx += 1
-        return scaled
-
-    remaining_words = target_length - min_total
-    if remaining_words <= 0:
-        return mins
-
-    total_weight = sum(
-        SECTION_PROPORTIONAL_WEIGHTS.get(s, 10) for s in sections_to_use
-    ) or len(sections_to_use)
-
-    # Allocate remaining words proportionally by weights.
     exacts = {
-        s: SECTION_PROPORTIONAL_WEIGHTS.get(s, 10) * remaining_words / total_weight
+        s: (SECTION_PROPORTIONAL_WEIGHTS.get(s, 0) * body_target / total_weight)
         for s in sections_to_use
     }
-    floors = {s: int(exacts[s]) for s in sections_to_use}
-    remainders = {s: exacts[s] - floors[s] for s in sections_to_use}
-    leftover = remaining_words - sum(floors.values())
+    budgets: Dict[str, int] = {s: int(exacts[s]) for s in sections_to_use}
+    remainders = {s: exacts[s] - budgets[s] for s in sections_to_use}
 
-    if leftover > 0:
-        for s in sorted(remainders, key=remainders.get, reverse=True)[:leftover]:
-            floors[s] += 1
-
-    budgets = {s: mins[s] + floors[s] for s in sections_to_use}
-
-    # Final sanity: ensure exact sum.
-    drift = target_length - sum(budgets.values())
-    if drift != 0 and budgets:
-        # Apply drift to the highest-weight narrative sections first.
-        order = sorted(
-            sections_to_use,
-            key=lambda s: SECTION_PROPORTIONAL_WEIGHTS.get(s, 10),
-            reverse=True,
-        )
+    drift = body_target - sum(budgets.values())
+    if drift != 0:
+        order = sorted(sections_to_use, key=lambda s: remainders.get(s, 0), reverse=True)
         step = 1 if drift > 0 else -1
         remaining = abs(drift)
         idx = 0
-        while remaining > 0 and order:
+        while remaining > 0 and order and idx < 10_000:
             section = order[idx % len(order)]
-            next_val = budgets[section] + step
-            if next_val >= 10:
+            next_val = budgets.get(section, 0) + step
+            if next_val >= 0:
                 budgets[section] = next_val
                 remaining -= 1
             idx += 1
+
+    # Avoid 0-word sections when the target is extremely small.
+    zeros = [s for s in sections_to_use if budgets.get(s, 0) <= 0]
+    if zeros:
+        for s in zeros:
+            budgets[s] = 1
+        # Re-balance to preserve exact sum.
+        diff = sum(budgets.values()) - body_target
+        if diff > 0:
+            order = sorted(sections_to_use, key=lambda s: budgets.get(s, 0), reverse=True)
+            idx = 0
+            while diff > 0 and order and idx < 10_000:
+                section = order[idx % len(order)]
+                if budgets.get(section, 0) > 1:
+                    budgets[section] -= 1
+                    diff -= 1
+                idx += 1
 
     return budgets
 
@@ -3854,19 +3793,24 @@ def _calculate_section_min_words_for_target(
 
         base_min = int(base_mins.get(section, 25))
 
+        # Target-aware minimums: keep sections from collapsing so the distribution
+        # stays close to the fixed proportional budgets.
+        min_floor = 1
         if section == "Key Metrics":
-            ratio_min = max(3, int(budget * 0.40))
+            # Data-block sections can be concise, but should still be substantial
+            # relative to their budget to preserve the fixed distribution.
+            ratio_min = max(min_floor, int(budget * 0.70))
         elif section in {"Risk Factors", "Closing Takeaway"}:
-            # These are the "bookends" users remember; keep them substantive even
-            # for short targets where other sections must compress.
-            ratio_min = max(10, int(budget * 0.85))
+            # These are the "bookends" users remember; keep them substantive.
+            ratio_min = max(min_floor, int(budget * 0.75))
         elif section == "Financial Health Rating":
-            ratio_min = max(3, int(budget * 0.50))
+            ratio_min = max(min_floor, int(budget * 0.70))
         else:
-            ratio_min = max(3, int(budget * 0.50))
+            ratio_min = max(min_floor, int(budget * 0.70))
 
         if budget < base_min:
-            mins[section] = max(3, min(budget, ratio_min))
+            # Never require a minimum larger than the budget.
+            mins[section] = max(min_floor, min(budget, ratio_min))
         else:
             mins[section] = max(base_min, ratio_min)
 
@@ -3886,10 +3830,15 @@ def _format_section_word_budgets(
     """
     budgets = _calculate_section_word_budgets(target_length, include_health_rating)
 
+    sections_to_use = list(SECTION_PROPORTIONAL_WEIGHTS.keys())
+    if not include_health_rating:
+        sections_to_use = [s for s in sections_to_use if s != "Financial Health Rating"]
+    heading_words = sum(len(re.findall(r"\b\w+\b", s)) for s in sections_to_use)
+
     lines = [
         "=== SECTION WORD BUDGETS (PROPORTIONAL DISTRIBUTION) ===",
-        "CRITICAL: Distribute your words PROPORTIONALLY across ALL sections.",
-        f"Do NOT take all reduction from one section (especially Closing Takeaway).",
+        "CRITICAL: The section-length distribution is FIXED. Maintain these proportions regardless of the user's target length.",
+        "Do NOT steal words from one section to inflate another.",
         "",
         "TARGET WORD ALLOCATION PER SECTION:",
     ]
@@ -3901,13 +3850,14 @@ def _format_section_word_budgets(
     lines.extend(
         [
             "",
-            f"  TOTAL: ~{total_budgeted} words",
+            f"  TOTAL (SECTION BODIES ONLY): ~{total_budgeted} words",
+            f"  NOTE: Section headings add ~{heading_words} words, so the full memo lands near the requested total.",
             "",
             "IMPORTANT:",
-            "- These are TARGET budgets, not hard limits",
-            "- If you need to reduce length, reduce EACH section proportionally",
-            "- Protect Key Metrics and the Closing Takeaway; trim longer narrative sections first if needed",
-            "- The Closing Takeaway should be a COMPLETE verdict (50-80 words typical)",
+            "- Treat these as REQUIRED proportional budgets (minor variance is okay, but keep sections in the same shape)",
+            "- If you need to CUT words: cut from EVERY section proportionally",
+            "- If you need to ADD words: add to EVERY section proportionally",
+            "- Keep Key Metrics as a scannable, arrow-line data block (no prose paragraphs)",
             "- Do NOT sacrifice one section to make room for another",
             "=== END SECTION WORD BUDGETS ===",
         ]
@@ -5474,55 +5424,260 @@ def _compute_health_score_data(
 
 
 def _format_metric_value(key: str, value: float) -> str:
+    """Format a metric value for display in the Key Metrics block.
+
+    NOTE: We must NOT hallucinate values. This function only formats numbers already
+    present in calculated_metrics or deterministically derived from them.
+    """
+
+    if value is None:
+        return ""
+
+    pct_keys = {
+        "operating_margin",
+        "net_margin",
+        "gross_margin",
+        "revenue_growth_yoy",
+        "fcf_margin",
+        "roe",
+        "roic",
+        "roa",
+    }
+    ratio_keys = {
+        "current_ratio",
+        "quick_ratio",
+        "debt_to_equity",
+        "interest_coverage",
+        "leverage",
+    }
+
     if key == "diluted_eps":
-        return f"${value:.2f}"
-    if key in {"operating_margin", "net_margin"}:
-        return f"{value:.1f}%"
-    return _format_dollar(value) or f"{value:,.2f}"
+        return f"${float(value):.2f}"
+    if key in pct_keys:
+        return f"{float(value):.1f}%"
+    if key in ratio_keys:
+        return f"{float(value):.1f}x"
+
+    formatted = _format_dollar(float(value))
+    return formatted or f"{float(value):,.2f}"
 
 
-def _build_key_metrics_block(calculated_metrics: Dict[str, Any]) -> str:
-    """Build a compact, scannable Key Metrics block with only core figures."""
-    revenue = calculated_metrics.get("revenue") or calculated_metrics.get(
-        "total_revenue"
-    )
-    operating_income = calculated_metrics.get("operating_income")
-    net_income = calculated_metrics.get("net_income")
-    capital_expenditures = calculated_metrics.get("capital_expenditures")
-    total_assets = calculated_metrics.get("total_assets")
+def _build_key_metrics_block(
+    calculated_metrics: Dict[str, Any],
+    *,
+    target_length: Optional[int] = None,
+    include_health_rating: bool = True,
+    health_score_data: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build a scannable Key Metrics block sized to the fixed distribution.
 
-    line1_parts: List[str] = []
-    if revenue is not None:
-        line1_parts.append(f"Revenue: {_format_metric_value('revenue', revenue)}")
-    if operating_income is not None:
-        line1_parts.append(
-            f"Operating Income: {_format_metric_value('operating_income', operating_income)}"
-        )
-    if net_income is not None:
-        line1_parts.append(
-            f"Net Income: {_format_metric_value('net_income', net_income)}"
-        )
+    Product requirement: Key Metrics should remain ~10% of the overall memo length
+    (independent of the user's target_length). We therefore scale the number of
+    metric rows based on the computed per-section budget.
 
-    line2_parts: List[str] = []
-    if capital_expenditures is not None:
-        line2_parts.append(
-            f"Capital Expenditures: {_format_metric_value('capital_expenditures', capital_expenditures)}"
+    The output MUST stay "data-block" style (arrow lines), not prose paragraphs.
+    """
+
+    budgets: Dict[str, int] = {}
+    if target_length and target_length > 0:
+        budgets = _calculate_section_word_budgets(
+            target_length, include_health_rating=include_health_rating
         )
-    if total_assets is not None:
-        line2_parts.append(
-            f"Total Assets: {_format_metric_value('total_assets', total_assets)}"
-        )
+    budget_words = int(budgets.get("Key Metrics", 0) or 0)
+
+    def _get(key: str) -> Any:
+        return calculated_metrics.get(key)
+
+    def _add_line(label: str, key: str, value: Any, *, fmt_key: Optional[str] = None) -> None:
+        if value is None:
+            return
+        try:
+            rendered = _format_metric_value((fmt_key or key).lower(), float(value))
+        except Exception:
+            return
+        if not rendered:
+            return
+        lines.append(f"→ {label}: {rendered}")
 
     lines: List[str] = []
-    if line1_parts:
-        lines.append("→ " + " | ".join(line1_parts))
-    if line2_parts:
-        lines.append("→ " + " | ".join(line2_parts))
 
-    return (
-        "\n".join(lines).strip()
-        or "→ No reliable structured metrics available from this filing."
+    # --- Core scale / growth ---
+    revenue = _get("revenue") or _get("total_revenue")
+    _add_line("Revenue", "revenue", revenue)
+    _add_line("Revenue YoY", "revenue_growth_yoy", _get("revenue_growth_yoy"), fmt_key="revenue_growth_yoy")
+
+    # --- Profitability ---
+    _add_line("Gross Margin", "gross_margin", _get("gross_margin"), fmt_key="gross_margin")
+    _add_line(
+        "Operating Margin",
+        "operating_margin",
+        _get("operating_margin"),
+        fmt_key="operating_margin",
     )
+    _add_line("Net Margin", "net_margin", _get("net_margin"), fmt_key="net_margin")
+
+    operating_income = _get("operating_income")
+    net_income = _get("net_income")
+    _add_line("Operating Income", "operating_income", operating_income)
+    _add_line("Net Income", "net_income", net_income)
+    _add_line("Diluted EPS", "diluted_eps", _get("diluted_eps"), fmt_key="diluted_eps")
+
+    # --- Cash flow / reinvestment ---
+    ocf = _get("operating_cash_flow")
+    fcf = _get("free_cash_flow")
+    capex = _get("capital_expenditures")
+    _add_line("Operating Cash Flow", "operating_cash_flow", ocf)
+    _add_line("Free Cash Flow", "free_cash_flow", fcf)
+    _add_line("FCF Margin", "fcf_margin", _get("fcf_margin"), fmt_key="fcf_margin")
+    if (fcf is not None) and (revenue is not None) and _get("fcf_margin") is None:
+        try:
+            derived_fcf_margin = (float(fcf) / float(revenue)) * 100
+            _add_line("FCF Margin", "fcf_margin", derived_fcf_margin, fmt_key="fcf_margin")
+        except Exception:
+            pass
+    _add_line("Capex", "capital_expenditures", capex)
+    if (capex is not None) and (revenue is not None) and float(revenue) != 0:
+        try:
+            capex_intensity = (abs(float(capex)) / float(revenue)) * 100
+            _add_line("Capex as % Rev", "capex_intensity", capex_intensity, fmt_key="gross_margin")
+        except Exception:
+            pass
+
+    # --- Balance sheet / liquidity ---
+    cash = _get("cash")
+    securities = _get("marketable_securities")
+    total_assets = _get("total_assets")
+    total_liabilities = _get("total_liabilities")
+    total_debt = _get("total_debt")
+
+    if cash is not None or securities is not None:
+        try:
+            cash_total = float(cash or 0) + float(securities or 0)
+            _add_line("Cash + Securities", "cash_total", cash_total)
+        except Exception:
+            pass
+
+    _add_line("Total Assets", "total_assets", total_assets)
+    _add_line("Total Liabilities", "total_liabilities", total_liabilities)
+    _add_line("Total Debt", "total_debt", total_debt)
+
+    total_equity = None
+    if total_assets is not None and total_liabilities is not None:
+        try:
+            total_equity = float(total_assets) - float(total_liabilities)
+            if total_equity != 0:
+                _add_line("Total Equity", "total_equity", total_equity)
+        except Exception:
+            total_equity = None
+
+    if (cash is not None or securities is not None) and total_debt is not None:
+        try:
+            cash_total = float(cash or 0) + float(securities or 0)
+            net_cash = cash_total - float(total_debt)
+            label = "Net Cash" if net_cash >= 0 else "Net Debt"
+            _add_line(label, "net_cash", net_cash)
+        except Exception:
+            pass
+
+    # Deterministically derive common ratios when not already present.
+    debt_to_equity = _get("debt_to_equity")
+    if debt_to_equity is None and total_liabilities is not None and total_equity is not None and total_equity > 0:
+        try:
+            debt_to_equity = float(total_liabilities) / float(total_equity)
+        except Exception:
+            debt_to_equity = None
+    _add_line("Debt / Equity", "debt_to_equity", debt_to_equity, fmt_key="debt_to_equity")
+
+    current_assets = _get("current_assets")
+    current_liabilities = _get("current_liabilities")
+    current_ratio = _get("current_ratio")
+    if current_ratio is None and current_assets is not None and current_liabilities is not None and float(current_liabilities) != 0:
+        try:
+            current_ratio = float(current_assets) / float(current_liabilities)
+        except Exception:
+            current_ratio = None
+    _add_line("Current Ratio", "current_ratio", current_ratio, fmt_key="current_ratio")
+
+    quick_ratio = _get("quick_ratio")
+    inventory = _get("inventory")
+    if quick_ratio is None and current_assets is not None and current_liabilities is not None and float(current_liabilities) != 0:
+        try:
+            quick_assets = float(current_assets) - float(inventory or 0)
+            quick_ratio = quick_assets / float(current_liabilities)
+        except Exception:
+            quick_ratio = None
+    _add_line("Quick Ratio", "quick_ratio", quick_ratio, fmt_key="quick_ratio")
+
+    interest_coverage = _get("interest_coverage")
+    interest_expense = _get("interest_expense")
+    if interest_coverage is None and operating_income is not None and interest_expense is not None and float(interest_expense) != 0:
+        try:
+            interest_coverage = float(operating_income) / abs(float(interest_expense))
+        except Exception:
+            interest_coverage = None
+    _add_line("Interest Coverage", "interest_coverage", interest_coverage, fmt_key="interest_coverage")
+
+    # ROA / ROE (percent) from available metrics.
+    if net_income is not None and total_assets is not None and float(total_assets) != 0:
+        try:
+            roa_pct = (float(net_income) / float(total_assets)) * 100
+            _add_line("ROA", "roa", roa_pct, fmt_key="roa")
+        except Exception:
+            pass
+    if net_income is not None and total_equity is not None and total_equity != 0:
+        try:
+            roe_pct = (float(net_income) / float(total_equity)) * 100
+            _add_line("ROE", "roe", roe_pct, fmt_key="roe")
+        except Exception:
+            pass
+
+    if total_liabilities is not None and total_assets is not None and float(total_assets) != 0:
+        try:
+            leverage = float(total_liabilities) / float(total_assets)
+            _add_line("Leverage (Liab/Assets)", "leverage", leverage, fmt_key="leverage")
+        except Exception:
+            pass
+
+    # Optional: include health drivers under Key Metrics (deterministic, non-hallucinated).
+    if include_health_rating and health_score_data:
+        drivers_block = _build_health_driver_block(calculated_metrics, health_score_data)
+        if drivers_block:
+            # Insert as its own sub-block for scannability.
+            lines.append("")
+            lines.extend([ln for ln in drivers_block.splitlines() if ln.strip()])
+
+    if not [ln for ln in lines if ln.strip()]:
+        return "→ No reliable structured metrics available from this filing."
+
+    # If we have a budget, trim/pad the block to stay near it.
+    block = "\n".join(lines).strip()
+    if budget_words > 0:
+        current_words = _count_words(block)
+        if current_words > budget_words:
+            block = _trim_appendix_preserving_rows(block, budget_words)
+        elif current_words < budget_words:
+            deficit = budget_words - current_words
+            watch_templates = [
+                "→ Watch: cash conversion vs net income",
+                "→ Watch: margin trend vs pricing/mix",
+                "→ Watch: working-capital swings",
+                "→ Watch: capex intensity vs growth",
+                "→ Watch: leverage and refinancing terms",
+                "→ Watch: customer concentration risk",
+            ]
+            used = set(block.splitlines())
+            for template in watch_templates:
+                if deficit <= 0:
+                    break
+                if template in used:
+                    continue
+                block = (block + "\n" + template).strip()
+                deficit = budget_words - _count_words(block)
+            # Final clamp (avoid overshooting the Key Metrics budget).
+            if _count_words(block) > budget_words:
+                block = _trim_appendix_preserving_rows(block, budget_words)
+
+    return block.strip() or "→ No reliable structured metrics available from this filing."
 
 
 def _build_health_driver_block(
@@ -5608,7 +5763,7 @@ def _build_health_driver_block(
         profitability_bits.append(f"net margin {_pct(net_margin)}")
     if profitability_bits:
         lines.append(
-            f"- Profitability: {', '.join(bit for bit in profitability_bits if bit)}."
+            f"→ Profitability: {', '.join(bit for bit in profitability_bits if bit)}."
         )
 
     cash_bits: List[str] = []
@@ -5624,7 +5779,7 @@ def _build_health_driver_block(
         cash_bits.append(f"FCF margin {_pct(fcf_margin)}")
     if cash_bits:
         lines.append(
-            f"- Cash conversion: {', '.join(bit for bit in cash_bits if bit)}."
+            f"→ Cash conversion: {', '.join(bit for bit in cash_bits if bit)}."
         )
 
     balance_bits: List[str] = []
@@ -5642,14 +5797,14 @@ def _build_health_driver_block(
         balance_bits.append(f"interest coverage {_ratio(interest_coverage)}")
     if balance_bits:
         lines.append(
-            f"- Balance sheet: {', '.join(bit for bit in balance_bits if bit)}."
+            f"→ Balance sheet: {', '.join(bit for bit in balance_bits if bit)}."
         )
 
     liquidity_bits: List[str] = []
     if current_ratio is not None:
         liquidity_bits.append(f"current ratio {_ratio(current_ratio)}")
     if liquidity_bits:
-        lines.append(f"- Liquidity: {', '.join(bit for bit in liquidity_bits if bit)}.")
+        lines.append(f"→ Liquidity: {', '.join(bit for bit in liquidity_bits if bit)}.")
 
     return "\n".join(lines) if len(lines) > 1 else None
 
@@ -7464,7 +7619,12 @@ def generate_filing_summary(
         )
 
         progress_cache[str(filing_id)] = "Analyzing Risk Factors..."
-        metrics_lines = _build_key_metrics_block(calculated_metrics)
+        metrics_lines = _build_key_metrics_block(
+            calculated_metrics,
+            target_length=target_length,
+            include_health_rating=include_health_rating,
+            health_score_data=pre_calculated_health,
+        )
         token_budget: Optional[TokenBudget] = _summary_token_budget()
         if token_budget.total_tokens <= 0:
             token_budget = None
@@ -7633,17 +7793,32 @@ def generate_filing_summary(
                 ),
                 (
                     "Key Metrics",
-                    "Concise data appendix (arrow format). Use this EXACT layout:\n"
-                    "→ Revenue: $X.XB | Operating Income: $X.XB | Net Income: $X.XB\n"
-                    "→ Capital Expenditures: $X.XM | Total Assets: $X.XB\n\n"
+                    "Scannable data appendix (arrow format).\n"
+                    "CRITICAL: This section should be ~10% of the total memo length (fixed distribution). "
+                    "Include ENOUGH metric rows to match the Key Metrics word budget; do not keep it artificially short.\n\n"
+                    "FORMAT RULES:\n"
+                    "- Use arrow lines only (start each line with '→ ').\n"
+                    "- NO narrative paragraphs, NO emojis, NO formulas/equations (no '=' signs).\n"
+                    "- Use ONLY metrics provided in the 'KEY METRICS' reference block above (do not invent numbers).\n"
+                    "- If a metric is missing, OMIT the line (no 'N/A' placeholders).\n\n"
+                    "SUGGESTED ROWS (include what is available):\n"
+                    "→ Revenue: $X.XB\n"
+                    "→ Revenue YoY: X.X%\n"
+                    "→ Gross Margin: X.X%\n"
+                    "→ Operating Margin: X.X%\n"
+                    "→ Net Margin: X.X%\n"
+                    "→ Operating Cash Flow: $X.XB\n"
+                    "→ Free Cash Flow: $X.XB\n"
+                    "→ FCF Margin: X.X%\n"
+                    "→ Cash + Securities: $X.XB\n"
+                    "→ Total Debt: $X.XB\n"
+                    "→ Current Ratio: X.Xx\n\n"
+                    "If Health Rating is enabled, also include a sub-block:\n"
                     "Health Score Drivers:\n"
-                    "→ Profitability: operating margin X.X%, net margin X.X%.\n"
-                    "→ Cash conversion: operating cash flow $X.XB, FCF $X.XB, FCF margin X.X%.\n"
-                    "→ Balance sheet: cash + securities $X.XB, liabilities $X.XB, leverage X.Xx assets, interest coverage X.Xx.\n"
-                    "→ Liquidity: current ratio X.Xx.\n\n"
-                    "Do NOT explain or interpret these metrics here. No narrative, no bullets beyond the lines above. "
-                    "Do NOT show formulas/equations (no '=' signs). If a metric is missing, OMIT that line—no 'N/A' or 'not calculable' placeholders. "
-                    "This section should be purely a scannable data block.",
+                    "→ Profitability: ...\n"
+                    "→ Cash conversion: ...\n"
+                    "→ Balance sheet: ...\n"
+                    "→ Liquidity: ...\n",
                 ),
                 _build_closing_takeaway_description(
                     selected_persona_name,
@@ -10759,23 +10934,36 @@ def _ensure_required_sections(
     # Also replace if the existing one is under the minimum word count
     # Pass persona_name to maintain persona voice in fallback
     def _min_closing_words() -> int:
-        base_min = int(min_words_by_section.get("Closing Takeaway", 50))
+        """Minimum closing length aligned to the fixed section distribution."""
+        base_min = int(min_words_by_section.get("Closing Takeaway", 25))
         if not target_length or target_length <= 0:
-            return max(base_min, 60)
-        if target_length >= 500:
-            floor = max(60, int(target_length * 0.12))
-        elif target_length >= 350:
-            floor = max(50, int(target_length * 0.12))
-        else:
-            floor = max(35, int(target_length * 0.15))
+            # No explicit target length => keep a substantive close.
+            return max(base_min, 35)
+
+        budgets = _calculate_section_word_budgets(
+            target_length, include_health_rating=include_health_rating
+        )
+        budget = int(budgets.get("Closing Takeaway", 0) or 0)
+        if budget <= 0:
+            return base_min
+
+        # Require most of the allocated budget so the closing doesn't collapse.
+        floor = max(1, int(budget * 0.70))
         return max(base_min, floor)
 
     def _min_closing_sentences() -> int:
-        if not target_length or target_length >= 500:
-            return 4
-        if target_length >= 350:
+        if not target_length or target_length <= 0:
             return 3
-        return 3
+
+        budgets = _calculate_section_word_budgets(
+            target_length, include_health_rating=include_health_rating
+        )
+        budget = int(budgets.get("Closing Takeaway", 0) or 0)
+        if budget >= 75:
+            return 4
+        if budget >= 45:
+            return 3
+        return 2
 
     def _closing_has_reasoned_takeaway(text: str) -> bool:
         if not text:
@@ -10948,7 +11136,8 @@ def _ensure_required_sections(
             )
         _append_section("Closing Takeaway", closing_body)
 
-    # Normalize Key Metrics body to the deterministic compact block to avoid verbose or emoji-filled output
+    # Normalize Key Metrics body to the deterministic block sized to the fixed
+    # proportional distribution (prevents hallucinated numbers / emojis).
     if metrics_lines.strip() and _section_present("Key Metrics"):
         desired_body = metrics_lines.strip()
         if include_health_rating and health_score_data:
@@ -10957,6 +11146,18 @@ def _ensure_required_sections(
             )
             if drivers_block and "Health Score Drivers" not in desired_body:
                 desired_body = f"{desired_body}\n\n{drivers_block}".strip()
+
+        # Keep Key Metrics near its allocated budget for the chosen target length.
+        if target_length and target_length > 0:
+            budgets = _calculate_section_word_budgets(
+                target_length, include_health_rating=include_health_rating
+            )
+            km_budget = int(budgets.get("Key Metrics", 0) or 0)
+            if km_budget > 0:
+                min_words = int(min_words_by_section.get("Key Metrics", 1))
+                max_words = max(min_words, int(km_budget * 1.15))
+                if _count_words(desired_body) > max_words:
+                    desired_body = _trim_appendix_preserving_rows(desired_body, max_words)
         km_pattern = re.compile(
             r"##\s*(Key Metrics|Key Data Appendix)\s*\n+[\s\S]*?(?=\n##\s|\Z)",
             re.IGNORECASE,
@@ -10992,12 +11193,17 @@ def _ensure_required_sections(
             trimmed = _truncate_text_to_word_limit(body, max_words)
             text = pattern.sub(lambda _mm: f"## {title}\n{trimmed}\n", text, count=1)
 
-        for core_title in (
+        core_titles: List[str] = [
             "Executive Summary",
             "Financial Performance",
             "Management Discussion & Analysis",
             "Risk Factors",
-        ):
+            "Closing Takeaway",
+        ]
+        if include_health_rating:
+            core_titles.insert(0, "Financial Health Rating")
+
+        for core_title in core_titles:
             _cap_section_to_budget(core_title)
 
     # Final repetition cleanup: this function can append addenda and padding that

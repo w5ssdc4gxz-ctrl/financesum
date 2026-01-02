@@ -53,28 +53,27 @@ def test_padding_is_spread_across_shortest_sections() -> None:
         "Overall, this is a business to watch, but the risk-reward is not obviously asymmetric today."
     )
 
-    padded = filings_api._distribute_padding_across_sections(base, required_words=25)
+    padded = filings_api._distribute_padding_across_sections(base, required_words=60)
 
-    # Padding should not be dumped into a single section. For this synthetic base,
-    # we intentionally avoid padding Executive Summary / Risk Factors / Closing Takeaway,
-    # so the added words should land in MD&A and Financial Performance first.
-    assert _get_section_body(padded, "Executive Summary") == _get_section_body(
-        base, "Executive Summary"
-    )
+    # Padding should be spread across multiple *underweight* sections, not dumped
+    # entirely into Financial Performance / MD&A (which makes the memo feel lopsided).
     assert _get_section_body(padded, "Financial Health Rating") == _get_section_body(
         base, "Financial Health Rating"
     )
     assert _get_section_body(padded, "Key Metrics") == _get_section_body(base, "Key Metrics")
-    assert _get_section_body(padded, "Closing Takeaway") == _get_section_body(
-        base, "Closing Takeaway"
-    )
-    assert _get_section_body(padded, "Risk Factors") == _get_section_body(
-        base, "Risk Factors"
-    )
 
-    mdna_body = _get_section_body(padded, "Management Discussion & Analysis")
+    base_exec = _get_section_body(base, "Executive Summary")
+    padded_exec = _get_section_body(padded, "Executive Summary")
+    assert len(padded_exec.split()) > len(base_exec.split())
+
+    base_risk = _get_section_body(base, "Risk Factors")
+    padded_risk = _get_section_body(padded, "Risk Factors")
+    assert len(padded_risk.split()) > len(base_risk.split())
+
     base_mdna = _get_section_body(base, "Management Discussion & Analysis")
-    assert len(mdna_body.split()) > len(base_mdna.split())
+    padded_mdna = _get_section_body(padded, "Management Discussion & Analysis")
+    assert len(padded_mdna.split()) > len(base_mdna.split())
 
-    fp_body = _get_section_body(padded, "Financial Performance")
-    assert len(fp_body.split()) > len(_get_section_body(base, "Financial Performance").split())
+    base_fp = _get_section_body(base, "Financial Performance")
+    padded_fp = _get_section_body(padded, "Financial Performance")
+    assert len(padded_fp.split()) > len(base_fp.split())
