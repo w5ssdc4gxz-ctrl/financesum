@@ -357,6 +357,8 @@ def _build_closing_takeaway_description(
     *,
     target_length: Optional[int] = None,
     persona_requested: bool = False,
+    budget_words: Optional[int] = None,
+    budget_tolerance: int = 10,
 ) -> Tuple[str, str]:
     """Build a dynamic Closing Takeaway section description based on the selected persona.
 
@@ -365,7 +367,13 @@ def _build_closing_takeaway_description(
     """
     title = "Closing Takeaway"
 
-    if target_length and target_length < 350:
+    if budget_words and budget_words > 0:
+        # Budget is for the section body (heading excluded) and must follow the
+        # fixed proportional distribution.
+        length_guidance = (
+            f"Target ~{int(budget_words)} words (±{int(budget_tolerance)}) in the Closing Takeaway body."
+        )
+    elif target_length and target_length < 350:
         length_guidance = "3-4 COMPLETE sentences (~45-70 words)."
     elif target_length and target_length < 500:
         length_guidance = "4-5 COMPLETE sentences (~70-95 words)."
@@ -708,6 +716,7 @@ def _enforce_whitespace_word_band(
     tolerance: int = 10,
     *,
     allow_padding: bool = True,
+    dedupe: bool = True,
 ) -> str:
     """Enforce the word band using user-visible whitespace token counting.
 
@@ -724,19 +733,55 @@ def _enforce_whitespace_word_band(
     lower = target_length - tolerance
     upper = target_length + tolerance
 
+    def _strip_markdown_list_tokens(value: str) -> str:
+        """Reduce whitespace-only markdown tokens without changing semantic words.
+
+        These tokens (e.g., leading '-' bullets) inflate `len(text.split())` but are
+        ignored by `_count_words()` and can make the dual-band constraint unsatisfiable.
+        """
+        if not value:
+            return value
+
+        out_lines: List[str] = []
+        changed = False
+        for raw in value.splitlines():
+            line = raw.rstrip()
+            # Drop standalone list-marker lines.
+            if re.match(r"^\s*[-*•]\s*$", line):
+                changed = True
+                continue
+            # Strip leading list markers (keep the content).
+            stripped = re.sub(r"^(\s*)[-*•]\s+", r"\1", line)
+            if stripped != line:
+                changed = True
+            out_lines.append(stripped)
+
+        if not changed:
+            return value
+        return "\n".join(out_lines).strip()
+
     for _ in range(5):
         split_count = len(text.split())
         stripped_count = _count_words(text)
 
         if lower <= split_count <= upper and lower <= stripped_count <= upper:
-            cleaned = _dedupe_consecutive_sentences(text)
-            cleaned = _deduplicate_sentences(cleaned)
-            if cleaned != text:
-                text = cleaned
-                continue
+            if dedupe:
+                cleaned = _dedupe_consecutive_sentences(text)
+                cleaned = _deduplicate_sentences(cleaned)
+                if cleaned != text:
+                    text = cleaned
+                    continue
             return text
 
         if split_count > upper or stripped_count > upper:
+            # If whitespace tokens are dominating the overage, try removing purely
+            # presentational markdown tokens first (no semantic loss).
+            if split_count > upper and (split_count - stripped_count) > tolerance:
+                cleaned = _strip_markdown_list_tokens(text)
+                if cleaned and cleaned != text and len(cleaned.split()) < split_count:
+                    text = cleaned
+                    continue
+
             excess = max(split_count - upper, stripped_count - upper)
 
             # For tiny overages, prefer micro-trimming filler words over dropping sentences.
@@ -765,7 +810,71 @@ def _enforce_whitespace_word_band(
     final_stripped = _count_words(text)
     if lower <= final_split <= upper and lower <= final_stripped <= upper:
         return text
-    return _clamp_to_band(text, lower, upper, allow_padding=allow_padding)
+
+    # Fallback: clamp and then re-check BOTH counting methods. `_clamp_to_band()` enforces
+    # the MS-Word-style count only; we need to guarantee the UI-visible whitespace count
+    # stays inside the same band as well.
+    text = _clamp_to_band(text, lower, upper, allow_padding=allow_padding)
+
+    for _ in range(8):
+        split_count = len(text.split())
+        stripped_count = _count_words(text)
+        if lower <= split_count <= upper and lower <= stripped_count <= upper:
+            return text
+
+        if split_count > upper or stripped_count > upper:
+            if split_count > upper and (split_count - stripped_count) > tolerance:
+                cleaned = _strip_markdown_list_tokens(text)
+                if cleaned and cleaned != text and len(cleaned.split()) < split_count:
+                    text = cleaned
+                    continue
+
+            # Whitespace tokens can exceed the stripped count due to markdown markers
+            # (e.g., leading '##'). Compute the effective upper bound for stripped words
+            # that will still satisfy the whitespace band.
+            delta = max(0, split_count - stripped_count)
+            effective_upper = max(lower, upper - delta)
+
+            excess = max(split_count - upper, stripped_count - upper, 1)
+            target_words = max(lower, min(effective_upper, stripped_count - excess))
+            text = _trim_preserving_headings(text, target_words)
+            continue
+
+        # Under target: pad (deterministically) into sections.
+        deficit = max(lower - split_count, lower - stripped_count)
+        if deficit <= 0:
+            return text
+        if not allow_padding:
+            return text
+        text = _distribute_padding_across_sections(text, deficit)
+
+    return text
+
+
+def _ensure_final_strict_word_band(
+    text: str,
+    target_length: int,
+    *,
+    include_health_rating: bool,
+    tolerance: int = 10,
+) -> str:
+    """Final, idempotent guard to ensure the strict total word band after all other processing."""
+    if not text or target_length is None:
+        return text
+
+    lower = int(target_length) - int(tolerance)
+    upper = int(target_length) + int(tolerance)
+    split_count = len((text or "").split())
+    stripped_count = _count_words(text or "")
+    if lower <= split_count <= upper and lower <= stripped_count <= upper:
+        return text
+
+    enforced = _enforce_whitespace_word_band(
+        text, int(target_length), tolerance=int(tolerance), allow_padding=True
+    )
+    return _enforce_section_order(
+        enforced, include_health_rating=include_health_rating
+    )
 
 
 def _call_gemini_client(
@@ -1704,12 +1813,25 @@ def _truncate_text_to_word_limit(text: str, max_words: int) -> str:
     if max_words <= 0:
         return ""
 
-    matches = list(re.finditer(r"\b\w+\b", text))
-    if len(matches) <= max_words:
+    # IMPORTANT:
+    # This truncator must be consistent with `_count_words()` (which the backend/UI/tests
+    # use as an MS Word-style approximation). The prior implementation used `\b\w+\b`,
+    # which splits tokens like "33.9%" into multiple "words" and can therefore truncate
+    # numeric-heavy sections far more aggressively than intended.
+    punct = string.punctuation + "\u201c\u201d\u2018\u2019\u2014\u2013\u2026"
+
+    counted: List[re.Match[str]] = []
+    for m in re.finditer(r"\S+", text or ""):
+        raw = m.group(0)
+        token = raw.strip(punct)
+        if token:
+            counted.append(m)
+
+    if len(counted) <= max_words:
         return text.rstrip()
 
-    # Initial hard cutoff
-    cutoff_index = matches[max_words - 1].end()
+    # Initial hard cutoff at the end of the Nth counted token.
+    cutoff_index = counted[max_words - 1].end()
     truncated = text[:cutoff_index].rstrip()
 
     # ALWAYS find the last complete sentence - don't allow incomplete sentences
@@ -2067,10 +2189,16 @@ def _generate_padding_sentences(
     section: Optional[str] = None,
     is_persona: bool = False,
     exclude_risk_names: Optional[set[str]] = None,
+    max_words: Optional[int] = None,
 ) -> List[str]:
     """Generate concise, finance-relevant padding sentences to reach required word counts."""
     if required_words <= 0:
         return []
+
+    if max_words is not None:
+        max_words = int(max_words)
+        if max_words <= 0:
+            return []
 
     # IMPORTANT:
     # Padding is a LAST-RESORT safety net to satisfy strict word floors.
@@ -2081,7 +2209,8 @@ def _generate_padding_sentences(
     # - Avoid repetitive, boilerplate “template” finance slogans users notice.
     # - Prefer section-aware connective sentences that can be appended seamlessly.
 
-    canon_section = (section or "").strip().lower()
+    canon_section = (section or "").strip().lower().replace("&", "and")
+    canon_section = re.sub(r"\s+", " ", canon_section).strip()
 
     def _voice(persona: str, neutral: str) -> str:
         return persona if is_persona else neutral
@@ -2096,7 +2225,53 @@ def _generate_padding_sentences(
         return None
 
     section_templates: Dict[str, List[str]] = {
+        "financial health rating": [
+            _voice(
+                "I weigh margins and cash flow most heavily.",
+                "Margins and cash flow drive the score.",
+            ),
+            _voice(
+                "I focus on liquidity as the margin of safety.",
+                "Liquidity sets the margin of safety.",
+            ),
+            _voice(
+                "Leverage matters because it limits flexibility in a downturn.",
+                "Leverage limits flexibility in a downturn.",
+            ),
+            _voice(
+                "I want cash and liabilities to leave room for error.",
+                "Cash versus liabilities defines the room for error.",
+            ),
+            _voice(
+                "Free cash flow supports reinvestment without forcing leverage.",
+                "Free cash flow supports reinvestment without forcing leverage.",
+            ),
+        ],
         "executive summary": [
+            _voice(
+                "I watch cash conversion and incentives closely.",
+                "Watch cash conversion and incentives closely.",
+            ),
+            _voice(
+                "My swing factor is sustained cash conversion.",
+                "The swing factor is sustained cash conversion.",
+            ),
+            _voice(
+                "I underwrite the thesis off margins and cash.",
+                "Underwrite the thesis off margins and cash.",
+            ),
+            _voice(
+                "Execution and unit economics drive my stance.",
+                "Execution and unit economics drive the stance.",
+            ),
+            _voice(
+                "From my perspective, the core question is whether cash conversion stays repeatable.",
+                "The core question is whether cash conversion stays repeatable.",
+            ),
+            _voice(
+                "I care about durability: margins and cash should move together, not diverge.",
+                "Durability improves when margins and cash move together, not diverge.",
+            ),
             _voice(
                 "From my perspective, the underwriting swing factor is whether unit economics translate into repeatable cash conversion as growth investments normalize.",
                 "The underwriting swing factor is whether unit economics translate into repeatable cash conversion as growth investments normalize.",
@@ -2112,6 +2287,34 @@ def _generate_padding_sentences(
         ],
         "closing takeaway": [
             _voice(
+                "I stay cautious until cash proves out.",
+                "Stay cautious until cash proves out.",
+            ),
+            _voice(
+                "I would wait for cleaner cash conversion.",
+                "Wait for cleaner cash conversion.",
+            ),
+            _voice(
+                "I want more evidence on durable margins.",
+                "Seek more evidence of durable margins.",
+            ),
+            _voice(
+                "I would revisit if margins weaken materially.",
+                "Revisit if margins weaken materially.",
+            ),
+            _voice(
+                "My view improves with repeatable cash conversion.",
+                "Conviction improves with repeatable cash conversion.",
+            ),
+            _voice(
+                "I would revisit the thesis quickly if cash conversion deteriorates or leverage rises.",
+                "Revisit the thesis quickly if cash conversion deteriorates or leverage rises.",
+            ),
+            _voice(
+                "Absent cleaner cash conversion, I stay cautious on the risk-reward.",
+                "Absent cleaner cash conversion, a cautious stance is warranted.",
+            ),
+            _voice(
                 "What changes my view is clearer evidence that margins can hold through a softer period and that free cash flow conversion improves as reinvestment intensity normalizes.",
                 "What changes the view is clearer evidence that margins can hold through a softer period and that free cash flow conversion improves as reinvestment intensity normalizes.",
             ),
@@ -2121,6 +2324,30 @@ def _generate_padding_sentences(
             ),
         ],
         "financial performance": [
+            _voice(
+                "I want margins to translate into cash.",
+                "Margins should translate into cash.",
+            ),
+            _voice(
+                "I want cash to confirm earnings quality.",
+                "Cash should confirm earnings quality.",
+            ),
+            _voice(
+                "I watch working capital for timing noise.",
+                "Watch working capital for timing noise.",
+            ),
+            _voice(
+                "I focus on mix, pricing, and incentives.",
+                "Focus on mix, pricing, and incentives.",
+            ),
+            _voice(
+                "I watch whether reported margin strength shows up in free cash flow.",
+                "Watch whether reported margin strength shows up in free cash flow.",
+            ),
+            _voice(
+                "If cash lags earnings, working-capital timing is usually the culprit.",
+                "If cash lags earnings, working-capital timing is usually the culprit.",
+            ),
             _voice(
                 "I focus on the bridge from operating profit to free cash flow, because that is where working-capital timing and capex show up in earnings quality.",
                 "The bridge from operating profit to free cash flow is where working-capital timing and capex show up in earnings quality.",
@@ -2136,6 +2363,30 @@ def _generate_padding_sentences(
         ],
         "management discussion and analysis": [
             _voice(
+                "I want reinvestment to earn its keep.",
+                "Reinvestment should earn its keep.",
+            ),
+            _voice(
+                "I look for disciplined capital allocation.",
+                "Look for disciplined capital allocation.",
+            ),
+            _voice(
+                "I want execution to match the narrative.",
+                "Execution must match the narrative.",
+            ),
+            _voice(
+                "I care about payback periods and unit economics.",
+                "Payback periods and unit economics matter.",
+            ),
+            _voice(
+                "I want capex and hiring to map to a clear payback period.",
+                "Capex and hiring should map to a clear payback period.",
+            ),
+            _voice(
+                "Strategy matters only if it improves unit economics over time.",
+                "Strategy matters only if it improves unit economics over time.",
+            ),
+            _voice(
                 "What I want to see is disciplined reinvestment that shows up in operating leverage, not a spend curve that outpaces the margin profile.",
                 "The key is disciplined reinvestment that shows up in operating leverage, not a spend curve that outpaces the margin profile.",
             ),
@@ -2150,12 +2401,40 @@ def _generate_padding_sentences(
         ],
         "risk factors": [
             _voice(
+                "**Execution Risk**: If reinvestment outpaces revenue, margins can reset lower.",
+                "**Execution Risk**: If reinvestment outpaces revenue, margins can reset lower.",
+            ),
+            _voice(
+                "**Competitive / Pricing Risk**: Higher incentives can pressure take rates and margins.",
+                "**Competitive / Pricing Risk**: Higher incentives can pressure take rates and margins.",
+            ),
+            _voice(
+                "**Regulatory / Platform Risk**: Policy shifts can reduce monetization or raise compliance costs.",
+                "**Regulatory / Platform Risk**: Policy shifts can reduce monetization or raise compliance costs.",
+            ),
+            _voice(
+                "**Technology / Platform Risk**: Outages or fraud can damage trust and retention.",
+                "**Technology / Platform Risk**: Outages or fraud can damage trust and retention.",
+            ),
+            _voice(
+                "**Cyclicality / Demand Risk**: A slowdown can reduce volumes and utilization.",
+                "**Cyclicality / Demand Risk**: A slowdown can reduce volumes and utilization.",
+            ),
+            _voice(
+                "**Legal / Litigation Risk**: Claims and settlements can add volatility.",
+                "**Legal / Litigation Risk**: Claims and settlements can add volatility.",
+            ),
+            _voice(
                 "**Earnings Quality Risk**: I worry that reported profitability can look steadier than the cash profile when working capital or capex timing shifts. If cash conversion weakens for multiple quarters, valuation support can erode even if revenue holds up.",
                 "**Earnings Quality Risk**: Reported profitability can look steadier than the cash profile when working capital or capex timing shifts. If cash conversion weakens for multiple quarters, valuation support can erode even if revenue holds up.",
             ),
             _voice(
                 "**Margin Compression Risk**: I worry that competitive intensity forces higher incentives or reinvestment, limiting operating leverage. If growth slows at the same time, small cost inflation can translate into outsized profit pressure.",
                 "**Margin Compression Risk**: Competitive intensity can force higher incentives or reinvestment, limiting operating leverage. If growth slows at the same time, small cost inflation can translate into outsized profit pressure.",
+            ),
+            _voice(
+                "**Balance Sheet Risk**: Leverage or maturities can reduce strategic flexibility.",
+                "**Balance Sheet Risk**: Leverage or maturities can reduce strategic flexibility.",
             ),
         ],
     }
@@ -2202,7 +2481,9 @@ def _generate_padding_sentences(
             risk_name = _risk_name_from_template(t)
             if risk_name and risk_name in risk_name_blacklist:
                 continue
-        candidates.append((len(t.split()), t))
+        wc = _count_words(t)
+        if wc > 0:
+            candidates.append((wc, t))
 
     if not candidates:
         # If the section already contains all of its padding templates, broaden to the
@@ -2211,16 +2492,23 @@ def _generate_padding_sentences(
             for t in fallback_templates:
                 if excluded and _norm_sentence(t) in excluded:
                     continue
-                candidates.append((len(t.split()), t))
+                wc = _count_words(t)
+                if wc > 0:
+                    candidates.append((wc, t))
 
         # If everything was still excluded, fall back to allowing repeats so we can
         # satisfy strict length bands.
         if not candidates:
-            candidates = [(len(t.split()), t) for t in templates]
+            candidates = []
+            for t in templates:
+                wc = _count_words(t)
+                if wc > 0:
+                    candidates.append((wc, t))
     candidates.sort(key=lambda x: x[0])
 
     sentences: List[str] = []
-    remaining = required_words
+    remaining = int(required_words)
+    budget_remaining = int(max_words) if max_words is not None else None
     used: set[str] = set()
 
     def _stable_pick(options: List[Tuple[int, str]], key: str) -> Tuple[int, str]:
@@ -2230,34 +2518,40 @@ def _generate_padding_sentences(
         idx = int.from_bytes(digest[:2], "big") % len(options)
         return options[idx]
 
-    # Greedy: pick the smallest sentence that covers the remaining deficit.
-    # To avoid repetitive "always the same shortest template", rotate among
-    # same-length candidates using a stable hash.
-    while remaining > 0:
-        eligible = [(wc, t) for wc, t in candidates if t not in used and wc >= remaining]
-        choice: Optional[Tuple[int, str]] = None
-        if eligible:
-            min_wc = min(wc for wc, _t in eligible)
-            same_size = [(wc, t) for wc, t in eligible if wc == min_wc]
-            choice = _stable_pick(
-                same_size, f"{canon_section}:{is_persona}:{remaining}:{len(used)}"
-            )
-        if choice is None:
-            unused = [(wc, t) for wc, t in candidates if t not in used]
-            if unused:
-                max_wc = max(wc for wc, _t in unused)
-                same_size = [(wc, t) for wc, t in unused if wc == max_wc]
-                choice = _stable_pick(
-                    same_size, f"{canon_section}:{is_persona}:longest:{len(used)}"
-                )
-        if choice is None:
-            # As a last resort, allow repeats.
-            choice = candidates[-1]
+    # Greedy within bounds:
+    # - Prefer the smallest sentence that covers the remaining deficit.
+    # - If none can cover, take the longest sentence that still fits to make progress.
+    while remaining > 0 and candidates:
+        if budget_remaining is not None and budget_remaining <= 0:
+            break
 
-        wc, sentence = choice
+        available = [(wc, t) for wc, t in candidates if t not in used]
+        if budget_remaining is not None:
+            available = [(wc, t) for wc, t in available if wc <= budget_remaining]
+        if not available:
+            break
+
+        cover = [(wc, t) for wc, t in available if wc >= remaining]
+        if cover:
+            min_wc = min(wc for wc, _t in cover)
+            same_size = [(wc, t) for wc, t in cover if wc == min_wc]
+            wc, sentence = _stable_pick(
+                same_size,
+                f"{canon_section}:{is_persona}:{remaining}:{budget_remaining}:{len(used)}",
+            )
+        else:
+            max_wc = max(wc for wc, _t in available)
+            same_size = [(wc, t) for wc, t in available if wc == max_wc]
+            wc, sentence = _stable_pick(
+                same_size,
+                f"{canon_section}:{is_persona}:longest:{budget_remaining}:{len(used)}",
+            )
+
         sentences.append(sentence)
         used.add(sentence)
         remaining -= wc
+        if budget_remaining is not None:
+            budget_remaining -= wc
 
     return sentences
 
@@ -3678,6 +3972,25 @@ SECTION_PROPORTIONAL_WEIGHTS: Dict[str, int] = {
 }
 
 
+def _section_budget_tolerance_words(budget_words: int, *, max_tolerance: int = 10) -> int:
+    """Compute a per-section word tolerance for enforcing the fixed distribution.
+
+    A flat ±10 words is far too loose for short targets (e.g., a 20-word budget would
+    allow a 0–40 word section). We scale tolerance to the section budget so the
+    proportions stay stable across all target lengths.
+    """
+
+    max_tolerance = max(0, int(max_tolerance))
+    budget_words = int(budget_words or 0)
+    if budget_words <= 0:
+        return max(4, max_tolerance) if max_tolerance else 4
+
+    # ~6% of the section budget, bounded to avoid over-tightening and impossible
+    # padding when the budget is small.
+    scaled = max(4, int(round(budget_words * 0.06)))
+    return min(max_tolerance, scaled) if max_tolerance else scaled
+
+
 def _calculate_section_word_budgets(
     target_length: int,
     include_health_rating: bool = True,
@@ -3866,6 +4179,615 @@ def _format_section_word_budgets(
     return "\n".join(lines)
 
 
+def _enforce_section_budget_distribution(
+    summary_text: str,
+    *,
+    target_length: int,
+    include_health_rating: bool,
+    metrics_lines: Optional[str] = None,
+    section_tolerance: int = 10,
+) -> str:
+    """Deterministically nudge section lengths toward the fixed proportional budgets.
+
+    This is the final safety net to keep the *actual* output distribution stable even
+    after post-processing steps (filler removal, health-score injection, etc.).
+
+    Rules:
+    - Uses `_count_words()` (MS Word-style approximation used by the backend).
+    - Ensures each section body is within ±section_tolerance of its computed budget.
+    - Does NOT add extra headings or sections.
+    - If `metrics_lines` is provided, Key Metrics is replaced with that deterministic block.
+    """
+
+    if not summary_text or not target_length:
+        return summary_text
+
+    budgets = _calculate_section_word_budgets(
+        int(target_length), include_health_rating=include_health_rating
+    )
+    if not budgets:
+        return summary_text
+
+    heading_regex = re.compile(r"^\s*##\s+.+")
+    sections: List[Tuple[str, str]] = []
+    current_heading: Optional[str] = None
+    buffer: List[str] = []
+    preamble: List[str] = []
+    first_heading_seen = False
+
+    for line in (summary_text or "").splitlines():
+        if heading_regex.match(line):
+            if not first_heading_seen and buffer:
+                preamble = buffer[:]
+                buffer = []
+            first_heading_seen = True
+            if current_heading is not None:
+                sections.append((current_heading, "\n".join(buffer).strip()))
+            current_heading = line.strip()
+            buffer = []
+        elif current_heading is not None:
+            buffer.append(line)
+        else:
+            preamble.append(line)
+
+    if current_heading is not None:
+        sections.append((current_heading, "\n".join(buffer).strip()))
+
+    if not sections:
+        return summary_text
+
+    # Merge duplicate canonical sections.
+    merged: Dict[str, str] = {}
+    for heading, body in sections:
+        canon = _standard_section_name_from_heading(heading)
+        if canon in merged:
+            combined = (merged[canon] or "").strip()
+            addition = (body or "").strip()
+            merged[canon] = f"{combined}\n\n{addition}".strip() if addition else combined
+        else:
+            merged[canon] = (body or "").strip()
+
+    # If we captured any preamble, fold it into Executive Summary so it doesn't steal
+    # from the proportional budgets.
+    preamble_text = "\n".join([ln for ln in preamble if ln.strip()]).strip()
+    if preamble_text:
+        exec_body = (merged.get("Executive Summary") or "").strip()
+        merged["Executive Summary"] = f"{preamble_text}\n\n{exec_body}".strip() if exec_body else preamble_text
+
+    # Replace Key Metrics with deterministic, non-hallucinated block when available.
+    if metrics_lines:
+        merged["Key Metrics"] = (metrics_lines or "").strip()
+
+    def _normalize_key_metrics_for_word_band(body: str) -> str:
+        """Reduce whitespace-token inflation in Key Metrics without losing content."""
+        body = (body or "").replace("\u00A0", " ").strip()
+        if not body:
+            return body
+
+        out_lines: List[str] = []
+        for raw in body.splitlines():
+            line = (raw or "").rstrip()
+            # Pipes are punctuation-only tokens under whitespace counting; convert them to commas.
+            line = re.sub(r"\s*\|\s*", ", ", line)
+            # Leading '-' bullets inflate `len(text.split())` but don't count as words in `_count_words()`.
+            line = re.sub(r"^\s*-\s+", "", line)
+            # Prefer words over punctuation-only separators.
+            line = line.replace(" + ", " and ")
+            line = line.replace(" & ", " and ")
+            out_lines.append(line)
+
+        cleaned = "\n".join(out_lines).strip()
+        cleaned = re.sub(r",\s*,+", ", ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned
+
+    if "Key Metrics" in merged:
+        merged["Key Metrics"] = _normalize_key_metrics_for_word_band(merged.get("Key Metrics") or "")
+
+    is_persona = bool(re.search(r"\b(?:I|my|I'm|I’m)\b", summary_text or ""))
+
+    def _append_padding(body: str, pad_text: str, section_name: str) -> str:
+        body = (body or "").strip()
+        pad_text = (pad_text or "").strip()
+        if not pad_text:
+            return body
+        if not body:
+            return pad_text
+        if section_name == "Risk Factors":
+            return f"{body}\n\n{pad_text}".strip()
+        cleaned = body.rstrip()
+        cleaned = re.sub(r"[-\u2013\u2014]+\s*$", "", cleaned).rstrip()
+        if cleaned and not cleaned.endswith((".", "!", "?")):
+            cleaned += "."
+        return f"{cleaned} {pad_text}".strip()
+
+    def _trim_key_metrics_to(body: str, limit_words: int) -> str:
+        return _trim_appendix_preserving_rows((body or "").strip(), limit_words)
+
+    def _pad_key_metrics(body: str, add_words: int, *, upper_words: int) -> str:
+        """Pad Key Metrics with additional arrow-line watch items (no prose)."""
+        body = (body or "").strip()
+        if add_words <= 0:
+            return body
+
+        upper_words = max(1, int(upper_words))
+        target_words = min(upper_words, _count_words(body) + int(add_words))
+
+        # Keep this list broad so we can pad Key Metrics budgets without inventing numbers.
+        # These are intentionally written as "watch items" (not metrics) so they stay non-hallucinatory.
+        watch_topics = [
+            # Cash + earnings quality
+            "cash conversion vs net income",
+            "free cash flow conversion",
+            "working-capital swings",
+            "one-offs vs core earnings",
+            "non-GAAP adjustments cadence",
+            "cash taxes vs reported tax",
+            "cash interest expense",
+            # Margins + cost structure
+            "margin trend vs pricing/mix",
+            "gross margin trajectory",
+            "operating margin trajectory",
+            "pricing discipline",
+            "input cost inflation",
+            "opex discipline",
+            # Capex + reinvestment
+            "capex pacing",
+            "capex intensity vs growth",
+            "reinvestment intensity",
+            "capex efficiency",
+            # Balance sheet + liquidity
+            "liquidity runway and maturities",
+            "debt maturities profile",
+            "refinancing rate sensitivity",
+            "leverage and refinancing terms",
+            "interest coverage and covenants",
+            "covenant headroom",
+            "lease obligations",
+            # Working capital components
+            "receivables turns",
+            "inventory turns",
+            "payables turns",
+            "AR aging",
+            "bad debt expense",
+            # Capital allocation
+            "share count dilution",
+            "SBC and dilution cadence",
+            "buyback pace vs free cash flow",
+            "M&A spend vs organic reinvestment",
+            # Demand + execution signals (generic)
+            "backlog/bookings momentum",
+            "order cancellations",
+            "customer concentration risk",
+            "supplier concentration risk",
+            "segment mix shifts",
+            "regional demand mix",
+            "competitive intensity",
+            # FX / macro transmission (keep generic)
+            "FX and geographic mix",
+            "FX hedging effectiveness",
+        ]
+
+        watch_templates = [f"→ Watch: {topic}" for topic in watch_topics]
+        candidates: List[Tuple[int, str]] = [(_count_words(t), t) for t in watch_templates]
+        candidates = [(wc, t) for wc, t in candidates if wc > 0 and t]
+        candidates.sort(key=lambda x: x[0])
+
+        used = set((body or "").splitlines())
+        working = body
+
+        # Add lines until we hit the target budget, staying <= upper_words.
+        for _ in range(600):
+            current = _count_words(working)
+            if current >= target_words or current >= upper_words:
+                break
+
+            slack = max(0, upper_words - current)
+            if slack <= 0:
+                break
+
+            chosen: Optional[str] = None
+            # Prefer unused lines; pick the longest that fits the remaining slack.
+            for wc, template in reversed(candidates):
+                if wc <= slack and template not in used:
+                    chosen = template
+                    break
+            # If we've exhausted unique lines, allow repeats as a last resort to
+            # satisfy strict distribution budgets.
+            if chosen is None:
+                for wc, template in reversed(candidates):
+                    if wc <= slack:
+                        chosen = template
+                        break
+            if chosen is None:
+                break
+
+            working = (working + "\n" + chosen).strip() if working else chosen
+            used.add(chosen)
+
+        if _count_words(working) > upper_words:
+            working = _trim_key_metrics_to(working, upper_words)
+        return working.strip()
+
+    def _seed_exclude_norms(body: str) -> set[str]:
+        """Collect existing sentences so padding avoids duplicating model text."""
+        norms: set[str] = set()
+        for line in (body or "").splitlines():
+            stripped = (line or "").strip()
+            if not stripped:
+                continue
+            # Skip obvious non-prose lines.
+            if stripped.startswith("#") or stripped.startswith("→"):
+                continue
+            # Keep risk paragraphs (they start with **name**: ...) but ignore bullet
+            # markers that don't add meaning.
+            if stripped in {"-", "*", "•"}:
+                continue
+            for sent in re.split(r"(?<=[.!?])\s+", stripped):
+                sent = (sent or "").strip()
+                if len(sent.split()) < 5:
+                    continue
+                norms.add(sent)
+        return norms
+
+    def _extract_risk_names(body: str) -> set[str]:
+        names: set[str] = set()
+        for match in re.finditer(r"\*\*(.+?)\*\*\s*:", body or ""):
+            name = re.sub(r"[^a-z0-9]+", " ", match.group(1).lower()).strip()
+            if name:
+                names.add(name)
+        return names
+
+    def _remove_last_sentence(body: str, *, min_words: int) -> str:
+        """Remove exactly one trailing sentence (complete-thought safe).
+
+        Returns the original body if we cannot remove a full sentence while staying
+        above `min_words`.
+        """
+        body = (body or "").strip()
+        if _count_words(body) <= min_words:
+            return body
+
+        endings: List[int] = []
+        for i, char in enumerate(body):
+            if char not in ".!?":
+                continue
+            # Skip decimals like 1.2
+            if i + 1 < len(body) and body[i + 1].isdigit():
+                continue
+            # Skip abbreviations mid-token
+            if i + 1 < len(body) and body[i + 1] not in " \n\t\"'":
+                continue
+            endings.append(i)
+
+        # Need at least two sentence endings to remove *one* sentence.
+        if len(endings) < 2:
+            return body
+
+        candidate = body[: endings[-2] + 1].rstrip()
+        return candidate if _count_words(candidate) >= min_words else body
+
+    def _trim_one_key_metrics_row(body: str, *, min_words: int) -> str:
+        """Remove one trailing Key Metrics row (arrow-line safe)."""
+        body = (body or "").strip()
+        if _count_words(body) <= min_words:
+            return body
+
+        lines = [ln.rstrip() for ln in body.splitlines()]
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if len(lines) <= 1:
+            return body
+
+        candidate = "\n".join(lines[:-1]).strip()
+        return candidate if _count_words(candidate) >= min_words else body
+
+    # Adjust each canonical section into its budget band.
+    for section_name, budget in budgets.items():
+        # If the model omitted a canonical section, create an empty placeholder so
+        # deterministic padding can still restore the fixed distribution.
+        if section_name not in merged:
+            merged[section_name] = ""
+        budget = int(budget or 0)
+        if budget <= 0:
+            continue
+
+        tol = _section_budget_tolerance_words(budget, max_tolerance=int(section_tolerance))
+        lower = max(1, budget - tol)
+        upper = budget + tol
+
+        body = (merged.get(section_name) or "").strip()
+
+        # Trim if overweight.
+        wc = _count_words(body)
+        if wc > upper:
+            if section_name == "Key Metrics":
+                body = _trim_appendix_preserving_rows(body, upper)
+            else:
+                body = _truncate_text_to_word_limit(body, upper)
+            wc = _count_words(body)
+
+        # Pad if underweight.
+        if wc < lower:
+            if section_name == "Key Metrics":
+                body = _pad_key_metrics(body, lower - wc, upper_words=upper)
+                wc = _count_words(body)
+            else:
+                # IMPORTANT: Padding must be incremental so we don't overshoot the
+                # section upper bound and then get truncated back to the original
+                # text (no net progress).
+                exclude_norms = _seed_exclude_norms(body)
+
+                while wc < lower and wc < upper:
+                    risk_name_exclusions = (
+                        _extract_risk_names(body) if section_name == "Risk Factors" else None
+                    )
+                    slack = max(0, upper - wc)
+                    needed = max(1, lower - wc)
+
+                    request_candidates = [
+                        min(needed, slack, 12),
+                        min(needed, slack, 8),
+                        min(needed, slack, 5),
+                        1,
+                    ]
+                    request_candidates = [r for r in request_candidates if r > 0]
+                    request_candidates = list(dict.fromkeys(request_candidates))
+
+                    progressed = False
+                    for allow_repeats in (False, True):
+                        for req in request_candidates:
+                            pad_sentences = _generate_padding_sentences(
+                                req,
+                                exclude_norms=None if allow_repeats else exclude_norms,
+                                section=section_name,
+                                is_persona=is_persona,
+                                exclude_risk_names=risk_name_exclusions,
+                                max_words=slack,
+                            )
+                            pad_text = " ".join(pad_sentences).strip()
+                            candidate = _append_padding(body, pad_text, section_name)
+                            if _count_words(candidate) > upper:
+                                candidate = _truncate_text_to_word_limit(candidate, upper)
+                            new_wc = _count_words(candidate)
+                            if new_wc > wc:
+                                body = candidate
+                                wc = new_wc
+                                exclude_norms = _seed_exclude_norms(body)
+                                progressed = True
+                                break
+                        if progressed:
+                            break
+
+                    if not progressed:
+                        break
+
+        merged[section_name] = (body or "").strip()
+
+    # Canonical order (no extra headings allowed here).
+    order = [
+        "Financial Health Rating" if include_health_rating else None,
+        "Executive Summary",
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Risk Factors",
+        "Key Metrics",
+        "Closing Takeaway",
+    ]
+    order = [o for o in order if o]
+
+    overall_lower = int(target_length) - 10
+    overall_upper = int(target_length) + 10
+
+    def _section_bounds(name: str) -> Tuple[int, int]:
+        budget = int(budgets.get(name, 0) or 0)
+        if budget <= 0:
+            return 1, max(2, int(section_tolerance))
+        tol = _section_budget_tolerance_words(budget, max_tolerance=int(section_tolerance))
+        return max(1, budget - tol), budget + tol
+
+    def _rebuild_from_merged() -> str:
+        blocks: List[str] = []
+        for name in order:
+            body = (merged.get(name) or "").strip()
+            if not body:
+                continue
+            blocks.append(f"## {name}\n{body}".strip())
+        return "\n\n".join(blocks).strip()
+
+    # Global rebalance loop: keep BOTH overall word counts (whitespace + MS-word style)
+    # inside the band while preserving per-section bounds.
+    for _ in range(12):
+        rebuilt = _rebuild_from_merged()
+        split_count = len(rebuilt.split())
+        stripped_count = _count_words(rebuilt)
+
+        if (
+            overall_lower <= split_count <= overall_upper
+            and overall_lower <= stripped_count <= overall_upper
+        ):
+            break
+
+        if split_count > overall_upper or stripped_count > overall_upper:
+            excess = max(split_count - overall_upper, stripped_count - overall_upper)
+            # Trim from sections with the most slack above their lower bound.
+            trim_candidates: List[Tuple[int, str]] = []  # (slack, name)
+            for name in order:
+                body = (merged.get(name) or "").strip()
+                if not body:
+                    continue
+                sec_lower, _sec_upper = _section_bounds(name)
+                current_wc = _count_words(body)
+                slack = current_wc - sec_lower
+                if slack > 0:
+                    trim_candidates.append((slack, name))
+
+            trim_candidates.sort(reverse=True)
+
+            for _slack, name in trim_candidates:
+                if excess <= 0:
+                    break
+                body = (merged.get(name) or "").strip()
+                if not body:
+                    continue
+                sec_lower, _sec_upper = _section_bounds(name)
+                current_wc = _count_words(body)
+                if current_wc <= sec_lower:
+                    continue
+                # For small overages, sentence-safe word targeting can undershoot
+                # dramatically (e.g., dropping an entire paragraph). Prefer removing
+                # ONE complete sentence/row at a time.
+                if name == "Key Metrics":
+                    new_body = _trim_one_key_metrics_row(body, min_words=sec_lower)
+                else:
+                    new_body = _remove_last_sentence(body, min_words=sec_lower)
+
+                new_wc = _count_words(new_body)
+                removed = max(0, current_wc - new_wc)
+                if removed > 0:
+                    merged[name] = new_body.strip()
+                    excess = max(0, excess - removed)
+            continue
+
+        # Under target: pad into sections that still have room up to their upper bound.
+        deficit = max(overall_lower - split_count, overall_lower - stripped_count)
+        pad_candidates: List[Tuple[int, str]] = []  # (slack, name)
+        for name in order:
+            body = (merged.get(name) or "").strip()
+            _sec_lower, sec_upper = _section_bounds(name)
+            current_wc = _count_words(body)
+            slack = max(0, sec_upper - current_wc)
+            if slack > 0:
+                pad_candidates.append((slack, name))
+
+        pad_candidates.sort(reverse=True)
+
+        for _slack, name in pad_candidates:
+            if deficit <= 0:
+                break
+            body = (merged.get(name) or "").strip()
+            sec_lower, sec_upper = _section_bounds(name)
+            current_wc = _count_words(body)
+            slack = max(0, sec_upper - current_wc)
+            if slack <= 0:
+                continue
+
+            if name == "Key Metrics":
+                new_body = _pad_key_metrics(body, deficit, upper_words=sec_upper)
+            else:
+                # IMPORTANT:
+                # `_generate_padding_sentences(required_words)` chooses the *shortest* template
+                # that is >= required_words. If we request the full slack (often ~20 words),
+                # the chosen sentence can overshoot the section upper bound and then get
+                # truncated away entirely (no net progress). To guarantee progress, request
+                # smaller chunks that fit inside the slack.
+                request_candidates = [
+                    min(deficit, slack, 12),
+                    min(deficit, slack, 8),
+                    min(deficit, slack, 5),
+                    1,
+                ]
+                request_candidates = [r for r in request_candidates if r > 0]
+                request_candidates = list(dict.fromkeys(request_candidates))
+
+                new_body = body
+                risk_name_exclusions = (
+                    _extract_risk_names(body) if name == "Risk Factors" else None
+                )
+                exclude_norms = _seed_exclude_norms(body)
+                for allow_repeats in (False, True):
+                    for req in request_candidates:
+                        pad_sentences = _generate_padding_sentences(
+                            req,
+                            exclude_norms=None if allow_repeats else exclude_norms,
+                            section=name,
+                            is_persona=is_persona,
+                            exclude_risk_names=risk_name_exclusions,
+                            max_words=slack,
+                        )
+                        pad_text = " ".join(pad_sentences).strip()
+                        candidate = _append_padding(body, pad_text, name)
+                        if _count_words(candidate) > sec_upper:
+                            candidate = _truncate_text_to_word_limit(candidate, sec_upper)
+                        if _count_words(candidate) > current_wc:
+                            new_body = candidate
+                            break
+                    if _count_words(new_body) > current_wc:
+                        break
+
+            new_wc = _count_words(new_body)
+            added = max(0, new_wc - current_wc)
+            if added > 0:
+                merged[name] = new_body.strip()
+                deficit = max(0, deficit - added)
+
+    rebuilt = _rebuild_from_merged().strip()
+
+    # Final safety: if we're still over the strict band, prefer reducing punctuation-heavy
+    # whitespace tokens (Key Metrics separators) BEFORE removing real words.
+    final_split = len(rebuilt.split())
+    final_stripped = _count_words(rebuilt)
+    if final_split > overall_upper or final_stripped > overall_upper:
+        if "Key Metrics" in merged:
+            merged["Key Metrics"] = _normalize_key_metrics_for_word_band(
+                merged.get("Key Metrics") or ""
+            )
+        rebuilt = _rebuild_from_merged().strip()
+        final_split = len(rebuilt.split())
+        final_stripped = _count_words(rebuilt)
+
+    # If we're still over, trim within per-section lower bounds (sentence/row safe).
+    if final_split > overall_upper or final_stripped > overall_upper:
+        for _ in range(600):
+            final_split = len(rebuilt.split())
+            final_stripped = _count_words(rebuilt)
+            if final_split <= overall_upper and final_stripped <= overall_upper:
+                break
+
+            excess = max(final_split - overall_upper, final_stripped - overall_upper)
+            trimmed_any = False
+
+            trim_candidates: List[Tuple[int, str]] = []  # (slack, name)
+            for name in order:
+                body = (merged.get(name) or "").strip()
+                if not body:
+                    continue
+                sec_lower, _sec_upper = _section_bounds(name)
+                current_wc = _count_words(body)
+                slack = current_wc - sec_lower
+                if slack > 0:
+                    trim_candidates.append((slack, name))
+
+            trim_candidates.sort(reverse=True)
+            for _slack, name in trim_candidates:
+                if excess <= 0:
+                    break
+                body = (merged.get(name) or "").strip()
+                if not body:
+                    continue
+                sec_lower, _sec_upper = _section_bounds(name)
+                current_wc = _count_words(body)
+                if current_wc <= sec_lower:
+                    continue
+
+                if name == "Key Metrics":
+                    new_body = _trim_one_key_metrics_row(body, min_words=sec_lower)
+                else:
+                    new_body = _remove_last_sentence(body, min_words=sec_lower)
+
+                new_wc = _count_words(new_body)
+                removed = max(0, current_wc - new_wc)
+                if removed > 0:
+                    merged[name] = new_body.strip()
+                    excess = max(0, excess - removed)
+                    trimmed_any = True
+
+            rebuilt = _rebuild_from_merged().strip()
+            if not trimmed_any:
+                break
+    return rebuilt.strip()
+
+
 # Rating scale - using dashboard-aligned labels only (no letter grades per user decision)
 # Scale: 0-49 = At Risk, 50-69 = Watch, 70-84 = Healthy, 85-100 = Very Healthy
 # NO letter grades (A, B, C, D) - numeric score + descriptive label only
@@ -3920,7 +4842,7 @@ def _make_section_completeness_validator(
                     next_section_index = future_pos
                     break
             section_body = text[section_start:next_section_index].strip()
-            word_count = len(re.findall(r"\b\w+\b", section_body))
+            word_count = _count_words(section_body)
             min_words = int(min_words_by_section.get(title, 25))
             if word_count < min_words:
                 return (
@@ -3928,6 +4850,41 @@ def _make_section_completeness_validator(
                     "and ensure it concludes on a full sentence."
                 )
             search_start = section_start
+        return None
+
+    return _validator
+
+
+def _make_no_extra_sections_validator(
+    include_health_rating: bool,
+) -> Callable[[str], Optional[str]]:
+    """Fail if the model adds extra headings beyond the canonical memo structure.
+
+    Extra sections (e.g., "Valuation", "Outlook") break the fixed distribution because
+    they consume word budget that is supposed to belong to the 6/7 canonical sections.
+    """
+
+    allowed = {
+        title
+        for title, _ in SUMMARY_SECTION_REQUIREMENTS
+        if include_health_rating or title != "Financial Health Rating"
+    }
+
+    heading_re = re.compile(r"^\s*##\s+(.+?)\s*$", re.MULTILINE)
+
+    def _validator(text: str) -> Optional[str]:
+        if not text:
+            return None
+        for match in heading_re.finditer(text):
+            raw_title = (match.group(1) or "").strip()
+            canon = _standard_section_name_from_heading(f"## {raw_title}")
+            if canon not in allowed:
+                return (
+                    f"Extra section heading detected: '## {raw_title}'. "
+                    "Only use the required headings (Financial Health Rating, Executive Summary, "
+                    "Financial Performance, Management Discussion & Analysis, Risk Factors, Key Metrics, Closing Takeaway). "
+                    "Fold any extra content into the closest relevant required section (usually MD&A)."
+                )
         return None
 
     return _validator
@@ -3946,6 +4903,10 @@ def _make_section_balance_validator(include_health_rating: bool, target_length: 
     )
     lower = target_length - 10
     upper = target_length + 10
+
+    # User requirement: enforce the proportional distribution tightly.
+    # Budgets are for *section body* words (heading titles excluded).
+    section_tolerance = 10
 
     required_titles: List[Tuple[str, int]] = [
         (title, minimum)
@@ -3985,22 +4946,17 @@ def _make_section_balance_validator(include_health_rating: bool, target_length: 
                 search_start = section_start
                 continue
 
-            # Wide bounds to avoid excessive retries, but still catch lopsided drafts.
-            if title in {"Key Metrics", "Financial Health Rating"}:
-                min_allowed = max(3, int(expected * 0.30))
-                max_allowed = max(min_allowed, int(expected * 2.50))
-            else:
-                min_allowed = max(3, int(expected * 0.55))
-                max_allowed = max(min_allowed, int(expected * 1.75))
+            min_allowed = max(1, expected - section_tolerance)
+            max_allowed = expected + section_tolerance
 
             if word_count < min_allowed:
                 return (
-                    f"Section balance issue: '{title}' is underweight ({word_count} words vs ~{expected}). "
+                    f"Section balance issue: '{title}' is underweight ({word_count} words; target ~{expected}±{section_tolerance}). "
                     f"Expand it and shorten other sections proportionally so the memo stays within {lower}-{upper} words."
                 )
             if word_count > max_allowed:
                 return (
-                    f"Section balance issue: '{title}' is overweight ({word_count} words vs ~{expected}). "
+                    f"Section balance issue: '{title}' is overweight ({word_count} words; target ~{expected}±{section_tolerance}). "
                     f"Tighten it and reallocate words to the shorter sections (especially Risk Factors), "
                     f"while staying within {lower}-{upper} words."
                 )
@@ -4474,6 +5430,8 @@ def _build_health_rating_instructions(
     preferences: Optional[FilingSummaryPreferences],
     company_name: str,
     persona_id: Optional[str] = None,
+    *,
+    target_length: Optional[int] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     config = _resolve_health_rating_config(preferences)
     if not config:
@@ -4481,6 +5439,24 @@ def _build_health_rating_instructions(
 
     display_style = config.get("display_style", "score_plus_grade")
     is_custom_mode = preferences and preferences.mode == "custom"
+
+    # If the user requested a total length, make the health-rating directives
+    # budget-aware so they do not fight the fixed distribution requirements.
+    health_budget_min: Optional[int] = None
+    health_budget_max: Optional[int] = None
+    if target_length and int(target_length) > 0:
+        try:
+            budgets = _calculate_section_word_budgets(
+                int(target_length), include_health_rating=True
+            )
+            budget = int(budgets.get("Financial Health Rating", 0) or 0)
+            if budget > 0:
+                tol = _section_budget_tolerance_words(budget, max_tolerance=10)
+                health_budget_min = max(1, budget - tol)
+                health_budget_max = budget + tol
+        except Exception:
+            health_budget_min = None
+            health_budget_max = None
 
     # Build header based on whether user has customized
     if is_custom_mode:
@@ -4532,7 +5508,7 @@ def _build_health_rating_instructions(
                 "MANDATORY FORMAT (YOU MUST INCLUDE ALL ELEMENTS):",
                 "1. The score (0-100) with rating label (Very Healthy/Healthy/Watch/At Risk)",
                 "2. NO letter grades or abbreviations in parentheses",
-                "3. A MANDATORY explanation of 4-5 sentences (55-90 words)",
+                "3. A MANDATORY explanation of 3-5 sentences (length must fit the memo's Financial Health Rating word budget if provided)",
                 "",
                 "YOUR EXPLANATION MUST COVER:",
                 "- What drove the score (specific metrics with values)",
@@ -4560,7 +5536,7 @@ def _build_health_rating_instructions(
                 "",
                 "MANDATORY FORMAT (YOU MUST INCLUDE ALL ELEMENTS):",
                 "1. The score (0-100) with traffic light: 70-100=GREEN, 50-69=YELLOW, 0-49=RED",
-                "2. A MANDATORY explanation of 3-4 sentences (40-75 words)",
+                "2. A MANDATORY explanation of 3-4 sentences (length must fit the memo's Financial Health Rating word budget if provided)",
                 "",
                 "YOUR EXPLANATION MUST COVER:",
                 "- What drove the score (specific metrics with values)",
@@ -4581,7 +5557,7 @@ def _build_health_rating_instructions(
                 "",
                 "MANDATORY FORMAT - EXTENDED NARRATIVE REQUIRED:",
                 "1. The score (0-100) with rating label",
-                "2. A DETAILED narrative paragraph of 5-7 sentences (80-120 words minimum)",
+                "2. A DETAILED narrative paragraph of 4-7 sentences (length must fit the memo's Financial Health Rating word budget if provided)",
                 "",
                 "YOUR NARRATIVE MUST ANALYZE:",
                 "- Profitability metrics (margins, ROE, ROA) with specific values",
@@ -4623,8 +5599,13 @@ def _build_health_rating_instructions(
             "- 50-69 = Watch",
             "- 0-49 = At Risk",
             "",
-            "=== MINIMUM CONTENT REQUIREMENT (CRITICAL) ===",
-            "The Financial Health Rating section MUST be at least 40 words.",
+            "=== LENGTH + CONTENT REQUIREMENT (CRITICAL) ===",
+            (
+                f"The Financial Health Rating section body MUST be between {health_budget_min} and {health_budget_max} words. "
+                "If any other instruction conflicts with this word budget, the word budget WINS."
+            )
+            if (health_budget_min is not None and health_budget_max is not None)
+            else "The Financial Health Rating section MUST be at least 40 words.",
             "A single line like 'Company receives 78/100 - Healthy.' is INVALID.",
             "You MUST explain WHY the company received this score with specific metrics.",
             "",
@@ -4634,8 +5615,13 @@ def _build_health_rating_instructions(
             "3. At least ONE balance sheet observation (e.g., 'conservative debt levels')",
             "4. At least ONE risk or concern that impacts the score",
             "",
-            "If you write fewer than 40 words for this section, your output is INVALID.",
-            "=== END MINIMUM CONTENT REQUIREMENT ===",
+            (
+                f"VERIFICATION: Your Financial Health Rating body word count is {health_budget_min}–{health_budget_max}. "
+                "If outside that band, rewrite this section (do not steal words from other sections)."
+            )
+            if (health_budget_min is not None and health_budget_max is not None)
+            else "If you write fewer than 40 words for this section, your output is INVALID.",
+            "=== END LENGTH + CONTENT REQUIREMENT ===",
         ]
     )
 
@@ -7683,7 +8669,10 @@ def generate_filing_summary(
         health_rating_block = None
         if include_health_rating:
             health_config, health_rating_block = _build_health_rating_instructions(
-                preferences, company_label, persona_id_for_health
+                preferences,
+                company_label,
+                persona_id_for_health,
+                target_length=target_length,
             )
         health_directives_section = ""
         if health_rating_block:
@@ -7691,6 +8680,46 @@ def generate_filing_summary(
                 f"\n HEALTH RATING DIRECTIVES\n {health_rating_block}\n"
             )
         section_descriptions: List[Tuple[str, str]] = []
+
+        # Section budgets (body words, headings excluded) for enforcing the fixed distribution.
+        # User requirement: keep each section within ±10 words of its budget.
+        section_budget_tolerance = 10
+        section_budgets: Dict[str, int] = {}
+        if target_length and target_length > 0:
+            section_budgets = _calculate_section_word_budgets(
+                int(target_length), include_health_rating=include_health_rating
+            )
+
+        health_budget = int(section_budgets.get("Financial Health Rating", 0) or 0)
+        exec_budget = int(section_budgets.get("Executive Summary", 0) or 0)
+        perf_budget = int(section_budgets.get("Financial Performance", 0) or 0)
+        mdna_budget = int(section_budgets.get("Management Discussion & Analysis", 0) or 0)
+        risk_budget = int(section_budgets.get("Risk Factors", 0) or 0)
+        key_metrics_budget = int(section_budgets.get("Key Metrics", 0) or 0)
+        closing_budget = int(section_budgets.get("Closing Takeaway", 0) or 0)
+
+        def _budget_sentence(section: str, budget: int) -> str:
+            if budget <= 0:
+                return ""
+            tol = _section_budget_tolerance_words(
+                int(budget), max_tolerance=int(section_budget_tolerance)
+            )
+            return (
+                f"LENGTH TARGET: ~{budget} words for this section body "
+                f"(acceptable range: {max(1, budget - tol)}–{budget + tol})."
+            )
+
+        health_budget_sentence = _budget_sentence("Financial Health Rating", health_budget)
+        exec_budget_sentence = _budget_sentence("Executive Summary", exec_budget)
+        perf_budget_sentence = _budget_sentence("Financial Performance", perf_budget)
+        mdna_budget_sentence = _budget_sentence(
+            "Management Discussion & Analysis", mdna_budget
+        )
+        risk_budget_sentence = _budget_sentence("Risk Factors", risk_budget)
+        key_metrics_budget_sentence = _budget_sentence("Key Metrics", key_metrics_budget)
+        risk_budget_sentence_block = (
+            f"{risk_budget_sentence}\n" if risk_budget_sentence else ""
+        )
         if health_rating_block:
             if pre_calculated_score is not None and pre_calculated_band:
                 health_rating_description = (
@@ -7703,7 +8732,7 @@ def generate_filing_summary(
                     f"3. The band is '{pre_calculated_band}' - use this EXACT label\n"
                     f"4. Start the section with: '{pre_calculated_score:.0f}/100 - {pre_calculated_band}. ...'\n"
                     f"5. Then EXPLAIN why this score was assigned based on the metrics.\n"
-                    f"   - Write a cohesive paragraph of 6-8 sentences (~90-130 words).\n"
+                    f"   - {health_budget_sentence or 'Write a cohesive paragraph of 6-8 sentences (~90-130 words).'}\n"
                     f"   - Use specific figures (margins, cash flow, leverage/liquidity).\n"
                     f"   - Avoid one-sentence paragraphs and disconnected one-liners.\n"
                     f"   - End with one sentence that sets up the operating analysis that follows.\n\n"
@@ -7717,7 +8746,7 @@ def generate_filing_summary(
                     "Explain why the score landed there with specific metrics: margins, cash flow, leverage, liquidity. "
                     "A company with 60%+ margins should score 70+ unless there are severe balance sheet issues.\n\n"
                     "STRUCTURE (FLOW IS MANDATORY):\n"
-                    "- After the score line, write 6-8 sentences (~90-130 words) as one cohesive paragraph.\n"
+                    f"- {health_budget_sentence or 'After the score line, write 6-8 sentences (~90-130 words) as one cohesive paragraph.'}\n"
                     "- Use at least 3 concrete figures (%, $ amounts, ratios).\n"
                     "- Avoid one-sentence paragraphs and disconnected one-liners.\n"
                     "- End with one sentence that sets up the operating analysis that follows."
@@ -7729,7 +8758,8 @@ def generate_filing_summary(
             [
                 (
                     "Executive Summary",
-                    "THIS IS THE HERO SECTION - the premium insight users pay for. KEEP IT TIGHT (80-110 WORDS).\n\n"
+                    "THIS IS THE HERO SECTION - the premium insight users pay for.\n"
+                    f"{exec_budget_sentence or 'LENGTH TARGET: 80-110 words for this section body.'}\n\n"
                     "STRUCTURE (FLOW IS MANDATORY):\n"
                     "- Write 2 cohesive paragraphs (2-4 sentences each).\n"
                     "- Avoid one-sentence paragraphs and staccato one-liners.\n"
@@ -7752,7 +8782,8 @@ def generate_filing_summary(
                 ),
                 (
                     "Financial Performance",
-                    "Quantitative analysis (100-135 words). Cover KEY metrics:\n"
+                    f"{perf_budget_sentence or 'Quantitative analysis (100-135 words).'}\n"
+                    "Cover KEY metrics:\n"
                     "- Revenue with YoY% change and mix shifts (e.g., Mobility vs Delivery)\n"
                     "- Margin bridge: revenue growth → operating margin → net margin gap (explain drivers)\n"
                     "- Cash conversion: OCF to FCF, QoQ changes, capex context\n\n"
@@ -7767,7 +8798,8 @@ def generate_filing_summary(
                 ),
                 (
                     "Management Discussion & Analysis",
-                    "Expanded management assessment (125-175 words). Focus on:\n"
+                    f"{mdna_budget_sentence or 'Expanded management assessment (125-175 words).'}\n"
+                    "Focus on:\n"
                     "1. Strategy and capital deployment priorities (R&D, incentives, capex, buybacks/M&A)\n"
                     "2. Alignment check: do the claims MATCH operating margin trajectory and cash conversion?\n"
                     "3. Earnings quality: reconcile operating income vs net income and call out one-offs\n\n"
@@ -7780,7 +8812,9 @@ def generate_filing_summary(
                 ),
                 (
                     "Risk Factors",
-                    "2-3 MATERIAL, company-specific risks (concise but substantive). Each MUST:\n"
+                    "2-3 MATERIAL, company-specific risks (concise but substantive).\n"
+                    f"{risk_budget_sentence_block}"
+                    "Each MUST:\n"
                     "1. Have a clear name that includes the *specific driver* (segment/product/platform/regulation). Avoid generic labels like 'Margin Compression Risk' unless you tie it to a named driver (e.g., TAC, capex, incentives, insurance).\n"
                     "2. Be 2-3 sentences with concrete mechanisms and quantified impact where possible\n"
                     "3. Be specific to THIS business model (not generic macro filler)\n"
@@ -7794,6 +8828,7 @@ def generate_filing_summary(
                 (
                     "Key Metrics",
                     "Scannable data appendix (arrow format).\n"
+                    f"{key_metrics_budget_sentence or ''}\n"
                     "CRITICAL: This section should be ~10% of the total memo length (fixed distribution). "
                     "Include ENOUGH metric rows to match the Key Metrics word budget; do not keep it artificially short.\n\n"
                     "FORMAT RULES:\n"
@@ -7825,6 +8860,8 @@ def generate_filing_summary(
                     company_name,
                     target_length=target_length,
                     persona_requested=bool(investor_focus),
+                    budget_words=closing_budget,
+                    budget_tolerance=section_budget_tolerance,
                 ),
             ]
         )
@@ -8090,6 +9127,9 @@ Before you output anything, verify:
                 include_health_rating, target_length=target_length
             )
         ]
+        quality_validators.append(
+            _make_no_extra_sections_validator(include_health_rating)
+        )
         quality_validators.append(
             _make_risk_specificity_validator(risk_factors_excerpt=risk_factors_excerpt)
         )
@@ -8400,6 +9440,25 @@ Before you output anything, verify:
         summary_text = _normalize_underwriting_questions_formatting(summary_text)
         summary_text = _relocate_underwriting_questions_to_mdna(summary_text)
         summary_text = _merge_staccato_paragraphs(summary_text)
+
+        # Final guardrail: enforce the fixed section distribution after *all* cleanup.
+        if target_length:
+            summary_text = _enforce_section_budget_distribution(
+                summary_text,
+                target_length=int(target_length),
+                include_health_rating=include_health_rating,
+                metrics_lines=metrics_lines,
+                section_tolerance=10,
+            )
+            summary_text = _enforce_section_order(
+                summary_text, include_health_rating=include_health_rating
+            )
+            summary_text = _ensure_final_strict_word_band(
+                summary_text,
+                int(target_length),
+                include_health_rating=include_health_rating,
+                tolerance=10,
+            )
 
         # Final guard: ensure the document ends with punctuation for substantive outputs
         if (
