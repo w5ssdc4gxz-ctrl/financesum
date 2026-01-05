@@ -386,18 +386,32 @@ export default function CompanyPage() {
   ];
 
   const parseProgressStatus = (status: string): { step: number; percentage: number | null; displayText: string } => {
-    const percentMatch = status.match(/(\d+)%/)
+    const raw = (status || "").trim()
+
+    const cleaned = raw
+      .replace(/\(attempt\s*\d+\s*\/\s*\d+\)/gi, "")
+      .replace(/\(http fallback\)/gi, "")
+      .replace(/\s+/g, " ")
+      .trim()
+
+    const percentMatch = cleaned.match(/(\d+)%/)
     const percentage = percentMatch ? parseInt(percentMatch[1], 10) : null
 
-    if (status.includes("Generating Summary")) {
-      return { step: 6, percentage, displayText: status }
+    if (/^complete$/i.test(cleaned)) {
+      return { step: LOADING_STEPS.length - 1, percentage: null, displayText: "Polishing Output..." }
     }
 
-    const stepIndex = LOADING_STEPS.findIndex(s => status.startsWith(s.text.replace("...", "")))
+    if (cleaned.toLowerCase().includes("generating summary")) {
+      const displayText = "Generating Summary..."
+      return { step: 6, percentage, displayText }
+    }
+
+    const canonical = cleaned.replace(/\.*\s*(\d+%)?$/g, "").trim()
+    const stepIndex = LOADING_STEPS.findIndex(s => canonical.startsWith(s.text.replace("...", "")))
     return {
       step: stepIndex >= 0 ? stepIndex : 0,
       percentage,
-      displayText: status
+      displayText: cleaned || "Initializing AI Agent..."
     }
   }
 

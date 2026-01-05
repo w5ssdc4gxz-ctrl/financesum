@@ -138,7 +138,8 @@ class GeminiClient:
             GeminiTimeoutError: When request times out
         """
         if progress_callback:
-            progress_callback(5, f"{stage_name}... 5% (HTTP fallback)")
+            # Keep user-facing progress clean; internal transport (HTTP fallback vs SDK) is not relevant.
+            progress_callback(5, f"{stage_name}... 5%")
 
         generation_config = (
             self.persona_generation_config if use_persona_model else self.base_generation_config

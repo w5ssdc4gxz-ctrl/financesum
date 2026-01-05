@@ -1,4 +1,12 @@
-<!-- 86ad19e0-a6ad-4f14-b904-444f92061b37 cb25dd1c-d31b-424c-b8a8-7a9f25b57920 -->
+---
+name: Financial Analysis Platform - Full MVP Implementation
+overview: ""
+todos:
+  - id: 87a7eb7a-86a2-4e56-8d29-8d12a3445a4a
+    content: Set up Next.js frontend, FastAPI backend, Docker Compose, and Supabase database schema
+    status: completed
+---
+
 # Financial Analysis Platform - Full MVP Implementation
 
 ## Architecture Overview
@@ -312,7 +320,3 @@ financesum/
 - **PDF Storage**: Use Supabase Storage buckets with signed URLs for secure access
 - **Persona Disclaimer**: Display prominently on all persona outputs
 - **Provenance**: Always store which filings/pages were used for each analysis
-
-### To-dos
-
-- [x] Set up Next.js frontend, FastAPI backend, Docker Compose, and Supabase database schema

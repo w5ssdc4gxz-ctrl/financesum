@@ -1,4 +1,9 @@
-<!-- 669f148b-4ed6-4ea0-ac16-2c40e963f90e 34b57177-d29c-4c6d-8bcc-66b4b098378b -->
+---
+name: Restore SEC View & Improve Analysis
+overview: ""
+todos: []
+---
+
 # Restore SEC View & Improve Analysis
 
 1. revert-viewer — Simplify `GET /api/v1/filings/{id}/document` to return the downloaded SEC file immediately (or redirect to the SEC URL) without the new HTML wrapper.

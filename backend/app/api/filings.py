@@ -648,6 +648,10 @@ def _micro_trim_filler_words(text: str, max_remove: int) -> Tuple[str, int]:
         "quite",
         "very",
         "really",
+        "currently",
+        "significant",
+        "substantial",
+        "materially",
     ]
 
     heading_re = re.compile(r"^\s*##\s*(.+?)\s*$")
@@ -660,6 +664,10 @@ def _micro_trim_filler_words(text: str, max_remove: int) -> Tuple[str, int]:
     discourse_re = re.compile(
         r"\b(?:Overall|Notably|Importantly)\s*,\s+", re.IGNORECASE
     )
+    phrase_trim_rules: List[Tuple[re.Pattern[str], int]] = [
+        (re.compile(r"\bright\s+now\s+", re.IGNORECASE), 2),
+        (re.compile(r"\bat\s+this\s+juncture\s+", re.IGNORECASE), 3),
+    ]
 
     def _cleanup_spaces(s: str) -> str:
         s = re.sub(r"[ \t]{2,}", " ", s)
@@ -694,6 +702,16 @@ def _micro_trim_filler_words(text: str, max_remove: int) -> Tuple[str, int]:
             working, n = discourse_re.subn("", working, count=1)
             if n:
                 removed += 1
+
+        # 1b) Remove a couple of common filler phrases (multi-word, counted precisely).
+        if removed < max_remove:
+            for rule_re, rule_words in phrase_trim_rules:
+                if removed + rule_words > max_remove:
+                    continue
+                working, n = rule_re.subn("", working, count=1)
+                if n:
+                    removed += rule_words
+                    break
 
         # 2) Remove standalone filler words.
         # Remove one word per pass to keep edits minimal.
@@ -2227,176 +2245,141 @@ def _generate_padding_sentences(
     section_templates: Dict[str, List[str]] = {
         "financial health rating": [
             _voice(
-                "I weigh margins and cash flow most heavily.",
-                "Margins and cash flow drive the score.",
+                "I anchor the score on operating profitability and cash conversion because those signals tend to persist through a cycle.",
+                "The score anchors on operating profitability and cash conversion because those signals tend to persist through a cycle.",
             ),
             _voice(
-                "I focus on liquidity as the margin of safety.",
-                "Liquidity sets the margin of safety.",
+                "Liquidity is the margin of safety; it determines whether the company can absorb a shock without defensive financing.",
+                "Liquidity is the margin of safety; it determines whether the company can absorb a shock without defensive financing.",
             ),
             _voice(
-                "Leverage matters because it limits flexibility in a downturn.",
-                "Leverage limits flexibility in a downturn.",
+                "Leverage is the constraint: it can force bad decisions when demand softens or funding costs rise.",
+                "Leverage is the constraint: it can force bad decisions when demand softens or funding costs rise.",
             ),
             _voice(
-                "I want cash and liabilities to leave room for error.",
-                "Cash versus liabilities defines the room for error.",
+                "I look for balance-sheet room for error so the operating plan can survive a weaker tape.",
+                "Balance-sheet room for error determines how much stress the operating plan can absorb.",
             ),
             _voice(
-                "Free cash flow supports reinvestment without forcing leverage.",
-                "Free cash flow supports reinvestment without forcing leverage.",
+                "Free cash flow is the difference between optionality and dependence on external capital.",
+                "Free cash flow is the difference between optionality and dependence on external capital.",
+            ),
+            _voice(
+                "I treat clean conversion from operating income to free cash flow as the check on earnings quality.",
+                "Clean conversion from operating income to free cash flow is the check on earnings quality.",
             ),
         ],
         "executive summary": [
             _voice(
-                "I watch cash conversion and incentives closely.",
-                "Watch cash conversion and incentives closely.",
+                "I frame the debate around durability: can scale translate into structural operating leverage without relying on incentives that can be competed away?",
+                "The debate is durability: can scale translate into structural operating leverage without relying on incentives that can be competed away?",
             ),
             _voice(
-                "My swing factor is sustained cash conversion.",
-                "The swing factor is sustained cash conversion.",
+                "The cleanest check is cash conversion—when the operating story is real, it shows up as repeatable free cash flow after reinvestment.",
+                "The cleanest check is cash conversion—when the operating story is real, it shows up as repeatable free cash flow after reinvestment.",
             ),
             _voice(
-                "I underwrite the thesis off margins and cash.",
-                "Underwrite the thesis off margins and cash.",
+                "The bull case is an improving flywheel: better marketplace efficiency supports margin expansion without buying growth back through incentives.",
+                "The bull case is an improving flywheel: better marketplace efficiency supports margin expansion without buying growth back through incentives.",
             ),
             _voice(
-                "Execution and unit economics drive my stance.",
-                "Execution and unit economics drive the stance.",
+                "The bear case is a cost reset: regulation, labor dynamics, or competition can force higher variable costs that compress margins quickly.",
+                "The bear case is a cost reset: regulation, labor dynamics, or competition can force higher variable costs that compress margins quickly.",
             ),
             _voice(
-                "From my perspective, the core question is whether cash conversion stays repeatable.",
-                "The core question is whether cash conversion stays repeatable.",
+                "I’m less focused on a perfect quarter and more focused on the through-cycle algorithm: pricing, incentives, and retention should move in predictable ways.",
+                "Focus less on a perfect quarter and more on the through-cycle algorithm: pricing, incentives, and retention should move in predictable ways.",
             ),
             _voice(
-                "I care about durability: margins and cash should move together, not diverge.",
-                "Durability improves when margins and cash move together, not diverge.",
+                "Balance-sheet flexibility matters because it decides whether management can invest through a slowdown instead of cutting defensively.",
+                "Balance-sheet flexibility matters because it decides whether management can invest through a slowdown instead of cutting defensively.",
             ),
             _voice(
-                "From my perspective, the underwriting swing factor is whether unit economics translate into repeatable cash conversion as growth investments normalize.",
-                "The underwriting swing factor is whether unit economics translate into repeatable cash conversion as growth investments normalize.",
-            ),
-            _voice(
-                "I care most about durability: the thesis improves if incremental margins expand without relying on one-offs or aggressive accounting.",
-                "Durability improves when incremental margins expand without relying on one-offs or aggressive accounting.",
-            ),
-            _voice(
-                "For me, balance-sheet flexibility matters because it determines how aggressively the company can invest through a downturn without compromising optionality.",
-                "Balance-sheet flexibility matters because it determines how aggressively the company can invest through a downturn without compromising optionality.",
+                "The thesis reads best when unit economics, margins, and cash flow all reconcile to the same story; divergence is where risk shows up first.",
+                "The thesis reads best when unit economics, margins, and cash flow all reconcile to the same story; divergence is where risk shows up first.",
             ),
         ],
         "closing takeaway": [
             _voice(
-                "I stay cautious until cash proves out.",
-                "Stay cautious until cash proves out.",
+                "I get more constructive when free cash flow confirms that margin gains are structural (not timing) and the balance sheet keeps optionality intact.",
+                "Conviction improves when free cash flow confirms that margin gains are structural (not timing) and the balance sheet keeps optionality intact.",
             ),
             _voice(
-                "I would wait for cleaner cash conversion.",
-                "Wait for cleaner cash conversion.",
+                "I would revisit quickly if cash conversion weakens at the same time leverage rises, because those two moves together compress the margin for error.",
+                "Revisit quickly if cash conversion weakens at the same time leverage rises, because those two moves together compress the margin for error.",
             ),
             _voice(
-                "I want more evidence on durable margins.",
-                "Seek more evidence of durable margins.",
+                "The durability question is straightforward: can margins hold through a softer demand tape without buying volume back with incentives?",
+                "The durability question is straightforward: can margins hold through a softer demand tape without buying volume back with incentives?",
             ),
             _voice(
-                "I would revisit if margins weaken materially.",
-                "Revisit if margins weaken materially.",
+                "The most informative monitor is the bridge from operating margin to free cash flow after reinvestment; that is where durability shows up.",
+                "The most informative monitor is the bridge from operating margin to free cash flow after reinvestment; that is where durability shows up.",
             ),
             _voice(
-                "My view improves with repeatable cash conversion.",
-                "Conviction improves with repeatable cash conversion.",
+                "If profitability looks steady but cash conversion weakens for multiple quarters, I treat it as a valuation risk even if revenue remains resilient.",
+                "If profitability looks steady but cash conversion weakens for multiple quarters, treat it as a valuation risk even if revenue remains resilient.",
             ),
             _voice(
-                "I would revisit the thesis quickly if cash conversion deteriorates or leverage rises.",
-                "Revisit the thesis quickly if cash conversion deteriorates or leverage rises.",
+                "Upside comes from structural operating leverage; downside comes from incentives, regulation, or competition resetting the cost base.",
+                "Upside comes from structural operating leverage; downside comes from incentives, regulation, or competition resetting the cost base.",
             ),
             _voice(
-                "Absent cleaner cash conversion, I stay cautious on the risk-reward.",
-                "Absent cleaner cash conversion, a cautious stance is warranted.",
+                "What changes my view is evidence the company can self-fund growth while protecting cash conversion as the cycle softens and funding costs stay high.",
+                "What changes the view is evidence the company can self-fund growth while protecting cash conversion as the cycle softens and funding costs stay high.",
             ),
             _voice(
-                "What changes my view is clearer evidence that margins can hold through a softer period and that free cash flow conversion improves as reinvestment intensity normalizes.",
-                "What changes the view is clearer evidence that margins can hold through a softer period and that free cash flow conversion improves as reinvestment intensity normalizes.",
+                "A practical watch list keeps it simple: incentives, take rates, regulatory headlines, and balance-sheet flexibility.",
+                "A practical watch list keeps it simple: incentives, take rates, regulatory headlines, and balance-sheet flexibility.",
             ),
-            _voice(
-                "I would get more constructive if management proves it can fund growth and still compound cash; I would get more cautious if leverage rises or working-capital swings start to consume cash.",
-                "Conviction improves if management proves it can fund growth and still compound cash; caution rises if leverage increases or working-capital swings start to consume cash.",
-            ),
+            _voice("Net: stay cautious.", "Net: stay cautious."),
+            _voice("Base case: hold.", "Base case: hold."),
+            _voice("Watch cash conversion.", "Watch cash conversion."),
+            _voice("Margin for error matters.", "Margin for error matters."),
+            _voice("Risk stays two-sided.", "Risk stays two-sided."),
         ],
         "financial performance": [
             _voice(
-                "I want margins to translate into cash.",
-                "Margins should translate into cash.",
+                "I focus on the bridge from operating profit to free cash flow because that is where incentives, working-capital timing, and capex reveal earnings quality.",
+                "The bridge from operating profit to free cash flow is where incentives, working-capital timing, and capex reveal earnings quality.",
             ),
             _voice(
-                "I want cash to confirm earnings quality.",
-                "Cash should confirm earnings quality.",
+                "When profitability improves, I separate pricing and mix from incentive cuts; one tends to persist, the other can reverse quickly in competition.",
+                "When profitability improves, separate pricing and mix from incentive cuts; one tends to persist, the other can reverse quickly in competition.",
             ),
             _voice(
-                "I watch working capital for timing noise.",
-                "Watch working capital for timing noise.",
+                "If cash conversion weakens while margins look fine, I treat it as a signal to investigate working-capital drift and the true cost of volume acquisition.",
+                "If cash conversion weakens while margins look fine, treat it as a signal to investigate working-capital drift and the true cost of volume acquisition.",
             ),
             _voice(
-                "I focus on mix, pricing, and incentives.",
-                "Focus on mix, pricing, and incentives.",
+                "A high free cash flow margin with low capex supports an asset-light model, but the durability still depends on variable-cost discipline.",
+                "A high free cash flow margin with low capex supports an asset-light model, but durability still depends on variable-cost discipline.",
             ),
             _voice(
-                "I watch whether reported margin strength shows up in free cash flow.",
-                "Watch whether reported margin strength shows up in free cash flow.",
-            ),
-            _voice(
-                "If cash lags earnings, working-capital timing is usually the culprit.",
-                "If cash lags earnings, working-capital timing is usually the culprit.",
-            ),
-            _voice(
-                "I focus on the bridge from operating profit to free cash flow, because that is where working-capital timing and capex show up in earnings quality.",
-                "The bridge from operating profit to free cash flow is where working-capital timing and capex show up in earnings quality.",
-            ),
-            _voice(
-                "If profitability moved, I want to know whether mix and pricing drove it, or whether incentives and cost timing are masking pressure.",
-                "If profitability moved, the key question is whether mix and pricing drove it, or whether incentives and cost timing are masking pressure.",
-            ),
-            _voice(
-                "When revenue, margins, and cash tell the same story, the signal is durable; when they diverge, the sustainability question gets louder.",
-                "When revenue, margins, and cash tell the same story, the signal is durable; when they diverge, the sustainability question gets louder.",
+                "The most informative quarters are the ones where revenue, margins, and cash all tell the same story; divergence is where sustainability questions start.",
+                "The most informative quarters are the ones where revenue, margins, and cash all tell the same story; divergence is where sustainability questions start.",
             ),
         ],
         "management discussion and analysis": [
             _voice(
-                "I want reinvestment to earn its keep.",
-                "Reinvestment should earn its keep.",
+                "I want reinvestment to earn its keep: hiring, R&D, and marketing should map to a clear payback period and show up as operating leverage over time.",
+                "Reinvestment should earn its keep: hiring, R&D, and marketing should map to a clear payback period and show up as operating leverage over time.",
             ),
             _voice(
-                "I look for disciplined capital allocation.",
-                "Look for disciplined capital allocation.",
+                "The cleanest management narratives reconcile to the financials: operating margin and cash flow should explain the strategy without leaning on recurring adjustments.",
+                "The cleanest management narratives reconcile to the financials: operating margin and cash flow should explain the strategy without leaning on recurring adjustments.",
             ),
             _voice(
-                "I want execution to match the narrative.",
-                "Execution must match the narrative.",
+                "Capital allocation is a durability signal when growth is self-funded and the balance sheet stays flexible; it is a warning sign when it relies on leverage or dilution.",
+                "Capital allocation is a durability signal when growth is self-funded and the balance sheet stays flexible; it is a warning sign when it relies on leverage or dilution.",
             ),
             _voice(
-                "I care about payback periods and unit economics.",
-                "Payback periods and unit economics matter.",
+                "If buybacks are part of the plan, I want them funded by free cash flow after core reinvestment, not by shrinking the cash cushion.",
+                "If buybacks are part of the plan, they should be funded by free cash flow after core reinvestment, not by shrinking the cash cushion.",
             ),
             _voice(
-                "I want capex and hiring to map to a clear payback period.",
-                "Capex and hiring should map to a clear payback period.",
-            ),
-            _voice(
-                "Strategy matters only if it improves unit economics over time.",
-                "Strategy matters only if it improves unit economics over time.",
-            ),
-            _voice(
-                "What I want to see is disciplined reinvestment that shows up in operating leverage, not a spend curve that outpaces the margin profile.",
-                "The key is disciplined reinvestment that shows up in operating leverage, not a spend curve that outpaces the margin profile.",
-            ),
-            _voice(
-                "I read capital allocation as a proxy for confidence: self-funded growth and measured buybacks tend to signal durability better than adjusted narratives.",
-                "Capital allocation is a proxy for confidence: self-funded growth and measured buybacks tend to signal durability better than adjusted narratives.",
-            ),
-            _voice(
-                "The check is whether management’s commentary reconciles cleanly to operating margin and cash flow without leaning on recurring adjustments.",
-                "The check is whether management’s commentary reconciles cleanly to operating margin and cash flow without leaning on recurring adjustments.",
+                "Stock-based compensation is economically real even when it is non-cash; dilution cadence should be evaluated alongside free cash flow generation.",
+                "Stock-based compensation is economically real even when it is non-cash; dilution cadence should be evaluated alongside free cash flow generation.",
             ),
         ],
         "risk factors": [
@@ -2405,24 +2388,24 @@ def _generate_padding_sentences(
                 "**Execution Risk**: If reinvestment outpaces revenue, margins can reset lower.",
             ),
             _voice(
-                "**Competitive / Pricing Risk**: Higher incentives can pressure take rates and margins.",
-                "**Competitive / Pricing Risk**: Higher incentives can pressure take rates and margins.",
+                "**Competitive Pricing Risk**: Higher incentives can pressure take rates and margins.",
+                "**Competitive Pricing Risk**: Higher incentives can pressure take rates and margins.",
             ),
             _voice(
-                "**Regulatory / Platform Risk**: Policy shifts can reduce monetization or raise compliance costs.",
-                "**Regulatory / Platform Risk**: Policy shifts can reduce monetization or raise compliance costs.",
+                "**Regulatory Platform Risk**: Policy shifts can reduce monetization or raise compliance costs.",
+                "**Regulatory Platform Risk**: Policy shifts can reduce monetization or raise compliance costs.",
             ),
             _voice(
-                "**Technology / Platform Risk**: Outages or fraud can damage trust and retention.",
-                "**Technology / Platform Risk**: Outages or fraud can damage trust and retention.",
+                "**Technology Platform Risk**: Outages or fraud can damage trust and retention.",
+                "**Technology Platform Risk**: Outages or fraud can damage trust and retention.",
             ),
             _voice(
-                "**Cyclicality / Demand Risk**: A slowdown can reduce volumes and utilization.",
-                "**Cyclicality / Demand Risk**: A slowdown can reduce volumes and utilization.",
+                "**Cyclicality Demand Risk**: A slowdown can reduce volumes and utilization.",
+                "**Cyclicality Demand Risk**: A slowdown can reduce volumes and utilization.",
             ),
             _voice(
-                "**Legal / Litigation Risk**: Claims and settlements can add volatility.",
-                "**Legal / Litigation Risk**: Claims and settlements can add volatility.",
+                "**Legal Litigation Risk**: Claims and settlements can add volatility.",
+                "**Legal Litigation Risk**: Claims and settlements can add volatility.",
             ),
             _voice(
                 "**Earnings Quality Risk**: I worry that reported profitability can look steadier than the cash profile when working capital or capex timing shifts. If cash conversion weakens for multiple quarters, valuation support can erode even if revenue holds up.",
@@ -2844,9 +2827,81 @@ def _deduplicate_sentences(text: str) -> str:
     if not text:
         return text
 
+    def _is_orphan_fragment(sentence: str) -> bool:
+        s = (sentence or "").strip()
+        if not s:
+            return True
+        words = s.split()
+        if len(words) <= 1:
+            return True
+        if len(words) < 5 and any(ch.isdigit() for ch in s):
+            return True
+        lowered = s.lower()
+        if lowered.startswith("the full footnote"):
+            return True
+        if lowered.startswith("when we ") and len(words) < 8:
+            return True
+        if re.search(r"\bto[.!?]?$", lowered) and len(words) < 12:
+            return True
+        return False
+
+    stopwords = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "if",
+        "then",
+        "so",
+        "to",
+        "of",
+        "in",
+        "on",
+        "for",
+        "with",
+        "as",
+        "at",
+        "by",
+        "from",
+        "into",
+        "that",
+        "this",
+        "it",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "will",
+        "would",
+        "can",
+        "could",
+        "should",
+        "may",
+        "might",
+        "we",
+        "i",
+        "my",
+        "our",
+        "your",
+    }
+
+    def _content_signature(sentence: str) -> str:
+        lowered = (sentence or "").lower()
+        tokens = re.split(r"[^a-z0-9]+", lowered)
+        tokens = [t for t in tokens if t and t not in stopwords and len(t) >= 3]
+        # Use a sorted, de-duplicated signature so minor rephrasings collapse.
+        uniq = sorted(set(tokens))
+        return " ".join(uniq[:18])
+
     # Split into lines to preserve structure
     lines = text.splitlines()
     seen_sentences: set = set()
+    seen_signatures: set = set()
     result_lines: List[str] = []
 
     for line in lines:
@@ -2861,8 +2916,21 @@ def _deduplicate_sentences(text: str) -> str:
         unique_sentences: List[str] = []
 
         for sentence in sentences:
+            sentence = (sentence or "").strip()
+            if not sentence:
+                continue
+            if _is_orphan_fragment(sentence):
+                continue
             # Normalize for comparison (lowercase, strip extra whitespace)
             normalized = " ".join(sentence.lower().split())
+            normalized = normalized.strip(" \t\"'“”‘’")
+            normalized = normalized.rstrip(".!?")
+            # Strip common discourse openers that tend to get repeated as filler.
+            normalized = re.sub(
+                r"^(?:from my perspective|in my view|for me|my take is|i think|i believe|my stance is|the key monitor is|what changes my view is)\s*[:,;-]?\s+",
+                "",
+                normalized,
+            )
             # Treat the deterministic padding label as non-substantive so repeated
             # underwriting-question sentences can be deduplicated cleanly.
             normalized = re.sub(
@@ -2870,8 +2938,11 @@ def _deduplicate_sentences(text: str) -> str:
                 "",
                 normalized,
             )
-            if normalized and normalized not in seen_sentences:
+            signature = _content_signature(normalized)
+            if normalized and normalized not in seen_sentences and signature not in seen_signatures:
                 seen_sentences.add(normalized)
+                if signature:
+                    seen_signatures.add(signature)
                 unique_sentences.append(sentence)
 
         if unique_sentences:
@@ -3671,9 +3742,10 @@ def _generate_summary_with_quality_control(
     for attempt in range(1, MAX_SUMMARY_ATTEMPTS + 1):
         if timeout_seconds and (time.time() - start_time) > timeout_seconds:
             raise TimeoutError(f"Summary generation exceeded {timeout_seconds} seconds")
-        attempt_label = f"Generating Summary (attempt {attempt}/{MAX_SUMMARY_ATTEMPTS})"
+        stage_label = "Generating Summary"
         if filing_id:
-            progress_cache[str(filing_id)] = f"{attempt_label}... 0%"
+            # Keep the status user-facing and stable across retries; internal attempt counts are noise.
+            progress_cache[str(filing_id)] = f"{stage_label}..."
 
         expected_out_tokens = (
             min(max_output_tokens, max(500, int(target_length * 2)))
@@ -3692,7 +3764,7 @@ def _generate_summary_with_quality_control(
             prompt,
             allow_stream=bool(filing_id),
             progress_callback=_progress_callback if filing_id else None,
-            stage_name=attempt_label if filing_id else "Generating",
+            stage_name=stage_label if filing_id else "Generating",
             expected_tokens=expected_out_tokens,
         )
         if token_budget:
@@ -3971,6 +4043,15 @@ SECTION_PROPORTIONAL_WEIGHTS: Dict[str, int] = {
     "Closing Takeaway": 10,
 }
 
+# Key Metrics is a fixed-format, scannable data block. Past a certain length,
+# scaling it with the full memo causes low-quality output (repeated "watch" lines).
+# For long targets, cap Key Metrics and redistribute the remaining budget across
+# narrative sections using their existing weights.
+KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS = 1000
+KEY_METRICS_FIXED_BUDGET_WORDS = 170
+KEY_METRICS_MAX_WORDS = 190
+KEY_METRICS_MAX_WATCH_ITEMS = 8
+
 
 def _section_budget_tolerance_words(budget_words: int, *, max_tolerance: int = 10) -> int:
     """Compute a per-section word tolerance for enforcing the fixed distribution.
@@ -4027,20 +4108,36 @@ def _calculate_section_word_budgets(
         # divide-by-zero.
         body_target = int(target_length)
 
-    total_weight = sum(SECTION_PROPORTIONAL_WEIGHTS.get(s, 0) for s in sections_to_use)
+    use_key_metrics_cap = (
+        int(target_length) >= int(KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS)
+        and "Key Metrics" in sections_to_use
+    )
+    fixed_key_metrics_budget = 0
+    distribution_sections = sections_to_use[:]
+    if use_key_metrics_cap:
+        distribution_sections = [s for s in sections_to_use if s != "Key Metrics"]
+        fixed_key_metrics_budget = min(int(KEY_METRICS_FIXED_BUDGET_WORDS), int(body_target))
+
+    remaining_body_target = max(0, int(body_target) - int(fixed_key_metrics_budget))
+
+    total_weight = sum(
+        SECTION_PROPORTIONAL_WEIGHTS.get(s, 0) for s in distribution_sections
+    )
     if total_weight <= 0:
-        total_weight = len(sections_to_use)
+        total_weight = len(distribution_sections) if distribution_sections else 1
 
     exacts = {
-        s: (SECTION_PROPORTIONAL_WEIGHTS.get(s, 0) * body_target / total_weight)
-        for s in sections_to_use
+        s: (SECTION_PROPORTIONAL_WEIGHTS.get(s, 0) * remaining_body_target / total_weight)
+        for s in distribution_sections
     }
-    budgets: Dict[str, int] = {s: int(exacts[s]) for s in sections_to_use}
-    remainders = {s: exacts[s] - budgets[s] for s in sections_to_use}
+    budgets: Dict[str, int] = {s: int(exacts[s]) for s in distribution_sections}
+    remainders = {s: exacts[s] - budgets[s] for s in distribution_sections}
 
-    drift = body_target - sum(budgets.values())
+    drift = remaining_body_target - sum(budgets.values())
     if drift != 0:
-        order = sorted(sections_to_use, key=lambda s: remainders.get(s, 0), reverse=True)
+        order = sorted(
+            distribution_sections, key=lambda s: remainders.get(s, 0), reverse=True
+        )
         step = 1 if drift > 0 else -1
         remaining = abs(drift)
         idx = 0
@@ -4051,6 +4148,9 @@ def _calculate_section_word_budgets(
                 budgets[section] = next_val
                 remaining -= 1
             idx += 1
+
+    if use_key_metrics_cap:
+        budgets["Key Metrics"] = int(fixed_key_metrics_budget)
 
     # Avoid 0-word sections when the target is extremely small.
     zeros = [s for s in sections_to_use if budgets.get(s, 0) <= 0]
@@ -4110,9 +4210,12 @@ def _calculate_section_min_words_for_target(
         # stays close to the fixed proportional budgets.
         min_floor = 1
         if section == "Key Metrics":
-            # Data-block sections can be concise, but should still be substantial
-            # relative to their budget to preserve the fixed distribution.
-            ratio_min = max(min_floor, int(budget * 0.70))
+            # Key Metrics is a fixed-format data block; avoid forcing the model to bloat it
+            # just to satisfy long-target distributions.
+            if int(target_length) >= int(KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS):
+                ratio_min = max(min_floor, min(base_min, budget))
+            else:
+                ratio_min = max(min_floor, int(budget * 0.70))
         elif section in {"Risk Factors", "Closing Takeaway"}:
             # These are the "bookends" users remember; keep them substantive.
             ratio_min = max(min_floor, int(budget * 0.75))
@@ -4150,7 +4253,8 @@ def _format_section_word_budgets(
 
     lines = [
         "=== SECTION WORD BUDGETS (PROPORTIONAL DISTRIBUTION) ===",
-        "CRITICAL: The section-length distribution is FIXED. Maintain these proportions regardless of the user's target length.",
+        "CRITICAL: The narrative section-length distribution is FIXED. Maintain these proportions regardless of the user's target length.",
+        f"Key Metrics is capped at ~{KEY_METRICS_FIXED_BUDGET_WORDS} words for long targets (>= {KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS} words); redistribute the remainder to narrative sections.",
         "Do NOT steal words from one section to inflate another.",
         "",
         "TARGET WORD ALLOCATION PER SECTION:",
@@ -4201,6 +4305,12 @@ def _enforce_section_budget_distribution(
 
     if not summary_text or not target_length:
         return summary_text
+
+    # When we have deterministic Key Metrics (from extracted financials), do not pad it into
+    # low-signal filler; keep it compact and shift length to narrative sections instead.
+    key_metrics_capped = bool(metrics_lines) or (
+        int(target_length) >= int(KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS)
+    )
 
     budgets = _calculate_section_word_budgets(
         int(target_length), include_health_rating=include_health_rating
@@ -4283,6 +4393,46 @@ def _enforce_section_budget_distribution(
 
     if "Key Metrics" in merged:
         merged["Key Metrics"] = _normalize_key_metrics_for_word_band(merged.get("Key Metrics") or "")
+        if key_metrics_capped:
+            merged["Key Metrics"] = _trim_appendix_preserving_rows(
+                merged.get("Key Metrics") or "", int(KEY_METRICS_MAX_WORDS)
+            )
+            # Treat Key Metrics as a compact, fixed-content block; redistribute any budget
+            # slack to narrative sections instead of padding Key Metrics into noisy lists.
+            km_budget = int(budgets.get("Key Metrics") or 0)
+            km_wc = _count_words(merged.get("Key Metrics") or "")
+            delta = int(km_budget) - int(km_wc)
+            if delta != 0:
+                recipients = [s for s in budgets.keys() if s != "Key Metrics"]
+                total_w = sum(SECTION_PROPORTIONAL_WEIGHTS.get(s, 0) for s in recipients) or len(
+                    recipients
+                )
+                magnitude = abs(int(delta))
+                exacts = {
+                    s: (SECTION_PROPORTIONAL_WEIGHTS.get(s, 0) * magnitude / total_w)
+                    for s in recipients
+                }
+                bump: Dict[str, int] = {s: int(exacts[s]) for s in recipients}
+                remainders = {s: exacts[s] - bump[s] for s in recipients}
+                drift = int(magnitude) - sum(bump.values())
+                if drift:
+                    order = sorted(recipients, key=lambda s: remainders.get(s, 0), reverse=True)
+                    idx = 0
+                    while drift > 0 and order and idx < 10_000:
+                        section = order[idx % len(order)]
+                        bump[section] = int(bump.get(section, 0)) + 1
+                        drift -= 1
+                        idx += 1
+
+                for section, inc in bump.items():
+                    current = int(budgets.get(section, 0) or 0)
+                    budgets[section] = (
+                        current + int(inc or 0)
+                        if delta > 0
+                        else max(1, current - int(inc or 0))
+                    )
+
+            budgets["Key Metrics"] = max(0, int(km_wc))
 
     is_persona = bool(re.search(r"\b(?:I|my|I'm|I’m)\b", summary_text or ""))
 
@@ -4482,6 +4632,77 @@ def _enforce_section_budget_distribution(
         candidate = "\n".join(lines[:-1]).strip()
         return candidate if _count_words(candidate) >= min_words else body
 
+    def _normalize_risk_factors_body(body: str, *, max_items: int = 10) -> str:
+        """Normalize Risk Factors so each risk starts on its own paragraph and duplicates are removed."""
+        body = (body or "").replace("\u00A0", " ").strip()
+        if not body:
+            return body
+
+        preamble = ""
+        first_header = re.search(r"\*\*[^*]{2,120}\*\*\s*:", body)
+        if first_header and first_header.start() > 0:
+            preamble = body[: first_header.start()].strip()
+            body = body[first_header.start() :].strip()
+
+        # If the model emitted multiple risks inline (e.g., "**A**: ... **B**: ..."),
+        # force each risk header to start on its own line so the UI renders it cleanly.
+        body = re.sub(r"\s+(?=\*\*[^*]{2,120}\*\*\s*:)", "\n", body)
+        body = re.sub(r"\n{3,}", "\n\n", body).strip()
+
+        lines = [ln.strip() for ln in body.splitlines() if (ln or "").strip()]
+        items: List[Tuple[str, str]] = []
+        buffer: List[str] = []
+        current_title: Optional[str] = None
+
+        def _flush() -> None:
+            nonlocal buffer, current_title, items
+            if not current_title:
+                buffer = []
+                return
+            desc = " ".join(buffer).strip()
+            desc = re.sub(r"\s+", " ", desc).strip()
+            if desc:
+                sentences = re.split(r"(?<=[.!?])\s+", desc)
+                desc = " ".join([s for s in sentences[:3] if s]).strip()
+                items.append((current_title, desc))
+            buffer = []
+            current_title = None
+
+        for line in lines:
+            match = re.match(r"^\*\*(.+?)\*\*\s*:\s*(.*)$", line)
+            if match:
+                _flush()
+                current_title = match.group(1).strip()
+                remainder = (match.group(2) or "").strip()
+                if remainder:
+                    buffer.append(remainder)
+                continue
+
+            if current_title:
+                buffer.append(line)
+
+        _flush()
+
+        if not items:
+            return body
+
+        seen: set[str] = set()
+        out: List[str] = []
+        for title, desc in items:
+            norm = re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            out.append(f"**{title}**: {desc}".strip())
+            if len(out) >= int(max_items):
+                break
+
+        blocks: List[str] = []
+        if preamble:
+            blocks.append(preamble)
+        blocks.append("\n\n".join(out).strip())
+        return "\n\n".join([b for b in blocks if b.strip()]).strip()
+
     # Adjust each canonical section into its budget band.
     for section_name, budget in budgets.items():
         # If the model omitted a canonical section, create an empty placeholder so
@@ -4502,7 +4723,8 @@ def _enforce_section_budget_distribution(
         wc = _count_words(body)
         if wc > upper:
             if section_name == "Key Metrics":
-                body = _trim_appendix_preserving_rows(body, upper)
+                cap = int(KEY_METRICS_MAX_WORDS) if key_metrics_capped else upper
+                body = _trim_appendix_preserving_rows(body, min(upper, cap))
             else:
                 body = _truncate_text_to_word_limit(body, upper)
             wc = _count_words(body)
@@ -4510,8 +4732,11 @@ def _enforce_section_budget_distribution(
         # Pad if underweight.
         if wc < lower:
             if section_name == "Key Metrics":
-                body = _pad_key_metrics(body, lower - wc, upper_words=upper)
-                wc = _count_words(body)
+                # Only pad Key Metrics for shorter targets where the budget is small.
+                # For long targets, padding becomes a repetitive "watch list" dump.
+                if not key_metrics_capped:
+                    body = _pad_key_metrics(body, lower - wc, upper_words=upper)
+                    wc = _count_words(body)
             else:
                 # IMPORTANT: Padding must be incremental so we don't overshoot the
                 # section upper bound and then get truncated back to the original
@@ -4535,7 +4760,8 @@ def _enforce_section_budget_distribution(
                     request_candidates = list(dict.fromkeys(request_candidates))
 
                     progressed = False
-                    for allow_repeats in (False, True):
+                    repeat_policy = (False,) if section_name == "Risk Factors" else (False, True)
+                    for allow_repeats in repeat_policy:
                         for req in request_candidates:
                             pad_sentences = _generate_padding_sentences(
                                 req,
@@ -4545,7 +4771,10 @@ def _enforce_section_budget_distribution(
                                 exclude_risk_names=risk_name_exclusions,
                                 max_words=slack,
                             )
-                            pad_text = " ".join(pad_sentences).strip()
+                            if section_name == "Risk Factors":
+                                pad_text = "\n".join([s for s in pad_sentences if (s or "").strip()]).strip()
+                            else:
+                                pad_text = " ".join(pad_sentences).strip()
                             candidate = _append_padding(body, pad_text, section_name)
                             if _count_words(candidate) > upper:
                                 candidate = _truncate_text_to_word_limit(candidate, upper)
@@ -4562,6 +4791,8 @@ def _enforce_section_budget_distribution(
                     if not progressed:
                         break
 
+        if section_name == "Risk Factors":
+            body = _normalize_risk_factors_body(body, max_items=10)
         merged[section_name] = (body or "").strip()
 
     # Canonical order (no extra headings allowed here).
@@ -4673,6 +4904,8 @@ def _enforce_section_budget_distribution(
                 continue
 
             if name == "Key Metrics":
+                if key_metrics_capped:
+                    continue
                 new_body = _pad_key_metrics(body, deficit, upper_words=sec_upper)
             else:
                 # IMPORTANT:
@@ -4759,6 +4992,44 @@ def _enforce_section_budget_distribution(
                     trim_candidates.append((slack, name))
 
             trim_candidates.sort(reverse=True)
+
+            # For tiny overages, prefer micro-trimming single filler words rather than
+            # removing whole sentences (which can undershoot section lower bounds).
+            if excess <= 25:
+                for slack, name in trim_candidates:
+                    if excess <= 0:
+                        break
+                    body = (merged.get(name) or "").strip()
+                    if not body:
+                        continue
+                    sec_lower, _sec_upper = _section_bounds(name)
+                    current_wc = _count_words(body)
+                    if current_wc <= sec_lower:
+                        continue
+
+                    attempt = min(int(excess), int(slack), 6)
+                    if attempt <= 0:
+                        continue
+
+                    # Reuse the global micro-trimmer on a synthetic section so it doesn't
+                    # accidentally skip based on the real section name.
+                    trimmed_text, removed_words = _micro_trim_filler_words(
+                        f"## Temp\n{body}", attempt
+                    )
+                    if not removed_words:
+                        continue
+
+                    new_body = "\n".join(trimmed_text.splitlines()[1:]).strip()
+                    new_wc = _count_words(new_body)
+                    if new_wc >= sec_lower and new_wc < current_wc:
+                        merged[name] = new_body.strip()
+                        excess = max(0, int(excess) - int(removed_words))
+                        trimmed_any = True
+
+                if trimmed_any:
+                    rebuilt = _rebuild_from_merged().strip()
+                    continue
+
             for _slack, name in trim_candidates:
                 if excess <= 0:
                     break
@@ -6455,24 +6726,48 @@ def _build_key_metrics_block(
     include_health_rating: bool = True,
     health_score_data: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Build a scannable Key Metrics block sized to the fixed distribution.
+    """Build a compact, scannable Key Metrics data block.
 
-    Product requirement: Key Metrics should remain ~10% of the overall memo length
-    (independent of the user's target_length). We therefore scale the number of
-    metric rows based on the computed per-section budget.
-
-    The output MUST stay "data-block" style (arrow lines), not prose paragraphs.
+    For long memos, Key Metrics is capped and extra length is shifted into the
+    narrative sections to avoid low-quality repetition.
     """
 
-    budgets: Dict[str, int] = {}
+    max_words = 0
     if target_length and target_length > 0:
-        budgets = _calculate_section_word_budgets(
-            target_length, include_health_rating=include_health_rating
-        )
-    budget_words = int(budgets.get("Key Metrics", 0) or 0)
+        if int(target_length) >= int(KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS):
+            max_words = int(KEY_METRICS_MAX_WORDS)
+        else:
+            budgets = _calculate_section_word_budgets(
+                target_length, include_health_rating=include_health_rating
+            )
+            max_words = int(budgets.get("Key Metrics", 0) or 0)
+
+    if max_words > 0:
+        max_words = min(int(max_words), int(KEY_METRICS_MAX_WORDS))
+
+    max_metric_lines = 12
+    if target_length and target_length > 0:
+        if int(target_length) < 500:
+            max_metric_lines = 8
+        elif int(target_length) < 900:
+            max_metric_lines = 10
 
     def _get(key: str) -> Any:
         return calculated_metrics.get(key)
+
+    def _push_line(line: str) -> None:
+        line = (line or "").strip()
+        if not line:
+            return
+        if line in lines:
+            return
+        if len([ln for ln in lines if ln.strip()]) >= int(max_metric_lines):
+            return
+        if max_words > 0:
+            candidate = ("\n".join([*lines, line])).strip()
+            if _count_words(candidate) > int(max_words):
+                return
+        lines.append(line)
 
     def _add_line(label: str, key: str, value: Any, *, fmt_key: Optional[str] = None) -> None:
         if value is None:
@@ -6483,17 +6778,15 @@ def _build_key_metrics_block(
             return
         if not rendered:
             return
-        lines.append(f"→ {label}: {rendered}")
+        _push_line(f"→ {label}: {rendered}")
 
     lines: List[str] = []
 
-    # --- Core scale / growth ---
+    # --- Core scale ---
     revenue = _get("revenue") or _get("total_revenue")
     _add_line("Revenue", "revenue", revenue)
-    _add_line("Revenue YoY", "revenue_growth_yoy", _get("revenue_growth_yoy"), fmt_key="revenue_growth_yoy")
 
-    # --- Profitability ---
-    _add_line("Gross Margin", "gross_margin", _get("gross_margin"), fmt_key="gross_margin")
+    # --- Profitability (keep tight and thesis-relevant) ---
     _add_line(
         "Operating Margin",
         "operating_margin",
@@ -6504,15 +6797,10 @@ def _build_key_metrics_block(
 
     operating_income = _get("operating_income")
     net_income = _get("net_income")
-    _add_line("Operating Income", "operating_income", operating_income)
-    _add_line("Net Income", "net_income", net_income)
-    _add_line("Diluted EPS", "diluted_eps", _get("diluted_eps"), fmt_key="diluted_eps")
 
     # --- Cash flow / reinvestment ---
-    ocf = _get("operating_cash_flow")
     fcf = _get("free_cash_flow")
     capex = _get("capital_expenditures")
-    _add_line("Operating Cash Flow", "operating_cash_flow", ocf)
     _add_line("Free Cash Flow", "free_cash_flow", fcf)
     _add_line("FCF Margin", "fcf_margin", _get("fcf_margin"), fmt_key="fcf_margin")
     if (fcf is not None) and (revenue is not None) and _get("fcf_margin") is None:
@@ -6521,7 +6809,6 @@ def _build_key_metrics_block(
             _add_line("FCF Margin", "fcf_margin", derived_fcf_margin, fmt_key="fcf_margin")
         except Exception:
             pass
-    _add_line("Capex", "capital_expenditures", capex)
     if (capex is not None) and (revenue is not None) and float(revenue) != 0:
         try:
             capex_intensity = (abs(float(capex)) / float(revenue)) * 100
@@ -6532,7 +6819,6 @@ def _build_key_metrics_block(
     # --- Balance sheet / liquidity ---
     cash = _get("cash")
     securities = _get("marketable_securities")
-    total_assets = _get("total_assets")
     total_liabilities = _get("total_liabilities")
     total_debt = _get("total_debt")
 
@@ -6543,19 +6829,9 @@ def _build_key_metrics_block(
         except Exception:
             pass
 
-    _add_line("Total Assets", "total_assets", total_assets)
     _add_line("Total Liabilities", "total_liabilities", total_liabilities)
-    _add_line("Total Debt", "total_debt", total_debt)
 
     total_equity = None
-    if total_assets is not None and total_liabilities is not None:
-        try:
-            total_equity = float(total_assets) - float(total_liabilities)
-            if total_equity != 0:
-                _add_line("Total Equity", "total_equity", total_equity)
-        except Exception:
-            total_equity = None
-
     if (cash is not None or securities is not None) and total_debt is not None:
         try:
             cash_total = float(cash or 0) + float(securities or 0)
@@ -6567,11 +6843,6 @@ def _build_key_metrics_block(
 
     # Deterministically derive common ratios when not already present.
     debt_to_equity = _get("debt_to_equity")
-    if debt_to_equity is None and total_liabilities is not None and total_equity is not None and total_equity > 0:
-        try:
-            debt_to_equity = float(total_liabilities) / float(total_equity)
-        except Exception:
-            debt_to_equity = None
     _add_line("Debt / Equity", "debt_to_equity", debt_to_equity, fmt_key="debt_to_equity")
 
     current_assets = _get("current_assets")
@@ -6584,16 +6855,6 @@ def _build_key_metrics_block(
             current_ratio = None
     _add_line("Current Ratio", "current_ratio", current_ratio, fmt_key="current_ratio")
 
-    quick_ratio = _get("quick_ratio")
-    inventory = _get("inventory")
-    if quick_ratio is None and current_assets is not None and current_liabilities is not None and float(current_liabilities) != 0:
-        try:
-            quick_assets = float(current_assets) - float(inventory or 0)
-            quick_ratio = quick_assets / float(current_liabilities)
-        except Exception:
-            quick_ratio = None
-    _add_line("Quick Ratio", "quick_ratio", quick_ratio, fmt_key="quick_ratio")
-
     interest_coverage = _get("interest_coverage")
     interest_expense = _get("interest_expense")
     if interest_coverage is None and operating_income is not None and interest_expense is not None and float(interest_expense) != 0:
@@ -6603,65 +6864,36 @@ def _build_key_metrics_block(
             interest_coverage = None
     _add_line("Interest Coverage", "interest_coverage", interest_coverage, fmt_key="interest_coverage")
 
-    # ROA / ROE (percent) from available metrics.
-    if net_income is not None and total_assets is not None and float(total_assets) != 0:
-        try:
-            roa_pct = (float(net_income) / float(total_assets)) * 100
-            _add_line("ROA", "roa", roa_pct, fmt_key="roa")
-        except Exception:
-            pass
-    if net_income is not None and total_equity is not None and total_equity != 0:
-        try:
-            roe_pct = (float(net_income) / float(total_equity)) * 100
-            _add_line("ROE", "roe", roe_pct, fmt_key="roe")
-        except Exception:
-            pass
-
-    if total_liabilities is not None and total_assets is not None and float(total_assets) != 0:
-        try:
-            leverage = float(total_liabilities) / float(total_assets)
-            _add_line("Leverage (Liab/Assets)", "leverage", leverage, fmt_key="leverage")
-        except Exception:
-            pass
-
-    # Optional: include health drivers under Key Metrics (deterministic, non-hallucinated).
-    if include_health_rating and health_score_data:
-        drivers_block = _build_health_driver_block(calculated_metrics, health_score_data)
-        if drivers_block:
-            # Insert as its own sub-block for scannability.
-            lines.append("")
-            lines.extend([ln for ln in drivers_block.splitlines() if ln.strip()])
-
     if not [ln for ln in lines if ln.strip()]:
         return "→ No reliable structured metrics available from this filing."
 
-    # If we have a budget, trim/pad the block to stay near it.
     block = "\n".join(lines).strip()
-    if budget_words > 0:
-        current_words = _count_words(block)
-        if current_words > budget_words:
-            block = _trim_appendix_preserving_rows(block, budget_words)
-        elif current_words < budget_words:
-            deficit = budget_words - current_words
-            watch_templates = [
-                "→ Watch: cash conversion vs net income",
-                "→ Watch: margin trend vs pricing/mix",
-                "→ Watch: working-capital swings",
-                "→ Watch: capex intensity vs growth",
-                "→ Watch: leverage and refinancing terms",
-                "→ Watch: customer concentration risk",
-            ]
-            used = set(block.splitlines())
-            for template in watch_templates:
-                if deficit <= 0:
-                    break
-                if template in used:
-                    continue
-                block = (block + "\n" + template).strip()
-                deficit = budget_words - _count_words(block)
-            # Final clamp (avoid overshooting the Key Metrics budget).
-            if _count_words(block) > budget_words:
-                block = _trim_appendix_preserving_rows(block, budget_words)
+
+    # Optional, bounded watch list (unique lines only; never repeat to hit a word target).
+    if max_words > 0:
+        watch_templates = [
+            "→ Watch: cash conversion vs earnings",
+            "→ Watch: incentive intensity vs margin",
+            "→ Watch: regulatory / labor classification",
+            "→ Watch: leverage and refinancing terms",
+            "→ Watch: SBC and dilution cadence",
+        ]
+        used = set((block or "").splitlines())
+        added = 0
+        for template in watch_templates:
+            if added >= int(KEY_METRICS_MAX_WATCH_ITEMS):
+                break
+            if template in used:
+                continue
+            candidate = (block + "\n" + template).strip()
+            if _count_words(candidate) > max_words:
+                break
+            block = candidate
+            used.add(template)
+            added += 1
+
+        if _count_words(block) > max_words:
+            block = _trim_appendix_preserving_rows(block, max_words)
 
     return block.strip() or "→ No reliable structured metrics available from this filing."
 
@@ -8947,6 +9179,15 @@ Your goal is to provide actionable, differentiated insight, not just a summary o
             else ""
         )
 
+        anti_repetition_rules = ""
+        if target_length and int(target_length) >= 1000:
+            anti_repetition_rules = (
+                " - NO REPETITION: Do not repeat the same sentence (or near-identical phrasing) to hit length.\n"
+                " - VARIETY: Avoid looping discourse openers like 'From my perspective' / 'In my view' / 'For me'; use them sparingly.\n"
+                " - EXPAND WITH NEW ANGLES: Add depth via drivers (pricing, incentives, mix), unit economics, segment/geography, working capital, and cycle sensitivity — not re-statements.\n"
+                " - KEY METRICS LENGTH: Keep Key Metrics compact; do not add long watch lists or repeated rows.\n"
+            )
+
         company_profile_lines: List[str] = []
         if company.get("ticker"):
             company_profile_lines.append(f"- Ticker: {company.get('ticker')}")
@@ -9045,6 +9286,7 @@ Failure to follow user customizations = INVALID OUTPUT. Re-read the preference b
  - SYNTHESIZE, DO NOT SUMMARIZE. Tell us what the numbers mean, not just what they are.
  - SPECIFY TIME PERIODS: Always label figures with their time period (FY24, Q3 FY25, TTM, etc.).
  - NO REDUNDANCY: Avoid repeating the same metric across multiple sections. Executive Summary should be mostly qualitative; keep dense figures in Financial Performance / Key Metrics.
+{anti_repetition_rules}
  - **SUSTAINABILITY**: Do NOT mention sustainability or ESG efforts unless they are a primary revenue driver (e.g., for a solar company). For most companies, this is fluff.
  - **MD&A**: Do NOT say "Management discusses..." or "In the MD&A section...". Just state the facts found there.
  - USE TRANSITIONS: Connect sections logically. Each section should flow naturally from the previous one.
@@ -9443,12 +9685,17 @@ Before you output anything, verify:
 
         # Final guardrail: enforce the fixed section distribution after *all* cleanup.
         if target_length:
+            distribution_tolerance = 10
+            if int(target_length) >= int(KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS):
+                # Long-form outputs can vary slightly by section; overly tight enforcement
+                # encourages low-quality padding and repetition.
+                distribution_tolerance = 40
             summary_text = _enforce_section_budget_distribution(
                 summary_text,
                 target_length=int(target_length),
                 include_health_rating=include_health_rating,
                 metrics_lines=metrics_lines,
-                section_tolerance=10,
+                section_tolerance=distribution_tolerance,
             )
             summary_text = _enforce_section_order(
                 summary_text, include_health_rating=include_health_rating

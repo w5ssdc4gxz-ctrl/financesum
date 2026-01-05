@@ -30,11 +30,11 @@ def test_section_word_budgets_follow_fixed_distribution_large_target() -> None:
     budgets = filings_api._calculate_section_word_budgets(1000, include_health_rating=True)
     assert sum(budgets.values()) == 1000 - 16
 
-    # Body target = 984 words.
-    assert budgets["Financial Health Rating"] == 98
-    assert budgets["Executive Summary"] == 148
-    assert budgets["Financial Performance"] == 197
-    assert budgets["Management Discussion & Analysis"] == 197
-    assert budgets["Risk Factors"] == 148
-    assert budgets["Key Metrics"] == 98
-    assert budgets["Closing Takeaway"] == 98
+    # For long targets, Key Metrics is capped and the remaining budget is redistributed.
+    assert budgets["Key Metrics"] == filings_api.KEY_METRICS_FIXED_BUDGET_WORDS
+    assert budgets["Financial Health Rating"] == 90
+    assert budgets["Executive Summary"] == 136
+    assert budgets["Financial Performance"] == 181
+    assert budgets["Management Discussion & Analysis"] == 181
+    assert budgets["Risk Factors"] == 136
+    assert budgets["Closing Takeaway"] == 90

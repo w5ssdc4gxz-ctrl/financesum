@@ -1,4 +1,18 @@
-<!-- 5e0fac72-b2de-4f54-bca6-7a1ae6d60598 5aebea93-dab1-413d-a393-a54f106e97d7 -->
+---
+name: Fix Sentence Cutoff Issue
+overview: ""
+todos:
+  - id: c10aaef0-b50d-471f-94be-a406f79e13dc
+    content: Add persona_name param to _generate_fallback_closing_takeaway with persona-specific text
+    status: pending
+  - id: 0c38c0dc-c861-4a5c-8a47-68c54a71fae4
+    content: Add persona_name param to _ensure_required_sections and pass through
+    status: pending
+  - id: 4d1b3883-4580-41d1-8a12-4c7800baeacf
+    content: Pass selected_persona_name to all 3 _ensure_required_sections calls
+    status: pending
+---
+
 # Fix Sentence Cutoff Issue
 
 ## Problem
@@ -34,9 +48,3 @@ Modify the `CRITICAL LENGTH CONSTRAINT` section to:
 ### 2. Strengthen existing sentence completion rules in main prompt
 
 The main prompt already has sentence completion rules but they need to be elevated to highest priority, above word count.
-
-### To-dos
-
-- [ ] Add persona_name param to _generate_fallback_closing_takeaway with persona-specific text
-- [ ] Add persona_name param to _ensure_required_sections and pass through
-- [ ] Pass selected_persona_name to all 3 _ensure_required_sections calls

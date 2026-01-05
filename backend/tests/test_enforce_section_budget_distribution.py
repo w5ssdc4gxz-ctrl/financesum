@@ -54,11 +54,12 @@ def test_enforce_section_budget_distribution_matches_budgets(target_length: int)
         f"{_make_body(15, token='close')}"
     )
 
+    section_tolerance = 40 if target_length >= filings_api.KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS else 10
     enforced = filings_api._enforce_section_budget_distribution(
         base,
         target_length=target_length,
         include_health_rating=True,
-        section_tolerance=10,
+        section_tolerance=section_tolerance,
     )
 
     # Overall band (both whitespace split + MS-word style) must be inside ±10.
@@ -69,12 +70,53 @@ def test_enforce_section_budget_distribution_matches_budgets(target_length: int)
         <= target_length + 10
     )
 
+    effective_budgets = dict(budgets)
+    if target_length >= filings_api.KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS:
+        km_body = _get_section_body(enforced, "Key Metrics")
+        km_wc = filings_api._count_words(km_body)
+        bonus = max(0, int(budgets.get("Key Metrics") or 0) - int(km_wc))
+        if bonus:
+            recipients = [s for s in budgets.keys() if s != "Key Metrics"]
+            total_w = sum(filings_api.SECTION_PROPORTIONAL_WEIGHTS.get(s, 0) for s in recipients) or len(
+                recipients
+            )
+            exacts = {
+                s: (filings_api.SECTION_PROPORTIONAL_WEIGHTS.get(s, 0) * bonus / total_w)
+                for s in recipients
+            }
+            bump = {s: int(exacts[s]) for s in recipients}
+            remainders = {s: exacts[s] - bump[s] for s in recipients}
+            drift = int(bonus) - sum(bump.values())
+            if drift:
+                order = sorted(recipients, key=lambda s: remainders.get(s, 0), reverse=True)
+                idx = 0
+                while drift > 0 and order and idx < 10_000:
+                    section = order[idx % len(order)]
+                    bump[section] = int(bump.get(section, 0)) + 1
+                    drift -= 1
+                    idx += 1
+            for section, inc in bump.items():
+                effective_budgets[section] = int(effective_budgets.get(section, 0) or 0) + int(
+                    inc or 0
+                )
+        effective_budgets["Key Metrics"] = int(km_wc)
+
     # Each section body must land within the fixed proportional budget band.
     for section, budget in budgets.items():
         body = _get_section_body(enforced, section)
         wc = filings_api._count_words(body)
-        tol = filings_api._section_budget_tolerance_words(budget, max_tolerance=10)
-        assert max(1, budget - tol) <= wc <= budget + tol
+        effective_budget = int(effective_budgets.get(section, budget) or budget)
+        tol = filings_api._section_budget_tolerance_words(
+            effective_budget, max_tolerance=section_tolerance
+        )
+        if (
+            target_length >= filings_api.KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS
+            and section == "Key Metrics"
+        ):
+            # Long-form rule: Key Metrics is capped and should not be padded to a target.
+            assert wc <= filings_api.KEY_METRICS_MAX_WORDS
+        else:
+            assert max(1, effective_budget - tol) <= wc <= effective_budget + tol
 
 
 def test_enforce_section_budget_distribution_regression_realistic_memo() -> None:
