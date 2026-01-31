@@ -583,7 +583,7 @@ async def _build_history(
 
 
 def _cache_config() -> Tuple[str, int, int]:
-    version = (os.getenv("SPOTLIGHT_CACHE_VERSION") or "").strip() or "spotlight-cache-evidence-20260131-2"
+    version = (os.getenv("SPOTLIGHT_CACHE_VERSION") or "").strip() or "spotlight-cache-evidence-20260131-3"
     ttl_s = _int_env("SPOTLIGHT_CACHE_TTL_SECONDS", 604800)
     ttl_s = max(0, int(ttl_s))
     max_items = _int_env("SPOTLIGHT_CACHE_MAX_ITEMS", 4000)

@@ -140,6 +140,56 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     ),
     (
         re.compile(
+            r"(?:backlog|order\s+backlog)" + _CONNECTOR +
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
+            re.IGNORECASE,
+        ),
+        "Backlog",
+        "$",
+        86,
+    ),
+    (
+        re.compile(
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
+            r"(?:in\s+)?(?:backlog|order\s+backlog)",
+            re.IGNORECASE,
+        ),
+        "Backlog",
+        "$",
+        86,
+    ),
+    (
+        re.compile(
+            r"(?:remaining\s+performance\s+obligations(?:\s*\(RPO\))?|RPO)" + _CONNECTOR +
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
+            re.IGNORECASE,
+        ),
+        "Remaining Performance Obligations (RPO)",
+        "$",
+        84,
+    ),
+    (
+        re.compile(
+            r"(?:bookings|net\s+bookings|gross\s+bookings)" + _CONNECTOR +
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
+            re.IGNORECASE,
+        ),
+        "Bookings",
+        "$",
+        83,
+    ),
+    (
+        re.compile(
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
+            r"(?:in\s+)?(?:bookings|net\s+bookings|gross\s+bookings)",
+            re.IGNORECASE,
+        ),
+        "Bookings",
+        "$",
+        83,
+    ),
+    (
+        re.compile(
             r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
             r"(?:orders?|transactions?)",
             re.IGNORECASE,

@@ -15,14 +15,10 @@ _NEGATIVE_NAME_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"\bgeographic\b", re.I),
     re.compile(r"\bdeferred\s+revenue\b", re.I),
     re.compile(r"\bcontract\s+liabilit", re.I),
-    re.compile(r"\bcontent\s+obligations?\b", re.I),
-    re.compile(r"\bobligations?\b", re.I),
     re.compile(r"\bcommitments?\b", re.I),
     re.compile(r"\bliabilit", re.I),
     re.compile(r"\bleases?\b", re.I),
     re.compile(r"\bdebt\b", re.I),
-    # Backlog/RPO is often an accounting construct and not the "signature KPI" users expect.
-    re.compile(r"\b(backlog|rpo|remaining performance obligations)\b", re.I),
 )
 
 _GENERIC_FINANCIAL_NAME_PATTERNS: Tuple[re.Pattern[str], ...] = (

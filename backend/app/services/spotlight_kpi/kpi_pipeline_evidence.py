@@ -322,6 +322,7 @@ Constraints:
 - Do NOT choose generic metrics (revenue, net income, EPS, gross margin, EBITDA, free cash flow, capex, cash, debt).
 - Do NOT choose generic accounting/GAAP line items or policy/tax disclosures (e.g., stock-based compensation, excess tax benefits,
   deferred taxes, effective tax rate, depreciation/amortization, interest expense, working capital, balance sheet line items).
+- "Company-specific" means the metric is explicitly disclosed for this company; it does NOT need to be unique across companies.
 - The KPI MUST be explicitly mentioned in the filing and MUST include evidence.
 - You MUST provide page numbers and short quotes from the document that contain:
   - a reported value (most recent value), and
@@ -367,6 +368,7 @@ Hard rules:
 - Do NOT choose generic metrics (revenue, net income, EPS, gross margin, EBITDA, free cash flow, capex, cash, debt).
 - Do NOT choose generic accounting/GAAP line items (e.g., stock-based compensation, excess tax benefits, taxes, depreciation/amortization,
   interest expense, working capital, balance sheet line items). These are not operating KPIs.
+- "Company-specific" means the metric is disclosed for this company; it does NOT need to be unique across companies.
 - If you cannot prove the KPI exists with evidence, you MUST return `"selected_kpi": null`.
 - Evidence requirements for a non-null KPI:
   - at least ONE "value" evidence quote + page (must contain the KPI name and a numeric value).
@@ -690,6 +692,7 @@ Constraints:
 - Do NOT choose generic metrics (revenue, net income, EPS, gross margin, EBITDA, free cash flow, capex, cash, debt).
 - Do NOT choose generic accounting/GAAP line items or policy/tax disclosures (e.g., stock-based compensation, excess tax benefits,
   deferred taxes, effective tax rate, depreciation/amortization, interest expense, working capital, balance sheet line items).
+- "Company-specific" means the metric is explicitly disclosed for this company; it does NOT need to be unique across companies.
 - The KPI MUST be explicitly mentioned in the provided page text and MUST include evidence.
 - You MUST provide page numbers and short quotes from the page text that contain:
   - a reported value (most recent value), and
@@ -839,7 +842,45 @@ def _verify_evidence_against_document(
         if inferred_type in ("definition", "value") and name_variants:
             quote_norm = _normalize_for_matching(quote)
             if not any(v and v in quote_norm for v in name_variants):
-                inferred_type = "context"
+                # Table rows frequently contain only the numeric value; the KPI name
+                # can appear in the row/column header nearby. For multi-page PDFs,
+                # accept value-like evidence when the KPI name appears close by on
+                # the SAME page. This keeps verification strict (still page-scoped)
+                # while avoiding false negatives.
+                if inferred_type == "value" and len(page_texts_norm) >= 2:
+                    page_norm = page_texts_norm[picked - 1] if (picked - 1) < len(page_texts_norm) else ""
+                    if page_norm and any(v and v in page_norm for v in name_variants):
+                        pos_quote = page_norm.find(quote_norm)
+                        if pos_quote < 0:
+                            inferred_type = "value"
+                        else:
+                            positions: List[int] = []
+                            for v in name_variants:
+                                if not v:
+                                    continue
+                                start = 0
+                                while True:
+                                    pos = page_norm.find(v, start)
+                                    if pos < 0:
+                                        break
+                                    positions.append(int(pos))
+                                    start = pos + max(1, len(v))
+                                    if len(positions) >= 12:
+                                        break
+                                if len(positions) >= 12:
+                                    break
+                            if positions:
+                                nearest = min(abs(int(pos_quote) - int(p)) for p in positions)
+                                if nearest <= 1200:
+                                    inferred_type = "value"
+                                else:
+                                    inferred_type = "context"
+                            else:
+                                inferred_type = "context"
+                    else:
+                        inferred_type = "context"
+                else:
+                    inferred_type = "context"
 
         verified.append({"page": picked, "quote": quote, "type": inferred_type})
 
@@ -1148,9 +1189,60 @@ def extract_kpi_with_evidence_from_file(
     raw_candidates = [c for c in (pass1.get("candidates") or []) if isinstance(c, dict)]
     debug["pass1_candidates_count"] = len(raw_candidates)
     if not raw_candidates:
-        debug["reason"] = "pass1_no_candidates"
-        debug["failure_reason"] = str(pass1.get("failure_reason") or "").strip() or None
-        return None, debug
+        # Recovery: some PDFs are hard for the model to parse as a file, but the
+        # extracted text layer contains the metric table. If Pass 1 returns no
+        # candidates, try a text-only Pass 1 on high-signal page excerpts (once).
+        if not bool(debug.get("pass1_fallback_used")) and _remaining_time() >= 2.8:
+            pages = _select_pages_for_text_pass(page_texts, max_pages=16, max_chars_per_page=2800)
+            if pages:
+                debug["pass1_fallback_attempted"] = "page_excerpts_no_candidates"
+                pass1_prompt_text = _build_pass1_prompt_from_page_excerpts(
+                    company_name,
+                    max_candidates=int(config.max_candidates),
+                    pages=pages,
+                )
+
+                def _do_pass1_text_retry(cfg: Dict[str, Any]) -> str:
+                    timeout = min(float(config.pass1_timeout_seconds), _remaining_time())
+                    try:
+                        return gemini_client.stream_generate_content(
+                            pass1_prompt_text,
+                            stage_name="KPI Evidence Pass 1 (Candidates Text Fallback)",
+                            expected_tokens=int(config.pass1_max_output_tokens),
+                            generation_config_override=cfg,
+                            timeout_seconds=timeout,
+                            retry=False,
+                        )
+                    except TypeError:
+                        return gemini_client.stream_generate_content(
+                            pass1_prompt_text,
+                            stage_name="KPI Evidence Pass 1 (Candidates Text Fallback)",
+                            expected_tokens=int(config.pass1_max_output_tokens),
+                            generation_config_override=cfg,
+                            timeout_seconds=timeout,
+                        )
+
+                pass1_raw_alt, _ = _call_with_compat_retry(
+                    fn=_do_pass1_text_retry,
+                    gen_cfg=gen_cfg_pass1,
+                    pass_name="pass1_text_no_candidates",
+                )
+                pass1_alt = parse_json_object(pass1_raw_alt or "") if pass1_raw_alt else None
+                alt_candidates = (
+                    [c for c in (pass1_alt.get("candidates") or []) if isinstance(c, dict)]
+                    if isinstance(pass1_alt, dict)
+                    else []
+                )
+                if alt_candidates:
+                    debug["pass1_fallback_used"] = True
+                    pass1 = pass1_alt
+                    raw_candidates = alt_candidates
+                    debug["pass1_candidates_count"] = len(raw_candidates)
+
+        if not raw_candidates:
+            debug["reason"] = "pass1_no_candidates"
+            debug["failure_reason"] = str(pass1.get("failure_reason") or "").strip() or None
+            return None, debug
 
     def _canon_name_key(text: str) -> str:
         return re.sub(r"\s+", " ", (text or "").strip().lower())
