@@ -565,7 +565,13 @@ def get_company_filings(
         return []
 
 
-def download_filing(url: str, output_path: str) -> bool:
+def download_filing(
+    url: str,
+    output_path: str,
+    *,
+    force_best_exhibit: bool = False,
+    max_exhibit_size_bytes: int = 0,
+) -> bool:
     """
     Download a filing from SEC EDGAR.
     """
@@ -705,7 +711,9 @@ def download_filing(url: str, output_path: str) -> bool:
         base_path = "/" + "/".join(parts[: idx + 3])  # includes accession directory
         return f"{parsed_local.scheme}://{parsed_local.netloc}{base_path}/index.json"
 
-    def _choose_best_exhibit_url(original_url: str) -> Optional[str]:
+    def _choose_best_exhibit_url(
+        original_url: str, *, max_size_bytes: Optional[int] = None
+    ) -> Optional[str]:
         index_url = _dir_index_json_url(original_url)
         if not index_url:
             return None
@@ -780,6 +788,19 @@ def download_filing(url: str, output_path: str) -> bool:
             .lower()
             .endswith((".htm", ".html", ".pdf", ".txt"))
         ]
+        if isinstance(max_size_bytes, int) and max_size_bytes > 0:
+            filtered: list[dict] = []
+            for it in candidate_items:
+                try:
+                    size = int(it.get("size") or 0)
+                except Exception:
+                    size = 0
+                # If size is missing/0, keep it (best-effort).
+                if size and size > int(max_size_bytes):
+                    continue
+                filtered.append(it)
+            if filtered:
+                candidate_items = filtered
         if not candidate_items:
             return None
 
@@ -797,7 +818,14 @@ def download_filing(url: str, output_path: str) -> bool:
             return None
     
     try:
-        response = requests.get(url, headers=headers, timeout=30)
+        requested_url = url
+        if force_best_exhibit:
+            limit = int(max_exhibit_size_bytes) if int(max_exhibit_size_bytes) > 0 else None
+            upgraded_url = _choose_best_exhibit_url(url, max_size_bytes=limit)
+            if upgraded_url:
+                requested_url = upgraded_url
+
+        response = requests.get(requested_url, headers=headers, timeout=30)
         response.raise_for_status()
         
         with open(output_path, 'wb') as f:
@@ -806,7 +834,8 @@ def download_filing(url: str, output_path: str) -> bool:
         # If the downloaded doc is likely just a cover page, try to replace it with
         # the most relevant exhibit/attachment in the accession directory.
         if _looks_low_signal_filing(response.content) or _looks_ixbrl_noise_filing(response.content):
-            upgraded_url = _choose_best_exhibit_url(url)
+            limit = int(max_exhibit_size_bytes) if int(max_exhibit_size_bytes) > 0 else None
+            upgraded_url = _choose_best_exhibit_url(url, max_size_bytes=limit)
             if upgraded_url and upgraded_url != url:
                 try:
                     upgraded = requests.get(upgraded_url, headers=headers, timeout=30)

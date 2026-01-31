@@ -63,3 +63,92 @@ def test_download_filing_upgrades_cover_doc_to_press_release(tmp_path, monkeypat
     assert b"Net bookings" in written
     assert len(written) > len(cover_bytes)
 
+
+def test_download_filing_force_best_exhibit_even_when_not_low_signal(tmp_path, monkeypatch):
+    """When forced, always prefer the best exhibit from index.json."""
+    original_url = "https://www.sec.gov/Archives/edgar/data/937966/000162828025045043/form10q.htm"
+    index_url = "https://www.sec.gov/Archives/edgar/data/937966/000162828025045043/index.json"
+    press_url = "https://www.sec.gov/Archives/edgar/data/937966/000162828025045043/pressreleasequarterlyresul.htm"
+    txt_url = "https://www.sec.gov/Archives/edgar/data/937966/000162828025045043/fullsubmission.txt"
+
+    # Original looks like a real filing (no 6-K/8-K boilerplate, long enough).
+    original_bytes = (
+        b"FORM 10-Q\nMANAGEMENT DISCUSSION & ANALYSIS\nSome content...\n"
+        + (b"x" * 70_000)
+    )
+    press_bytes = b"Quarterly results\nNet bookings were $5.0 billion\n" + (b"y" * 50_000)
+    txt_bytes = b"Complete submission text\nNet bookings were $5.0 billion\n" + (b"z" * 70_000)
+
+    index_payload = {
+        "directory": {
+            "item": [
+                {"name": "form10q.htm", "type": "text.gif", "size": str(len(original_bytes))},
+                {"name": "pressreleasequarterlyresul.htm", "type": "text.gif", "size": str(len(press_bytes))},
+                {"name": "fullsubmission.txt", "type": "text.gif", "size": str(len(txt_bytes))},
+            ]
+        }
+    }
+
+    def fake_get(url, headers=None, timeout=None):  # noqa: ARG001
+        if url == original_url:
+            return _Resp(content=original_bytes)
+        if url == index_url:
+            return _Resp(json_data=index_payload)
+        if url == press_url:
+            return _Resp(content=press_bytes)
+        if url == txt_url:
+            return _Resp(content=txt_bytes)
+        raise AssertionError(f"Unexpected URL fetched: {url}")
+
+    monkeypatch.setattr(edgar_fetcher.requests, "get", fake_get)
+
+    out = Path(tmp_path) / "filing.html"
+    ok = edgar_fetcher.download_filing(original_url, str(out), force_best_exhibit=True)
+    assert ok is True
+    assert b"Net bookings" in out.read_bytes()
+
+
+def test_download_filing_force_best_exhibit_respects_max_size(tmp_path, monkeypatch):
+    original_url = "https://www.sec.gov/Archives/edgar/data/937966/000162828025045043/form10q.htm"
+    index_url = "https://www.sec.gov/Archives/edgar/data/937966/000162828025045043/index.json"
+    press_url = "https://www.sec.gov/Archives/edgar/data/937966/000162828025045043/pressreleasequarterlyresul.htm"
+    txt_url = "https://www.sec.gov/Archives/edgar/data/937966/000162828025045043/fullsubmission.txt"
+
+    original_bytes = b"FORM 10-Q\nContent...\n" + (b"x" * 80_000)
+    press_bytes = b"Quarterly results\nNet bookings were $5.0 billion\n" + (b"y" * 80_000)
+    txt_bytes = b"Complete submission text\nNet bookings were $5.0 billion\n" + (b"z" * 20_000)
+
+    # Mark the press exhibit as too large in the index so it gets filtered out.
+    index_payload = {
+        "directory": {
+            "item": [
+                {"name": "form10q.htm", "type": "text.gif", "size": str(len(original_bytes))},
+                {"name": "pressreleasequarterlyresul.htm", "type": "text.gif", "size": "80000000"},
+                {"name": "fullsubmission.txt", "type": "text.gif", "size": str(len(txt_bytes))},
+            ]
+        }
+    }
+
+    def fake_get(url, headers=None, timeout=None):  # noqa: ARG001
+        if url == original_url:
+            return _Resp(content=original_bytes)
+        if url == index_url:
+            return _Resp(json_data=index_payload)
+        if url == press_url:
+            return _Resp(content=press_bytes)
+        if url == txt_url:
+            return _Resp(content=txt_bytes)
+        raise AssertionError(f"Unexpected URL fetched: {url}")
+
+    monkeypatch.setattr(edgar_fetcher.requests, "get", fake_get)
+
+    out = Path(tmp_path) / "filing.html"
+    ok = edgar_fetcher.download_filing(
+        original_url,
+        str(out),
+        force_best_exhibit=True,
+        max_exhibit_size_bytes=50_000_000,
+    )
+    assert ok is True
+    written = out.read_bytes()
+    assert b"Complete submission text" in written

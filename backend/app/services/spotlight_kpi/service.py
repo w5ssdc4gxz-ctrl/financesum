@@ -8,11 +8,13 @@ from datetime import datetime, timezone
 from html import unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import anyio
 
 from app.models.database import get_supabase_client
 from app.services.gemini_client import get_gemini_client
+from app.services.edgar_fetcher import download_filing
 from app.services.local_cache import (
     fallback_filings,
     fallback_spotlight_kpis_by_id,
@@ -77,6 +79,17 @@ def _infer_local_document_mime_type(path: Path) -> str:
     if suffix in (".txt", ".text"):
         return "text/plain"
     return "application/octet-stream"
+
+
+def _is_sec_document_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except Exception:  # noqa: BLE001
+        return False
+    if (parsed.scheme or "").lower() not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").lower().strip()
+    return bool(host.endswith("sec.gov"))
 
 
 def _strip_html_to_text(raw_html: str) -> str:
@@ -676,7 +689,7 @@ async def _build_history(
 
 
 def _cache_config() -> Tuple[str, int, int]:
-    version = (os.getenv("SPOTLIGHT_CACHE_VERSION") or "").strip() or "spotlight-cache-evidence-20260131-5"
+    version = (os.getenv("SPOTLIGHT_CACHE_VERSION") or "").strip() or "spotlight-cache-evidence-20260131-6"
     ttl_s = _int_env("SPOTLIGHT_CACHE_TTL_SECONDS", 604800)
     ttl_s = max(0, int(ttl_s))
     max_items = _int_env("SPOTLIGHT_CACHE_MAX_ITEMS", 4000)
@@ -1026,6 +1039,199 @@ async def build_spotlight_payload_for_filing(
         except Exception as exc:  # noqa: BLE001
             if debug:
                 debug_info["table_extraction_error"] = str(exc)[:200]
+
+    # 5) EDGAR artifact fallback: older/obscure filings sometimes cache a low-signal
+    # SEC primary document (or an iXBRL-heavy HTML) that contains few/no extractable
+    # operating KPIs, while an exhibit or the full submission TXT does. When the
+    # evidence pipeline returns no candidates, try re-downloading the best exhibit
+    # from the accession directory into a sidecar file and re-run extraction.
+    if (
+        not best_kpi
+        and gemini_client
+        and has_local
+        and evidence_pipeline_reason in {"pass1_no_candidates", "pass1_no_valid_candidates"}
+        and str(os.getenv("SPOTLIGHT_ALLOW_NETWORK", "1") or "").strip().lower() in {"1", "true", "yes"}
+        and str(os.getenv("SPOTLIGHT_EDGAR_ARTIFACT_FALLBACK", "1") or "").strip().lower() in {"1", "true", "yes"}
+        and not os.getenv("PYTEST_CURRENT_TEST")
+    ):
+        source_url = str(filing.get("source_doc_url") or filing.get("url") or "").strip()
+        if source_url and _is_sec_document_url(source_url) and local_document_path:
+            try:
+                raw_max = (os.getenv("SPOTLIGHT_EDGAR_FALLBACK_MAX_BYTES") or "").strip() or "25000000"
+                try:
+                    max_exhibit_size = int(raw_max)
+                except ValueError:
+                    max_exhibit_size = 25_000_000
+                max_exhibit_size = max(0, int(max_exhibit_size))
+            except Exception:  # noqa: BLE001
+                max_exhibit_size = 25_000_000
+
+            alt_path = local_document_path.with_name(
+                f"{local_document_path.stem}.spotlight-edgar-alt{local_document_path.suffix or '.html'}"
+            )
+
+            ok = False
+            try:
+                with anyio.fail_after(18.0):
+                    ok = await anyio.to_thread.run_sync(
+                        lambda: download_filing(
+                            source_url,
+                            str(alt_path),
+                            force_best_exhibit=True,
+                            max_exhibit_size_bytes=max_exhibit_size,
+                        ),
+                        cancellable=True,
+                    )
+            except TimeoutError:
+                ok = False
+            except Exception as exc:  # noqa: BLE001
+                ok = False
+                if debug:
+                    debug_info["edgar_fallback_download_error"] = str(exc)[:200]
+
+            if debug:
+                debug_info["edgar_fallback_attempted"] = True
+                debug_info["edgar_fallback_source_url"] = source_url
+                debug_info["edgar_fallback_ok"] = bool(ok)
+                debug_info["edgar_fallback_max_bytes"] = int(max_exhibit_size)
+
+            if ok and alt_path.exists():
+                # Recompute excerpt and upload bytes for the alternate artifact.
+                excerpt_limit = _spotlight_document_excerpt_limit()
+                alt_text = _load_spotlight_context_text(alt_path, limit=excerpt_limit)
+
+                alt_bytes: Optional[bytes] = None
+                alt_mime: Optional[str] = None
+                alt_unavailable_reason: Optional[str] = None
+
+                try:
+                    max_bytes_raw = (
+                        os.getenv("SPOTLIGHT_FILE_PIPELINE_MAX_UPLOAD_BYTES") or ""
+                    ).strip() or "50000000"
+                    try:
+                        max_bytes = int(max_bytes_raw)
+                    except ValueError:
+                        max_bytes = 50_000_000
+                    max_bytes = max(0, int(max_bytes))
+                    if max_bytes <= 0:
+                        alt_unavailable_reason = "file_pipeline_upload_disabled"
+                    else:
+                        raw = alt_path.read_bytes()
+                        if raw and len(raw) <= max_bytes:
+                            alt_mime = _infer_local_document_mime_type(alt_path)
+                            alt_bytes = raw
+                        else:
+                            alt_unavailable_reason = (
+                                "file_pipeline_file_too_large"
+                                if raw and len(raw) > max_bytes
+                                else "file_pipeline_empty_file"
+                            )
+                except Exception:  # noqa: BLE001
+                    alt_bytes = None
+                    alt_mime = None
+                    if alt_unavailable_reason is None:
+                        alt_unavailable_reason = "file_pipeline_read_failed"
+
+                upload_mode = (os.getenv("SPOTLIGHT_HTML_UPLOAD_MODE") or "").strip().lower() or "clean_text"
+                if (
+                    alt_bytes
+                    and alt_mime == "text/html"
+                    and upload_mode in ("clean_text", "text", "plain", "txt")
+                    and (alt_text or "").strip()
+                ):
+                    alt_bytes = (alt_text or "").encode("utf-8", errors="ignore")
+                    alt_mime = "text/plain"
+
+                if debug:
+                    debug_info["edgar_fallback_document_text_chars"] = int(len(alt_text or ""))
+                    debug_info["edgar_fallback_pipeline_file_bytes"] = bool(alt_bytes)
+                    debug_info["edgar_fallback_pipeline_file_mime"] = alt_mime
+                    debug_info["edgar_fallback_pipeline_unavailable_reason"] = alt_unavailable_reason
+
+                # Try the evidence pipeline again on the alternate artifact first.
+                if alt_bytes and alt_mime:
+                    try:
+                        timeout_s = 20.0
+                        raw_timeout = (
+                            os.getenv("SPOTLIGHT_KPI_ENDPOINT_TIMEOUT_SECONDS") or ""
+                        ).strip()
+                        if raw_timeout:
+                            timeout_s = min(float(raw_timeout), 30.0)
+                    except ValueError:
+                        timeout_s = 20.0
+
+                    try:
+                        with anyio.fail_after(timeout_s):
+                            alt_kpi, alt_dbg = await anyio.to_thread.run_sync(
+                                lambda: extract_kpi_with_evidence_from_file(
+                                    gemini_client,
+                                    file_bytes=alt_bytes or b"",
+                                    mime_type=alt_mime or "application/octet-stream",
+                                    company_name=company_name,
+                                ),
+                                cancellable=True,
+                            )
+                    except TimeoutError:
+                        alt_kpi, alt_dbg = None, {"reason": "spotlight_evidence_timeout"}
+                    except Exception as exc:  # noqa: BLE001
+                        alt_kpi, alt_dbg = None, {
+                            "reason": "spotlight_evidence_exception",
+                            "error": str(exc)[:500],
+                        }
+
+                    if debug:
+                        debug_info["edgar_fallback_evidence_pipeline"] = alt_dbg
+
+                    if alt_kpi:
+                        spotlight_used_fallbacks = True
+                        item = dict(alt_kpi)
+                        item["company_specific"] = True
+                        best_kpi = item
+
+                # If file upload is unavailable for the alternate artifact, try text-only extraction.
+                if not best_kpi and (alt_text or "").strip():
+                    try:
+                        with anyio.fail_after(18.0):
+                            alt_kpi, alt_text_dbg = await anyio.to_thread.run_sync(
+                                lambda: extract_company_specific_spotlight_kpi_from_text(
+                                    gemini_client,
+                                    context_text=alt_text,
+                                    company_name=company_name,
+                                ),
+                                cancellable=True,
+                            )
+                        if debug:
+                            debug_info["edgar_fallback_text_pipeline"] = alt_text_dbg
+                        if alt_kpi:
+                            spotlight_used_fallbacks = True
+                            item = dict(alt_kpi)
+                            item["company_specific"] = True
+                            validated = pick_best_spotlight_kpi([item], context_text=alt_text)
+                            if validated:
+                                best_kpi = dict(validated)
+                                best_kpi["company_specific"] = True
+                    except TimeoutError:
+                        if debug:
+                            debug_info["edgar_fallback_text_pipeline_error"] = "timeout"
+                    except Exception as exc:  # noqa: BLE001
+                        if debug:
+                            debug_info["edgar_fallback_text_pipeline_error"] = str(exc)[:200]
+
+                # Deterministic fallbacks on the alternate text.
+                if not best_kpi and (alt_text or "").strip():
+                    candidates = extract_kpis_with_regex(alt_text, company_name, max_results=5)
+                    picked: Optional[SpotlightKpiCandidate] = None
+                    for cand in candidates:
+                        if not isinstance(cand, dict):
+                            continue
+                        if not _quote_in_context(str(cand.get("source_quote") or ""), alt_text):
+                            continue
+                        picked = dict(cand)
+                        break
+                    if picked:
+                        spotlight_used_fallbacks = True
+                        picked["company_specific"] = True
+                        best_kpi = picked
 
     if debug:
         debug_info["spotlight_used_fallbacks"] = spotlight_used_fallbacks

@@ -330,8 +330,11 @@ Constraints:
   - (if present) a definition (how the KPI is calculated / what it means).
 - Prefer TRUE operating KPIs that describe the business (usage/volume/capacity), such as: customers/subscribers, orders/transactions,
   units shipped/delivered, bookings/backlog, AUM, GMV/TPV, churn/retention, occupancy/utilization, store count, etc.
-- For EACH candidate, `evidence` MUST include at least ONE item with type = "value"
-  (must contain the KPI name and a numeric value). Include definition evidence when available.
+- For EACH candidate, `evidence` MUST include at least ONE item with type = "value" that contains a numeric value.
+  - If the KPI is in a TABLE and the value cell does not repeat the KPI name, you may:
+    (a) quote the full table row (KPI label + value), OR
+    (b) provide TWO evidence quotes on the SAME page: one with the KPI name (type "context") and one with the numeric value (type "value").
+  - Quotes MUST be verbatim excerpts from the filing (include enough surrounding text to be uniquely matchable).
 - If you cannot find a company-specific KPI with evidence, return `candidates: []` and set `failure_reason`.
 - Do not guess.
 
@@ -372,7 +375,8 @@ Hard rules:
 - "Company-specific" means the metric is disclosed for this company; it does NOT need to be unique across companies.
 - If you cannot prove the KPI exists with evidence, you MUST return `"selected_kpi": null`.
 - Evidence requirements for a non-null KPI:
-  - at least ONE "value" evidence quote + page (must contain the KPI name and a numeric value).
+  - at least ONE "value" evidence quote + page that contains a numeric value.
+    If the value appears in a TABLE cell without the KPI name, include an additional "context" quote on the SAME page that contains the KPI name.
   - Include "definition" evidence if the filing explicitly defines the metric. If not defined, still return the KPI if value evidence exists.
 - Do not guess.
 - Output MUST be valid JSON matching the schema below. No extra text.
@@ -714,8 +718,10 @@ Constraints:
 - You MUST provide page numbers and short quotes from the page text that contain:
   - a reported value (most recent value), and
   - (if present) a definition (how the KPI is calculated / what it means).
-- For EACH candidate, `evidence` MUST include at least ONE item with type = "value"
-  (must contain the KPI name and a numeric value).
+- For EACH candidate, `evidence` MUST include at least ONE item with type = "value" that contains a numeric value.
+  - If the KPI is in a TABLE and the value cell does not repeat the KPI name, you may:
+    (a) quote the full table row (KPI label + value), OR
+    (b) provide TWO evidence quotes on the SAME page: one with the KPI name (type "context") and one with the numeric value (type "value").
 - Quotes MUST be verbatim substrings of the corresponding PAGE text.
 - Prefer TRUE operating KPIs that describe the business (usage/volume/capacity), such as: customers/subscribers, orders/transactions,
   units shipped/delivered, bookings/backlog, AUM, GMV/TPV, churn/retention, occupancy/utilization, store count, etc.
