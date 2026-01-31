@@ -93,7 +93,6 @@ export interface ChartData {
   prior_label: string
   company_kpi?: CompanyKPI | null
   company_charts?: CompanyKPI[] | null
-  proxy_kpi?: CompanyKPI | null
 }
 
 export interface HealthDisplayData {
@@ -742,10 +741,9 @@ function normalizeCompanyKpi(input: unknown): CompanyKPI | null {
         ? anyInput.companySpecific
         : undefined
 
-  // Company Spotlight should reject generic financial KPIs.
-  // But: if the backend explicitly marks the KPI as non-company-specific (fallback),
-  // allow it so we don't end up with "No unique KPI" purely due to frontend filtering.
-  if (companySpecific !== false && isGenericCompanyKpi(anyInput.name)) return null
+  // Company Spotlight should ONLY show evidence-backed company-specific KPIs.
+  if (companySpecific === false) return null
+  if (isGenericCompanyKpi(anyInput.name)) return null
 
   const toNumber = (value: unknown): number | null => {
     if (typeof value === 'number' && Number.isFinite(value)) return value
@@ -904,84 +902,6 @@ function normalizeCompanyKpi(input: unknown): CompanyKPI | null {
   }
 }
 
-function normalizeProxyKpi(input: unknown): CompanyKPI | null {
-  if (!input || typeof input !== 'object') return null
-  const anyInput = input as any
-  if (typeof anyInput.name !== 'string' || anyInput.name.trim().length === 0) return null
-
-  const toNumber = (value: unknown): number | null => {
-    if (typeof value === 'number' && Number.isFinite(value)) return value
-    if (typeof value !== 'string') return null
-    let text = value.trim()
-    if (!text) return null
-
-    let negative = false
-    if (text.startsWith('(') && text.endsWith(')')) {
-      negative = true
-      text = text.slice(1, -1).trim()
-    }
-
-    text = text.replace(/[,]/g, '')
-    text = text.replace(/[$€£]/g, '')
-    text = text.replace(/\s+/g, '')
-    text = text.replace(/%/g, '')
-
-    const match = text.match(
-      /^([+-]?\d+(?:\.\d+)?)(K|M|B|T|THOUSAND|MILLION|BILLION|TRILLION|BN|MM)?$/i,
-    )
-    if (!match) return null
-
-    const parsed = Number(match[1])
-    if (!Number.isFinite(parsed)) return null
-
-    const suffix = (match[2] ?? '').toUpperCase()
-    const multiplier =
-      suffix === 'K' || suffix === 'THOUSAND'
-        ? 1_000
-        : suffix === 'M' || suffix === 'MILLION' || suffix === 'MM'
-          ? 1_000_000
-          : suffix === 'B' || suffix === 'BILLION' || suffix === 'BN'
-            ? 1_000_000_000
-            : suffix === 'T' || suffix === 'TRILLION'
-              ? 1_000_000_000_000
-              : 1
-
-    const out = parsed * multiplier
-    return negative ? -out : out
-  }
-
-  const rawValue = toNumber(anyInput.value ?? anyInput.current_value ?? anyInput.currentValue)
-  if (rawValue == null) return null
-
-  const unit = typeof anyInput.unit === 'string' ? normalizeKpiUnit(anyInput.unit) : undefined
-  const value = normalizePercentageValue(rawValue, unit)
-  const priorValueRaw = toNumber(anyInput.prior_value ?? anyInput.priorValue ?? anyInput.previous_value ?? anyInput.previousValue)
-  const priorValue = priorValueRaw == null ? null : normalizePercentageValue(priorValueRaw, unit)
-  const description = typeof anyInput.description === 'string' ? anyInput.description : undefined
-
-  const rawChartType =
-    typeof anyInput.chart_type === 'string'
-      ? anyInput.chart_type
-      : typeof anyInput.chartType === 'string'
-        ? anyInput.chartType
-        : typeof anyInput.chart === 'string'
-          ? anyInput.chart
-          : typeof anyInput.type === 'string'
-            ? anyInput.type
-            : undefined
-  const chartType = typeof rawChartType === 'string' ? rawChartType.trim().toLowerCase() : undefined
-
-  return {
-    name: anyInput.name.trim(),
-    value,
-    prior_value: priorValueRaw == null ? null : priorValue,
-    unit,
-    description,
-    company_specific: false,
-    chart_type: chartType,
-  }
-}
-
 function buildCompanyCharts(chartData: ChartData): CompanyKPI[] {
   const rawCharts =
     chartData.company_charts && Array.isArray(chartData.company_charts) && chartData.company_charts.length > 0
@@ -993,218 +913,9 @@ function buildCompanyCharts(chartData: ChartData): CompanyKPI[] {
   return rawCharts
     .map(normalizeCompanyKpi)
     .filter((kpi): kpi is CompanyKPI => kpi != null)
+    .filter((kpi) => kpi.company_specific === true)
     .filter((kpi, idx, arr) => arr.findIndex(other => other.name === kpi.name) === idx)
     .slice(0, 1)
-}
-
-function buildProxySpotlightFallback(chartData: ChartData): CompanyKPI | null {
-  const current = chartData.current_period || {}
-  const prior = chartData.prior_period || {}
-
-  const finite = (value: unknown): number | null =>
-    typeof value === 'number' && Number.isFinite(value) ? value : null
-
-  const revenue = finite(current.revenue)
-  const priorRevenue = finite((prior as any)?.revenue)
-
-  const candidates: Array<{ score: number; kpi: CompanyKPI }> = []
-
-  // Prefer "intensity" and "conversion" style metrics because they tend to be
-  // informative across industries and pass the generic KPI filter.
-  const rnd = finite(current.rnd_expense)
-  const priorRnd = finite((prior as any)?.rnd_expense)
-  if (revenue && revenue > 0 && rnd != null && rnd >= 0) {
-    candidates.push({
-      score: 95,
-      kpi: {
-        name: 'R&D Intensity',
-        value: (rnd / revenue) * 100,
-        prior_value:
-          priorRevenue && priorRevenue > 0 && priorRnd != null && priorRnd >= 0
-            ? (priorRnd / priorRevenue) * 100
-            : null,
-        unit: '%',
-        chart_type: 'gauge',
-        company_specific: false,
-        description: 'R&D spend as a share of revenue.',
-      },
-    })
-  }
-
-  const sga = finite(current.sga_expense)
-  const priorSga = finite((prior as any)?.sga_expense)
-  if (revenue && revenue > 0 && sga != null && sga >= 0) {
-    candidates.push({
-      score: 75,
-      kpi: {
-        name: 'SG&A Intensity',
-        value: (sga / revenue) * 100,
-        prior_value:
-          priorRevenue && priorRevenue > 0 && priorSga != null && priorSga >= 0
-            ? (priorSga / priorRevenue) * 100
-            : null,
-        unit: '%',
-        chart_type: 'gauge',
-        company_specific: false,
-        description: 'SG&A expense as a share of revenue.',
-      },
-    })
-  }
-
-  const capex = finite(current.capex)
-  const priorCapex = finite((prior as any)?.capex)
-  if (revenue && revenue > 0 && capex != null && capex !== 0) {
-    candidates.push({
-      score: 70,
-      kpi: {
-        name: 'Capex Intensity',
-        value: (Math.abs(capex) / revenue) * 100,
-        prior_value:
-          priorRevenue && priorRevenue > 0 && priorCapex != null && priorCapex !== 0
-            ? (Math.abs(priorCapex) / priorRevenue) * 100
-            : null,
-        unit: '%',
-        chart_type: 'gauge',
-        company_specific: false,
-        description: 'Capex as a share of revenue.',
-      },
-    })
-  }
-
-  const fcf = finite(current.free_cash_flow)
-  const priorFcf = finite((prior as any)?.free_cash_flow)
-  const netIncome = finite(current.net_income)
-  const priorNetIncome = finite((prior as any)?.net_income)
-  if (fcf != null && netIncome != null && netIncome !== 0) {
-    candidates.push({
-      score: 85,
-      kpi: {
-        name: 'Cash Conversion',
-        value: (fcf / netIncome) * 100,
-        prior_value:
-          priorFcf != null && priorNetIncome != null && priorNetIncome !== 0
-            ? (priorFcf / priorNetIncome) * 100
-            : null,
-        unit: '%',
-        chart_type: 'gauge',
-        company_specific: false,
-        description: 'Free cash flow as a % of net income.',
-      },
-    })
-  }
-
-  // If net income isn't available, fall back to a cash conversion definition
-  // that uses revenue as the denominator (widely available).
-  if (revenue && revenue > 0 && fcf != null) {
-    candidates.push({
-      score: 80,
-      kpi: {
-        name: 'Cash Conversion',
-        value: (fcf / revenue) * 100,
-        prior_value:
-          priorRevenue && priorRevenue > 0 && priorFcf != null
-            ? (priorFcf / priorRevenue) * 100
-            : null,
-        unit: '%',
-        chart_type: 'gauge',
-        company_specific: false,
-        description: 'Free cash flow as a % of revenue.',
-      },
-    })
-  }
-
-  const operatingMargin = finite(current.operating_margin)
-  const priorOperatingMargin = finite((prior as any)?.operating_margin)
-  if (operatingMargin != null) {
-    candidates.push({
-      score: 55,
-      kpi: {
-        name: 'Operating Efficiency',
-        value: operatingMargin,
-        prior_value: priorOperatingMargin,
-        unit: '%',
-        chart_type: 'gauge',
-        company_specific: false,
-        description: 'Operating profit as a % of revenue.',
-      },
-    })
-  }
-
-  const totalDebt = finite(current.total_debt)
-  const priorDebt = finite((prior as any)?.total_debt)
-  const ebitda = finite(current.ebitda)
-  const priorEbitda = finite((prior as any)?.ebitda)
-  if (totalDebt != null && ebitda != null && Math.abs(ebitda) > 0) {
-    candidates.push({
-      score: 60,
-      kpi: {
-        name: 'Leverage Multiple',
-        value: totalDebt / Math.abs(ebitda),
-        prior_value:
-          priorDebt != null && priorEbitda != null && Math.abs(priorEbitda) > 0
-            ? priorDebt / Math.abs(priorEbitda)
-            : null,
-        unit: 'x',
-        chart_type: 'metric',
-        company_specific: false,
-        description: 'Total debt relative to EBITDA.',
-      },
-    })
-  }
-
-  const best = candidates.sort((a, b) => b.score - a.score)[0]
-  if (!best) return null
-  return {
-    ...best.kpi,
-    value: best.kpi.unit === '%' ? normalizePercentageValue(best.kpi.value, '%') : best.kpi.value,
-    prior_value:
-      best.kpi.unit === '%' && typeof best.kpi.prior_value === 'number'
-        ? normalizePercentageValue(best.kpi.prior_value, '%')
-        : best.kpi.prior_value ?? null,
-  }
-}
-
-function buildFinancialSpotlightFallback(chartData: ChartData): CompanyKPI[] {
-  const current = chartData.current_period || {}
-  const prior = chartData.prior_period || {}
-
-  const candidates: Array<{
-    key: keyof ChartData['current_period']
-    name: string
-    unit?: string
-    chart_type?: string
-  }> = [
-    { key: 'revenue', name: 'Revenue', unit: '$', chart_type: 'comparison' },
-    { key: 'operating_margin', name: 'Operating Margin', unit: '%', chart_type: 'gauge' },
-    { key: 'free_cash_flow', name: 'Free Cash Flow', unit: '$', chart_type: 'comparison' },
-    { key: 'gross_margin', name: 'Gross Margin', unit: '%', chart_type: 'gauge' },
-    { key: 'net_income', name: 'Net Income', unit: '$', chart_type: 'comparison' },
-    { key: 'operating_income', name: 'Operating Income', unit: '$', chart_type: 'comparison' },
-    { key: 'ebitda', name: 'EBITDA', unit: '$', chart_type: 'comparison' },
-  ]
-
-  const out: CompanyKPI[] = []
-  for (const cand of candidates) {
-    const curVal = current[cand.key]
-    if (typeof curVal !== 'number' || !Number.isFinite(curVal)) continue
-    const priorVal = prior ? (prior as any)[cand.key] : null
-    const unit = cand.unit
-    out.push({
-      name: cand.name,
-      value: unit === '%' ? normalizePercentageValue(curVal, unit) : curVal,
-      prior_value:
-        typeof priorVal === 'number' && Number.isFinite(priorVal)
-          ? unit === '%'
-            ? normalizePercentageValue(priorVal, unit)
-            : priorVal
-          : null,
-      unit,
-      company_specific: false,
-      chart_type: cand.chart_type,
-    })
-    if (out.length >= 3) break
-  }
-  return out
 }
 
 function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData; filingId?: string | null }) {
@@ -1224,7 +935,6 @@ function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData;
       : []
   const spotlightTier: 'loading' | 'spotlight' | 'none' =
     awaitingRemote ? 'loading' : charts.length > 0 ? 'spotlight' : 'none'
-  const allFinancial = displayCharts.length > 0 && displayCharts.every(kpi => kpi.company_specific === false)
 
   useEffect(() => {
     if (!shouldFetchRemoteSpotlight) {
@@ -1351,21 +1061,11 @@ function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData;
 	                />
 		              {spotlightTier === "loading"
 		                  ? 'Finding KPI…'
-	                : allFinancial
-	                  ? displayCharts.length === 1
-	                    ? 'Financial Metric'
-	                    : `Financial Metrics • ${displayCharts.length}`
-	                  : displayCharts.length === 1
-	                    ? 'Spotlight KPI'
-	                    : `KPI Candidates • ${displayCharts.length}`}
+	                : displayCharts.length === 1
+	                  ? 'Spotlight KPI'
+	                  : `KPI Candidates • ${displayCharts.length}`}
 		            </span>
 		          </div>
-
-            {spotlightTier === 'spotlight' && allFinancial && (
-              <p className="mb-4 text-xs text-slate-500 dark:text-gray-400 leading-relaxed">
-                These are financial statement metrics. If the filing discloses an operating KPI (users/subscribers/orders/etc.), it will appear here instead.
-              </p>
-            )}
 
           <div className={cn("grid gap-4", gridLayout)}>
             {displayCharts.map((kpi, idx) => (

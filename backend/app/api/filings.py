@@ -13363,7 +13363,6 @@ Before you output anything, verify:
                 "prior_label": prior_label,
                 "company_kpi": None,  # Will be populated if available
                 "company_charts": [],  # Optional array of insight charts
-                "proxy_kpi": None,  # Financial proxy shown separately in UI
             }
 
             # SKIP KPI EXTRACTION DURING SUMMARY GENERATION
@@ -13375,7 +13374,6 @@ Before you output anything, verify:
             if company_charts:
                 chart_data["company_charts"] = company_charts
                 chart_data["company_kpi"] = company_charts[0]
-            chart_data["proxy_kpi"] = None
 
             # Merge chart_data into response_data instead of returning separately
             response_data["chart_data"] = chart_data
@@ -16183,49 +16181,27 @@ async def get_filing_spotlight_kpi(
     filing = context["filing"]
     company = context["company"]
 
-    # Spotlight should be fast: do NOT trigger SEC resolution + downloads here.
+    # Spotlight needs the filing text. If the local document is missing, we must
+    # resolve + download it (older filings often have no cached document yet).
     local_document = _ensure_local_document(context, settings, allow_network=False)
 
-    # Optional: allow a single best-effort SEC download when no local document exists.
-    # This is disabled by default and does NOT perform CIK resolution; it only uses an
-    # already-known `source_doc_url`.
-    allow_spotlight_download = str(
-        os.getenv("SPOTLIGHT_ALLOW_NETWORK", "0") or ""
-    ).strip().lower() in ("1", "true", "yes")
-    source_doc_url = str(filing.get("source_doc_url") or "")
-    if (
-        allow_spotlight_download
-        and (not local_document or not local_document.exists())
-        and source_doc_url
-        and _is_sec_document_url(source_doc_url)
-    ):
+    allow_spotlight_network = str(os.getenv("SPOTLIGHT_ALLOW_NETWORK", "1") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+    if allow_spotlight_network and (not local_document or not local_document.exists()):
         try:
-            storage_dir = _ensure_storage_dir(settings)
-            target_path = _build_local_document_path(storage_dir, str(filing_id))
-
-            def _download():
-                return download_filing(source_doc_url, str(target_path))
-
-            downloaded = False
-            try:
-                with anyio.fail_after(15.0):
-                    downloaded = await anyio.to_thread.run_sync(_download, cancellable=True)
-            except TimeoutError:
-                downloaded = False
-
-            if downloaded and target_path.exists():
-                local_document = target_path
-                filing["local_document_path"] = str(target_path)
-                try:
-                    _persist_filing_field_updates(
-                        context,
-                        str(filing_id),
-                        {"local_document_path": str(target_path)},
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
+            with anyio.fail_after(25.0):
+                local_document = await anyio.to_thread.run_sync(
+                    lambda: _ensure_local_document(context, settings, allow_network=True),
+                    cancellable=True,
+                )
+        except TimeoutError:
+            local_document = None
         except Exception:  # noqa: BLE001
-            pass
+            local_document = None
 
     payload = await build_spotlight_payload_for_filing(
         str(filing_id),

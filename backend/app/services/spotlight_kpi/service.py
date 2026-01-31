@@ -19,7 +19,9 @@ from app.services.local_cache import (
 )
 
 from .kpi_pipeline_evidence import extract_kpi_with_evidence_from_file
+from .ranker import pick_best_spotlight_kpi
 from .regex_fallback import extract_kpis_with_regex
+from .text_pipeline import extract_company_specific_spotlight_kpi_from_text
 from .types import SpotlightKpiCandidate
 
 
@@ -552,7 +554,7 @@ async def _build_history(
 
 
 def _cache_config() -> Tuple[str, int, int]:
-    version = (os.getenv("SPOTLIGHT_CACHE_VERSION") or "").strip() or "spotlight-cache-evidence-20260130"
+    version = (os.getenv("SPOTLIGHT_CACHE_VERSION") or "").strip() or "spotlight-cache-evidence-20260131"
     ttl_s = _int_env("SPOTLIGHT_CACHE_TTL_SECONDS", 604800)
     ttl_s = max(0, int(ttl_s))
     max_items = _int_env("SPOTLIGHT_CACHE_MAX_ITEMS", 4000)
@@ -561,7 +563,7 @@ def _cache_config() -> Tuple[str, int, int]:
 
 
 def _cache_get(filing_id: str, *, debug: bool) -> Optional[Dict[str, Any]]:
-    if debug:
+    if debug or os.getenv("PYTEST_CURRENT_TEST"):
         return None
     cache_key = str(filing_id)
     version, ttl_s, _max_items = _cache_config()
@@ -589,9 +591,11 @@ def _cache_get(filing_id: str, *, debug: bool) -> Optional[Dict[str, Any]]:
 
 
 def _cache_set(filing_id: str, payload: Dict[str, Any], *, reason: Optional[str], debug: bool) -> None:
-    if debug:
+    if debug or os.getenv("PYTEST_CURRENT_TEST"):
         return
     transient_reasons = {
+        # Missing local document is not stable; the filing can be downloaded later.
+        "no_local_document",
         "pass1_invalid_json",
         "pass2_invalid_json",
         "pass3_invalid_json",
@@ -789,7 +793,43 @@ async def build_spotlight_payload_for_filing(
             # Avoid rejecting on a truncated `document_text` excerpt (common for long PDFs).
             best_kpi = item
 
-    # 2) Deterministic regex fallback when Gemini unavailable (safe + verifiable quote).
+    # 2) Text-only pipeline when Gemini configured and local text exists, but we cannot
+    # upload bytes (disabled/too-large). This pipeline still requires verbatim excerpts
+    # and should return None when evidence is weak.
+    if (
+        not best_kpi
+        and gemini_client
+        and (document_text or "").strip()
+        and not (pipeline_file_bytes and pipeline_file_mime)
+    ):
+        try:
+            with anyio.fail_after(18.0):
+                kpi_candidate, text_dbg = await anyio.to_thread.run_sync(
+                    lambda: extract_company_specific_spotlight_kpi_from_text(
+                        gemini_client,
+                        context_text=document_text,
+                        company_name=company_name,
+                    ),
+                    cancellable=True,
+                )
+            if debug:
+                debug_info["text_pipeline"] = text_dbg
+            if kpi_candidate:
+                spotlight_used_fallbacks = True
+                item = dict(kpi_candidate)
+                item["company_specific"] = True
+                validated = pick_best_spotlight_kpi([item], context_text=document_text)
+                if validated:
+                    best_kpi = dict(validated)
+                    best_kpi["company_specific"] = True
+        except TimeoutError:
+            if debug:
+                debug_info["text_pipeline_error"] = "timeout"
+        except Exception as exc:  # noqa: BLE001
+            if debug:
+                debug_info["text_pipeline_error"] = str(exc)[:300]
+
+    # 3) Deterministic regex fallback when Gemini unavailable (safe + verifiable quote).
     if not best_kpi and not gemini_client and (document_text or "").strip():
         candidates = extract_kpis_with_regex(document_text, company_name, max_results=5)
         picked: Optional[SpotlightKpiCandidate] = None
