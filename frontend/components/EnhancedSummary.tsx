@@ -1216,30 +1216,14 @@ function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData;
   const baseHasCompanySpecific = baseCharts.some((kpi) => kpi.company_specific === true)
   const shouldFetchRemoteSpotlight = Boolean(filingId && !baseHasCompanySpecific)
   const charts = shouldFetchRemoteSpotlight ? (remoteCharts ?? []) : baseCharts
-  const proxyKpi = useMemo(() => {
-    return normalizeProxyKpi(chartData.proxy_kpi) ?? buildProxySpotlightFallback(chartData)
-  }, [chartData])
-  const fallbackCharts = useMemo(() => buildFinancialSpotlightFallback(chartData), [chartData])
   const awaitingRemote = Boolean(shouldFetchRemoteSpotlight && remoteCharts == null)
   const displayCharts = awaitingRemote
     ? []
     : charts.length > 0
       ? charts
-      : proxyKpi
-        ? [proxyKpi]
-        : fallbackCharts
-  const spotlightTier: 'loading' | 'spotlight' | 'proxy' | 'financial' | 'none' =
-    awaitingRemote
-      ? 'loading'
-      : charts.length > 0
-        ? 'spotlight'
-        : proxyKpi
-          ? 'proxy'
-          : fallbackCharts.length > 0
-            ? 'financial'
-            : 'none'
-  const showingFinancialFallback = spotlightTier === 'financial'
-  const showingProxy = spotlightTier === 'proxy'
+      : []
+  const spotlightTier: 'loading' | 'spotlight' | 'none' =
+    awaitingRemote ? 'loading' : charts.length > 0 ? 'spotlight' : 'none'
   const allFinancial = displayCharts.length > 0 && displayCharts.every(kpi => kpi.company_specific === false)
 
   useEffect(() => {
@@ -1362,19 +1346,11 @@ function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData;
 	                      ? "bg-amber-400"
 	                      : spotlightTier === "spotlight"
 	                        ? "bg-emerald-500"
-	                        : spotlightTier === "proxy"
-	                          ? "bg-sky-500"
-	                          : spotlightTier === "financial"
-                            ? "bg-slate-400"
-                            : "bg-slate-400"
+	                        : "bg-slate-400"
                   )}
 	                />
 		              {spotlightTier === "loading"
 		                  ? 'Finding KPI…'
-		                  : showingProxy
-		                    ? 'Proxy KPI'
-		                    : showingFinancialFallback
-                      ? 'Financial Highlights'
 	                : allFinancial
 	                  ? displayCharts.length === 1
 	                    ? 'Financial Metric'
@@ -1384,18 +1360,6 @@ function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData;
 	                    : `KPI Candidates • ${displayCharts.length}`}
 		            </span>
 		          </div>
-
-		          {showingProxy && (
-		            <p className="mb-4 text-xs text-slate-500 dark:text-gray-400 leading-relaxed">
-		              Showing a financial proxy KPI derived from the financial statements.
-		            </p>
-		          )}
-
-	          {showingFinancialFallback && !awaitingRemote && (
-	            <p className="mb-4 text-xs text-slate-500 dark:text-gray-400 leading-relaxed">
-	              No unique operating KPI was found in the filing text. Showing top financial highlights as a fallback.
-	            </p>
-	          )}
 
             {spotlightTier === 'spotlight' && allFinancial && (
               <p className="mb-4 text-xs text-slate-500 dark:text-gray-400 leading-relaxed">
