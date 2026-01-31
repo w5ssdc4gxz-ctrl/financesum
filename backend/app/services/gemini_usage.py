@@ -25,6 +25,111 @@ USAGE_LOCK_FILE = USAGE_DIR / "gemini_usage.lock"
 
 DEFAULT_TARGET_COST_USD = 0.1
 
+# Gemini 3 Flash pricing (estimated, adjust based on actual pricing)
+# These are used for token budget enforcement
+GEMINI_3_FLASH_INPUT_RATE_PER_M = 0.04  # $0.04 per 1M input tokens
+GEMINI_3_FLASH_OUTPUT_RATE_PER_M = 0.15  # $0.15 per 1M output tokens
+
+
+class TokenBudget:
+    """Enforces a cost budget for Gemini API calls.
+
+    This class tracks token usage across multiple calls and prevents
+    exceeding a target cost (default $0.10 per summary).
+
+    Usage:
+        budget = TokenBudget(target_cost_usd=0.10)
+
+        # Before each call:
+        if budget.can_afford(prompt, expected_output_tokens=500):
+            response = gemini_client.generate(prompt)
+            budget.charge(prompt, response)
+        else:
+            # Budget exhausted - abort or use fallback
+            pass
+    """
+
+    def __init__(
+        self,
+        target_cost_usd: float = DEFAULT_TARGET_COST_USD,
+        input_rate_per_m: Optional[float] = None,
+        output_rate_per_m: Optional[float] = None,
+    ):
+        self.target_cost_usd = float(target_cost_usd)
+
+        # Load rates from env or use defaults
+        if input_rate_per_m is not None:
+            self.input_rate_per_m = float(input_rate_per_m)
+        else:
+            self.input_rate_per_m = _float_env(
+                "GEMINI_COST_PER_1M_INPUT_TOKENS", GEMINI_3_FLASH_INPUT_RATE_PER_M
+            )
+
+        if output_rate_per_m is not None:
+            self.output_rate_per_m = float(output_rate_per_m)
+        else:
+            self.output_rate_per_m = _float_env(
+                "GEMINI_COST_PER_1M_OUTPUT_TOKENS", GEMINI_3_FLASH_OUTPUT_RATE_PER_M
+            )
+
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.total_cost_usd = 0.0
+        self.call_count = 0
+
+    @property
+    def remaining_budget(self) -> float:
+        """Remaining budget in USD."""
+        return max(0.0, self.target_cost_usd - self.total_cost_usd)
+
+    @property
+    def remaining_tokens(self) -> int:
+        """Approximate remaining tokens (assuming output-heavy usage)."""
+        if self.output_rate_per_m <= 0:
+            return 1_000_000  # No limit if rate is 0
+        return int((self.remaining_budget / self.output_rate_per_m) * 1_000_000)
+
+    def _estimate_cost(self, input_tokens: int, output_tokens: int) -> float:
+        """Estimate cost for given token counts."""
+        input_cost = (input_tokens / 1_000_000) * self.input_rate_per_m
+        output_cost = (output_tokens / 1_000_000) * self.output_rate_per_m
+        return input_cost + output_cost
+
+    def can_afford(self, prompt: str, expected_output_tokens: int = 500) -> bool:
+        """Check if we can afford another call within budget."""
+        input_tokens = _estimate_tokens(prompt)
+        estimated_cost = self._estimate_cost(input_tokens, expected_output_tokens)
+        return (self.total_cost_usd + estimated_cost) <= self.target_cost_usd
+
+    def charge(self, prompt: str, response: str) -> float:
+        """Record a completed call and return the cost charged."""
+        input_tokens = _estimate_tokens(prompt)
+        output_tokens = _estimate_tokens(response)
+        cost = self._estimate_cost(input_tokens, output_tokens)
+
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.total_cost_usd += cost
+        self.call_count += 1
+
+        return cost
+
+    def is_exhausted(self) -> bool:
+        """Check if budget is exhausted."""
+        return self.total_cost_usd >= self.target_cost_usd
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return budget state as a dictionary."""
+        return {
+            "target_cost_usd": self.target_cost_usd,
+            "total_cost_usd": round(self.total_cost_usd, 6),
+            "remaining_budget": round(self.remaining_budget, 6),
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "call_count": self.call_count,
+            "is_exhausted": self.is_exhausted(),
+        }
+
 
 @contextmanager
 def _exclusive_lock(path: Path):
@@ -109,9 +214,15 @@ def record_gemini_usage(
         total_tokens = None
 
         if usage_metadata:
-            prompt_tokens = usage_metadata.get("prompt_token_count") or usage_metadata.get("promptTokenCount")
-            output_tokens = usage_metadata.get("candidates_token_count") or usage_metadata.get("candidatesTokenCount")
-            total_tokens = usage_metadata.get("total_token_count") or usage_metadata.get("totalTokenCount")
+            prompt_tokens = usage_metadata.get(
+                "prompt_token_count"
+            ) or usage_metadata.get("promptTokenCount")
+            output_tokens = usage_metadata.get(
+                "candidates_token_count"
+            ) or usage_metadata.get("candidatesTokenCount")
+            total_tokens = usage_metadata.get(
+                "total_token_count"
+            ) or usage_metadata.get("totalTokenCount")
 
         if prompt_tokens is None:
             prompt_tokens = _estimate_tokens(prompt)

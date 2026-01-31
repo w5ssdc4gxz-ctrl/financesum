@@ -169,6 +169,10 @@ cd frontend
 npm run lint
 ```
 
+## Deployment
+
+Cloud Run deployment (Cloud Build → Cloud Run), verification, and rollback steps are in `HOW_TO_DEPLOY.md`.
+
 ## License
 
 MIT License

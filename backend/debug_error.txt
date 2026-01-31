@@ -1,7 +1,7 @@
-UNEXPECTED ERROR: 'DummyClient' object has no attribute 'set_usage_context'
-Type: <class 'AttributeError'>
+UNEXPECTED ERROR: name 'section_budget_tolerance' is not defined
+Type: <class 'NameError'>
 Traceback (most recent call last):
-  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 5275, in generate_filing_summary
-    gemini_client.set_usage_context(
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-AttributeError: 'DummyClient' object has no attribute 'set_usage_context'
+  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 10451, in generate_filing_summary
+    budget_tolerance=section_budget_tolerance,
+                     ^^^^^^^^^^^^^^^^^^^^^^^^
+NameError: name 'section_budget_tolerance' is not defined. Did you mean: '_section_budget_tolerance_words'?

@@ -19,6 +19,7 @@ from app.config import get_settings
 from app.api.companies import _supabase_configured
 from app.api.auth import CurrentUser, get_current_user
 from app.services.summary_export import build_summary_docx, build_summary_pdf
+from app.services.summary_length import clamp_summary_target_length
 from app.services.analysis_fallback import (
     get_analysis as fallback_get_analysis,
     get_analysis_status as fallback_get_analysis_status,
@@ -129,7 +130,9 @@ async def run_analysis(
         
         if request.analysis_options:
             include_personas = request.analysis_options.get("include_personas")
-            target_length = request.analysis_options.get("target_length")
+            target_length = clamp_summary_target_length(
+                request.analysis_options.get("target_length")
+            )
             complexity = request.analysis_options.get("complexity", "intermediate")
         
         task = analyze_company_task.delay(
@@ -392,4 +395,3 @@ async def delete_analysis(
         if is_supabase_table_missing_error(e):
             return None
         raise HTTPException(status_code=500, detail=f"Error deleting analysis: {str(e)}")
-

@@ -1,7 +1,11 @@
 """Gemini AI client for generating summaries and analysis."""
+
 import inspect
+import json
 import logging
+import os
 import re
+import time
 from types import SimpleNamespace
 from uuid import uuid4
 from typing import Any, Callable, Dict, List, Optional
@@ -27,33 +31,33 @@ from app.services.gemini_usage import record_gemini_usage
 
 logger = logging.getLogger(__name__)
 
-# Retry configuration constants
-DEFAULT_MAX_RETRIES = 5
+# Retry configuration constants - reduced for faster response times
+DEFAULT_MAX_RETRIES = 2  # Reduced from 5 to fail faster
 DEFAULT_INITIAL_WAIT = 1  # seconds
-DEFAULT_MAX_WAIT = 60  # seconds
+DEFAULT_MAX_WAIT = 15  # Reduced from 60 to fail faster
 DEFAULT_EXPONENTIAL_MULTIPLIER = 2
 
 # Persona word count targets (midpoint of recommended range ±10 tolerance)
 PERSONA_DEFAULT_LENGTHS = {
-    "dalio": 425,      # midpoint of 350-500
-    "buffett": 325,    # midpoint of 250-400
-    "lynch": 375,      # midpoint of 300-450
-    "greenblatt": 150, # midpoint of 100-200
-    "marks": 475,      # midpoint of 400-550
-    "ackman": 475,     # midpoint of 400-550
-    "bogle": 425,      # midpoint of 350-500
-    "munger": 225,     # midpoint of 150-300
-    "graham": 250,     # midpoint of 200-300
-    "wood": 300,       # midpoint of 250-350
+    "dalio": 425,  # midpoint of 350-500
+    "buffett": 325,  # midpoint of 250-400
+    "lynch": 375,  # midpoint of 300-450
+    "greenblatt": 150,  # midpoint of 100-200
+    "marks": 475,  # midpoint of 400-550
+    "ackman": 475,  # midpoint of 400-550
+    "bogle": 425,  # midpoint of 350-500
+    "munger": 225,  # midpoint of 150-300
+    "graham": 250,  # midpoint of 200-300
+    "wood": 300,  # midpoint of 250-350
 }
 
 
 class GeminiClient:
     """Client for interacting with Gemini AI."""
-    
+
     def __init__(
         self,
-        model_name: str = "gemini-2.5-flash",
+        model_name: str = "gemini-3-flash-preview",
         max_retries: int = DEFAULT_MAX_RETRIES,
         initial_wait: int = DEFAULT_INITIAL_WAIT,
         max_wait: int = DEFAULT_MAX_WAIT,
@@ -69,14 +73,24 @@ class GeminiClient:
         """
         settings = get_settings()
         self.api_key = settings.gemini_api_key
-        self.request_timeout = 180  # seconds per API call - summary generation can take 2-3 minutes
+        # Default timeout: keep summaries responsive. Reduced from 90s.
+        # (Cloud Run request timeouts + UI polling make multi-minute calls feel "stuck".)
+        self.request_timeout = int(os.getenv("GEMINI_REQUEST_TIMEOUT_SECONDS", "45"))
         genai.configure(api_key=self.api_key)
         self.model_name = model_name
         self.persona_model_name = model_name
-        # Cap output tokens to speed up responses while leaving headroom for long memos
-        self.base_generation_config = {"maxOutputTokens": 9000, "temperature": 0.55}
+        # Cap output tokens to speed up responses. Allow env override.
+        default_out = int(os.getenv("GEMINI_DEFAULT_MAX_OUTPUT_TOKENS", "4500"))
+        self.base_generation_config = {
+            "maxOutputTokens": default_out,
+            "temperature": 0.45,
+        }
         # Slightly higher temperature/topP for personas to encourage phrasing variance without losing structure
-        self.persona_generation_config = {"maxOutputTokens": 9000, "temperature": 0.65, "topP": 0.92}
+        self.persona_generation_config = {
+            "maxOutputTokens": max(default_out, 5200),
+            "temperature": 0.55,
+            "topP": 0.92,
+        }
         # Force HTTP fallback by default to avoid request_options schema mismatches that surface as 500s
         self.force_http_fallback = True
 
@@ -92,7 +106,7 @@ class GeminiClient:
             generation_config=genai.types.GenerationConfig(
                 max_output_tokens=16000,
                 temperature=0.5,  # Lowered from 0.7 for more consistent output
-            )
+            ),
         )
 
         # Premium model for persona generation - balanced temperature for distinctive voice
@@ -104,7 +118,7 @@ class GeminiClient:
                 max_output_tokens=16000,
                 temperature=0.50,  # Increased for more distinctive persona voice
                 top_p=0.9,  # Added for better diversity
-            )
+            ),
         )
         # ALWAYS use HTTP fallback - the google-generativeai SDK has a known bug where
         # it passes request_options to the proto which doesn't accept it, causing:
@@ -115,10 +129,296 @@ class GeminiClient:
 
     def set_usage_context(self, context: Optional[Dict[str, Any]]) -> None:
         self.usage_context = context or None
-    
+
     def _resolve_model_path(self, use_persona_model: bool = False) -> str:
         raw_name = self.persona_model_name if use_persona_model else self.model_name
         return raw_name if raw_name.startswith("models/") else f"models/{raw_name}"
+
+    def upload_file_bytes(
+        self,
+        *,
+        data: bytes,
+        mime_type: str,
+        display_name: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Upload bytes to the Gemini Files API and return the `file` object."""
+        if not self.api_key:
+            raise GeminiAPIError("Gemini API key not configured", status_code=401)
+
+        boundary = f"boundary_{int(time.time() * 1000)}"
+        meta: Dict[str, Any] = {"file": {}}
+        if display_name:
+            meta["file"]["displayName"] = str(display_name)
+
+        body = b"".join(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                b"Content-Type: application/json; charset=utf-8\r\n\r\n",
+                json.dumps(meta).encode("utf-8"),
+                b"\r\n",
+                f"--{boundary}\r\n".encode("utf-8"),
+                f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8"),
+                data,
+                b"\r\n",
+                f"--{boundary}--\r\n".encode("utf-8"),
+            ]
+        )
+
+        url = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+        headers = {
+            "X-Goog-Upload-Protocol": "multipart",
+            "Content-Type": f'multipart/related; boundary="{boundary}"',
+        }
+
+        try:
+            timeout = (
+                float(timeout_seconds)
+                if timeout_seconds is not None
+                else float(self.request_timeout + 10)
+            )
+            with httpx.Client(timeout=timeout) as client:
+                response = client.post(
+                    url,
+                    params={"key": self.api_key},
+                    headers=headers,
+                    content=body,
+                )
+
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    retry_seconds = (
+                        int(retry_after)
+                        if retry_after and str(retry_after).isdigit()
+                        else None
+                    )
+                    error_msg = "Gemini Files API rate limit exceeded."
+                    if retry_seconds:
+                        error_msg += f" Retry after {retry_seconds} seconds."
+                    raise GeminiRateLimitError(error_msg, retry_after=retry_seconds)
+
+                if response.status_code >= 400:
+                    response_text = (response.text or "")[:2000]
+                    raise GeminiAPIError(
+                        f"Gemini Files API error: {response.status_code}",
+                        status_code=response.status_code,
+                        response_body=response_text,
+                    )
+
+                payload = response.json()
+        except httpx.TimeoutException as timeout_exc:
+            raise GeminiTimeoutError(
+                f"Gemini Files API request timed out after {self.request_timeout}s"
+            ) from timeout_exc
+
+        if isinstance(payload, dict) and isinstance(payload.get("file"), dict):
+            return payload["file"]
+        if isinstance(payload, dict):
+            return payload
+        raise GeminiAPIError(
+            "Gemini Files API returned unexpected response",
+            status_code=500,
+            response_body=str(payload),
+        )
+
+    def _http_generate_content_with_parts(
+        self,
+        *,
+        parts: List[Dict[str, Any]],
+        prompt_for_usage: str,
+        use_persona_model: bool = False,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        stage_name: str = "Generating",
+        usage_context: Optional[Dict[str, Any]] = None,
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> str:
+        """HTTP generateContent using structured parts (e.g., fileData + text)."""
+        if progress_callback:
+            progress_callback(5, stage_name)
+
+        generation_config: Dict[str, Any] = dict(
+            self.persona_generation_config
+            if use_persona_model
+            else self.base_generation_config
+        )
+        if isinstance(generation_config_override, dict) and generation_config_override:
+            generation_config.update(
+                {k: v for k, v in generation_config_override.items() if v is not None}
+            )
+
+        payload = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {
+                k: v for k, v in generation_config.items() if v is not None
+            },
+        }
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/"
+            f"{self._resolve_model_path(use_persona_model)}:generateContent"
+        )
+
+        try:
+            timeout = (
+                float(timeout_seconds)
+                if timeout_seconds is not None
+                else float(self.request_timeout + 5)
+            )
+            with httpx.Client(timeout=timeout) as client:
+                response = client.post(url, params={"key": self.api_key}, json=payload)
+
+                # Best-effort retry once without unrecognized generationConfig fields.
+                if response.status_code == 400 and isinstance(
+                    payload.get("generationConfig"), dict
+                ):
+                    err_text = (response.text or "")[:2000]
+                    gen_cfg = dict(payload.get("generationConfig") or {})
+                    removable = []
+                    for field in (
+                        "responseMimeType",
+                        "responseSchema",
+                        "thinkingConfig",
+                    ):
+                        if field not in gen_cfg:
+                            continue
+                        if field == "thinkingConfig":
+                            if any(
+                                tok in err_text
+                                for tok in (
+                                    "thinkingConfig",
+                                    "thinkingLevel",
+                                    "thinkingBudget",
+                                    "includeThoughts",
+                                    "thinking",
+                                )
+                            ):
+                                removable.append(field)
+                            continue
+                        if field == "responseMimeType":
+                            if any(
+                                tok in err_text
+                                for tok in (
+                                    "responseMimeType",
+                                    "response_mime_type",
+                                    "mime",
+                                    "application/json",
+                                )
+                            ):
+                                removable.append(field)
+                            continue
+                        if field in err_text:
+                            removable.append(field)
+                    if removable:
+                        payload_retry = dict(payload)
+                        gen_cfg_retry = dict(
+                            payload_retry.get("generationConfig") or {}
+                        )
+                        for field in removable:
+                            gen_cfg_retry.pop(field, None)
+                        payload_retry["generationConfig"] = gen_cfg_retry
+                        response = client.post(
+                            url, params={"key": self.api_key}, json=payload_retry
+                        )
+
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    retry_seconds = (
+                        int(retry_after)
+                        if retry_after and str(retry_after).isdigit()
+                        else None
+                    )
+                    error_msg = "Gemini API rate limit exceeded."
+                    if retry_seconds:
+                        error_msg += f" Retry after {retry_seconds} seconds."
+                    raise GeminiRateLimitError(error_msg, retry_after=retry_seconds)
+
+                if response.status_code >= 400:
+                    response_text = response.text[:500]
+                    raise GeminiAPIError(
+                        f"Gemini API error: {response.status_code}",
+                        status_code=response.status_code,
+                        response_body=response_text,
+                    )
+
+                data = response.json()
+        except httpx.TimeoutException as timeout_exc:
+            raise GeminiTimeoutError(
+                f"Gemini API request timed out after {self.request_timeout}s"
+            ) from timeout_exc
+        except (GeminiRateLimitError, GeminiAPIError, GeminiTimeoutError):
+            raise
+        except Exception as unexpected_exc:  # noqa: BLE001
+            raise GeminiAPIError(
+                f"Unexpected error during Gemini API call: {str(unexpected_exc)}",
+                status_code=500,
+                response_body=None,
+            ) from unexpected_exc
+
+        usage_metadata = data.get("usageMetadata") if isinstance(data, dict) else None
+
+        text_response = ""
+        for candidate in data.get("candidates") or []:
+            content = candidate.get("content") or {}
+            content_parts = content.get("parts") or []
+            texts = [
+                part.get("text")
+                for part in content_parts
+                if isinstance(part, dict) and part.get("text")
+            ]
+            if texts:
+                text_response = "".join(texts)
+                break
+
+        if not text_response:
+            raise GeminiAPIError(
+                "Gemini API returned no text content",
+                status_code=500,
+                response_body=str(data),
+            )
+
+        record_gemini_usage(
+            prompt=prompt_for_usage,
+            response_text=text_response,
+            usage_metadata=usage_metadata,
+            model=self.persona_model_name if use_persona_model else self.model_name,
+            usage_context=usage_context or self.usage_context,
+        )
+
+        if progress_callback:
+            progress_callback(100, stage_name)
+
+        return text_response
+
+    def stream_generate_content_with_file_uri(
+        self,
+        *,
+        file_uri: str,
+        file_mime_type: str,
+        prompt: str,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        stage_name: str = "Generating",
+        expected_tokens: int = 4000,
+        use_persona_model: bool = False,
+        usage_context: Optional[Dict[str, Any]] = None,
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> str:
+        """Generate content using an uploaded file reference (fileUri)."""
+        _ = expected_tokens  # kept for signature parity with `stream_generate_content`
+        parts: List[Dict[str, Any]] = [
+            {"fileData": {"fileUri": str(file_uri), "mimeType": str(file_mime_type)}},
+            {"text": str(prompt or "")},
+        ]
+        return self._http_generate_content_with_parts(
+            parts=parts,
+            prompt_for_usage=prompt,
+            use_persona_model=use_persona_model,
+            progress_callback=progress_callback,
+            stage_name=stage_name,
+            usage_context=usage_context,
+            generation_config_override=generation_config_override,
+            timeout_seconds=timeout_seconds,
+        )
 
     def _http_generate_content(
         self,
@@ -127,6 +427,8 @@ class GeminiClient:
         progress_callback: Optional[Callable[[int, str], None]] = None,
         stage_name: str = "Generating",
         usage_context: Optional[Dict[str, Any]] = None,
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        timeout_seconds: Optional[float] = None,
     ) -> str:
         """
         Lightweight HTTP fallback with proper error handling.
@@ -139,14 +441,23 @@ class GeminiClient:
         """
         if progress_callback:
             # Keep user-facing progress clean; internal transport (HTTP fallback vs SDK) is not relevant.
-            progress_callback(5, f"{stage_name}... 5%")
+            progress_callback(5, stage_name)
 
-        generation_config = (
-            self.persona_generation_config if use_persona_model else self.base_generation_config
+        generation_config: Dict[str, Any] = dict(
+            self.persona_generation_config
+            if use_persona_model
+            else self.base_generation_config
         )
+        if isinstance(generation_config_override, dict) and generation_config_override:
+            # Allow call sites to enforce JSON output, lower temperature, etc.
+            generation_config.update(
+                {k: v for k, v in generation_config_override.items() if v is not None}
+            )
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {k: v for k, v in generation_config.items() if v is not None},
+            "generationConfig": {
+                k: v for k, v in generation_config.items() if v is not None
+            },
         }
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/"
@@ -154,13 +465,79 @@ class GeminiClient:
         )
 
         try:
-            with httpx.Client(timeout=self.request_timeout + 5) as client:
+            timeout = (
+                float(timeout_seconds)
+                if timeout_seconds is not None
+                else float(self.request_timeout + 5)
+            )
+            with httpx.Client(timeout=timeout) as client:
                 response = client.post(url, params={"key": self.api_key}, json=payload)
+
+                # Some Gemini API versions reject newer generationConfig fields.
+                # Retry once without unrecognized fields (best-effort).
+                if response.status_code == 400 and isinstance(
+                    payload.get("generationConfig"), dict
+                ):
+                    err_text = (response.text or "")[:2000]
+                    gen_cfg = dict(payload.get("generationConfig") or {})
+                    removable = []
+                    for field in (
+                        "responseMimeType",
+                        "responseSchema",
+                        "thinkingConfig",
+                    ):
+                        if field not in gen_cfg:
+                            continue
+                        # Some error payloads mention nested keys (e.g. thinkingLevel) rather than
+                        # the parent object name. Be conservative: if the error mentions
+                        # "thinking" at all, drop thinkingConfig on retry.
+                        if field == "thinkingConfig":
+                            if any(
+                                tok in err_text
+                                for tok in (
+                                    "thinkingConfig",
+                                    "thinkingLevel",
+                                    "thinkingBudget",
+                                    "includeThoughts",
+                                    "thinking",
+                                )
+                            ):
+                                removable.append(field)
+                            continue
+                        if field == "responseMimeType":
+                            if any(
+                                tok in err_text
+                                for tok in (
+                                    "responseMimeType",
+                                    "response_mime_type",
+                                    "mime",
+                                    "application/json",
+                                )
+                            ):
+                                removable.append(field)
+                            continue
+                        if field in err_text:
+                            removable.append(field)
+                    if removable:
+                        payload_retry = dict(payload)
+                        gen_cfg_retry = dict(
+                            payload_retry.get("generationConfig") or {}
+                        )
+                        for field in removable:
+                            gen_cfg_retry.pop(field, None)
+                        payload_retry["generationConfig"] = gen_cfg_retry
+                        response = client.post(
+                            url, params={"key": self.api_key}, json=payload_retry
+                        )
 
                 # Handle rate limiting (429) specifically
                 if response.status_code == 429:
                     retry_after = response.headers.get("Retry-After")
-                    retry_seconds = int(retry_after) if retry_after and retry_after.isdigit() else None
+                    retry_seconds = (
+                        int(retry_after)
+                        if retry_after and retry_after.isdigit()
+                        else None
+                    )
 
                     error_msg = "Gemini API rate limit exceeded."
                     if retry_seconds:
@@ -174,7 +551,7 @@ class GeminiClient:
                     raise GeminiAPIError(
                         f"Gemini API error: {response.status_code}",
                         status_code=response.status_code,
-                        response_body=response_text
+                        response_body=response_text,
                     )
 
                 # Parse successful response
@@ -194,7 +571,7 @@ class GeminiClient:
             raise GeminiAPIError(
                 f"HTTP error: {http_exc.response.status_code}",
                 status_code=http_exc.response.status_code,
-                response_body=str(http_exc)
+                response_body=str(http_exc),
             ) from http_exc
 
         except Exception as unexpected_exc:
@@ -202,7 +579,7 @@ class GeminiClient:
             raise GeminiAPIError(
                 f"Unexpected error during Gemini API call: {str(unexpected_exc)}",
                 status_code=500,
-                response_body=None
+                response_body=None,
             ) from unexpected_exc
 
         usage_metadata = data.get("usageMetadata") if isinstance(data, dict) else None
@@ -212,7 +589,11 @@ class GeminiClient:
         for candidate in data.get("candidates") or []:
             content = candidate.get("content") or {}
             parts = content.get("parts") or []
-            texts = [part.get("text") for part in parts if isinstance(part, dict) and part.get("text")]
+            texts = [
+                part.get("text")
+                for part in parts
+                if isinstance(part, dict) and part.get("text")
+            ]
             if texts:
                 text_response = "".join(texts)
                 break
@@ -221,7 +602,7 @@ class GeminiClient:
             raise GeminiAPIError(
                 "Gemini API returned no text content",
                 status_code=500,
-                response_body=str(data)
+                response_body=str(data),
             )
 
         record_gemini_usage(
@@ -233,7 +614,7 @@ class GeminiClient:
         )
 
         if progress_callback:
-            progress_callback(100, f"{stage_name}... Complete")
+            progress_callback(100, stage_name)
 
         return text_response
 
@@ -244,6 +625,8 @@ class GeminiClient:
         progress_callback: Optional[Callable[[int, str], None]] = None,
         stage_name: str = "Generating",
         usage_context: Optional[Dict[str, Any]] = None,
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        timeout_seconds: Optional[float] = None,
     ) -> str:
         """
         Wrapper around _http_generate_content with exponential backoff retry logic.
@@ -265,7 +648,11 @@ class GeminiClient:
         def _should_retry(exc: BaseException) -> bool:
             if isinstance(exc, (GeminiRateLimitError, GeminiTimeoutError)):
                 return True
-            if isinstance(exc, GeminiAPIError) and exc.status_code and exc.status_code >= 500:
+            if (
+                isinstance(exc, GeminiAPIError)
+                and exc.status_code
+                and exc.status_code >= 500
+            ):
                 return True
             return False
 
@@ -275,10 +662,10 @@ class GeminiClient:
             wait=wait_exponential(
                 multiplier=DEFAULT_EXPONENTIAL_MULTIPLIER,
                 min=self.initial_wait,
-                max=self.max_wait
+                max=self.max_wait,
             ),
             before_sleep=before_sleep_log(logger, logging.WARNING),
-            reraise=True  # Re-raise the exception after all retries exhausted
+            reraise=True,  # Re-raise the exception after all retries exhausted
         )
         def _retry_wrapper():
             return self._http_generate_content(
@@ -287,6 +674,8 @@ class GeminiClient:
                 progress_callback=progress_callback,
                 stage_name=stage_name,
                 usage_context=usage_context,
+                generation_config_override=generation_config_override,
+                timeout_seconds=timeout_seconds,
             )
 
         try:
@@ -303,47 +692,65 @@ class GeminiClient:
         expected_tokens: int = 4000,
         use_persona_model: bool = False,
         usage_context: Optional[Dict[str, Any]] = None,
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        timeout_seconds: Optional[float] = None,
+        retry: bool = True,
     ) -> str:
         """
         Generate content with streaming and real-time progress updates.
-        
+
         Args:
             prompt: The prompt to send to Gemini
             progress_callback: Callback function(percentage, status_message) for progress updates
             stage_name: Name of the current stage for status messages
             expected_tokens: Expected number of tokens in response for progress estimation
             use_persona_model: Whether to use the persona model (higher temperature)
-        
+
         Returns:
             Complete generated text
         """
         if self.force_http_fallback:
-            return self._http_generate_content_with_retry(
+            if retry:
+                return self._http_generate_content_with_retry(
+                    prompt,
+                    use_persona_model=use_persona_model,
+                    progress_callback=progress_callback,
+                    stage_name=stage_name,
+                    usage_context=usage_context,
+                    generation_config_override=generation_config_override,
+                    timeout_seconds=timeout_seconds,
+                )
+            return self._http_generate_content(
                 prompt,
                 use_persona_model=use_persona_model,
                 progress_callback=progress_callback,
                 stage_name=stage_name,
                 usage_context=usage_context,
+                generation_config_override=generation_config_override,
+                timeout_seconds=timeout_seconds,
             )
 
         model = self.persona_model if use_persona_model else self.model
         accumulated_text = ""
         chunk_count = 0
-        
+
         try:
             response = model.generate_content(prompt, stream=True)
-            
+
             for chunk in response:
                 if chunk.text:
                     accumulated_text += chunk.text
                     chunk_count += 1
-                    
+
                     if progress_callback and chunk_count % 5 == 0:
-                        estimated_progress = min(95, int((len(accumulated_text) / (expected_tokens * 4)) * 100))
-                        progress_callback(estimated_progress, f"{stage_name}... {estimated_progress}%")
-            
+                        estimated_progress = min(
+                            95,
+                            int((len(accumulated_text) / (expected_tokens * 4)) * 100),
+                        )
+                        progress_callback(estimated_progress, stage_name)
+
             if progress_callback:
-                progress_callback(100, f"{stage_name}... Complete")
+                progress_callback(100, stage_name)
 
             record_gemini_usage(
                 prompt=prompt,
@@ -354,11 +761,13 @@ class GeminiClient:
             )
 
             return accumulated_text
-            
+
         except ValueError as e:
             # Older SDK/proto combinations can raise on request_options mismatches
             if "request_options" in str(e):
-                print("Streaming generation error due to request_options; retrying with HTTP fallback.")
+                print(
+                    "Streaming generation error due to request_options; retrying with HTTP fallback."
+                )
                 self.force_http_fallback = True
                 return self._http_generate_content_with_retry(
                     prompt,
@@ -376,8 +785,10 @@ class GeminiClient:
                 record_gemini_usage(
                     prompt=prompt,
                     response_text=text,
-                    usage_metadata=_coerce_usage_metadata(response),
-                    model=self.persona_model_name if use_persona_model else self.model_name,
+                    usage_metadata=self._coerce_usage_metadata(response),
+                    model=self.persona_model_name
+                    if use_persona_model
+                    else self.model_name,
                     usage_context=usage_context or self.usage_context,
                 )
                 return text
@@ -398,6 +809,7 @@ class GeminiClient:
         use_persona_model: bool = False,
         timeout: Optional[int] = None,
         usage_context: Optional[Dict[str, Any]] = None,
+        generation_config_override: Optional[Dict[str, Any]] = None,
     ):
         """Wrapper to enforce request timeouts on non-streaming calls."""
         if self.force_http_fallback:
@@ -406,17 +818,32 @@ class GeminiClient:
                 use_persona_model=use_persona_model,
                 stage_name="Generating",
                 usage_context=usage_context,
+                generation_config_override=generation_config_override,
             )
             return SimpleNamespace(text=fallback_text)
 
         model = self.persona_model if use_persona_model else self.model
         # Rely on outer timeout guards instead of per-call request_options to avoid SDK/proto mismatches
         try:
-            response = model.generate_content(prompt)
+            if (
+                isinstance(generation_config_override, dict)
+                and generation_config_override
+            ):
+                gen_cfg = None
+                try:
+                    gen_cfg = genai.types.GenerationConfig(**generation_config_override)
+                except TypeError:
+                    gen_cfg = None
+                if gen_cfg is not None:
+                    response = model.generate_content(prompt, generation_config=gen_cfg)
+                else:
+                    response = model.generate_content(prompt)
+            else:
+                response = model.generate_content(prompt)
             record_gemini_usage(
                 prompt=prompt,
                 response_text=response.text,
-                usage_metadata=_coerce_usage_metadata(response),
+                usage_metadata=self._coerce_usage_metadata(response),
                 model=self.persona_model_name if use_persona_model else self.model_name,
                 usage_context=usage_context or self.usage_context,
             )
@@ -428,6 +855,7 @@ class GeminiClient:
                     use_persona_model=use_persona_model,
                     stage_name="Generating",
                     usage_context=usage_context,
+                    generation_config_override=generation_config_override,
                 )
                 self.force_http_fallback = True
                 return SimpleNamespace(text=fallback_text)
@@ -438,25 +866,31 @@ class GeminiClient:
                 use_persona_model=use_persona_model,
                 stage_name="Generating",
                 usage_context=usage_context,
+                generation_config_override=generation_config_override,
             )
             self.force_http_fallback = True
             return SimpleNamespace(text=fallback_text)
 
-
-def _coerce_usage_metadata(response: Any) -> Optional[Dict[str, Any]]:
-    usage = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
-    if usage is None:
-        return None
-    if isinstance(usage, dict):
-        return usage
-    data: Dict[str, Any] = {}
-    for attr in ("prompt_token_count", "candidates_token_count", "total_token_count"):
-        if hasattr(usage, attr):
-            data[attr] = getattr(usage, attr)
-    for attr in ("promptTokenCount", "candidatesTokenCount", "totalTokenCount"):
-        if hasattr(usage, attr):
-            data[attr] = getattr(usage, attr)
-    return data or None
+    def _coerce_usage_metadata(self, response: Any) -> Optional[Dict[str, Any]]:
+        usage = getattr(response, "usage_metadata", None) or getattr(
+            response, "usageMetadata", None
+        )
+        if usage is None:
+            return None
+        if isinstance(usage, dict):
+            return usage
+        data: Dict[str, Any] = {}
+        for attr in (
+            "prompt_token_count",
+            "candidates_token_count",
+            "total_token_count",
+        ):
+            if hasattr(usage, attr):
+                data[attr] = getattr(usage, attr)
+        for attr in ("promptTokenCount", "candidatesTokenCount", "totalTokenCount"):
+            if hasattr(usage, attr):
+                data[attr] = getattr(usage, attr)
+        return data or None
 
     def _post_process_summary(self, response_text: str) -> str:
         """
@@ -467,7 +901,7 @@ def _coerce_usage_metadata(response: Any) -> Optional[Dict[str, Any]]:
         4. Clean up formatting
         """
         import re
-        
+
         # Banned phrase patterns to remove
         banned_patterns = [
             r"Additionally,?\s*monitor[^.]*\.",
@@ -508,11 +942,11 @@ def _coerce_usage_metadata(response: Any) -> Optional[Dict[str, Any]]:
             r"pendulum",
             r"where are we in the cycle",
         ]
-        
+
         cleaned_text = response_text
         for pattern in banned_patterns:
             cleaned_text = re.sub(pattern, "", cleaned_text, flags=re.IGNORECASE)
-        
+
         # Remove stray monitoring directives at end of document (outside sections)
         monitoring_patterns = [
             r"\n\s*Monitor revenue trajectory[^\n]*",
@@ -525,101 +959,111 @@ def _coerce_usage_metadata(response: Any) -> Optional[Dict[str, Any]]:
         ]
         for pattern in monitoring_patterns:
             cleaned_text = re.sub(pattern, "", cleaned_text, flags=re.IGNORECASE)
-        
+
         # ALWAYS reorder sections to canonical 7-section order
-        lines = cleaned_text.strip().split('\n')
-        
+        lines = cleaned_text.strip().split("\n")
+
         # Section detection patterns - map to canonical keys
         section_patterns = [
-            ("health", r'^##?\s*\d*\.?\s*financial\s+health\s+rating'),
-            ("exec", r'^##?\s*\d*\.?\s*executive\s+summary'),
-            ("perf", r'^##?\s*\d*\.?\s*financial\s+performance'),
-            ("mda", r'^##?\s*\d*\.?\s*management\s+discussion'),
-            ("risks", r'^##?\s*\d*\.?\s*risk\s+factors?'),
-            ("metrics", r'^##?\s*\d*\.?\s*key\s+metrics'),
-            ("closing", r'^##?\s*\d*\.?\s*closing\s+takeaway'),
+            ("health", r"^##?\s*\d*\.?\s*financial\s+health\s+rating"),
+            ("exec", r"^##?\s*\d*\.?\s*executive\s+summary"),
+            ("perf", r"^##?\s*\d*\.?\s*financial\s+performance"),
+            ("mda", r"^##?\s*\d*\.?\s*management\s+discussion"),
+            ("risks", r"^##?\s*\d*\.?\s*risk\s+factors?"),
+            ("metrics", r"^##?\s*\d*\.?\s*key\s+metrics"),
+            ("closing", r"^##?\s*\d*\.?\s*closing\s+takeaway"),
         ]
-        
+
         # Non-canonical sections to fold or remove
         non_canonical_patterns = [
-            r'^##?\s*\d*\.?\s*strategic\s+initiatives',
-            r'^##?\s*\d*\.?\s*capital\s+allocation',
-            r'^##?\s*\d*\.?\s*competitive\s+landscape',
-            r'^##?\s*\d*\.?\s*catalysts?',
-            r'^##?\s*\d*\.?\s*investment\s+recommendation',
-            r'^##?\s*\d*\.?\s*investment\s+thesis',
-            r'^##?\s*\d*\.?\s*top\s+\d+\s+risks',
-            r'^##?\s*\d*\.?\s*key\s+kpis',
-            r'^##?\s*\d*\.?\s*cash\s+flow\s+analysis',
-            r'^##?\s*\d*\.?\s*key\s+data\s+appendix',
-            r'^##?\s*\d*\.?\s*health\s+score\s+drivers',
-            r'^##?\s*\d*\.?\s*tl;?dr',
+            r"^##?\s*\d*\.?\s*strategic\s+initiatives",
+            r"^##?\s*\d*\.?\s*capital\s+allocation",
+            r"^##?\s*\d*\.?\s*competitive\s+landscape",
+            r"^##?\s*\d*\.?\s*catalysts?",
+            r"^##?\s*\d*\.?\s*investment\s+recommendation",
+            r"^##?\s*\d*\.?\s*investment\s+thesis",
+            r"^##?\s*\d*\.?\s*top\s+\d+\s+risks",
+            r"^##?\s*\d*\.?\s*key\s+kpis",
+            r"^##?\s*\d*\.?\s*cash\s+flow\s+analysis",
+            r"^##?\s*\d*\.?\s*key\s+data\s+appendix",
+            r"^##?\s*\d*\.?\s*health\s+score\s+drivers",
+            r"^##?\s*\d*\.?\s*tl;?dr",
         ]
-        
+
         sections_found = {}
         current_section = None
         current_content = []
         preamble = []  # Content before first section
-        
+
         for line in lines:
             line_lower = line.lower().strip()
-            
+
             # Check if this line starts a canonical section
             found_section = None
             for section_key, pattern in section_patterns:
                 if re.match(pattern, line_lower):
                     found_section = section_key
                     break
-            
+
             # Check if this is a non-canonical section (to skip/fold)
-            is_non_canonical = any(re.match(p, line_lower) for p in non_canonical_patterns)
-            
+            is_non_canonical = any(
+                re.match(p, line_lower) for p in non_canonical_patterns
+            )
+
             if found_section:
                 # Save previous section
                 if current_section:
-                    sections_found[current_section] = '\n'.join(current_content)
+                    sections_found[current_section] = "\n".join(current_content)
                 elif current_content and not preamble:
                     preamble = current_content
-                
+
                 current_section = found_section
                 current_content = [line]
             elif is_non_canonical:
                 # Save previous section and start collecting non-canonical content
                 if current_section:
-                    sections_found[current_section] = '\n'.join(current_content)
+                    sections_found[current_section] = "\n".join(current_content)
                     current_content = []
                 # We'll skip the header of non-canonical sections
                 current_section = None  # Mark as non-canonical content
             else:
                 current_content.append(line)
-        
+
         # Save last section
         if current_section:
-            sections_found[current_section] = '\n'.join(current_content)
-        
+            sections_found[current_section] = "\n".join(current_content)
+
         # If no sections found, return original cleaned text
         if not sections_found:
-            cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
+            cleaned_text = re.sub(r"\n{3,}", "\n\n", cleaned_text)
             return cleaned_text.strip()
-        
+
         # Rebuild in canonical order: health, exec, perf, mda, risks, metrics, closing
-        canonical_order = ["health", "exec", "perf", "mda", "risks", "metrics", "closing"]
+        canonical_order = [
+            "health",
+            "exec",
+            "perf",
+            "mda",
+            "risks",
+            "metrics",
+            "closing",
+        ]
         rebuilt = []
-        
+
         for key in canonical_order:
             if key in sections_found:
                 rebuilt.append(sections_found[key])
-        
+
         if rebuilt:
-            cleaned_text = '\n\n'.join(rebuilt)
-        
+            cleaned_text = "\n\n".join(rebuilt)
+
         # Clean up multiple newlines
-        cleaned_text = re.sub(r'\n{3,}', '\n\n', cleaned_text)
-        
+        cleaned_text = re.sub(r"\n{3,}", "\n\n", cleaned_text)
+
         # Clean up empty sentences from removed phrases
-        cleaned_text = re.sub(r'\.\s*\.', '.', cleaned_text)
-        cleaned_text = re.sub(r'\s{2,}', ' ', cleaned_text)
-        
+        cleaned_text = re.sub(r"\.\s*\.", ".", cleaned_text)
+        cleaned_text = re.sub(r"\s{2,}", " ", cleaned_text)
+
         return cleaned_text.strip()
 
     def generate_company_summary(
@@ -631,11 +1075,11 @@ def _coerce_usage_metadata(response: Any) -> Optional[Dict[str, Any]]:
         mda_text: Optional[str] = None,
         risk_factors_text: Optional[str] = None,
         target_length: Optional[int] = None,
-        complexity: str = "intermediate"
+        complexity: str = "intermediate",
     ) -> Dict[str, str]:
         """
         Generate comprehensive company analysis summary.
-        
+
         Args:
             company_name: Name of the company
             financial_data: Financial statements data
@@ -645,7 +1089,7 @@ def _coerce_usage_metadata(response: Any) -> Optional[Dict[str, Any]]:
             risk_factors_text: Risk factors text
             target_length: Optional target length for the summary
             complexity: Complexity level of the summary
-        
+
         Returns:
             Dictionary with summary components
         """
@@ -663,54 +1107,66 @@ def _coerce_usage_metadata(response: Any) -> Optional[Dict[str, Any]]:
             complexity,
             variation_token,
         )
-        
+
         max_retries = 3
         current_try = 0
-        
+
         while current_try < max_retries:
             try:
                 response = self.generate_content(prompt)
                 summary_text = response.text
-                
-                # Check word count with ±10 tolerance
+
+                # Check word count against a hard cap
                 word_count = len(summary_text.split())
 
                 if target_length:
-                    min_acceptable = target_length - 10
-                    max_acceptable = target_length + 10
-
-                    if word_count < min_acceptable:
-                        delta = min_acceptable - word_count
-                        print(f"Summary too short ({word_count} words, target {target_length}±10). Retrying...")
-                        prompt += f"\n\nSYSTEM FEEDBACK: Word count {word_count} is {delta} words SHORT of minimum {min_acceptable}. Target: {target_length} words (±10 tolerance). You MUST add {delta}+ words of substantive analysis. NO FILLER PHRASES like 'Additional detail covers...' or 'Risk coverage includes...'. Add real analysis to 'Thesis' and 'Risks' sections."
-                        current_try += 1
-                        continue
-                    elif word_count > max_acceptable:
+                    max_acceptable = int(target_length)
+                    if word_count > max_acceptable:
                         excess = word_count - max_acceptable
-                        print(f"Summary too long ({word_count} words, target {target_length}±10). Retrying...")
-                        prompt += f"\n\nSYSTEM FEEDBACK: Word count {word_count} is {excess} words OVER maximum {max_acceptable}. Target: {target_length} words (±10 tolerance). CUT {excess}+ words. Remove generic phrases, redundancy, and filler. Keep only substantive analysis."
+                        print(
+                            f"Summary too long ({word_count} words, max {max_acceptable}). Retrying..."
+                        )
+                        prompt += (
+                            f"\n\nSYSTEM FEEDBACK: Word count {word_count} exceeds the maximum of {max_acceptable} by {excess} words. "
+                            f"CUT {excess}+ words by removing redundancy and generic filler while preserving substance."
+                        )
                         current_try += 1
                         continue
-                
+
                 # Parse the response into structured sections
                 # First, apply post-processing to fix section order and remove banned phrases
                 summary_text = self._post_process_summary(summary_text)
+                # Post-processing can delete whole sentences; re-check the final text we’ll parse/return.
+                if target_length:
+                    post_wc = len(summary_text.split())
+                    max_acceptable = int(target_length)
+                    if post_wc > max_acceptable:
+                        excess = post_wc - max_acceptable
+                        print(
+                            f"Summary too long after post-processing ({post_wc} words, max {max_acceptable}). Retrying..."
+                        )
+                        prompt += (
+                            f"\n\nSYSTEM FEEDBACK: After post-processing, word count {post_wc} exceeds the maximum of {max_acceptable} by {excess} words. "
+                            f"Cut {excess}+ words by removing redundancy and generic phrasing while preserving substance."
+                        )
+                        current_try += 1
+                        continue
                 sections = self._parse_summary_response(summary_text)
                 sections["tldr"] = self._clamp_tldr_length(sections.get("tldr", ""))
                 return sections
-            
+
             except Exception as e:
                 print(f"Error generating summary (attempt {current_try}): {e}")
                 current_try += 1
-        
+
         return {
             "tldr": "Error generating summary after retries",
             "thesis": "",
             "risks": "",
             "catalysts": "",
-            "kpis": ""
+            "kpis": "",
         }
-    
+
     def _build_summary_prompt(
         self,
         company_name: str,
@@ -725,15 +1181,21 @@ def _coerce_usage_metadata(response: Any) -> Optional[Dict[str, Any]]:
     ) -> str:
         """Build the prompt for company summary generation."""
         # Format financial data
-        ratios_str = "\n".join([
-            f"- {key}: {value:.2%}" if isinstance(value, float) and abs(value) < 10 else f"- {key}: {value:.2f}"
-            for key, value in ratios.items()
-            if value is not None
-        ])
-        
+        ratios_str = "\n".join(
+            [
+                f"- {key}: {value:.2%}"
+                if isinstance(value, float) and abs(value) < 10
+                else f"- {key}: {value:.2f}"
+                for key, value in ratios.items()
+                if value is not None
+            ]
+        )
+
         complexity_instruction = ""
         if complexity == "simple":
-            complexity_instruction = "Use plain English and avoid jargon. Explain financial concepts simply."
+            complexity_instruction = (
+                "Use plain English and avoid jargon. Explain financial concepts simply."
+            )
         elif complexity == "expert":
             complexity_instruction = "Use sophisticated financial terminology. Assume the reader is an expert investor."
         else:
@@ -741,35 +1203,47 @@ def _coerce_usage_metadata(response: Any) -> Optional[Dict[str, Any]]:
 
         length_instruction = ""
         if target_length:
-            min_words = target_length - 10
-            max_words = target_length + 10
             length_instruction = f"""
-CRITICAL LENGTH CONSTRAINT (STRICT ±10 WORDS - ABSOLUTE REQUIREMENT):
-Target: EXACTLY {target_length} words (acceptable range: {min_words}-{max_words} words).
-
-SECTION WORD ALLOCATION (7 sections):
-- Financial Health Rating: ~{int(target_length * 0.03)} words (1 line)
-- Executive Summary: ~{int(target_length * 0.25)} words
-- Financial Performance: ~{int(target_length * 0.20)} words
-- Management Discussion & Analysis: ~{int(target_length * 0.15)} words
-- Risk Factors: ~{int(target_length * 0.18)} words
-- Key Metrics: ~{int(target_length * 0.09)} words
-- Closing Takeaway: ~{int(target_length * 0.10)} words
-
-LENGTH ADJUSTMENT RULES:
-- If running SHORT: Add specific data points and analytical depth to Executive Summary or Financial Performance.
-- If running LONG: Remove redundancy and generic phrases.
-- NEVER cut off mid-sentence to hit word count.
+CRITICAL LENGTH CONSTRAINT (HARD CAP):
+Max length: {target_length} words.
+- Treat this as a maximum, not a quota. It is acceptable to be shorter if additional words would be repetitive.
+- Do NOT pad with generic filler or repeated framework sentences to reach a number.
+- If you would exceed the cap, remove redundancy and keep the most decision-relevant numbers and mechanisms.
+- NEVER cut off mid-sentence to manage length.
 """
 
         variation_clause = ""
         if variation_token:
             variation_clause = f"\nSTYLE VARIATION TOKEN: {variation_token}\n- Vary sentence openings and word choice from prior runs.\n- Avoid reusing identical phrasing in the Closing Takeaway.\n"
 
+        clarity_guidance = """
+CLARITY, STRUCTURE & SO-WHAT DISCIPLINE:
+10. CLARITY & CONCISION: State each core insight once, avoid replaying the same durability/margin/cash story, and keep paragraph length modest so ideas breathe and signal density stays high.
+11. STRUCTURE & HIERARCHY: Within every analytic section, start with the fact, follow with interpretation, and close with investor framing ("This matters because..." or "Investors should watch...") so readers can see how the evidence builds to a decision.
+12. SO WHAT: Conclude Executive Summary, MD&A, Risk Factors, and Closing Takeaway with an explicit "So what" sentence that tells the reader what to remember, which metric to monitor, and what would change the view.
+13. RISK DISCIPLINE: Group risks into discrete themes (execution, incentives/margins, financing, competition) and describe each once with crisp implications; do not re-litigate the same risk in multiple entries.
+14. KEY METRICS DISCIPLINE: Keep the Key Metrics block limited to the canonical data lines with no added prose or extra watch items. Redirect any surplus length into the narrative sections instead.
+15. TONE & POLISH: Keep the voice objective, action-focused, and investor-grade. Eliminate reflective asides, mechanical repeats, or sentence fragments; every sentence should feel intentional and complete.
+16. EDITING DISCIPLINE (MANDATORY): If an idea is stated once clearly, do not restate it later unless you add NEW information (new number, new mechanism, new trade-off, or a new conditional trigger).
+17. PROGRESSIVE LAYERING: Executive Summary introduces the thesis; Financial Performance adds period-over-period evidence; MD&A tests capital posture and execution; Risk Factors stress-test; Closing Takeaway resolves with one clear stance and triggers.
+18. WHAT-CHANGED FOCUS (MANDATORY): Explicitly compare the latest reported period to the immediately prior comparable period (QoQ for quarterly data; YoY for annual). Spread comparisons across sections (do not repeat the same delta multiple times).
+"""
+        long_form_addendum = ""
+        if target_length and target_length >= 1000:
+            long_form_addendum = """
+LONG-FORM QUALITY ADDENDUM (TARGET ≥ 1,000 WORDS):
+- Treat this memo like a short novel: keep each paragraph focused, use connective transitions, let one idea breathe before moving to the next, and charge the extra length with fresh nuance instead of repeating earlier phrases.
+- When you revisit durability, margins, or cash conversion, bring a new data point, timeframe, or scenario so the narrative keeps evolving.
+- Keep Key Metrics unchanged; push any extra words into Executive Summary, Financial Performance, MD&A, or Risk Factors with concrete investor implications and metrics to watch.
+- In Risk Factors, spell out the scenario that would change your view (e.g., "If X drifts below Y, conviction drops to hold") so the memo remains a high-quality decision tool.
+"""
+
         prompt = f"""You are an expert equity analyst. Analyze the following company data and produce a comprehensive investment memo.
 {complexity_instruction}
 {length_instruction}
 {variation_clause}
+{clarity_guidance}
+{long_form_addendum}
 
 CRITICAL STYLE GUIDELINES (PREMIUM ANALYSIS):
 1. **NO CORPORATE FLUFF**: Do NOT use generic investor relations language.
@@ -791,29 +1265,29 @@ Financial Ratios:
 {ratios_str}
 
 """
-        
+
         if mda_text:
             # Limit MD&A text to avoid token limits
             mda_snippet = mda_text[:3000] if len(mda_text) > 3000 else mda_text
             prompt += f"\nManagement Discussion & Analysis (excerpt):\n{mda_snippet}\n"
-        
+
         if risk_factors_text:
-            risk_snippet = risk_factors_text[:2000] if len(risk_factors_text) > 2000 else risk_factors_text
+            risk_snippet = (
+                risk_factors_text[:2000]
+                if len(risk_factors_text) > 2000
+                else risk_factors_text
+            )
             prompt += f"\nRisk Factors (excerpt):\n{risk_snippet}\n"
-        
-        # Define min/max words for the length reminder (use target_length if provided, otherwise skip)
+
         if target_length:
-            min_words = target_length - 10
-            max_words = target_length + 10
             length_reminder = f"""
-FINAL LENGTH VERIFICATION (MANDATORY):
-1. Count your total words before submitting.
-2. Your output MUST be between {min_words} and {max_words} words.
-3. Append this line at the very end: WORD COUNT: [your actual count]
-4. If your count is outside {min_words}-{max_words}, REWRITE until it fits."""
+LENGTH CHECK (MANDATORY):
+- Keep total length ≤ {target_length} words.
+- Do NOT append a WORD COUNT line or any extra content after Closing Takeaway.
+"""
         else:
             length_reminder = ""
-        
+
         prompt += f"""
 MANDATORY 7-SECTION STRUCTURE (OUTPUT IN EXACT ORDER - CRITICAL):
 You MUST output these 7 sections in EXACTLY this order. Do not skip, reorder, combine, or add extra sections.
@@ -827,9 +1301,13 @@ Example: "66/100 - Watch. Strong margins but elevated leverage."]
 ## 2. Executive Summary  
 [2-3 paragraphs covering:
 - Your conviction (bullish/bearish/neutral) with confidence level (high/medium/low)
+- State ONE clear spine for the memo: operating strength (pricing/margins) versus cash conversion durability (OCF→FCF, capex, working capital), and keep the thesis aligned to it
 - Core investment thesis in 2-3 clear sentences
 - Key narrative driving the stock
 - What matters most for investors to watch
+- Conviction tone MUST match the action: if the stance is HOLD/WAIT, explicitly explain the restraint (what blocks action now) and temper language accordingly
+- Do NOT describe your process ("this analysis/memo will...", "I looked at..."). State conclusions; let structure imply process
+- Include ONE explicit "what changed vs prior comparable period" sentence (QoQ for quarterly, YoY for annual) and do not repeat that same change later
 Write in flowing prose. NO bullet lists of "Monitor X" or "Track Y".]
 
 ## 3. Financial Performance
@@ -838,6 +1316,7 @@ Write in flowing prose. NO bullet lists of "Monitor X" or "Track Y".]
 - Operating margin - what it reveals about core business profitability
 - Net margin - if it diverges significantly from operating margin, explain WHY (e.g., non-operating income, one-time items)
 - Cash flow quality - FCF, cash conversion
+- Explicitly compare this period vs the prior comparable period (QoQ for quarterly, YoY for annual): what improved, what deteriorated, and why
 Every metric must be explained, not just stated. Use $ figures and %.]
 
 ## 4. Management Discussion & Analysis
@@ -845,14 +1324,17 @@ Every metric must be explained, not just stated. Use $ figures and %.]
 - Capital allocation priorities (R&D, capex, buybacks, dividends)
 - Earnings quality concerns (one-time items, non-operating income)
 - Strategic execution evidence from financials
+- Explicitly call out what changed versus the prior comparable period in posture (capex pacing, cost discipline, capital return) and whether numbers corroborate it
 Do NOT speculate about "management commentary" not in the filings.
 Do NOT say "Management discusses..." - just state the facts.]
 
 ## 5. Risk Factors  
 [3-5 SPECIFIC company risks. Each MUST:
 1. Have a clear name (e.g., "Customer Concentration", "Margin Compression Risk")
-2. Be 2-3 sentences with quantified impact where possible
+2. Be 2-4 sentences with quantified impact where possible
 3. Be specific to THIS company - NOT generic risks
+4. Include explicit weighting: severity/likelihood (High/Med/Low) and one sentence on why it does NOT dominate the thesis yet (and what would make it dominate)
+5. Include a change signal: one concrete sign the risk is getting worse versus the prior comparable period
 Format: "**Risk Name**: Explanation with specifics."
 Do NOT use generic risks like "macroeconomic volatility" or "regulatory uncertainty" without company-specific context.]
 
@@ -895,9 +1377,9 @@ SENTENCE COMPLETION (CRITICAL):
 - If you start a contrast ("but", "however"), you MUST complete it
 {length_reminder}
 """
-        
+
         return prompt
-    
+
     def _parse_summary_response(self, response_text: str) -> Dict[str, str]:
         """Parse the structured response from Gemini."""
         sections = {
@@ -911,7 +1393,7 @@ SENTENCE COMPLETION (CRITICAL):
             "competitive_landscape": "",
             "cash_flow": "",
             "conclusion": "",
-            "investment_recommendation": ""
+            "investment_recommendation": "",
         }
 
         # Simple parsing by section headers
@@ -923,11 +1405,17 @@ SENTENCE COMPLETION (CRITICAL):
 
             if "tl;dr" in line_lower or "tldr" in line_lower:
                 current_section = "tldr"
-            elif "investment thesis" in line_lower or ("thesis" in line_lower and "##" in line):
+            elif "investment thesis" in line_lower or (
+                "thesis" in line_lower and "##" in line
+            ):
                 current_section = "thesis"
-            elif "risk" in line_lower and ("top" in line_lower or "major" in line_lower or "##" in line):
+            elif "risk" in line_lower and (
+                "top" in line_lower or "major" in line_lower or "##" in line
+            ):
                 current_section = "risks"
-            elif "strategic" in line_lower and ("initiative" in line_lower or "capital" in line_lower):
+            elif "strategic" in line_lower and (
+                "initiative" in line_lower or "capital" in line_lower
+            ):
                 current_section = "strategic_initiatives"
             elif "valuation" in line_lower and "##" in line:
                 current_section = "valuation"
@@ -937,7 +1425,11 @@ SENTENCE COMPLETION (CRITICAL):
                 current_section = "cash_flow"
             elif "investment recommendation" in line_lower and "##" in line:
                 current_section = "investment_recommendation"
-            elif "closing takeaway" in line_lower or "conclusion" in line_lower or "assessment" in line_lower:
+            elif (
+                "closing takeaway" in line_lower
+                or "conclusion" in line_lower
+                or "assessment" in line_lower
+            ):
                 current_section = "conclusion"
             elif "catalyst" in line_lower:
                 current_section = "catalysts"
@@ -966,15 +1458,15 @@ SENTENCE COMPLETION (CRITICAL):
         # Try to find a natural sentence break within the limit
         trimmed = " ".join(tokens[:max_words])
         for i in range(len(trimmed) - 1, -1, -1):
-            if trimmed[i] in '.!?':
-                return trimmed[:i+1].strip()
+            if trimmed[i] in ".!?":
+                return trimmed[: i + 1].strip()
 
         # No sentence break found - truncate and add period
         trimmed = trimmed.strip()
         if trimmed and trimmed[-1] not in ".!?":
             trimmed += "."
         return trimmed
-    
+
     def generate_persona_view(
         self,
         persona_name: str,
@@ -997,11 +1489,11 @@ SENTENCE COMPLETION (CRITICAL):
         ignore_list: str = "",
         strict_mode: bool = False,
         target_length: Optional[int] = None,
-        persona_id: Optional[str] = None
+        persona_id: Optional[str] = None,
     ) -> Dict[str, str]:
         """
         Generate investor persona-specific view.
-        
+
         Args:
             persona_name: Name of the investor persona
             persona_philosophy: Philosophy description
@@ -1022,16 +1514,20 @@ SENTENCE COMPLETION (CRITICAL):
             verdict_style: Signature verdict logic for the persona
             ignore_list: Topics the persona explicitly ignores
             strict_mode: If True, bypasses generic templates and uses a rigid, persona-specific prompt.
-        
+
         Returns:
             Dictionary with persona view and stance
         """
-        ratios_str = "\n".join([
-            f"- {key}: {value:.2%}" if isinstance(value, float) and abs(value) < 10 else f"- {key}: {value:.2f}"
-            for key, value in ratios.items()
-            if value is not None
-        ])
-        
+        ratios_str = "\n".join(
+            [
+                f"- {key}: {value:.2%}"
+                if isinstance(value, float) and abs(value) < 10
+                else f"- {key}: {value:.2f}"
+                for key, value in ratios.items()
+                if value is not None
+            ]
+        )
+
         # Default structure if none provided
         if not structure_template:
             structure_template = """
@@ -1046,7 +1542,7 @@ SENTENCE COMPLETION (CRITICAL):
         cash = ratios.get("Cash", 0)
         fcf = ratios.get("Free Cash Flow", 0)
         net_income = ratios.get("Net Income", 0)
-        
+
         health_context = ""
         if fcf < 0:
             burn_rate = abs(fcf)
@@ -1067,31 +1563,51 @@ FINANCIAL HEALTH CHECK:
 
         # FACTUAL CONSTRAINTS (AGGRESSIVE GROUNDING)
         constraints = []
-        
+
         # 1. Dividend Check
         has_dividends = False
         if ratios.get("Dividend Yield", 0) > 0:
             has_dividends = True
-        
+
         if not has_dividends:
-            constraints.append("FACT: The company pays NO dividends. Do NOT suggest otherwise.")
+            constraints.append(
+                "FACT: The company pays NO dividends. Do NOT suggest otherwise."
+            )
         else:
-            constraints.append(f"FACT: The company pays a dividend (Yield: {ratios.get('Dividend Yield', 0):.2%}).")
+            constraints.append(
+                f"FACT: The company pays a dividend (Yield: {ratios.get('Dividend Yield', 0):.2%})."
+            )
 
         # If loss making, strictly forbid buyback suggestions regardless of past data
         if net_income < 0 or fcf < 0:
-            constraints.append("FACT: The company is loss-making/burning cash. It cannot sustainably support buybacks or dividends.")
-            constraints.append("CONSTRAINT: You MUST NOT suggest buybacks or dividends as a capital allocation strategy.")
+            constraints.append(
+                "FACT: The company is loss-making/burning cash. It cannot sustainably support buybacks or dividends."
+            )
+            constraints.append(
+                "CONSTRAINT: You MUST NOT suggest buybacks or dividends as a capital allocation strategy."
+            )
 
         constraints_str = "\n".join(constraints)
-        
+
         # Define helper variables for prompt construction
         ignore_clause = ignore_list if ignore_list else "N/A"
-        priorities_str = "\n".join([f"{i+1}. {p}" for i, p in enumerate(persona_priorities)]) if persona_priorities else "N/A"
-        priorities_inline = ", ".join(persona_priorities) if persona_priorities else "N/A"
-        verdict_clause = verdict_style if verdict_style else "Provide a clear buy/hold/sell recommendation"
-        required_vocab_str = ", ".join(required_vocabulary) if required_vocabulary else "N/A"
-        
+        priorities_str = (
+            "\n".join([f"{i + 1}. {p}" for i, p in enumerate(persona_priorities)])
+            if persona_priorities
+            else "N/A"
+        )
+        priorities_inline = (
+            ", ".join(persona_priorities) if persona_priorities else "N/A"
+        )
+        verdict_clause = (
+            verdict_style
+            if verdict_style
+            else "Provide a clear buy/hold/sell recommendation"
+        )
+        required_vocab_str = (
+            ", ".join(required_vocabulary) if required_vocabulary else "N/A"
+        )
+
         worldview_switch = f"""
 WORLDVIEW SWITCH (MANDATORY):
 - Abandon generic equity research headings (Executive Summary, Financial Health Rating, Management Discussion & Analysis, Risk Factors, Key Data Appendix). Use ONLY the persona-specific structure below.
@@ -1123,7 +1639,7 @@ NON-NEGOTIABLE PRIORITIES (in order):
 {priorities_str}
 
 MENTAL MODELS TO APPLY:
-{chr(10).join([f'- {item}' for item in persona_mental_models])}
+{chr(10).join([f"- {item}" for item in persona_mental_models])}
 
 {worldview_switch}
 
@@ -1148,7 +1664,7 @@ Analysis Structure (FOLLOW EXACTLY):
 ## Thinking Process (Internal Monologue)
 [STEP 0: Reset Worldview. Adopt {persona_name}'s mental model. Ignore generic analyst frameworks.]
 [STEP 1: Filter Data. What matters to {persona_name}? Discard noise.]
-[STEP 2: Apply Mental Models. How does {persona_mental_models[0] if persona_mental_models else 'this'} apply?]
+[STEP 2: Apply Mental Models. How does {persona_mental_models[0] if persona_mental_models else "this"} apply?]
 [STEP 3: Formulate Verdict. Is this a buy? Why?]
 
 {structure_template}
@@ -1171,18 +1687,18 @@ Task: Think first, then write the analysis. Be extremely concise. No filler.
 Philosophy: {persona_philosophy}
 
 Priority Checklist:
-{chr(10).join([f'{i+1}. {item}' for i, item in enumerate(persona_checklist)])}
+{chr(10).join([f"{i + 1}. {item}" for i, item in enumerate(persona_checklist)])}
 
 Persona Priorities (strict order):
 {priorities_str}
 
 Mental Models to Apply:
-{chr(10).join([f'- {item}' for i, item in enumerate(persona_mental_models)])}
+{chr(10).join([f"- {item}" for i, item in enumerate(persona_mental_models)])}
 
 Tone: {persona_tone}
 
 REQUIRED VOCABULARY (MUST USE AT LEAST 3):
-{', '.join(required_vocabulary)}
+{", ".join(required_vocabulary)}
 
 CATEGORIZATION FRAMEWORK:
 {categorization_framework}
@@ -1377,46 +1893,39 @@ At the end, include ONLY these two lines (no headers, just the content):
 STANCE: [Buy/Hold/Sell]
 VERDICT: [One sentence summary of why]
 """
-        
+
         max_retries = 3
         current_try = 0
-        
+
         while current_try < max_retries:
             try:
                 response = self.generate_content(prompt, use_persona_model=True)
                 result = self._parse_persona_response(response.text, persona_name)
-                
-                # Check word count with ±10 tolerance
+
+                # Check word count against a hard cap
                 word_count = len(result["summary"].split())
 
-                # Determine target word count
-                if target_length:
-                    # User specified target_length - use ±10 tolerance
-                    min_acceptable = target_length - 10
-                    max_acceptable = target_length + 10
-                    target_desc = f"{target_length} words (±10 tolerance)"
-                else:
-                    # Use persona-specific defaults with ±10 tolerance
-                    default_target = PERSONA_DEFAULT_LENGTHS.get(persona_id, 300)
-                    min_acceptable = default_target - 10
-                    max_acceptable = default_target + 10
-                    target_desc = f"{default_target} words (±10 tolerance)"
+                # Determine max word count: use user cap if provided, otherwise persona default cap.
+                max_acceptable = (
+                    int(target_length)
+                    if target_length
+                    else int(PERSONA_DEFAULT_LENGTHS.get(persona_id, 300))
+                )
 
-                if word_count < min_acceptable:
-                    delta = min_acceptable - word_count
-                    print(f"{persona_name} view too short ({word_count} words, target {target_desc}). Retrying...")
-                    prompt += f"\n\nSYSTEM FEEDBACK: {word_count} words is below minimum {min_acceptable}. Target: {target_desc}. Add {delta}+ words of substantive analysis. NO FILLER PHRASES like 'Additional detail covers...' or 'Risk coverage includes...'. Add real interpretation and insight."
-                    current_try += 1
-                    continue
-                elif word_count > max_acceptable:
+                if word_count > max_acceptable:
                     excess = word_count - max_acceptable
-                    print(f"{persona_name} view too long ({word_count} words, target {target_desc}). Retrying...")
-                    prompt += f"\n\nSYSTEM FEEDBACK: {word_count} words exceeds maximum {max_acceptable}. Target: {target_desc}. Cut {excess}+ words of filler. Remove generic phrases, redundancy, and placeholder text. Keep only substantive analysis."
+                    print(
+                        f"{persona_name} view too long ({word_count} words, max {max_acceptable}). Retrying..."
+                    )
+                    prompt += (
+                        f"\n\nSYSTEM FEEDBACK: Word count {word_count} exceeds the maximum of {max_acceptable} by {excess} words. "
+                        f"Cut {excess}+ words by removing redundancy and filler while preserving the stance and key mechanisms."
+                    )
                     current_try += 1
                     continue
-                    
+
                 return result
-            
+
             except Exception as e:
                 print(f"Error generating persona view: {e}")
                 current_try += 1
@@ -1426,10 +1935,12 @@ VERDICT: [One sentence summary of why]
             "summary": "Error generating persona view",
             "stance": "Hold",
             "reasoning": "Unable to generate analysis",
-            "key_points": []
+            "key_points": [],
         }
-    
-    def _parse_persona_response(self, response_text: str, persona_name: str) -> Dict[str, str]:
+
+    def _parse_persona_response(
+        self, response_text: str, persona_name: str
+    ) -> Dict[str, str]:
         """Parse persona response - FLEXIBLE parsing that respects persona-native format."""
         result = {
             "persona_name": persona_name,
@@ -1438,7 +1949,7 @@ VERDICT: [One sentence summary of why]
             "reasoning": "",
             "key_points": [],
             "scenario_analysis": "",
-            "thinking_process": ""
+            "thinking_process": "",
         }
 
         lines = response_text.split("\n")
@@ -1507,49 +2018,68 @@ VERDICT: [One sentence summary of why]
             cleaned_lines = []
             for line in lines:
                 line_lower = line.strip().lower()
-                if line_lower.startswith("stance:") or line_lower.startswith("verdict:"):
+                if line_lower.startswith("stance:") or line_lower.startswith(
+                    "verdict:"
+                ):
                     continue
                 cleaned_lines.append(line)
             result["summary"] = "\n".join(cleaned_lines).strip()
 
         # Extract key points from narrative (look for bullet points or numbered items)
-        for line in result["summary"].split('\n'):
+        for line in result["summary"].split("\n"):
             stripped = line.strip()
-            if stripped.startswith('- ') or stripped.startswith('• '):
+            if stripped.startswith("- ") or stripped.startswith("• "):
                 point = stripped[2:].strip()
                 if len(point) > 10 and len(result["key_points"]) < 5:
                     result["key_points"].append(point)
-            elif stripped.startswith(('1.', '2.', '3.', '4.', '5.')):
+            elif stripped.startswith(("1.", "2.", "3.", "4.", "5.")):
                 point = stripped[2:].strip()
                 if len(point) > 10 and len(result["key_points"]) < 5:
                     result["key_points"].append(point)
 
         # If still no key points, extract significant sentences
         if not result["key_points"]:
-            sentences = result["summary"].replace('\n', ' ').split('. ')
-            important_keywords = ['moat', 'margin', 'cash flow', 'growth', 'risk', 'value',
-                                  'price', 'earnings', 'return', 'debt', 'profit', 'peg', 'cycle']
+            sentences = result["summary"].replace("\n", " ").split(". ")
+            important_keywords = [
+                "moat",
+                "margin",
+                "cash flow",
+                "growth",
+                "risk",
+                "value",
+                "price",
+                "earnings",
+                "return",
+                "debt",
+                "profit",
+                "peg",
+                "cycle",
+            ]
             for sentence in sentences:
                 sentence_lower = sentence.lower()
                 if any(kw in sentence_lower for kw in important_keywords):
                     cleaned = sentence.strip()
-                    if len(cleaned) > 20 and len(cleaned) < 200 and len(result["key_points"]) < 5:
-                        result["key_points"].append(cleaned + '.')
+                    if (
+                        len(cleaned) > 20
+                        and len(cleaned) < 200
+                        and len(result["key_points"]) < 5
+                    ):
+                        result["key_points"].append(cleaned + ".")
 
         # If no reasoning extracted, use last paragraph
         if not result["reasoning"]:
-            paragraphs = [p.strip() for p in result["summary"].split('\n\n') if p.strip()]
+            paragraphs = [
+                p.strip() for p in result["summary"].split("\n\n") if p.strip()
+            ]
             if paragraphs:
                 last_para = paragraphs[-1]
                 if len(last_para) < 300:
                     result["reasoning"] = last_para
 
         return result
-    
+
     def generate_premium_persona_view(
-        self,
-        prompt: str,
-        persona_name: str
+        self, prompt: str, persona_name: str
     ) -> Dict[str, str]:
         """
         Generate premium persona analysis with lower temperature for authoritative voice.
@@ -1583,7 +2113,7 @@ VERDICT: [One sentence summary of why]
                 "summary": f"Error generating analysis: {str(e)}",
                 "stance": "Hold",
                 "reasoning": "Generation failed",
-                "key_points": []
+                "key_points": [],
             }
 
     def _is_truncated(self, text: str) -> bool:
@@ -1599,29 +2129,29 @@ VERDICT: [One sentence summary of why]
         # Check for obvious truncation patterns
         truncation_patterns = [
             # Ends with incomplete sentence markers
-            r'\.\.\.\s*$',  # Trailing ellipsis
-            r',\s*$',       # Trailing comma
-            r':\s*$',       # Trailing colon
-            r';\s*$',       # Trailing semicolon
-            r'\s+(?:and|or|but|the|a|an|to|of|for|with|in|on|at)\s*$',  # Ends with conjunction/article
+            r"\.\.\.\s*$",  # Trailing ellipsis
+            r",\s*$",  # Trailing comma
+            r":\s*$",  # Trailing colon
+            r";\s*$",  # Trailing semicolon
+            r"\s+(?:and|or|but|the|a|an|to|of|for|with|in|on|at)\s*$",  # Ends with conjunction/article
             # Incomplete financial figures
-            r'\$\d{1,3}\.\s*$',  # $31. instead of $31.91B
-            r'\$\d+\s*$',        # $31 at end with no unit
+            r"\$\d{1,3}\.\s*$",  # $31. instead of $31.91B
+            r"\$\d+\s*$",  # $31 at end with no unit
             # Incomplete ratio statements
-            r'falls within the \d+\.?\d*-\d+\.?\d*\.\s*$',  # Falls within the 0.7-1.
+            r"falls within the \d+\.?\d*-\d+\.?\d*\.\s*$",  # Falls within the 0.7-1.
             # Incomplete bullet points or headers
-            r'[-•]\s*$',         # Bullet point with no content
-            r'\*\*\d+\.\s*\*\*\s*$',  # **1. ** with no content
+            r"[-•]\s*$",  # Bullet point with no content
+            r"\*\*\d+\.\s*\*\*\s*$",  # **1. ** with no content
             # Common mid-sentence truncation patterns
-            r'but\s+the\s+figure\s+is\s+less\s+than\s+net\s*\.?\s*$',  # "but the figure is less than net..."
-            r'although\s+I\s+want\s+to\s+assess\s+if\s+this\s+is\s+sustainable\s+in\s+the\s+face\s+of\s+increasing\s*\.?\s*$',
-            r'driven\s+by\s+the\s+AI\s*\.?\s*$',  # "driven by the AI..."
-            r'which\s+is\s*\.?\s*$',  # "which is..."
-            r'but\s+I\s+acknowledge\s+the\s*\.?\s*$',  # "but I acknowledge the..."
-            r'and\s+I\s+need\s+to\s+see\s*\.?\s*$',  # "and I need to see..."
-            r'although\s+.*\s*$',  # Any "although..." at end
-            r'however\s+.*\s*$',  # Any "however..." trailing
-            r'while\s+.*\s*$',  # Any "while..." trailing
+            r"but\s+the\s+figure\s+is\s+less\s+than\s+net\s*\.?\s*$",  # "but the figure is less than net..."
+            r"although\s+I\s+want\s+to\s+assess\s+if\s+this\s+is\s+sustainable\s+in\s+the\s+face\s+of\s+increasing\s*\.?\s*$",
+            r"driven\s+by\s+the\s+AI\s*\.?\s*$",  # "driven by the AI..."
+            r"which\s+is\s*\.?\s*$",  # "which is..."
+            r"but\s+I\s+acknowledge\s+the\s*\.?\s*$",  # "but I acknowledge the..."
+            r"and\s+I\s+need\s+to\s+see\s*\.?\s*$",  # "and I need to see..."
+            r"although\s+.*\s*$",  # Any "although..." at end
+            r"however\s+.*\s*$",  # Any "however..." trailing
+            r"while\s+.*\s*$",  # Any "while..." trailing
         ]
 
         for pattern in truncation_patterns:
@@ -1629,9 +2159,11 @@ VERDICT: [One sentence summary of why]
                 return True
 
         # Check if text ends without proper sentence termination
-        if not text.rstrip().endswith(('.', '!', '?', '"', "'", ')', ']')):
+        if not text.rstrip().endswith((".", "!", "?", '"', "'", ")", "]")):
             # But allow if it ends with a complete-looking structure
-            if not re.search(r'(?:Pass|Buy|Hold|Sell|Watch)\s*[.!)]?\s*$', text, re.IGNORECASE):
+            if not re.search(
+                r"(?:Pass|Buy|Hold|Sell|Watch)\s*[.!)]?\s*$", text, re.IGNORECASE
+            ):
                 return True
 
         return False
@@ -1643,7 +2175,11 @@ VERDICT: [One sentence summary of why]
         """
         try:
             # Get the last ~300 characters for context
-            context_end = incomplete_text[-500:] if len(incomplete_text) > 500 else incomplete_text
+            context_end = (
+                incomplete_text[-500:]
+                if len(incomplete_text) > 500
+                else incomplete_text
+            )
 
             completion_prompt = f"""You are {persona_name}. Complete this text naturally, continuing EXACTLY where it left off.
 Do NOT repeat any of the provided text. Just write the next 1-3 sentences to finish the thought.
@@ -1659,97 +2195,136 @@ CONTINUE (do not repeat, just finish the thought):"""
             # Validate the completion isn't too long or repetitive
             if len(completion) > 500:
                 # Take just the first complete sentence
-                sentences = completion.split('. ')
+                sentences = completion.split(". ")
                 if sentences:
-                    completion = sentences[0] + '.'
+                    completion = sentences[0] + "."
 
             return completion
 
         except Exception as e:
             print(f"Completion attempt failed for {persona_name}: {e}")
             return ""
-    
-    def _parse_premium_persona_response(self, response_text: str, persona_name: str) -> Dict[str, str]:
+
+    def _parse_premium_persona_response(
+        self, response_text: str, persona_name: str
+    ) -> Dict[str, str]:
         """Parse premium persona response with improved extraction."""
         result = {
             "persona_name": persona_name,
             "summary": "",
             "stance": "Hold",
             "reasoning": "",
-            "key_points": []
+            "key_points": [],
         }
 
         # =========================================================================
         # STEP 1: Remove "Not available" / "N/A" lines that look unprofessional
         # =========================================================================
         cleaned_lines = []
-        for line in response_text.split('\n'):
+        for line in response_text.split("\n"):
             line_stripped = line.strip()
             # Skip lines that are just placeholders for missing data
-            if any(pattern in line_stripped.lower() for pattern in [
-                'not available',
-                'n/a',
-                ': n/a',
-                '(if available)',
-                'data not provided',
-                'cannot calculate',
-                'insufficient data',
-                'not disclosed',
-            ]):
+            if any(
+                pattern in line_stripped.lower()
+                for pattern in [
+                    "not available",
+                    "n/a",
+                    ": n/a",
+                    "(if available)",
+                    "data not provided",
+                    "cannot calculate",
+                    "insufficient data",
+                    "not disclosed",
+                ]
+            ):
                 # Only skip if the line is primarily about missing data
                 # Keep lines where "N/A" is mentioned but there's substantial content
-                if len(line_stripped) < 100 or line_stripped.lower().count('not available') > 0:
+                if (
+                    len(line_stripped) < 100
+                    or line_stripped.lower().count("not available") > 0
+                ):
                     continue
             cleaned_lines.append(line)
-        response_text = '\n'.join(cleaned_lines)
+        response_text = "\n".join(cleaned_lines)
 
         # The entire response is the summary for premium personas
         # Extract stance from the content
         text_lower = response_text.lower()
-        
+
         # Determine stance from content
-        buy_signals = ["buy", "back up the truck", "high conviction", "wonderful company at fair price", 
-                       "tenbagger", "favorable asymmetry", "aggressive stance", "overweight"]
-        sell_signals = ["sell", "pass", "obviously stupid", "rat poison", "avoid", 
-                        "unfavorable asymmetry", "defensive stance", "underweight"]
-        
+        buy_signals = [
+            "buy",
+            "back up the truck",
+            "high conviction",
+            "wonderful company at fair price",
+            "tenbagger",
+            "favorable asymmetry",
+            "aggressive stance",
+            "overweight",
+        ]
+        sell_signals = [
+            "sell",
+            "pass",
+            "obviously stupid",
+            "rat poison",
+            "avoid",
+            "unfavorable asymmetry",
+            "defensive stance",
+            "underweight",
+        ]
+
         buy_count = sum(1 for signal in buy_signals if signal in text_lower)
         sell_count = sum(1 for signal in sell_signals if signal in text_lower)
-        
+
         if buy_count > sell_count:
             result["stance"] = "Buy"
         elif sell_count > buy_count:
             result["stance"] = "Sell"
         else:
             result["stance"] = "Hold"
-        
+
         # Extract key points (look for bullet points or numbered items)
-        lines = response_text.split('\n')
+        lines = response_text.split("\n")
         for line in lines:
             stripped = line.strip()
-            if stripped.startswith('- ') or stripped.startswith('• '):
+            if stripped.startswith("- ") or stripped.startswith("• "):
                 point = stripped[2:].strip()
                 if len(point) > 10 and len(result["key_points"]) < 5:
                     result["key_points"].append(point)
-            elif stripped.startswith(('1.', '2.', '3.', '4.', '5.')):
+            elif stripped.startswith(("1.", "2.", "3.", "4.", "5.")):
                 point = stripped[2:].strip()
                 if len(point) > 10 and len(result["key_points"]) < 5:
                     result["key_points"].append(point)
-        
+
         # If no bullet points found, extract key sentences
         if not result["key_points"]:
-            sentences = response_text.replace('\n', ' ').split('. ')
-            important_keywords = ['moat', 'margin', 'cash flow', 'growth', 'risk', 'value', 
-                                  'price', 'earnings', 'return', 'debt', 'profit']
+            sentences = response_text.replace("\n", " ").split(". ")
+            important_keywords = [
+                "moat",
+                "margin",
+                "cash flow",
+                "growth",
+                "risk",
+                "value",
+                "price",
+                "earnings",
+                "return",
+                "debt",
+                "profit",
+            ]
             for sentence in sentences:
                 sentence_lower = sentence.lower()
                 if any(kw in sentence_lower for kw in important_keywords):
                     cleaned = sentence.strip()
-                    if len(cleaned) > 20 and len(cleaned) < 200 and len(result["key_points"]) < 5:
-                        result["key_points"].append(cleaned + '.')
-        
+                    if (
+                        len(cleaned) > 20
+                        and len(cleaned) < 200
+                        and len(result["key_points"]) < 5
+                    ):
+                        result["key_points"].append(cleaned + ".")
+
         # Extract reasoning (last paragraph or verdict section)
-        paragraphs = [p.strip() for p in response_text.split('\n\n') if p.strip()]
+        paragraphs = [p.strip() for p in response_text.split("\n\n") if p.strip()]
         if paragraphs:
             last_para = paragraphs[-1]
             if len(last_para) < 300:
@@ -1761,10 +2336,10 @@ CONTINUE (do not repeat, just finish the thought):"""
                     if stripped and len(stripped) < 200:
                         result["reasoning"] = stripped
                         break
-        
+
         # Set the full response as summary
         result["summary"] = response_text.strip()
-        
+
         return result
 
 
@@ -1773,6 +2348,7 @@ def get_gemini_client() -> GeminiClient:
     settings = get_settings()
 
     return GeminiClient(
+        model_name=(os.getenv("GEMINI_MODEL_NAME") or "").strip() or "gemini-3-flash-preview",
         max_retries=settings.gemini_max_retries,
         initial_wait=settings.gemini_initial_wait,
         max_wait=settings.gemini_max_wait,
@@ -1783,7 +2359,7 @@ def generate_growth_assessment(
     filing_text: str,
     company_name: str,
     weighting_preference: Optional[str] = None,
-    ratios: Optional[Dict[str, float]] = None
+    ratios: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """
     Generate AI-driven growth assessment based on management perspective and sector context.
@@ -1805,18 +2381,25 @@ def generate_growth_assessment(
         "cash_flow_conversion": "Focus on whether growth is CASH-GENERATING growth. Growth that improves free cash flow is valued; growth that burns cash is concerning.",
         "balance_sheet_strength": "Focus on whether growth is SUSTAINABLE without excessive leverage. Growth funded by debt is riskier than organic growth.",
         "liquidity_near_term_risk": "Focus on whether growth PRESERVES LIQUIDITY. Rapid expansion that strains cash reserves is concerning.",
-        "execution_competitiveness": "Focus on COMPETITIVE POSITIONING. Growth that captures market share and strengthens competitive moat is highly valued."
-    }.get(weighting_preference, "Evaluate overall growth potential considering management strategy and sector dynamics.")
+        "execution_competitiveness": "Focus on COMPETITIVE POSITIONING. Growth that captures market share and strengthens competitive moat is highly valued.",
+    }.get(
+        weighting_preference,
+        "Evaluate overall growth potential considering management strategy and sector dynamics.",
+    )
 
     # Build comprehensive context from ratios if available
     ratios_context = ""
     if ratios:
         if ratios.get("revenue_growth_yoy") is not None:
-            ratios_context += f"\n- Revenue Growth YoY: {ratios['revenue_growth_yoy'] * 100:.1f}%"
+            ratios_context += (
+                f"\n- Revenue Growth YoY: {ratios['revenue_growth_yoy'] * 100:.1f}%"
+            )
         if ratios.get("gross_margin") is not None:
             ratios_context += f"\n- Gross Margin: {ratios['gross_margin'] * 100:.1f}%"
         if ratios.get("operating_margin") is not None:
-            ratios_context += f"\n- Operating Margin: {ratios['operating_margin'] * 100:.1f}%"
+            ratios_context += (
+                f"\n- Operating Margin: {ratios['operating_margin'] * 100:.1f}%"
+            )
         if ratios.get("net_margin") is not None:
             ratios_context += f"\n- Net Margin: {ratios['net_margin'] * 100:.1f}%"
         if ratios.get("fcf_margin") is not None:
@@ -1826,7 +2409,9 @@ def generate_growth_assessment(
     filing_snippet = filing_text[:12000] if len(filing_text) > 12000 else filing_text
 
     # Define the metrics context with fallback (avoid backslash in f-string expression)
-    metrics_display = ratios_context if ratios_context else "\n- No historical metrics available"
+    metrics_display = (
+        ratios_context if ratios_context else "\n- No historical metrics available"
+    )
 
     prompt = f"""You are a financial analyst evaluating the GROWTH potential of {company_name}.
 
@@ -1869,31 +2454,25 @@ Be decisive. Ground your assessment in the filing text and metrics, not speculat
         score = 50  # Default neutral
         description = "Growth outlook based on sector positioning"
 
-        for line in result_text.split('\n'):
+        for line in result_text.split("\n"):
             line = line.strip()
-            if line.upper().startswith('SCORE:'):
+            if line.upper().startswith("SCORE:"):
                 try:
-                    score_str = line.split(':', 1)[1].strip()
+                    score_str = line.split(":", 1)[1].strip()
                     # Extract just the number
-                    score_num = ''.join(c for c in score_str if c.isdigit())
+                    score_num = "".join(c for c in score_str if c.isdigit())
                     if score_num:
                         score = min(100, max(0, int(score_num)))
                 except (ValueError, IndexError):
                     pass
-            elif line.upper().startswith('DESCRIPTION:'):
-                description = line.split(':', 1)[1].strip()
+            elif line.upper().startswith("DESCRIPTION:"):
+                description = line.split(":", 1)[1].strip()
                 # Truncate if too long
                 if len(description) > 100:
                     description = description[:97] + "..."
 
-        return {
-            "score": score,
-            "description": description
-        }
+        return {"score": score, "description": description}
 
     except Exception as e:
         print(f"Error generating growth assessment: {e}")
-        return {
-            "score": 50,
-            "description": "Growth assessment unavailable"
-        }
+        return {"score": 50, "description": "Growth assessment unavailable"}

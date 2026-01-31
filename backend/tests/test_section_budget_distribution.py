@@ -15,15 +15,14 @@ def test_section_word_budgets_follow_fixed_distribution() -> None:
     # + Closing Takeaway (2) = 16
     assert sum(budgets.values()) == 550 - 16
 
-    # Body target = 534 words, weights = 10/15/20/20/15/10/10.
-    # Rounding is deterministic based on remainder ordering.
-    assert budgets["Financial Health Rating"] == 54
-    assert budgets["Executive Summary"] == 80
-    assert budgets["Financial Performance"] == 107
-    assert budgets["Management Discussion & Analysis"] == 107
-    assert budgets["Risk Factors"] == 80
-    assert budgets["Key Metrics"] == 53
-    assert budgets["Closing Takeaway"] == 53
+    # Body target = 534 words. Distribution is fixed and deterministic.
+    assert budgets["Financial Health Rating"] == 75
+    assert budgets["Executive Summary"] == 75
+    assert budgets["Financial Performance"] == 80
+    assert budgets["Management Discussion & Analysis"] == 80
+    assert budgets["Risk Factors"] == 75
+    assert budgets["Key Metrics"] == 75
+    assert budgets["Closing Takeaway"] == 74
 
 
 def test_section_word_budgets_follow_fixed_distribution_large_target() -> None:
@@ -32,9 +31,9 @@ def test_section_word_budgets_follow_fixed_distribution_large_target() -> None:
 
     # For long targets, Key Metrics is capped and the remaining budget is redistributed.
     assert budgets["Key Metrics"] == filings_api.KEY_METRICS_FIXED_BUDGET_WORDS
-    assert budgets["Financial Health Rating"] == 90
-    assert budgets["Executive Summary"] == 136
-    assert budgets["Financial Performance"] == 181
-    assert budgets["Management Discussion & Analysis"] == 181
-    assert budgets["Risk Factors"] == 136
-    assert budgets["Closing Takeaway"] == 90
+    assert budgets["Financial Health Rating"] == 103
+    assert budgets["Executive Summary"] == 103
+    assert budgets["Financial Performance"] == 111
+    assert budgets["Management Discussion & Analysis"] == 111
+    assert budgets["Risk Factors"] == 103
+    assert budgets["Closing Takeaway"] == 103

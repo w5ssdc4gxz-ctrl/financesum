@@ -138,6 +138,12 @@ export type AnalysisExportPayload = {
   filing_date?: string
 }
 
+export type AnalysisRunOptions = {
+  includePersonas?: string[]
+  targetLength?: number
+  complexity?: string
+}
+
 // Company API
 export const companyApi = {
   lookup: (query: string) => 
@@ -173,23 +179,28 @@ export const filingsApi = {
     apiClient.post(`/api/v1/filings/${filingId}/parse`),
   
   summarizeFiling: (filingId: string, preferences?: FilingSummaryPreferencesPayload) =>
-    apiClient.post(`/api/v1/filings/${filingId}/summary`, preferences ?? undefined),
+    apiClient.post(`/api/v1/filings/${filingId}/summary`, preferences ?? {}),
 
   getSummaryProgress: (filingId: string) =>
     apiClient.get(`/api/v1/filings/${filingId}/progress`),
 
   exportSummary: (filingId: string, payload: SummaryExportPayload) =>
     apiClient.post(`/api/v1/filings/${filingId}/summary/export`, payload, { responseType: 'blob' }),
+
+  getSpotlightKpi: (filingId: string) =>
+    apiClient.get(`/api/v1/filings/${filingId}/spotlight`),
 }
 
 // Analysis API
 export const analysisApi = {
-  run: (companyId: string, filingIds?: string[], includePersonas?: string[]) =>
+  run: (companyId: string, filingIds?: string[], options?: AnalysisRunOptions) =>
     apiClient.post('/api/v1/analysis/run', {
       company_id: companyId,
       filing_ids: filingIds,
       analysis_options: {
-        include_personas: includePersonas,
+        include_personas: options?.includePersonas,
+        target_length: options?.targetLength,
+        complexity: options?.complexity,
       },
     }),
   

@@ -1,12 +1,12 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useState, useCallback } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import { useAuth } from "@/contexts/AuthContext"
 import { useTheme } from "next-themes"
 import { Button } from "@/components/base/buttons/button"
-import { IconUser, IconLock, IconMoon, IconSun, IconLogout, IconDeviceDesktop, IconCreditCard } from "@tabler/icons-react"
-import { motion } from "framer-motion"
+import { IconMoon, IconSun, IconLogout, IconDeviceDesktop, IconCreditCard, IconCheck, IconArrowRight } from "@tabler/icons-react"
+import { motion, AnimatePresence } from "framer-motion"
 import { billingApi } from "@/lib/api-client"
 
 const CHECKOUT_SESSION_STORAGE_KEY = "financesum.checkout.session_id"
@@ -24,10 +24,77 @@ type UsageResponse = {
     billing_unavailable?: boolean
 }
 
+// Clean, minimal theme card
+function ThemeCard({
+    mode,
+    label,
+    description,
+    isSelected,
+    onClick,
+}: {
+    mode: "light" | "dark" | "system"
+    label: string
+    description: string
+    isSelected: boolean
+    onClick: () => void
+}) {
+    const icons = {
+        light: IconSun,
+        dark: IconMoon,
+        system: IconDeviceDesktop,
+    }
+    const Icon = icons[mode]
+
+    return (
+        <motion.button
+            onClick={onClick}
+            className={`group relative w-full text-left p-5 rounded-2xl border-2 transition-all duration-200 ${
+                isSelected
+                    ? "border-foreground bg-foreground/[0.03]"
+                    : "border-transparent bg-muted/50 hover:bg-muted hover:border-border"
+            }`}
+            whileTap={{ scale: 0.98 }}
+            layout
+        >
+            <div className="flex items-start justify-between gap-4">
+                <div className="flex items-start gap-4">
+                    {/* Icon */}
+                    <div className={`flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center transition-colors ${
+                        isSelected ? "bg-foreground text-background" : "bg-muted-foreground/10 text-muted-foreground"
+                    }`}>
+                        <Icon size={20} strokeWidth={1.5} />
+                    </div>
+                    
+                    {/* Text */}
+                    <div>
+                        <div className="font-semibold text-foreground">{label}</div>
+                        <div className="text-sm text-muted-foreground mt-0.5">{description}</div>
+                    </div>
+                </div>
+
+                {/* Check indicator */}
+                <AnimatePresence>
+                    {isSelected && (
+                        <motion.div
+                            initial={{ scale: 0, opacity: 0 }}
+                            animate={{ scale: 1, opacity: 1 }}
+                            exit={{ scale: 0, opacity: 0 }}
+                            transition={{ type: "spring", stiffness: 500, damping: 30 }}
+                            className="flex-shrink-0 w-6 h-6 rounded-full bg-foreground flex items-center justify-center"
+                        >
+                            <IconCheck size={14} className="text-background" strokeWidth={3} />
+                        </motion.div>
+                    )}
+                </AnimatePresence>
+            </div>
+        </motion.button>
+    )
+}
+
 export default function SettingsPage() {
     const router = useRouter()
     const searchParams = useSearchParams()
-    const { user, session, signOut } = useAuth()
+    const { session, signOut } = useAuth()
     const { theme, setTheme } = useTheme()
     const [activeTab, setActiveTab] = useState("appearance")
     const [usage, setUsage] = useState<UsageResponse | null>(null)
@@ -39,21 +106,17 @@ export default function SettingsPage() {
 
     const tabs = [
         { id: "appearance", label: "Appearance", icon: IconSun },
-        { id: "security", label: "Security", icon: IconLock },
-        { id: "profile", label: "Profile", icon: IconUser },
         { id: "billing", label: "Billing", icon: IconCreditCard },
     ]
 
     useEffect(() => {
-        if (activeTab !== "appearance") return
         const tabParam = searchParams.get("tab")
-        if (!tabParam) return
-        if (["appearance", "security", "profile", "billing"].includes(tabParam)) {
+        if (tabParam && ["appearance", "billing"].includes(tabParam)) {
             setActiveTab(tabParam)
         }
-    }, [searchParams, activeTab])
+    }, [searchParams])
 
-    const refreshUsage = async () => {
+    const refreshUsage = useCallback(async () => {
         if (!session?.access_token) return
         setUsageLoading(true)
         setUsageError(null)
@@ -65,20 +128,16 @@ export default function SettingsPage() {
         } finally {
             setUsageLoading(false)
         }
-    }
+    }, [session?.access_token])
 
     useEffect(() => {
-        if (activeTab !== "billing") return
-        refreshUsage()
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeTab, session?.access_token])
+        if (activeTab === "billing") refreshUsage()
+    }, [activeTab, refreshUsage])
 
     useEffect(() => {
         if (activeTab !== "billing") return
         const handleFocus = () => {
-            if (document.visibilityState === "visible") {
-                refreshUsage()
-            }
+            if (document.visibilityState === "visible") refreshUsage()
         }
         window.addEventListener("focus", handleFocus)
         document.addEventListener("visibilitychange", handleFocus)
@@ -86,61 +145,41 @@ export default function SettingsPage() {
             window.removeEventListener("focus", handleFocus)
             document.removeEventListener("visibilitychange", handleFocus)
         }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeTab])
+    }, [activeTab, refreshUsage])
 
     useEffect(() => {
-        if (activeTab !== "billing") return
-        if (!session?.access_token) return
-        if (typeof window === "undefined") return
-        const sessionId = window.localStorage.getItem(CHECKOUT_SESSION_STORAGE_KEY)
+        if (activeTab !== "billing" || !session?.access_token) return
+        const sessionId = typeof window !== "undefined" 
+            ? window.localStorage.getItem(CHECKOUT_SESSION_STORAGE_KEY) 
+            : null
         if (!sessionId) return
+        
         let cancelled = false
-        const syncPendingCheckout = async () => {
+        const sync = async () => {
             try {
                 await billingApi.syncCheckoutSession(sessionId, session.access_token)
-                if (cancelled) return
-                window.localStorage.removeItem(CHECKOUT_SESSION_STORAGE_KEY)
-                refreshUsage()
-            } catch {
-                if (cancelled) return
-            }
+                if (!cancelled) {
+                    window.localStorage.removeItem(CHECKOUT_SESSION_STORAGE_KEY)
+                    refreshUsage()
+                }
+            } catch { /* ignore */ }
         }
-        syncPendingCheckout()
-        return () => {
-            cancelled = true
-        }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [activeTab, session?.access_token])
+        sync()
+        return () => { cancelled = true }
+    }, [activeTab, session?.access_token, refreshUsage])
 
     const normalizedPlan = useMemo(() => (usage?.plan ?? "").toLowerCase(), [usage?.plan])
     const isProPlan = normalizedPlan === "pro"
     const remainingCount = useMemo(() => {
         const raw = usage?.remaining ?? 0
-        const parsed = typeof raw === "string" ? Number(raw) : raw
-        return Number.isFinite(parsed) ? parsed : 0
+        return Number.isFinite(Number(raw)) ? Number(raw) : 0
     }, [usage?.remaining])
     const showUpgrade = !isProPlan
-    const upgradeTitle = remainingCount <= 0 ? "Trial used" : "Upgrade to Pro"
-    const upgradeDescription =
-        remainingCount <= 0
-            ? "Upgrade to Pro to keep generating summaries."
-            : "Get 100 summaries per month, priority support, and all export formats."
-    const isCanceling = Boolean(
-        isProPlan && (usage?.cancel_at_period_end || usage?.subscription_status === "canceled")
-    )
+    const isCanceling = isProPlan && (usage?.cancel_at_period_end || usage?.subscription_status === "canceled")
 
     const usagePercent = useMemo(() => {
         if (!usage?.limit || !usage.used) return 0
-        const ratio = Math.min(1, usage.used / usage.limit)
-        return Math.round(ratio * 100)
-    }, [usage?.limit, usage?.used])
-
-    const usageBarColor = useMemo(() => {
-        if (!usage?.limit) return "hsl(120 45% 45%)"
-        const ratio = Math.min(1, (usage.used ?? 0) / usage.limit)
-        const hue = Math.max(0, Math.min(120, 120 - 120 * ratio))
-        return `hsl(${hue} 70% 45%)`
+        return Math.min(100, Math.round((usage.used / usage.limit) * 100))
     }, [usage?.limit, usage?.used])
 
     const cancellationLabel = useMemo(() => {
@@ -150,8 +189,7 @@ export default function SettingsPage() {
     }, [usage?.period_end])
 
     const handleOpenStripePortal = async () => {
-        if (!session?.access_token) return
-        if (cancelLoading) return
+        if (!session?.access_token || cancelLoading) return
         setCancelLoading(true)
         setPortalMessage(null)
         setUsageError(null)
@@ -162,26 +200,23 @@ export default function SettingsPage() {
             setPortalMessage("Redirecting to Stripe…")
             window.location.href = url
         } catch (error: any) {
-            setUsageError(error?.response?.data?.detail || error?.message || "Unable to open the Stripe portal.")
+            setUsageError(error?.response?.data?.detail || error?.message || "Unable to open portal.")
         } finally {
             setCancelLoading(false)
         }
     }
 
     const handleUpgradeToPro = async () => {
-        if (!session?.access_token) return
-        if (upgradeLoading) return
+        if (!session?.access_token || upgradeLoading) return
         setUpgradeLoading(true)
         setPortalMessage(null)
         setUsageError(null)
         try {
             const response = await billingApi.createCheckoutSession({ plan: "pro" }, session.access_token)
             const url = response.data?.url as string | undefined
-            const sessionId = response.data?.id as string | undefined
+            const sid = response.data?.id as string | undefined
             if (!url) throw new Error("Missing checkout URL")
-            if (sessionId && typeof window !== "undefined") {
-                window.localStorage.setItem(CHECKOUT_SESSION_STORAGE_KEY, sessionId)
-            }
+            if (sid) window.localStorage.setItem(CHECKOUT_SESSION_STORAGE_KEY, sid)
             window.location.href = url
         } catch (error: any) {
             setUsageError(error?.response?.data?.detail || error?.message || "Unable to start checkout.")
@@ -191,285 +226,254 @@ export default function SettingsPage() {
     }
 
     return (
-        <div className="max-w-4xl mx-auto p-6 space-y-8">
-            <div className="flex items-center justify-between">
-                <h1 className="text-3xl font-bold text-foreground">Settings</h1>
-                <Button
-                    color="ghost"
-                    onClick={async () => {
-                        await signOut()
-                        router.push('/')
-                    }}
-                    className="gap-2 text-red-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/20 border border-red-200 dark:border-red-900"
+        <div className="min-h-screen bg-background">
+            <div className="max-w-3xl mx-auto px-6 py-12">
+                {/* Header */}
+                <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="flex items-center justify-between mb-12"
                 >
-                    <IconLogout size={18} />
-                    Log out
-                </Button>
-            </div>
+                    <div>
+                        <h1 className="text-2xl font-bold text-foreground">Settings</h1>
+                        <p className="text-muted-foreground mt-1">Manage your preferences</p>
+                    </div>
+                    <Button
+                        color="ghost"
+                        onClick={async () => {
+                            await signOut()
+                            router.push("/")
+                        }}
+                        className="text-muted-foreground hover:text-foreground"
+                    >
+                        <IconLogout size={18} />
+                        <span className="ml-2">Log out</span>
+                    </Button>
+                </motion.div>
 
-            <div className="flex flex-col md:flex-row gap-8">
-                {/* Sidebar Tabs */}
-                <div className="w-full md:w-64 flex flex-col gap-2">
+                {/* Tabs */}
+                <motion.div
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ delay: 0.05 }}
+                    className="flex gap-1 p-1 bg-muted/50 rounded-xl mb-8 w-fit"
+                >
                     {tabs.map((tab) => (
                         <button
                             key={tab.id}
                             onClick={() => setActiveTab(tab.id)}
-                            className={`flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-medium transition-all ${activeTab === tab.id
-                                ? "bg-primary/10 text-primary"
-                                : "text-muted-foreground hover:bg-muted hover:text-foreground"
-                                }`}
+                            className={`relative px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                                activeTab === tab.id
+                                    ? "text-foreground"
+                                    : "text-muted-foreground hover:text-foreground"
+                            }`}
                         >
-                            <tab.icon size={18} />
-                            {tab.label}
+                            {activeTab === tab.id && (
+                                <motion.div
+                                    layoutId="activeSettingsTab"
+                                    className="absolute inset-0 bg-background rounded-lg shadow-sm"
+                                    transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                                />
+                            )}
+                            <span className="relative z-10 flex items-center gap-2">
+                                <tab.icon size={16} />
+                                {tab.label}
+                            </span>
                         </button>
                     ))}
-                </div>
+                </motion.div>
 
-                {/* Content Area */}
-                <div className="flex-1 space-y-6">
-                    <motion.div
-                        key={activeTab}
-                        initial={{ opacity: 0, y: 10 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ duration: 0.2 }}
-                        className="bg-card border border-border rounded-2xl p-6 shadow-sm"
-                    >
-                        {activeTab === "appearance" && (
-                            <div className="space-y-6">
-                                <div>
-                                    <h2 className="text-xl font-semibold mb-1">Appearance</h2>
-                                    <p className="text-sm text-muted-foreground">Customize how FinanceSum looks on your device.</p>
-                                </div>
-
-                                <div className="grid grid-cols-3 gap-4">
-                                    <button
-                                        onClick={() => setTheme("light")}
-                                        className={`flex flex-col items-center gap-3 p-4 rounded-xl border-2 transition-all ${theme === "light"
-                                            ? "border-primary bg-primary/5"
-                                            : "border-border hover:border-primary/50"
-                                            }`}
-                                    >
-                                        <div className="p-3 rounded-full bg-white shadow-sm border border-gray-100">
-                                            <IconSun size={24} className="text-orange-500" />
-                                        </div>
-                                        <span className="text-sm font-medium">Light</span>
-                                    </button>
-
-                                    <button
-                                        onClick={() => setTheme("dark")}
-                                        className={`flex flex-col items-center gap-3 p-4 rounded-xl border-2 transition-all ${theme === "dark"
-                                            ? "border-primary bg-primary/5"
-                                            : "border-border hover:border-primary/50"
-                                            }`}
-                                    >
-                                        <div className="p-3 rounded-full bg-slate-950 shadow-sm border border-slate-800">
-                                            <IconMoon size={24} className="text-blue-400" />
-                                        </div>
-                                        <span className="text-sm font-medium">Dark</span>
-                                    </button>
-
-                                    <button
-                                        onClick={() => setTheme("system")}
-                                        className={`flex flex-col items-center gap-3 p-4 rounded-xl border-2 transition-all ${theme === "system"
-                                            ? "border-primary bg-primary/5"
-                                            : "border-border hover:border-primary/50"
-                                            }`}
-                                    >
-                                        <div className="p-3 rounded-full bg-gradient-to-br from-white to-slate-950 shadow-sm border border-gray-200">
-                                            <IconDeviceDesktop size={24} className="text-gray-500 mix-blend-difference" />
-                                        </div>
-                                        <span className="text-sm font-medium">System</span>
-                                    </button>
-                                </div>
+                {/* Content */}
+                <AnimatePresence mode="wait">
+                    {activeTab === "appearance" && (
+                        <motion.div
+                            key="appearance"
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -10 }}
+                            transition={{ duration: 0.2 }}
+                        >
+                            <div className="mb-6">
+                                <h2 className="text-lg font-semibold text-foreground">Theme</h2>
+                                <p className="text-sm text-muted-foreground mt-1">
+                                    Choose how FinanceSum looks on your device
+                                </p>
                             </div>
-                        )}
 
-                        {activeTab === "security" && (
-                            <div className="space-y-6">
-                                <div>
-                                    <h2 className="text-xl font-semibold mb-1">Security</h2>
-                                    <p className="text-sm text-muted-foreground">Manage your password and account security.</p>
-                                </div>
-
-                                <div className="space-y-4">
-                                    <div className="space-y-2">
-                                        <label className="text-sm font-medium">New Password</label>
-                                        <input
-                                            type="password"
-                                            className="w-full px-4 py-2 rounded-lg border border-input bg-background focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none transition-all"
-                                            placeholder="Enter new password"
-                                        />
-                                    </div>
-                                    <div className="space-y-2">
-                                        <label className="text-sm font-medium">Confirm Password</label>
-                                        <input
-                                            type="password"
-                                            className="w-full px-4 py-2 rounded-lg border border-input bg-background focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none transition-all"
-                                            placeholder="Confirm new password"
-                                        />
-                                    </div>
-                                    <div className="pt-2">
-                                        <Button>Update Password</Button>
-                                    </div>
-                                </div>
+                            <div className="space-y-3">
+                                <ThemeCard
+                                    mode="light"
+                                    label="Light"
+                                    description="Clean and bright interface"
+                                    isSelected={theme === "light"}
+                                    onClick={() => setTheme("light")}
+                                />
+                                <ThemeCard
+                                    mode="dark"
+                                    label="Dark"
+                                    description="Easy on the eyes in low light"
+                                    isSelected={theme === "dark"}
+                                    onClick={() => setTheme("dark")}
+                                />
+                                <ThemeCard
+                                    mode="system"
+                                    label="System"
+                                    description="Follows your device settings"
+                                    isSelected={theme === "system"}
+                                    onClick={() => setTheme("system")}
+                                />
                             </div>
-                        )}
+                        </motion.div>
+                    )}
 
-                        {activeTab === "profile" && (
-                            <div className="space-y-6">
-                                <div>
-                                    <h2 className="text-xl font-semibold mb-1">Profile</h2>
-                                    <p className="text-sm text-muted-foreground">Manage your personal information.</p>
-                                </div>
-
-                                <div className="space-y-4">
-                                    <div className="space-y-2">
-                                        <label className="text-sm font-medium">Email</label>
-                                        <input
-                                            type="email"
-                                            disabled
-                                            value={user?.email || ""}
-                                            className="w-full px-4 py-2 rounded-lg border border-input bg-muted text-muted-foreground cursor-not-allowed"
-                                        />
-                                        <p className="text-xs text-muted-foreground">Email cannot be changed.</p>
-                                    </div>
-
-                                    <div className="space-y-2">
-                                        <label className="text-sm font-medium">Full Name</label>
-                                        <input
-                                            type="text"
-                                            defaultValue={user?.user_metadata?.full_name || ""}
-                                            className="w-full px-4 py-2 rounded-lg border border-input bg-background focus:ring-2 focus:ring-primary/20 focus:border-primary outline-none transition-all"
-                                            placeholder="Your full name"
-                                        />
-                                    </div>
-
-                                    <div className="pt-2">
-                                        <Button>Save Changes</Button>
-                                    </div>
-                                </div>
-                            </div>
-                        )}
-
-                        {activeTab === "billing" && (
-                            <div className="space-y-6">
-                                <div>
-                                    <h2 className="text-xl font-semibold mb-1">Billing & Usage</h2>
-                                    <p className="text-sm text-muted-foreground">
-                                        Track your monthly summaries and manage your subscription.
-                                    </p>
-                                </div>
-
-                                <div className="rounded-2xl border border-border bg-background p-5 space-y-4">
-                                    {usageLoading ? (
-                                        <div className="text-sm text-muted-foreground">Loading usage…</div>
-                                    ) : (
-                                        <>
-                                            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                                                <div>
-                                                    <div className="text-sm text-muted-foreground">Plan</div>
-                                                    <div className="text-xl font-semibold">
-                                                        {isProPlan ? "Pro" : "Free"}
-                                                    </div>
-                                                </div>
-                                                <div className="text-sm text-muted-foreground">
-                                                    {!isProPlan ? (
-                                                        <>Trial limit (no reset)</>
-                                                    ) : usage?.period_end ? (
-                                                        <>Resets {new Date(usage.period_end).toLocaleDateString()}</>
-                                                    ) : (
-                                                        <>Resets —</>
-                                                    )}
-                                                </div>
-                                            </div>
-
-                                            <div className="space-y-2">
-                                                <div className="flex items-center justify-between text-sm">
-                                                    <span className="text-muted-foreground">Summaries remaining</span>
-                                                    <span className="font-semibold">{usage?.remaining ?? 0}</span>
-                                                </div>
-                                                <div className="h-3 w-full rounded-full bg-slate-100 overflow-hidden">
-                                                    <div
-                                                        className="h-full rounded-full transition-all"
-                                                        style={{ width: `${usagePercent}%`, backgroundColor: usageBarColor }}
-                                                    />
-                                                </div>
-                                                <div className="text-xs text-muted-foreground">
-                                                    Used {usage?.used ?? 0}/{usage?.limit ?? 0} this period
-                                                </div>
-                                            </div>
-
-                                    {usage?.billing_unavailable && (
-                                        <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-700">
-                                            Billing status is temporarily unavailable. Usage may be delayed.
-                                        </div>
-                                    )}
-
-                                    {showUpgrade && (
-                                        <div className="rounded-2xl border border-blue-100 bg-gradient-to-br from-blue-50 via-white to-blue-100 px-4 py-4 text-sm text-slate-900 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between shadow-soft dark:border-slate-700 dark:bg-gradient-to-br dark:from-slate-900 dark:via-slate-900 dark:to-slate-800 dark:text-white">
+                    {activeTab === "billing" && (
+                        <motion.div
+                            key="billing"
+                            initial={{ opacity: 0, y: 10 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0, y: -10 }}
+                            transition={{ duration: 0.2 }}
+                            className="space-y-6"
+                        >
+                            {/* Plan Card */}
+                            <div className="p-6 rounded-2xl border border-border bg-card">
+                                {usageLoading ? (
+                                    <div className="text-muted-foreground text-sm">Loading…</div>
+                                ) : (
+                                    <div className="space-y-6">
+                                        {/* Plan Header */}
+                                        <div className="flex items-start justify-between">
                                             <div>
-                                                <div className="text-sm font-semibold text-slate-900 dark:text-white">{upgradeTitle}</div>
-                                                <div className="text-xs text-slate-600 dark:text-slate-300">
-                                                    {upgradeDescription}
+                                                <div className="text-sm text-muted-foreground">Current plan</div>
+                                                <div className="text-2xl font-bold text-foreground mt-1">
+                                                    {isProPlan ? "Pro" : "Free"}
                                                 </div>
                                             </div>
+                                            {!isProPlan && (
+                                                <span className="text-xs px-2.5 py-1 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 font-medium">
+                                                    Trial
+                                                </span>
+                                            )}
+                                            {isProPlan && (
+                                                <span className="text-xs px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 font-medium">
+                                                    Active
+                                                </span>
+                                            )}
+                                        </div>
+
+                                        {/* Usage */}
+                                        <div>
+                                            <div className="flex items-center justify-between text-sm mb-2">
+                                                <span className="text-muted-foreground">Usage this period</span>
+                                                <span className="font-medium text-foreground">
+                                                    {usage?.used ?? 0} / {usage?.limit ?? 0}
+                                                </span>
+                                            </div>
+                                            <div className="h-2 bg-muted rounded-full overflow-hidden">
+                                                <motion.div
+                                                    className="h-full bg-foreground rounded-full"
+                                                    initial={{ width: 0 }}
+                                                    animate={{ width: `${usagePercent}%` }}
+                                                    transition={{ duration: 0.5, ease: "easeOut" }}
+                                                />
+                                            </div>
+                                            <div className="text-xs text-muted-foreground mt-2">
+                                                {remainingCount} summaries remaining
+                                                {usage?.period_end && isProPlan && (
+                                                    <> · Resets {new Date(usage.period_end).toLocaleDateString()}</>
+                                                )}
+                                            </div>
+                                        </div>
+
+                                        {/* Cancellation notice */}
+                                        {isCanceling && (
+                                            <div className="text-sm p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-400 border border-amber-200 dark:border-amber-800">
+                                                Your subscription ends on {cancellationLabel}
+                                            </div>
+                                        )}
+
+                                        {/* Actions */}
+                                        <div className="flex gap-3 pt-2">
                                             <Button
-                                                onClick={handleUpgradeToPro}
-                                                disabled={upgradeLoading}
-                                                size="sm"
+                                                onClick={refreshUsage}
                                                 color="ghost"
-                                                className="bg-white text-slate-900 border border-blue-200 hover:bg-blue-50 shadow-soft px-4 dark:bg-slate-900 dark:text-white dark:border-slate-700 dark:hover:bg-slate-800"
+                                                disabled={usageLoading}
+                                                className="text-sm"
                                             >
-                                                {upgradeLoading ? "Redirecting…" : "Upgrade to Pro"}
+                                                Refresh
                                             </Button>
+                                            {isProPlan && (
+                                                <Button
+                                                    onClick={handleOpenStripePortal}
+                                                    color="ghost"
+                                                    disabled={cancelLoading}
+                                                    className="text-sm"
+                                                >
+                                                    {cancelLoading ? "Opening…" : "Manage subscription"}
+                                                </Button>
+                                            )}
                                         </div>
-                                    )}
-
-                                    {isCanceling && (
-                                        <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-700">
-                                            Cancellation scheduled. You keep Pro access until {cancellationLabel}.
-                                        </div>
-                                    )}
-                                        </>
-                                    )}
-                                </div>
-
-                                <div className="flex flex-col gap-3 sm:flex-row">
-                                    <Button
-                                        onClick={refreshUsage}
-                                        color="ghost"
-                                        disabled={usageLoading}
-                                    >
-                                        Refresh usage
-                                    </Button>
-
-                                    {isProPlan && (
-                                        <Button
-                                            onClick={handleOpenStripePortal}
-                                            color="ghost"
-                                            className="border-slate-200 text-slate-700 hover:text-slate-900 hover:border-slate-300 dark:border-white/10 dark:text-gray-200 dark:hover:text-white dark:hover:border-white/20"
-                                            disabled={cancelLoading}
-                                        >
-                                            {cancelLoading ? "Opening Stripe…" : "Open Stripe Portal"}
-                                        </Button>
-                                    )}
-                                </div>
-
-                                {portalMessage && (
-                                    <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs text-emerald-700">
-                                        {portalMessage}
-                                    </div>
-                                )}
-
-                                {usageError && (
-                                    <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700">
-                                        {usageError}
                                     </div>
                                 )}
                             </div>
-                        )}
-                    </motion.div>
-                </div>
+
+                            {/* Upgrade Card */}
+                            {showUpgrade && (
+                                <motion.div
+                                    initial={{ opacity: 0, y: 10 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    transition={{ delay: 0.1 }}
+                                    className="p-6 rounded-2xl bg-foreground text-background"
+                                >
+                                    <div className="flex items-center justify-between gap-6">
+                                        <div>
+                                            <div className="font-semibold text-lg">Upgrade to Pro</div>
+                                            <div className="text-sm opacity-70 mt-1">
+                                                100 summaries/month, priority support, all export formats
+                                            </div>
+                                        </div>
+                                        <Button
+                                            onClick={handleUpgradeToPro}
+                                            disabled={upgradeLoading}
+                                            className="flex-shrink-0 bg-background text-foreground hover:bg-background/90 font-medium"
+                                        >
+                                            {upgradeLoading ? "Loading…" : (
+                                                <>
+                                                    Upgrade
+                                                    <IconArrowRight size={16} className="ml-1" />
+                                                </>
+                                            )}
+                                        </Button>
+                                    </div>
+                                </motion.div>
+                            )}
+
+                            {/* Error/Success Messages */}
+                            <AnimatePresence>
+                                {portalMessage && (
+                                    <motion.div
+                                        initial={{ opacity: 0, y: 5 }}
+                                        animate={{ opacity: 1, y: 0 }}
+                                        exit={{ opacity: 0 }}
+                                        className="text-sm p-3 rounded-lg bg-emerald-50 dark:bg-emerald-900/20 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800"
+                                    >
+                                        {portalMessage}
+                                    </motion.div>
+                                )}
+                                {usageError && (
+                                    <motion.div
+                                        initial={{ opacity: 0, y: 5 }}
+                                        animate={{ opacity: 1, y: 0 }}
+                                        exit={{ opacity: 0 }}
+                                        className="text-sm p-3 rounded-lg bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800"
+                                    >
+                                        {usageError}
+                                    </motion.div>
+                                )}
+                            </AnimatePresence>
+                        </motion.div>
+                    )}
+                </AnimatePresence>
             </div>
         </div>
     )

@@ -20,6 +20,8 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 COMPANIES_CACHE_FILE = CACHE_DIR / "companies.json"
 SUMMARY_EVENTS_CACHE_FILE = CACHE_DIR / "summary_events.json"
 SUMMARY_EVENTS_LOCK_FILE = CACHE_DIR / "summary_events.lock"
+SPOTLIGHT_KPIS_CACHE_FILE = CACHE_DIR / "spotlight_kpis.json"
+SPOTLIGHT_KPIS_LOCK_FILE = CACHE_DIR / "spotlight_kpis.lock"
 
 
 @contextmanager
@@ -75,6 +77,12 @@ fallback_companies: Dict[str, Dict[str, Any]] = _load_json(COMPANIES_CACHE_FILE)
 # Append-only list of summary generation events when Supabase is unavailable
 summary_events_cache: List[Dict[str, Any]] = _load_json(SUMMARY_EVENTS_CACHE_FILE).get("events", [])
 
+# Stores cached Spotlight KPI results keyed by filing ID.
+_spotlight_payload = _load_json(SPOTLIGHT_KPIS_CACHE_FILE)
+fallback_spotlight_kpis_by_id: Dict[str, Dict[str, Any]] = (
+    _spotlight_payload.get("kpis", {}) if isinstance(_spotlight_payload, dict) else {}
+)
+
 
 def load_summary_events_cache() -> List[Dict[str, Any]]:
     """Reload summary generation events from disk (best-effort)."""
@@ -110,6 +118,22 @@ def save_summary_events_cache() -> None:
         _save_json(SUMMARY_EVENTS_CACHE_FILE, {"events": summary_events_cache})
 
 
+def load_spotlight_kpis_cache() -> Dict[str, Dict[str, Any]]:
+    """Reload Spotlight KPI cache from disk (best-effort)."""
+    global fallback_spotlight_kpis_by_id
+    with _exclusive_lock(SPOTLIGHT_KPIS_LOCK_FILE):
+        payload = _load_json(SPOTLIGHT_KPIS_CACHE_FILE)
+        kpis = payload.get("kpis", {}) if isinstance(payload, dict) else {}
+        fallback_spotlight_kpis_by_id = kpis if isinstance(kpis, dict) else {}
+    return fallback_spotlight_kpis_by_id
+
+
+def save_spotlight_kpis_cache() -> None:
+    """Persist Spotlight KPI cache to disk (best-effort)."""
+    with _exclusive_lock(SPOTLIGHT_KPIS_LOCK_FILE):
+        _save_json(SPOTLIGHT_KPIS_CACHE_FILE, {"kpis": fallback_spotlight_kpis_by_id})
+
+
 # Stores serialized filing dictionaries keyed by company ID (as string)
 fallback_filings: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -133,3 +157,6 @@ fallback_filing_summaries: Dict[str, str] = {}
 
 # Stores real-time progress status keyed by filing ID (as string)
 progress_cache: Dict[str, str] = {}
+
+# Stores structured progress snapshots keyed by filing ID (as string)
+summary_progress_cache: Dict[str, Dict[str, Any]] = {}

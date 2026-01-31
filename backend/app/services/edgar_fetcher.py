@@ -2,6 +2,8 @@
 import httpx
 import asyncio
 import json
+import re
+from functools import lru_cache
 import requests  # Used for synchronous SEC calls
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
@@ -15,6 +17,110 @@ from app.services.eodhd_client import (
 from app.services.country_resolver import extract_country_from_sec_submission
 
 settings = get_settings()
+
+@lru_cache(maxsize=1)
+def _sec_ticker_map() -> Dict[str, str]:
+    """Return a mapping of TICKER -> zero-padded CIK string.
+
+    Uses the SEC-provided `company_tickers.json` mapping.
+    """
+    tickers_url = "https://www.sec.gov/files/company_tickers.json"
+    headers = {
+        "User-Agent": settings.edgar_user_agent,
+        "Accept-Encoding": "gzip, deflate",
+        "Host": "www.sec.gov",
+        "Accept": "application/json",
+    }
+    response = requests.get(tickers_url, headers=headers, timeout=12)
+    response.raise_for_status()
+    payload = response.json() or {}
+
+    mapping: Dict[str, str] = {}
+    for _, company in (payload or {}).items():
+        ticker = str(company.get("ticker") or "").upper().strip()
+        cik_str = str(company.get("cik_str") or "").strip()
+        if not ticker or not cik_str:
+            continue
+        digits = "".join(ch for ch in cik_str if ch.isdigit())
+        if not digits:
+            continue
+        mapping[ticker] = digits.zfill(10)
+    return mapping
+
+
+def resolve_cik_from_ticker_sync(ticker: str) -> Optional[str]:
+    """Best-effort synchronous ticker -> CIK resolution."""
+    try:
+        raw = (ticker or "").upper().strip()
+        if not raw:
+            return None
+
+        # Try a few common ticker normalizations.
+        variants: List[str] = []
+
+        def _add(v: str) -> None:
+            vv = (v or "").upper().strip()
+            if vv and vv not in variants:
+                variants.append(vv)
+
+        _add(raw)
+
+        # Common vendor formats: "AAPL:US", "AAPL US"
+        if ":" in raw:
+            _add(raw.split(":", 1)[0])
+        if " " in raw:
+            _add(raw.split()[0])
+
+        # Exchange/country suffixes: "SHOP.TO", "ASML.AS"
+        m = re.match(r"^([A-Z0-9][A-Z0-9._-]{0,14})[.:-]([A-Z]{2,4})$", raw)
+        if m:
+            base, suffix = m.group(1), m.group(2)
+            common_suffixes = {
+                "US",
+                "NASDAQ",
+                "NAS",
+                "NMS",
+                "NYSE",
+                "NYQ",
+                "NYS",
+                "AMEX",
+                "ASE",
+                "ARCX",
+                "BATS",
+                "TO",
+                "V",
+                "L",
+                "LN",
+                "AS",
+                "PA",
+                "DE",
+                "SW",
+                "SS",
+                "SZ",
+                "HK",
+                "T",
+                "KS",
+                "KQ",
+                "SI",
+                "AX",
+            }
+            if suffix in common_suffixes:
+                _add(base)
+
+        # SEC tickers sometimes use '-' for share classes; some vendors use '.' and vice versa.
+        if "." in raw:
+            _add(raw.replace(".", "-"))
+        if "-" in raw:
+            _add(raw.replace("-", "."))
+
+        mapping = _sec_ticker_map()
+        for key in variants:
+            cik = mapping.get(key)
+            if cik:
+                return cik
+        return None
+    except Exception:
+        return None
 
 
 async def _ensure_country(company: Dict) -> Dict:
@@ -366,6 +472,174 @@ def download_filing(url: str, output_path: str) -> bool:
         "User-Agent": settings.edgar_user_agent,
         "Accept-Encoding": "gzip, deflate"
     }
+
+    def _looks_low_signal_filing(body: bytes) -> bool:
+        """Heuristic: detect cover/boilerplate pages that lack the real filing content.
+
+        Common case: 6-K / 8-K primaryDocument is a short cover page, while exhibits
+        (press release / investor presentation) contain the actual numbers.
+        """
+        if not body:
+            return True
+        try:
+            head = body[:120_000].decode("utf-8", errors="ignore")
+        except Exception:
+            return False
+        upper = head.upper()
+        # Cover-page boilerplate hints.
+        boilerplate = (
+            "INDICATE BY CHECK MARK",
+            "PURSUANT TO RULE 13A-16 OR 15D-16",
+            "COMMISSION FILE NUMBER",
+            "SECURITIES AND EXCHANGE COMMISSION",
+            "FORM 6-K",
+            "FORM 8-K",
+            "REPORT OF FOREIGN PRIVATE ISSUER",
+        )
+        has_boilerplate = any(b in upper for b in boilerplate)
+
+        # Short primary docs (esp. 6-K/8-K) are often cover sheets that mention exhibits
+        # but do not include the numeric content we need for KPI extraction. Use a
+        # currency/scale heuristic to detect real content.
+        has_currency_number = bool(re.search(r"[$€£]\s*\d", head))
+        has_scale_number = bool(
+            re.search(r"\b\d+(?:\.\d+)?\s*(?:BILLION|MILLION|THOUSAND)\b", upper)
+        )
+        has_kpi_keyword = bool(
+            re.search(
+                r"\b("
+                r"BOOKINGS?|NET\s+BOOKINGS|BACKLOG|RPO|REMAINING\s+PERFORMANCE|"
+                r"SUBSCRIB|MAU|DAU|USERS?|CUSTOMERS?|ACCOUNTS?|SHIPMENTS?|DELIVERIES?|"
+                r"ORDERS?|TRANSACTIONS?|GMV|TPV|AUM|PAID\s+CLICKS|IMPRESSIONS"
+                r")\b",
+                upper,
+            )
+        )
+
+        # Short boilerplate-heavy docs are usually cover pages. Even if they contain
+        # a headline number, they rarely contain operational KPIs; prefer exhibits.
+        if has_boilerplate and len(body) < 60_000:
+            if not has_kpi_keyword:
+                return True
+            if not (has_currency_number or has_scale_number):
+                return True
+
+        # Many cover pages are only a few KB. But some exhibits are legitimately small
+        # while still containing real KPIs, so require the text to look "empty" too.
+        if len(body) < 35_000:
+            alpha = sum(1 for ch in upper if "A" <= ch <= "Z")
+            digits = sum(1 for ch in upper if "0" <= ch <= "9")
+            # If we have meaningful prose + numbers, treat it as content.
+            if alpha >= 2_500 and digits >= 40:
+                return False
+            return True
+        return False
+
+    def _dir_index_json_url(original_url: str) -> Optional[str]:
+        try:
+            parsed_local = urlparse(original_url)
+        except Exception:
+            return None
+        if not parsed_local.path:
+            return None
+        # Expect: /Archives/edgar/data/<cik>/<accession>/<filename>
+        parts = [p for p in parsed_local.path.split("/") if p]
+        try:
+            idx = parts.index("data")
+        except ValueError:
+            return None
+        # Need at least: data/<cik>/<accession>/<file>
+        if len(parts) < idx + 4:
+            return None
+        base_path = "/" + "/".join(parts[: idx + 3])  # includes accession directory
+        return f"{parsed_local.scheme}://{parsed_local.netloc}{base_path}/index.json"
+
+    def _choose_best_exhibit_url(original_url: str) -> Optional[str]:
+        index_url = _dir_index_json_url(original_url)
+        if not index_url:
+            return None
+        try:
+            resp = requests.get(index_url, headers=headers, timeout=20)
+            if resp.status_code >= 400:
+                return None
+            data = resp.json() or {}
+        except Exception:
+            return None
+
+        items = (data.get("directory") or {}).get("item") or []
+        if not isinstance(items, list) or not items:
+            return None
+
+        try:
+            parsed_local = urlparse(original_url)
+            original_name = (parsed_local.path or "").split("/")[-1]
+        except Exception:
+            original_name = ""
+
+        def _score_item(it: dict) -> tuple[int, int]:
+            name = str(it.get("name") or "")
+            size_raw = it.get("size")
+            try:
+                size = int(size_raw) if str(size_raw).strip() else 0
+            except Exception:
+                size = 0
+
+            lower = name.lower()
+            bonus = 0
+            # Prefer content exhibits / press releases over the index and over the cover doc.
+            if lower.endswith(("index.html", "index-headers.html")):
+                bonus -= 50
+            if original_name and lower == original_name.lower():
+                bonus -= 25
+            # High-signal content keywords.
+            # Press releases / results exhibits are usually best for KPI extraction.
+            if any(tok in lower for tok in ("press", "release", "earnings", "results")):
+                bonus += 55
+            if "quarter" in lower or "quarterly" in lower:
+                bonus += 15
+            if any(tok in lower for tok in ("ex99", "ex-99", "exhibit", "99")):
+                bonus += 25
+            # Investor presentations can be useful, but are often image-heavy. Prefer them
+            # only when we don't have a press release/results exhibit.
+            if "investor" in lower:
+                bonus += 8
+            if "presentation" in lower:
+                bonus += 12
+            if "financialstatements" in lower:
+                bonus += 10
+            # Prefer HTML content.
+            if lower.endswith((".htm", ".html")):
+                bonus += 10
+            # Allow PDFs (investor decks / exhibits). Keep a small preference for HTML
+            # so we don't accidentally select image-heavy presentations when a press
+            # release HTML is available.
+            if lower.endswith(".pdf"):
+                bonus += 6
+            return (bonus, size)
+
+        candidate_items = [
+            it
+            for it in items
+            if isinstance(it, dict)
+            and str(it.get("name") or "")
+            .lower()
+            .endswith((".htm", ".html", ".pdf"))
+        ]
+        if not candidate_items:
+            return None
+
+        best = max(candidate_items, key=_score_item)
+        best_name = str(best.get("name") or "").strip()
+        if not best_name:
+            return None
+
+        # Build the URL in the same directory.
+        try:
+            parsed_local = urlparse(original_url)
+            base = parsed_local.path.rsplit("/", 1)[0]
+            return f"{parsed_local.scheme}://{parsed_local.netloc}{base}/{best_name}"
+        except Exception:
+            return None
     
     try:
         response = requests.get(url, headers=headers, timeout=30)
@@ -373,6 +647,21 @@ def download_filing(url: str, output_path: str) -> bool:
         
         with open(output_path, 'wb') as f:
             f.write(response.content)
+
+        # If the downloaded doc is likely just a cover page, try to replace it with
+        # the most relevant exhibit/attachment in the accession directory.
+        if _looks_low_signal_filing(response.content):
+            upgraded_url = _choose_best_exhibit_url(url)
+            if upgraded_url and upgraded_url != url:
+                try:
+                    upgraded = requests.get(upgraded_url, headers=headers, timeout=30)
+                    upgraded.raise_for_status()
+                    if not _looks_low_signal_filing(upgraded.content):
+                        with open(output_path, "wb") as f:
+                            f.write(upgraded.content)
+                except Exception:
+                    # Best-effort only; keep original.
+                    pass
         
         return True
     

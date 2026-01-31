@@ -1,210 +1,155 @@
 "use client";
-import { cn } from "@/lib/utils";
-import { AnimatePresence, motion } from "framer-motion";
-import { useState, useEffect } from "react";
+
+import {
+  AnimatePresence,
+  animate,
+  motion,
+  useMotionValue,
+  useMotionValueEvent,
+  useTransform,
+} from "framer-motion";
 import { createPortal } from "react-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-const CheckIcon = ({ className }: { className?: string }) => {
-    return (
-        <svg
-            xmlns="http://www.w3.org/2000/svg"
-            fill="none"
-            viewBox="0 0 24 24"
-            strokeWidth={2.5}
-            stroke="currentColor"
-            className={cn("w-6 h-6", className)}
-        >
-            <path d="M5 13l4 4L19 7" />
-        </svg>
-    );
+export type SummaryProgressPayload = {
+  status?: string | null;
+  percent?: number | null;
+  percent_exact?: number | null;
+  eta_seconds?: number | null;
 };
 
-const CheckFilled = ({ className }: { className?: string }) => {
-    return (
-        <svg
-            xmlns="http://www.w3.org/2000/svg"
-            viewBox="0 0 24 24"
-            fill="currentColor"
-            className={cn("w-6 h-6", className)}
-        >
-            <path
-                fillRule="evenodd"
-                d="M2.25 12c0-5.385 4.365-9.75 9.75-9.75s9.75 4.365 9.75 9.75-4.365 9.75-9.75 9.75S2.25 17.385 2.25 12zm13.36-1.814a.75.75 0 10-1.22-.872l-3.236 4.53L9.53 12.22a.75.75 0 00-1.06 1.06l2.25 2.25a.75.75 0 001.14-.094l3.75-5.25z"
-                clipRule="evenodd"
-            />
-        </svg>
-    );
-};
-
-const LoaderIcon = ({ className }: { className?: string }) => {
-    return (
-        <svg
-            xmlns="http://www.w3.org/2000/svg"
-            fill="none"
-            viewBox="0 0 24 24"
-            strokeWidth={2.5}
-            stroke="currentColor"
-            className={cn("w-6 h-6 animate-spin", className)}
-        >
-            <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
-        </svg>
-    );
-};
-
-type LoadingState = {
-    text: string;
-};
-
-const LoaderCore = ({
-    loadingStates,
-    value = 0,
-    percentage,
-    statusText,
-}: {
-    loadingStates: LoadingState[];
-    value?: number;
-    percentage?: number | null;
-    statusText?: string;
-}) => {
-    return (
-        <div className="flex relative justify-start max-w-xl mx-auto flex-col mt-40">
-            {loadingStates.map((loadingState, index) => {
-                const distance = Math.abs(index - value);
-                const opacity = Math.max(1 - distance * 0.2, 0);
-
-                return (
-                    <motion.div
-                        key={index}
-                        className={cn("text-left flex gap-2 mb-4")}
-                        initial={{ opacity: 0, y: -(value * 40) }}
-                        animate={{ opacity: opacity, y: -(value * 40) }}
-                        transition={{ duration: 0.5 }}
-                    >
-                        <div className="w-6 h-6 flex items-center justify-center">
-                            {index > value ? (
-                                <div className="w-4 h-4 border-2 border-black dark:border-white" />
-                            ) : index === value ? (
-                                <LoaderIcon className="text-black dark:text-white" />
-                            ) : (
-                                <CheckFilled className={cn("text-black dark:text-white", value === index && "text-black dark:text-white opacity-100")} />
-                            )}
-                        </div>
-                        <span
-                            className={cn(
-                                "text-black dark:text-white text-lg font-bold uppercase",
-                                value === index && "text-black dark:text-white opacity-100"
-                            )}
-                        >
-                            {index === value && statusText ? statusText : loadingState.text}
-                        </span>
-                    </motion.div>
-                );
-            })}
-            
-            {percentage !== null && percentage !== undefined && (
-                <motion.div
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    className="mt-8 w-full max-w-md"
-                >
-                    <div className="flex justify-between text-sm font-bold mb-2">
-                        <span>Progress</span>
-                        <span>{percentage}%</span>
-                    </div>
-                    <div className="h-4 bg-gray-200 dark:bg-gray-700 border-2 border-black dark:border-white">
-                        <motion.div
-                            className="h-full bg-black dark:bg-white"
-                            initial={{ width: 0 }}
-                            animate={{ width: `${percentage}%` }}
-                            transition={{ duration: 0.3 }}
-                        />
-                    </div>
-                </motion.div>
-            )}
-        </div>
-    );
+const formatEta = (etaSeconds: number | null | undefined) => {
+  if (etaSeconds === null || etaSeconds === undefined) return "Taking longer than usual…";
+  const total = Math.max(0, Math.floor(etaSeconds));
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  if (minutes <= 0) return `${seconds}s remaining`;
+  return `${minutes}m ${String(seconds).padStart(2, "0")}s remaining`;
 };
 
 export const MultiStepLoader = ({
-    loadingStates,
-    loading,
-    duration = 2000,
-    loop = true,
-    stopOnLastStep,
-    currentStep,
-    percentage,
-    statusText,
+  loading,
+  progress,
+  title = "Generating AI Brief",
 }: {
-    loadingStates: LoadingState[];
-    loading?: boolean;
-    duration?: number;
-    loop?: boolean;
-    stopOnLastStep?: boolean;
-    currentStep?: number;
-    percentage?: number | null;
-    statusText?: string;
+  loading?: boolean;
+  progress?: SummaryProgressPayload | null;
+  title?: string;
 }) => {
-    const [internalState, setInternalState] = useState(0);
-    const [mounted, setMounted] = useState(false);
+  const [mounted, setMounted] = useState(false);
+  const progressValue = useMotionValue(0);
+  const progressWidth = useTransform(
+    progressValue,
+    (value) => `${Math.max(0, Math.min(100, value)).toFixed(2)}%`,
+  );
+  const [displayPercent, setDisplayPercent] = useState(0);
+  const displayPercentRef = useRef(0);
 
-    // Use external state if provided, otherwise internal
-    const currentState = currentStep !== undefined ? currentStep : internalState;
+  useEffect(() => {
+    setMounted(true);
+    return () => setMounted(false);
+  }, []);
 
-    useEffect(() => {
-        setMounted(true);
-        return () => setMounted(false);
-    }, []);
+  useMotionValueEvent(progressValue, "change", (value) => {
+    const next = Math.max(displayPercentRef.current, Math.max(0, Math.min(100, Math.floor(value))));
+    if (next === displayPercentRef.current) return;
+    displayPercentRef.current = next;
+    setDisplayPercent(next);
+  });
 
-    useEffect(() => {
-        if (!loading) {
-            setInternalState(0);
-            return;
-        }
+  const targetPercent = useMemo(() => {
+    const exact =
+      typeof progress?.percent_exact === "number" && Number.isFinite(progress.percent_exact)
+        ? progress.percent_exact
+        : null;
+    const fallback =
+      typeof progress?.percent === "number" && Number.isFinite(progress.percent) ? progress.percent : 0;
+    const value = exact ?? fallback;
+    return Math.max(0, Math.min(100, value));
+  }, [progress?.percent, progress?.percent_exact]);
 
-        // If controlled externally, skip internal timer
-        if (currentStep !== undefined) return;
+  useEffect(() => {
+    if (!loading) {
+      progressValue.set(0);
+      displayPercentRef.current = 0;
+      setDisplayPercent(0);
+      return;
+    }
+    const current = progressValue.get();
+    const target = targetPercent;
+    const delta = Math.max(0, target - current);
+    const duration = target >= 100 ? 0.25 : Math.min(2.6, 1.1 + delta * 0.04);
+    const controls = animate(progressValue, target, {
+      duration,
+      ease: [0.2, 0.8, 0.2, 1],
+    });
+    return () => controls.stop();
+  }, [loading, targetPercent, progressValue]);
 
-        // Add some randomness to the duration for a more "organic" feel
-        const randomDuration = duration * (0.8 + Math.random() * 0.4);
+  const status = (progress?.status || "Initializing…").toString();
+  const etaLabel = formatEta(progress?.eta_seconds ?? null);
 
-        const timeout = setTimeout(() => {
-            setInternalState((prevState) => {
-                if (stopOnLastStep && prevState === loadingStates.length - 1) {
-                    return prevState;
-                }
-                return loop
-                    ? (prevState + 1) % loadingStates.length
-                    : Math.min(prevState + 1, loadingStates.length - 1);
-            });
-        }, randomDuration);
+  const overlay = (
+    <AnimatePresence mode="wait">
+      {loading && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          className="fixed inset-0 flex items-center justify-center bg-white/80 dark:bg-black/80 backdrop-blur-xl"
+          style={{ zIndex: 100000 }}
+        >
+          <motion.div
+            initial={{ opacity: 0, y: 12, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 12, scale: 0.98 }}
+            transition={{ duration: 0.2 }}
+            className="w-full max-w-md sm:max-w-xl mx-4 bg-white dark:bg-zinc-900 border-2 border-black dark:border-white shadow-[8px_8px_0px_0px_rgba(0,0,0,1)] dark:shadow-[8px_8px_0px_0px_rgba(255,255,255,1)] p-4 sm:p-6 max-h-[85vh] overflow-auto"
+          >
+            <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4">
+              <div>
+                <div className="text-xs font-bold uppercase tracking-widest text-gray-500 dark:text-gray-400">
+                  FinanceSum
+                </div>
+                <h2 className="mt-1 text-xl sm:text-2xl font-black uppercase leading-tight break-words">
+                  {title}
+                </h2>
+              </div>
+              <div className="sm:text-right">
+                <div className="text-3xl sm:text-4xl font-black tabular-nums leading-none">
+                  {displayPercent}%
+                </div>
+                <div className="text-xs font-mono text-gray-500 dark:text-gray-400">{etaLabel}</div>
+              </div>
+            </div>
 
-        return () => clearTimeout(timeout);
-    }, [internalState, loading, loop, loadingStates.length, duration, stopOnLastStep, currentStep]);
+            <div className="mt-5">
+              <div className="flex items-center justify-between gap-3 text-xs font-mono text-gray-600 dark:text-gray-300">
+                <span className="whitespace-normal break-words">{status}</span>
+              </div>
 
-    const overlay = (
-        <AnimatePresence mode="wait">
-            {loading && (
+              <div className="mt-3 border-2 border-black dark:border-white bg-gray-100 dark:bg-black h-3 overflow-hidden relative">
                 <motion.div
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="fixed inset-0 flex items-center justify-center bg-white/90 dark:bg-black/90 backdrop-blur-xl"
-                    style={{ zIndex: 100000 }}
-                >
-                    <div className="h-96 relative">
-                        <LoaderCore
-                            value={currentState}
-                            loadingStates={loadingStates}
-                            percentage={percentage}
-                            statusText={statusText}
-                        />
-                    </div>
-                </motion.div>
-            )}
-        </AnimatePresence>
-    );
+                  className="h-full bg-black dark:bg-white"
+                  initial={{ width: 0 }}
+                  style={{ width: progressWidth }}
+                  transition={{ type: "tween", duration: 0.2, ease: "easeOut" }}
+                />
+                <motion.div
+                  aria-hidden
+                  className="absolute top-0 h-full w-1/3 bg-gradient-to-r from-transparent via-white/40 to-transparent"
+                  animate={{ x: ["-50%", "200%"] }}
+                  transition={{ duration: 1.2, ease: "linear", repeat: Infinity }}
+                  style={{ mixBlendMode: "overlay" }}
+                />
+              </div>
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
 
-    // Render at the document body level to avoid stacking context issues (e.g. transformed parents).
-    if (!mounted) return null;
-    return createPortal(overlay, document.body);
+  if (!mounted) return null;
+  return createPortal(overlay, document.body);
 };

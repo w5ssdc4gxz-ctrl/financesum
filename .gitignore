@@ -58,6 +58,11 @@ yarn-error.log*
 *.swo
 *~
 
+# Local tool state
+.gcloud/
+.opencode/
+.opencode.json
+
 # Testing
 coverage/
 .pytest_cache/

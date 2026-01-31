@@ -83,9 +83,9 @@ async function proxy(request: NextRequest, context: { params: Promise<Params> })
     init.duplex = 'half'
   }
 
-  // Use a long timeout for summary generation which can take 2-3+ minutes
+  // Use a long timeout for summary generation which can take several minutes
   const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), 5 * 60 * 1000) // 5 minute timeout
+  const timeoutId = setTimeout(() => controller.abort(), 14 * 60 * 1000) // 14 minute timeout (must be <= Cloud Run timeout)
 
   try {
     const response = await fetch(targetUrl, {

@@ -8,6 +8,10 @@ from app.services.ratio_calculator import calculate_ratios
 from app.services.health_scorer import calculate_health_score
 from app.services.gemini_client import get_gemini_client
 from app.services.persona_engine import get_persona_engine
+from app.services.summary_length import (
+    clamp_summary_target_length,
+    enforce_summary_target_length,
+)
 from app.services.eodhd_client import normalize_eodhd_to_internal_format, hydrate_country_with_eodhd, should_hydrate_country
 from app.services.summary_activity import record_summary_generated_event
 from app.services.country_resolver import (
@@ -44,6 +48,7 @@ def analyze_company_task(
         complexity: Complexity level of the summary
     """
     supabase = get_supabase_client()
+    target_length = clamp_summary_target_length(target_length)
     
     try:
         # Update analysis status
@@ -225,9 +230,10 @@ def analyze_company_task(
 ## Catalysts
 {summary_data.get('catalysts', '')}
 
-        ## Key KPIs to Monitor
+## Key KPIs
 {summary_data.get('kpis', '')}
 """
+        summary_md = enforce_summary_target_length(summary_md, target_length)
 
         # Track the completed company summary immediately (best-effort).
         record_summary_generated_event(
@@ -277,6 +283,12 @@ def analyze_company_task(
                         financial_data=merged_financial_data,
                         target_length=target_length  # Pass user-specified target length
                     )
+
+                    summary_text = persona_analysis.get("summary")
+                    if isinstance(summary_text, str):
+                        persona_analysis["summary"] = enforce_summary_target_length(
+                            summary_text, target_length
+                        )
                     
                     persona_summaries[persona_id] = persona_analysis
 

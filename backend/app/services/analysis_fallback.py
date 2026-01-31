@@ -29,6 +29,10 @@ from app.services.ratio_calculator import calculate_ratios
 from app.services.sample_data import sample_filings_by_ticker
 from app.services.gemini_client import get_gemini_client
 from app.services.persona_engine import get_persona_engine
+from app.services.summary_length import (
+    clamp_summary_target_length,
+    enforce_summary_target_length,
+)
 
 
 def run_analysis(request: AnalysisRunRequest, *, user_id: Optional[str] = None) -> AnalysisRunResponse:
@@ -284,14 +288,29 @@ def _build_analysis_record(
         "user_id": str(user_id) if user_id else None,
     }
 
+    target_length = None
+    if isinstance(analysis_options, dict):
+        target_length = analysis_options.get("target_length")
+    target_length = clamp_summary_target_length(target_length)
     summary_md, persona_summaries = _build_summary(
         company_name,
         health_score_data,
         ratios,
         len(filing_ids),
         filing_ids,
+        target_length=target_length,
         usage_context=usage_context,
     )
+    summary_md = enforce_summary_target_length(summary_md, target_length)
+    if target_length and isinstance(persona_summaries, dict):
+        for persona_output in persona_summaries.values():
+            if not isinstance(persona_output, dict):
+                continue
+            summary_text = persona_output.get("summary")
+            if isinstance(summary_text, str):
+                persona_output["summary"] = enforce_summary_target_length(
+                    summary_text, target_length
+                )
 
     record = {
         "id": analysis_id,
@@ -360,6 +379,7 @@ def _build_summary(
     ratios: Dict[str, Any],
     filings_count: int,
     filing_ids: List[str],
+    target_length: Optional[int] = None,
     usage_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     overall = health_score_data.get("overall_score")
@@ -425,6 +445,7 @@ def _build_summary(
         health_score=overall,
         narrative="\n".join(thesis_points),
         filing_ids=filing_ids,
+        target_length=target_length,
         usage_context=usage_context,
     )
 
@@ -449,7 +470,7 @@ def _build_summary(
 ## Catalysts
 {gemini_summary.get("catalysts") or chr(10).join(f"- {point}" for point in catalysts)}
 
-## Key KPIs to Monitor
+## Key KPIs
 {gemini_summary.get("kpis") or chr(10).join(f"- {item}" for item in kpis)}
 
 ## Financial Highlights
@@ -457,8 +478,6 @@ def _build_summary(
 
 ## Overall Takeaway
 {overall_takeaway}
-
-_Generated in local fallback mode with Gemini analysis._
 """
 
     return summary_md, persona_outputs
@@ -529,10 +548,22 @@ def _generate_fallback_summary(
     narrative: str,
 ) -> Dict[str, str]:
     """Generate a basic summary when Gemini is unavailable."""
+    def _clamp_to_max_words(text: str, max_words: int = 10) -> str:
+        text = (text or "").strip()
+        if not text:
+            return text
+        tokens = text.split()
+        if len(tokens) <= max_words:
+            return text
+        trimmed = " ".join(tokens[:max_words]).strip()
+        if trimmed and trimmed[-1] not in ".!?":
+            trimmed += "."
+        return trimmed
+
     score_text = f" with a health score of {health_score:.1f}/100" if health_score else ""
     
     return {
-        "tldr": f"{company_name}{score_text}. Strong margins, solid cash generation.",
+        "tldr": _clamp_to_max_words(f"{company_name}{score_text}. Strong margins, solid cash generation."),
         "thesis": narrative,
         "risks": "Set GEMINI_API_KEY in .env to generate AI-powered risk analysis, thesis, and investor persona views.",
         "catalysts": "AI-generated catalysts require Gemini API key configuration.",
@@ -546,6 +577,7 @@ def _generate_ai_sections(
     health_score: Optional[float],
     narrative: str,
     filing_ids: List[str],
+    target_length: Optional[int] = None,
     usage_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, str], Dict[str, Any]]:
     """Generates AI-generated sections for the analysis."""
@@ -568,6 +600,7 @@ def _generate_ai_sections(
                 health_score=health_score or 0,
                 mda_text=None,
                 risk_factors_text=None,
+                target_length=target_length,
             )
     except Exception as exc:
         import traceback

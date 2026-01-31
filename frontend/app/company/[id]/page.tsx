@@ -21,7 +21,7 @@ import { BrutalButton } from '@/components/ui/BrutalButton'
 import SummaryWizard, { INVESTOR_PERSONAS } from '@/components/SummaryWizard'
 import { Modal } from '@/components/ui/modal'
 import { cn } from '@/lib/utils'
-import { MultiStepLoader } from '@/components/ui/multi-step-loader'
+import { MultiStepLoader, type SummaryProgressPayload } from '@/components/ui/multi-step-loader'
 
 type SummaryMode = 'default' | 'custom'
 type SummaryTone = 'objective' | 'cautiously optimistic' | 'bullish' | 'bearish'
@@ -83,6 +83,13 @@ type SummaryPreferenceSnapshot = {
   selectedPersona?: string | null
 }
 
+type SummaryErrorModalState = {
+  isOpen: boolean
+  title: string
+  message: string
+  showExtensionTip: boolean
+}
+
 type HealthComponentScores = {
   financial_performance?: number
   profitability?: number
@@ -95,6 +102,24 @@ type HealthComponentScores = {
 
 type HealthComponentDescriptions = Partial<Record<keyof HealthComponentScores, string>>
 
+type ChartDataPeriod = {
+  revenue?: number | null
+  operating_income?: number | null
+  net_income?: number | null
+  free_cash_flow?: number | null
+  operating_margin?: number | null
+  net_margin?: number | null
+  gross_margin?: number | null
+}
+
+type ChartData = {
+  current_period: ChartDataPeriod
+  prior_period?: ChartDataPeriod | null
+  period_type: 'quarterly' | 'annual'
+  current_label: string
+  prior_label: string
+}
+
 type FilingSummary = {
   content: string
   metadata: SummaryPreferenceSnapshot
@@ -105,6 +130,7 @@ type FilingSummary = {
   healthComponentWeights?: Partial<Record<keyof HealthComponentScores, number>>  // Dynamic weights from user settings
   healthComponentDescriptions?: HealthComponentDescriptions  // Dynamic descriptions based on weighting
   healthComponentMetrics?: Partial<Record<keyof HealthComponentScores, string>>  // Actual metric values for display
+  chartData?: ChartData | null  // Chart data for visualizations
 }
 
 type FilingSummaryMap = Record<string, FilingSummary>
@@ -186,6 +212,8 @@ const healthRatingDefaults: HealthRatingFormState = {
   displayStyle: 'score_plus_grade',
 }
 
+const DEFAULT_TARGET_LENGTH_WORDS = 650
+
 const createDefaultSummaryPreferences = (): SummaryPreferenceFormState => ({
   mode: 'custom',
   investorFocus: '',
@@ -193,16 +221,16 @@ const createDefaultSummaryPreferences = (): SummaryPreferenceFormState => ({
   tone: 'objective',
   detailLevel: 'balanced',
   outputStyle: 'narrative',
-  targetLength: 650,
+  targetLength: DEFAULT_TARGET_LENGTH_WORDS,
   includeHealthScore: true,
   healthRating: { ...healthRatingDefaults },
   complexity: 'intermediate',
   selectedPersona: null,
 })
 
-const clampTargetLength = (value: number) => {
-  if (Number.isNaN(value)) return 300
-  return Math.max(10, Math.min(5000, Math.round(value)))
+const clampTargetLength = (value: number | null | undefined) => {
+  const numericValue = typeof value === 'number' && Number.isFinite(value) ? value : DEFAULT_TARGET_LENGTH_WORDS
+  return Math.max(1, Math.min(3000, Math.round(numericValue)))
 }
 
 const buildPreferencePayload = (prefs: SummaryPreferenceFormState): FilingSummaryPreferencesPayload | undefined => {
@@ -355,6 +383,14 @@ const parseNumericScore = (value: unknown): number | null => {
   return null
 }
 
+const getFilingColor = (type?: string) => {
+  const t = type?.toUpperCase() || ''
+  if (t.includes('10-K')) return 'bg-emerald-500'
+  if (t.includes('10-Q')) return 'bg-blue-500'
+  if (t.includes('8-K')) return 'bg-rose-500'
+  return 'bg-zinc-500'
+}
+
 export default function CompanyPage() {
   const params = useParams()
   const router = useRouter()
@@ -371,49 +407,15 @@ export default function CompanyPage() {
   const [currentAnalysisId, setCurrentAnalysisId] = useState<string | null>(analysisIdParam ?? null)
   const [localAnalysisSnapshot, setLocalAnalysisSnapshot] = useState<StoredAnalysisSnapshot | null>(null)
   const [loadingSummaries, setLoadingSummaries] = useState<Record<string, boolean>>({})
-  const [summaryProgress, setSummaryProgress] = useState<Record<string, string>>({})
+  const [activeSummaryProgressFilingId, setActiveSummaryProgressFilingId] = useState<string | null>(null)
+  const [summaryProgress, setSummaryProgress] = useState<Record<string, SummaryProgressPayload>>({})
   const [filingSummaries, setFilingSummaries] = useState<Record<string, FilingSummary>>({})
-
-  const LOADING_STEPS = [
-    { text: "Initializing AI Agent..." },
-    { text: "Reading Filing Content..." },
-    { text: "Extracting Financial Data..." },
-    { text: "Analyzing Risk Factors..." },
-    { text: "Computing Health Score..." },
-    { text: "Synthesizing Investor Insights..." },
-    { text: "Generating Summary..." },
-    { text: "Polishing Output..." },
-  ];
-
-  const parseProgressStatus = (status: string): { step: number; percentage: number | null; displayText: string } => {
-    const raw = (status || "").trim()
-
-    const cleaned = raw
-      .replace(/\(attempt\s*\d+\s*\/\s*\d+\)/gi, "")
-      .replace(/\(http fallback\)/gi, "")
-      .replace(/\s+/g, " ")
-      .trim()
-
-    const percentMatch = cleaned.match(/(\d+)%/)
-    const percentage = percentMatch ? parseInt(percentMatch[1], 10) : null
-
-    if (/^complete$/i.test(cleaned)) {
-      return { step: LOADING_STEPS.length - 1, percentage: null, displayText: "Polishing Output..." }
-    }
-
-    if (cleaned.toLowerCase().includes("generating summary")) {
-      const displayText = "Generating Summary..."
-      return { step: 6, percentage, displayText }
-    }
-
-    const canonical = cleaned.replace(/\.*\s*(\d+%)?$/g, "").trim()
-    const stepIndex = LOADING_STEPS.findIndex(s => canonical.startsWith(s.text.replace("...", "")))
-    return {
-      step: stepIndex >= 0 ? stepIndex : 0,
-      percentage,
-      displayText: cleaned || "Initializing AI Agent..."
-    }
-  }
+  const [summaryErrorModal, setSummaryErrorModal] = useState<SummaryErrorModalState>({
+    isOpen: false,
+    title: '',
+    message: '',
+    showExtensionTip: false,
+  })
 
   const [selectedFilingForSummary, setSelectedFilingForSummary] = useState<string>('')
   const [summaryPreferences, setSummaryPreferences] = useState<SummaryPreferenceFormState>(() => createDefaultSummaryPreferences())
@@ -429,11 +431,34 @@ export default function CompanyPage() {
   const preferencesHydratedRef = useRef(false)
   const isSummaryGenerating = selectedFilingForSummary ? !!loadingSummaries[selectedFilingForSummary] : false
   const queryClient = useQueryClient()
-  const sliderLengthValue = Math.max(50, Math.min(5000, summaryPreferences.targetLength))
+  const sliderLengthValue = Math.max(1, Math.min(3000, summaryPreferences.targetLength))
   const authPending = loading || !user
   const queriesEnabled = !!companyId && !authPending
   const fallbackTicker = searchParams?.get('ticker') ?? undefined
   const isLocalAnalysisId = currentAnalysisId?.startsWith('summary-') ?? false
+
+  const openSummaryError = useCallback((error: any, fallbackMessage: string) => {
+    const responseMessage = error?.response?.data?.detail
+    const message = String(responseMessage || error?.message || fallbackMessage || 'Failed to generate summary')
+    const status = error?.response?.status
+    const code = String(error?.code || '')
+    const raw = `${String(error?.message || '')} ${String(error?.toString?.() || '')}`.toLowerCase()
+
+    const looksLikeNetworkOrClientBlock =
+      !status &&
+      (code.toLowerCase().includes('network') ||
+        raw.includes('network error') ||
+        raw.includes('failed to fetch') ||
+        raw.includes('err_blocked_by_client') ||
+        raw.includes('net::err_'))
+
+    setSummaryErrorModal({
+      isOpen: true,
+      title: 'Couldn’t generate summary',
+      message,
+      showExtensionTip: looksLikeNetworkOrClientBlock,
+    })
+  }, [])
 
   useEffect(() => {
     if (!loading && !user) {
@@ -533,8 +558,12 @@ export default function CompanyPage() {
     preferences?: FilingSummaryPreferencesPayload,
     metadata?: SummaryPreferenceSnapshot,
   ) => {
+    setActiveSummaryProgressFilingId(filingId)
     setLoadingSummaries(prev => ({ ...prev, [filingId]: true }))
-    setSummaryProgress(prev => ({ ...prev, [filingId]: "Initializing..." }))
+    setSummaryProgress(prev => ({
+      ...prev,
+      [filingId]: { status: 'Initializing...', percent: 0, percent_exact: 0, eta_seconds: null },
+    }))
 
     let isPolling = true
     const pollProgress = async () => {
@@ -548,8 +577,16 @@ export default function CompanyPage() {
 
       try {
         const progressRes = await filingsApi.getSummaryProgress(filingId)
-        if (progressRes.data?.status && isMountedRef.current) {
-          setSummaryProgress(prev => ({ ...prev, [filingId]: progressRes.data.status }))
+        if (isMountedRef.current && progressRes.data) {
+          const status = String(progressRes.data.status ?? 'Initializing...')
+          const percent = typeof progressRes.data.percent === 'number' ? progressRes.data.percent : 0
+          const percent_exact =
+            typeof progressRes.data.percent_exact === 'number' ? progressRes.data.percent_exact : percent
+          const eta_seconds = typeof progressRes.data.eta_seconds === 'number' ? progressRes.data.eta_seconds : null
+          setSummaryProgress(prev => ({
+            ...prev,
+            [filingId]: { status, percent, percent_exact, eta_seconds },
+          }))
         }
       } catch (e) {
         // Ignore polling errors, just retry
@@ -565,6 +602,12 @@ export default function CompanyPage() {
 
     try {
       const response = await filingsApi.summarizeFiling(filingId, preferences)
+      if (isMountedRef.current) {
+        setSummaryProgress(prev => ({
+          ...prev,
+          [filingId]: { status: 'Complete', percent: 100, percent_exact: 100, eta_seconds: 0 },
+        }))
+      }
 
       // Extract health rating if present
       let healthRating: number | undefined;
@@ -588,6 +631,7 @@ export default function CompanyPage() {
       const healthComponentDescriptions = response.data.health_component_descriptions;
       const healthComponentMetrics = response.data.health_component_metrics;
       const companyCountry = response.data.company_country ?? null
+      const chartData = response.data.chart_data ?? null
 
       if (isMountedRef.current) {
         const generatedAt = new Date().toISOString()
@@ -603,13 +647,13 @@ export default function CompanyPage() {
             healthComponentWeights,
             healthComponentDescriptions,
             healthComponentMetrics,
+            chartData,
           },
         }))
       }
     } catch (error: any) {
       if (isMountedRef.current) {
-        const message = error?.response?.data?.detail ?? 'Failed to generate summary'
-        alert(message)
+        openSummaryError(error, 'Failed to generate summary')
       }
     } finally {
       isPolling = false
@@ -623,6 +667,7 @@ export default function CompanyPage() {
               delete next[filingId]
               return next
             })
+            setActiveSummaryProgressFilingId(prev => (prev === filingId ? null : prev))
           }
         }, 1000)
       }
@@ -1064,7 +1109,11 @@ export default function CompanyPage() {
 
   // Run analysis mutation
   const runAnalysisMutation = useMutation({
-    mutationFn: () => analysisApi.run(companyId, undefined, selectedPersonas),
+    mutationFn: () => analysisApi.run(companyId, undefined, {
+      includePersonas: selectedPersonas,
+      targetLength: clampTargetLength(summaryPreferences.targetLength),
+      complexity: summaryPreferences.complexity,
+    }),
     onSuccess: async (response) => {
       setCurrentAnalysisId(response.data.analysis_id)
       await refetchAnalyses()
@@ -1156,29 +1205,31 @@ export default function CompanyPage() {
 
   const summaryMarkdownComponents = useMemo(
     () => ({
-      h1: ({ node, ...props }: any) => <p className="font-mono font-semibold text-base mt-4 mb-2" {...props} />,
-      h2: ({ node, ...props }: any) => <p className="font-mono font-semibold text-base mt-4 mb-2" {...props} />,
-      h3: ({ node, ...props }: any) => <p className="font-mono font-semibold text-base mt-3 mb-1" {...props} />,
-      h4: ({ node, ...props }: any) => <p className="font-mono font-semibold text-base mt-3 mb-1" {...props} />,
-      h5: ({ node, ...props }: any) => <p className="font-mono font-semibold text-base mt-2 mb-1" {...props} />,
-      h6: ({ node, ...props }: any) => <p className="font-mono font-semibold text-base mt-2 mb-1" {...props} />,
-      p: ({ node, ...props }: any) => <p className="font-mono text-base leading-relaxed mb-3 whitespace-pre-wrap" {...props} />,
-      strong: ({ node, ...props }: any) => <span className="font-semibold" {...props} />,
-      em: ({ node, ...props }: any) => <span className="italic" {...props} />,
+      h1: ({ node, ...props }: any) => <h2 className="text-xl font-black uppercase mt-8 mb-4 flex items-center gap-2" {...props}><span className="w-3 h-3 bg-black dark:bg-white" /></h2>,
+      h2: ({ node, ...props }: any) => <h2 className="text-xl font-black uppercase mt-8 mb-4 flex items-center gap-2" {...props}><span className="w-3 h-3 bg-black dark:bg-white" /></h2>,
+      h3: ({ node, ...props }: any) => <h3 className="text-lg font-bold uppercase mt-6 mb-3 flex items-center gap-2 text-zinc-700 dark:text-zinc-300" {...props}><span className="text-blue-500">#</span></h3>,
+      p: ({ node, ...props }: any) => <p className="text-base leading-relaxed mb-4 text-zinc-800 dark:text-zinc-200" {...props} />,
+      strong: ({ node, ...props }: any) => <strong className="font-black bg-yellow-200/80 dark:bg-yellow-900/50 px-1 rounded" {...props} />,
+      em: ({ node, ...props }: any) => <span className="italic opacity-80" {...props} />,
       ul: ({ node, ordered, ...props }: any) => (
-        <ul className="list-disc pl-5 space-y-1 font-mono text-base leading-relaxed mb-3" {...props} />
+        <ul className="list-none space-y-3 mb-6 mt-2" {...props} />
       ),
       ol: ({ node, ordered, ...props }: any) => (
-        <ol className="list-decimal pl-5 space-y-1 font-mono text-base leading-relaxed mb-3" {...props} />
+        <ol className="list-decimal pl-6 space-y-3 mb-6 mt-2 text-zinc-800 dark:text-zinc-200" {...props} />
       ),
-      li: ({ node, ...props }: any) => <li className="font-mono text-base leading-relaxed" {...props} />,
+      li: ({ node, ...props }: any) => (
+        <li className="flex items-start gap-2 text-zinc-800 dark:text-zinc-200" {...props}>
+          <span className="text-blue-500 font-bold mt-0.5">→</span>
+          <span className="flex-1">{props.children}</span>
+        </li>
+      ),
       code: ({ inline, className, children, ...props }: any) => (
-        <code className="font-mono text-base bg-zinc-900/5 dark:bg-white/10 rounded px-1" {...props}>
+        <code className="font-mono text-sm bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded px-1.5 py-0.5" {...props}>
           {children}
         </code>
       ),
       blockquote: ({ node, ...props }: any) => (
-        <blockquote className="border-l-4 border-gray-300 dark:border-gray-700 pl-4 text-base leading-relaxed font-mono mb-3" {...props} />
+        <blockquote className="border-l-4 border-black dark:border-white pl-4 italic my-6 bg-zinc-50 dark:bg-zinc-900/50 p-4 rounded-r-lg text-zinc-700 dark:text-zinc-300" {...props} />
       ),
     }),
     [],
@@ -1267,6 +1318,41 @@ export default function CompanyPage() {
   return (
     <div className="h-screen w-full overflow-hidden bg-gray-50 dark:bg-black font-sans text-black dark:text-white selection:bg-yellow-300 selection:text-black flex flex-col">
       <Navbar />
+      <MultiStepLoader
+        loading={!!activeSummaryProgressFilingId}
+        progress={activeSummaryProgressFilingId ? summaryProgress[activeSummaryProgressFilingId] : null}
+        title="Generating AI Brief"
+      />
+      <Modal
+        isOpen={summaryErrorModal.isOpen}
+        onClose={() => setSummaryErrorModal(prev => ({ ...prev, isOpen: false }))}
+        className="max-w-xl"
+      >
+        <div className="pr-10">
+          <h2 className="text-2xl font-black uppercase tracking-tight">{summaryErrorModal.title || 'Couldn’t generate summary'}</h2>
+          <p className="mt-3 text-sm text-zinc-700 dark:text-zinc-300 whitespace-pre-wrap">
+            {summaryErrorModal.message}
+          </p>
+
+          <div className="mt-5 space-y-2 text-sm">
+            <p className="font-bold">Try this:</p>
+            <ul className="list-disc pl-5 space-y-1 text-zinc-800 dark:text-zinc-200">
+              <li>Retry once (temporary network/API hiccups happen).</li>
+              <li>Hard refresh the page, then try again.</li>
+              {summaryErrorModal.showExtensionTip ? (
+                <li>
+                  If you have browser extensions that inject into pages or block requests (e.g. Savier, ad blockers),
+                  temporarily disable them or try Incognito, then retry.
+                </li>
+              ) : null}
+            </ul>
+          </div>
+
+          <div className="mt-6 flex gap-3">
+            <Button onClick={() => setSummaryErrorModal(prev => ({ ...prev, isOpen: false }))}>Close</Button>
+          </div>
+        </div>
+      </Modal>
 
       <div className="flex-1 overflow-y-auto">
         <main className="container mx-auto px-4 py-8 max-w-7xl space-y-8">
@@ -1412,7 +1498,7 @@ export default function CompanyPage() {
                   </div>
 
                   {/* Generated Summaries List */}
-                  <div className="lg:col-span-2 space-y-6">
+                  <div className="lg:col-span-2 relative">
                     {Object.entries(filingSummaries).length === 0 && Object.keys(dashboardSavedSummaries).length === 0 ? (
                       <div className="bg-gray-50 dark:bg-zinc-900/50 border-2 border-dashed border-gray-300 dark:border-gray-700 p-12 text-center">
                         <div className="w-16 h-16 bg-gray-200 dark:bg-zinc-800 mx-auto mb-4 flex items-center justify-center border-2 border-gray-400 dark:border-gray-600">
@@ -1422,82 +1508,109 @@ export default function CompanyPage() {
                         <p className="text-sm text-gray-400 mt-2">Select a filing to generate an AI-powered brief.</p>
                       </div>
                     ) : (
-                      <div className="space-y-6">
-                        {Object.entries(filingSummaries).map(([fid, summary]) => (
-                          <motion.div
-                            key={fid}
-                            initial={{ opacity: 0, y: 20 }}
-                            animate={{ opacity: 1, y: 0 }}
-                            className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 shadow-[6px_6px_0px_0px_rgba(0,0,0,1)] dark:shadow-[6px_6px_0px_0px_rgba(255,255,255,1)]"
-                          >
-                            <div className="flex justify-between items-start mb-4 border-b-2 border-gray-100 dark:border-gray-800 pb-4">
-                              <div>
-                                <div className="flex items-center gap-3">
-                                  <h4 className="font-black uppercase text-lg">AI Brief</h4>
-                                  {summary.healthRating && (
-                                    <HealthScoreBadge
-                                      score={summary.healthRating}
-                                      band={scoreToRating(summary.healthRating).label}
-                                      size="sm"
-                                      componentScores={summary.healthComponents}
-                                      componentWeights={summary.healthComponentWeights}
-                                      componentDescriptions={summary.healthComponentDescriptions}
-                                      componentMetrics={summary.healthComponentMetrics}
-                                    />
-                                  )}
+                      <div className="space-y-8">
+                          {Object.entries(filingSummaries).map(([fid, summary], idx) => {
+                            const filing = filings?.find((item: any) => item.id === fid)
+                            const filingColor = getFilingColor(filing?.filing_type)
+                            
+                            return (
+                              <motion.div
+                                key={fid}
+                                initial={{ opacity: 0, y: 20 }}
+                                whileInView={{ opacity: 1, y: 0 }}
+                                viewport={{ once: true, margin: "-50px" }}
+                                transition={{ duration: 0.4, delay: idx * 0.08 }}
+                                className="group"
+                              >
+                                <div className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-0 shadow-[6px_6px_0px_0px_rgba(0,0,0,1)] dark:shadow-[6px_6px_0px_0px_rgba(255,255,255,1)] overflow-hidden transition-all duration-300 group-hover:shadow-[8px_8px_0px_0px_rgba(0,0,0,1)] dark:group-hover:shadow-[8px_8px_0px_0px_rgba(255,255,255,1)] group-hover:-translate-y-1">
+                                  {/* Card Header with Type Color */}
+                                  <div className={cn("h-2 w-full", filingColor)} />
+                                  
+                                  <div className="p-6">
+                                    <div className="flex flex-col md:flex-row justify-between items-start mb-6 gap-4 border-b-2 border-gray-100 dark:border-gray-800 pb-6">
+                                      <div>
+                                        <div className="flex items-center gap-3 flex-wrap">
+                                          <div className={cn("px-2 py-0.5 text-[10px] font-black uppercase text-white", filingColor)}>
+                                            {filing?.filing_type || 'Unknown'}
+                                          </div>
+                                          <h4 className="font-black uppercase text-xl">AI Financial Brief</h4>
+                                          {summary.healthRating && (
+                                            <HealthScoreBadge
+                                              score={summary.healthRating}
+                                              band={scoreToRating(summary.healthRating).label}
+                                              size="sm"
+                                              componentScores={summary.healthComponents}
+                                              componentWeights={summary.healthComponentWeights}
+                                              componentDescriptions={summary.healthComponentDescriptions}
+                                              componentMetrics={summary.healthComponentMetrics}
+                                            />
+                                          )}
+                                        </div>
+                                        <div className="flex items-center gap-2 mt-2">
+                                          <p className="text-xs font-mono text-gray-500">
+                                            Filing ID: <span className="text-black dark:text-white font-bold">{fid.slice(0, 12)}</span>
+                                          </p>
+                                          <span className="text-gray-300">•</span>
+                                          <p className="text-xs font-mono text-gray-500">
+                                            {new Date(summary.generatedAt).toLocaleDateString()}
+                                          </p>
+                                        </div>
+                                      </div>
+                                      
+                                      <div className="flex flex-wrap gap-2 justify-end">
+                                        <BrutalButton
+                                          onClick={() => handleAddSummaryToDashboard(fid)}
+                                          disabled={dashboardSavedSummaries[fid]}
+                                          className="px-3 py-1.5 text-[10px] bg-green-400 text-black border-2 border-black dark:border-white shadow-[2px_2px_0px_0px_rgba(0,0,0,1)]"
+                                        >
+                                          {dashboardSavedSummaries[fid] ? '✓ Saved' : 'Save to Dashboard'}
+                                        </BrutalButton>
+                                        <BrutalButton
+                                          onClick={() => handleCopySummary(fid)}
+                                          className="px-3 py-1.5 text-[10px] bg-yellow-300 text-black border-2 border-black dark:border-white shadow-[2px_2px_0px_0px_rgba(0,0,0,1)]"
+                                        >
+                                          {copiedSummaries[fid] ? 'Copied!' : 'Copy'}
+                                        </BrutalButton>
+                                        <BrutalButton
+                                          onClick={() => handleExportSummary(fid, 'pdf')}
+                                          disabled={!!exportingSummaries[fid]}
+                                          className="px-3 py-1.5 text-[10px] bg-blue-300 text-black border-2 border-black dark:border-white shadow-[2px_2px_0px_0px_rgba(0,0,0,1)]"
+                                        >
+                                          {exportingSummaries[fid] === 'pdf' ? '...' : 'PDF'}
+                                        </BrutalButton>
+                                        <BrutalButton
+                                          onClick={() => {
+                                            const newSummaries = { ...filingSummaries }
+                                            delete newSummaries[fid]
+                                            setFilingSummaries(newSummaries)
+                                          }}
+                                          className="px-3 py-1.5 text-[10px] bg-rose-400 text-black border-2 border-black dark:border-white shadow-[2px_2px_0px_0px_rgba(0,0,0,1)]"
+                                        >
+                                          Dismiss
+                                        </BrutalButton>
+                                      </div>
+                                    </div>
+
+                                    <div className="prose dark:prose-invert max-w-none">
+                                      <EnhancedSummary
+                                        content={summary.content}
+                                        persona={summary.metadata?.selectedPersona ? INVESTOR_PERSONAS.find(p => p.id === summary.metadata.selectedPersona) : null}
+                                        chartData={summary.chartData}
+                                        filingId={fid}
+                                        healthData={{
+                                          score: summary.healthRating,
+                                          components: summary.healthComponents,
+                                          weights: summary.healthComponentWeights,
+                                          descriptions: summary.healthComponentDescriptions,
+                                          metrics: summary.healthComponentMetrics,
+                                        }}
+                                      />
+                                    </div>
+                                  </div>
                                 </div>
-                                <p className="text-xs font-mono text-gray-500 mt-1">
-                                  Filing ID: {fid.slice(0, 8)}...
-                                </p>
-                              </div>
-                              <div className="flex flex-wrap gap-2 justify-end">
-                                <BrutalButton
-                                  onClick={() => handleAddSummaryToDashboard(fid)}
-                                  disabled={dashboardSavedSummaries[fid]}
-                                  className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-green-400 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)] disabled:opacity-50 disabled:cursor-not-allowed"
-                                >
-                                  {dashboardSavedSummaries[fid] ? 'Saved' : 'Save to Dashboard'}
-                                </BrutalButton>
-                                <BrutalButton
-                                  onClick={() => handleCopySummary(fid)}
-                                  className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-yellow-300 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)]"
-                                >
-                                  {copiedSummaries[fid] ? 'Copied' : 'Copy'}
-                                </BrutalButton>
-                                <BrutalButton
-                                  onClick={() => handleExportSummary(fid, 'pdf')}
-                                  disabled={!!exportingSummaries[fid]}
-                                  className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-blue-300 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)] disabled:opacity-50 disabled:cursor-not-allowed"
-                                >
-                                  {exportingSummaries[fid] === 'pdf' ? 'Exporting...' : 'Export PDF'}
-                                </BrutalButton>
-                                <BrutalButton
-                                  onClick={() => handleExportSummary(fid, 'docx')}
-                                  disabled={!!exportingSummaries[fid]}
-                                  className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-blue-300 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)] disabled:opacity-50 disabled:cursor-not-allowed"
-                                >
-                                  {exportingSummaries[fid] === 'docx' ? 'Exporting...' : 'Export Word'}
-                                </BrutalButton>
-                                <BrutalButton
-                                  onClick={() => {
-                                    const newSummaries = { ...filingSummaries }
-                                    delete newSummaries[fid]
-                                    setFilingSummaries(newSummaries)
-                                  }}
-                                  className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-red-400 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)]"
-                                >
-                                  Dismiss
-                                </BrutalButton>
-                              </div>
-                            </div>
-                            <div className="prose dark:prose-invert max-w-none font-mono text-sm">
-                                <EnhancedSummary
-                                  content={summary.content}
-                                  persona={summary.metadata?.selectedPersona ? INVESTOR_PERSONAS.find(p => p.id === summary.metadata.selectedPersona) : null}
-                                />
-                              </div>
-                          </motion.div>
-                        ))}
+                              </motion.div>
+                            )
+                          })}
                       </div>
                     )}
                   </div>
@@ -1534,20 +1647,6 @@ export default function CompanyPage() {
                               }`}>
                               {filing.status || 'Unknown'}
                             </span>
-                            {loadingSummaries[filing.id] && (() => {
-                              const progress = parseProgressStatus(summaryProgress[filing.id] || "Initializing AI Agent...")
-                              return (
-                                <MultiStepLoader
-                                  loadingStates={LOADING_STEPS}
-                                  loading={loadingSummaries[filing.id]}
-                                  duration={2000}
-                                  loop={false}
-                                  currentStep={progress.step}
-                                  percentage={progress.percentage}
-                                  statusText={progress.displayText}
-                                />
-                              )
-                            })()}
                           </div>
                           <p className="font-mono text-xs text-gray-600 dark:text-gray-400">
                             {new Date(filing.filing_date).toLocaleDateString()}

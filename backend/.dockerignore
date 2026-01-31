@@ -29,7 +29,7 @@ data/
 temp/
 *.pdf
 *.html
-
+debug_*.txt
 
 
 

@@ -298,3 +298,322 @@ body {
 .focus-ring {
   @apply focus:outline-none focus:ring-2 focus:ring-[#0015ff] focus:ring-offset-2;
 }
+
+/* ========================================
+   Settings Page - Premium Animations
+   ======================================== */
+
+/* Rotating gradient border for selected theme card */
+@property --gradient-angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}
+
+@keyframes rotate-gradient {
+  to {
+    --gradient-angle: 360deg;
+  }
+}
+
+.gradient-border-animated {
+  --gradient-angle: 0deg;
+  background: conic-gradient(
+    from var(--gradient-angle),
+    hsl(235 100% 50%),
+    hsl(270 100% 60%),
+    hsl(235 100% 50%)
+  );
+  animation: rotate-gradient 4s linear infinite;
+}
+
+/* Shimmer effect for Pro badge and premium elements */
+@keyframes shimmer {
+  0% {
+    background-position: -200% center;
+  }
+  100% {
+    background-position: 200% center;
+  }
+}
+
+.shimmer-text {
+  background: linear-gradient(
+    90deg,
+    hsl(var(--foreground)) 0%,
+    hsl(235 100% 60%) 50%,
+    hsl(var(--foreground)) 100%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer 3s ease-in-out infinite;
+}
+
+/* Glow pulse for selected cards */
+@keyframes glow-pulse {
+  0%, 100% {
+    box-shadow: 0 0 20px rgba(0, 21, 255, 0.15);
+  }
+  50% {
+    box-shadow: 0 0 35px rgba(0, 21, 255, 0.3);
+  }
+}
+
+.glow-pulse {
+  animation: glow-pulse 2s ease-in-out infinite;
+}
+
+/* Progress bar gradient animation */
+@keyframes gradient-shift {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+.animated-gradient-bar {
+  background: linear-gradient(
+    90deg,
+    hsl(235 100% 50%),
+    hsl(270 100% 60%),
+    hsl(235 100% 50%)
+  );
+  background-size: 200% 100%;
+  animation: gradient-shift 3s ease-in-out infinite;
+}
+
+/* Sun rays rotation */
+@keyframes rotate-rays {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-rotate-rays {
+  animation: rotate-rays 20s linear infinite;
+}
+
+/* Star twinkle effect */
+@keyframes twinkle {
+  0%, 100% {
+    opacity: 0.3;
+    transform: scale(0.8);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-twinkle {
+  animation: twinkle 2s ease-in-out infinite;
+}
+
+.animate-twinkle-delayed {
+  animation: twinkle 2.5s ease-in-out infinite;
+  animation-delay: 0.5s;
+}
+
+.animate-twinkle-slow {
+  animation: twinkle 3s ease-in-out infinite;
+  animation-delay: 1s;
+}
+
+/* Theme preview morph for System */
+@keyframes theme-morph {
+  0%, 45% {
+    opacity: 1;
+  }
+  50%, 95% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+
+@keyframes theme-morph-inverse {
+  0%, 45% {
+    opacity: 0;
+  }
+  50%, 95% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.morph-light {
+  animation: theme-morph 6s ease-in-out infinite;
+}
+
+.morph-dark {
+  animation: theme-morph-inverse 6s ease-in-out infinite;
+}
+
+/* Checkmark draw animation */
+@keyframes draw-check {
+  from {
+    stroke-dashoffset: 24;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+.animate-draw-check {
+  stroke-dasharray: 24;
+  stroke-dashoffset: 24;
+  animation: draw-check 0.4s ease-out forwards;
+}
+
+/* Ripple effect */
+@keyframes ripple {
+  0% {
+    transform: scale(0);
+    opacity: 0.5;
+  }
+  100% {
+    transform: scale(4);
+    opacity: 0;
+  }
+}
+
+.ripple-effect {
+  animation: ripple 0.6s ease-out forwards;
+}
+
+/* Button shake for logout */
+@keyframes shake {
+  0%, 100% {
+    transform: translateX(0);
+  }
+  25% {
+    transform: translateX(-2px) rotate(-1deg);
+  }
+  75% {
+    transform: translateX(2px) rotate(1deg);
+  }
+}
+
+.hover-shake:hover {
+  animation: shake 0.4s ease-in-out;
+}
+
+/* Warning pulse for usage bar near limit */
+@keyframes warning-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+.warning-pulse {
+  animation: warning-pulse 1.5s ease-in-out infinite;
+}
+
+/* Floating particles for upgrade CTA */
+@keyframes float-particle {
+  0%, 100% {
+    transform: translateY(0) translateX(0);
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  90% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(-30px) translateX(10px);
+    opacity: 0;
+  }
+}
+
+.particle {
+  animation: float-particle 2s ease-out infinite;
+}
+
+.particle-delayed {
+  animation: float-particle 2.2s ease-out infinite;
+  animation-delay: 0.3s;
+}
+
+.particle-slow {
+  animation: float-particle 2.5s ease-out infinite;
+  animation-delay: 0.6s;
+}
+
+/* Diagonal clip paths for System theme split preview */
+.clip-path-diagonal-left {
+  clip-path: polygon(0 0, 100% 0, 0 100%);
+}
+
+.clip-path-diagonal-right {
+  clip-path: polygon(100% 0, 100% 100%, 0 100%);
+}
+
+/* Animated gradient for Pro badge */
+@keyframes gradient-x {
+  0%, 100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+
+.animate-gradient {
+  animation: gradient-x 3s ease infinite;
+  background-size: 200% auto;
+}
+
+/* Breathing animation for cards */
+@keyframes breathe {
+  0%, 100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.02);
+  }
+}
+
+.animate-breathe {
+  animation: breathe 4s ease-in-out infinite;
+}
+
+/* Levitation shadow animation */
+@keyframes levitate-shadow {
+  0%, 100% {
+    box-shadow: 0 10px 40px -10px rgba(0, 0, 0, 0.15);
+    transform: translateY(0);
+  }
+  50% {
+    box-shadow: 0 20px 50px -15px rgba(0, 0, 0, 0.2);
+    transform: translateY(-5px);
+  }
+}
+
+.animate-levitate {
+  animation: levitate-shadow 4s ease-in-out infinite;
+}
+
+/* CSS variable for conic gradient rotation */
+@property --angle {
+  syntax: "<angle>";
+  initial-value: 0deg;
+  inherits: false;
+}

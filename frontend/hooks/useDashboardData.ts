@@ -30,6 +30,11 @@ const DEFAULT_PREFERENCES: StoredSummaryPreferences = {
   },
 }
 
+const clampTargetLength = (value: number | null | undefined) => {
+  const numericValue = typeof value === "number" && Number.isFinite(value) ? value : DEFAULT_PREFERENCES.targetLength
+  return Math.max(1, Math.min(3000, Math.round(numericValue)))
+}
+
 export type DashboardMapPoint = {
   id: string
   lat: number
@@ -175,7 +180,12 @@ export function useDashboardData() {
     }
     setHistory(DashboardStorage.loadAnalysisHistory(userId))
     setCompanies(DashboardStorage.loadRecentCompanies(userId))
-    setPreferences(DashboardStorage.loadSummaryPreferences(userId) ?? DEFAULT_PREFERENCES)
+    const storedPrefs = DashboardStorage.loadSummaryPreferences(userId)
+    if (storedPrefs) {
+      setPreferences({ ...storedPrefs, targetLength: clampTargetLength(storedPrefs.targetLength) })
+    } else {
+      setPreferences(DEFAULT_PREFERENCES)
+    }
   }, [userId])
 
   const removeHistoryEntry = useCallback(async (analysisId: string) => {

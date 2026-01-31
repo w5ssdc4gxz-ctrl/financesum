@@ -1,8 +1,7 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 
 import Stepper, { Step } from '@/components/ui/stepper';
 import { BrutalButton } from '@/components/ui/BrutalButton';
-import { MultiStepLoader } from '@/components/ui/multi-step-loader';
 import { Modal } from '@/components/ui/modal';
 import { BrutalSlider } from '@/components/ui/brutal-slider';
 import { cn } from '@/lib/utils';
@@ -67,6 +66,11 @@ const focusAreaOptions = [
     'Guidance & outlook',
 ];
 
+const TARGET_LENGTH_MIN_WORDS = 1;
+const TARGET_LENGTH_MAX_WORDS = 3000;
+const TARGET_LENGTH_STEP_WORDS = 1;
+const TARGET_LENGTH_DEFAULT_WORDS = 650;
+
 const toneOptions = [
     { value: 'objective', label: 'Objective' },
     { value: 'cautiously optimistic', label: 'Cautiously Optimistic' },
@@ -130,17 +134,6 @@ const healthDisplayOptions = [
     { value: 'score_plus_traffic_light', label: 'Score + Traffic Light' },
     { value: 'score_plus_pillars', label: 'Score + 4 Pillars' },
     { value: 'score_with_narrative', label: 'Score + Narrative' },
-];
-
-const loadingStates = [
-    { text: "Initializing AI Agent..." },
-    { text: "Reading Filing Content..." },
-    { text: "Extracting Financial Data..." },
-    { text: "Analyzing Risk Factors..." },
-    { text: "Computing Health Score..." },
-    { text: "Synthesizing Investor Insights..." },
-    { text: "Drafting Final Summary..." },
-    { text: "Polishing Output..." },
 ];
 
 export const INVESTOR_PERSONAS = [
@@ -286,9 +279,18 @@ export default function SummaryWizard({
     isGenerating,
 }: SummaryWizardProps) {
     const [isModalOpen, setIsModalOpen] = useState(false);
+    const clampTargetLength = (value: number | null | undefined) => {
+        const numericValue =
+            typeof value === 'number' && Number.isFinite(value) ? value : TARGET_LENGTH_DEFAULT_WORDS;
+        return Math.max(TARGET_LENGTH_MIN_WORDS, Math.min(TARGET_LENGTH_MAX_WORDS, Math.round(numericValue)));
+    };
+    const normalizedTargetLength = clampTargetLength(preferences.targetLength);
+    const [targetLengthInput, setTargetLengthInput] = useState(() => String(normalizedTargetLength));
 
     const updatePref = (updates: Partial<SummaryPreferenceFormState>) => {
-        onPreferencesChange({ ...preferences, ...updates });
+        const next = { ...preferences, ...updates };
+        next.targetLength = clampTargetLength(next.targetLength);
+        onPreferencesChange(next);
     };
 
     const updateHealth = (updates: Partial<HealthRatingFormState>) => {
@@ -305,6 +307,16 @@ export default function SummaryWizard({
             : [...current, area];
         updatePref({ focusAreas: updated });
     };
+
+    useEffect(() => {
+        if (preferences.targetLength !== normalizedTargetLength) {
+            updatePref({ targetLength: normalizedTargetLength });
+        }
+    }, [normalizedTargetLength, preferences.targetLength]);
+
+    useEffect(() => {
+        setTargetLengthInput(String(normalizedTargetLength));
+    }, [normalizedTargetLength]);
 
     const handleCustomizeClick = () => {
         updatePref({ mode: 'custom' });
@@ -325,13 +337,6 @@ export default function SummaryWizard({
 
     return (
         <div className="w-full">
-            <MultiStepLoader
-                loadingStates={loadingStates}
-                loading={isGenerating}
-                duration={2000}
-                stopOnLastStep={true}
-            />
-
             <div className="space-y-6">
                 <div>
                     <label className="block text-xs font-bold uppercase mb-2">Select Filing</label>
@@ -452,10 +457,23 @@ export default function SummaryWizard({
                                     <div className="flex items-center border-2 border-black dark:border-white shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] focus-within:shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:focus-within:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)] transition-all bg-white dark:bg-black mr-1">
                                         <input
                                             type="number"
-                                            value={preferences.targetLength}
+                                            min={TARGET_LENGTH_MIN_WORDS}
+                                            max={TARGET_LENGTH_MAX_WORDS}
+                                            step={TARGET_LENGTH_STEP_WORDS}
+                                            value={targetLengthInput}
                                             onChange={(e) => {
-                                                const val = parseInt(e.target.value);
-                                                if (!isNaN(val)) updatePref({ targetLength: val });
+                                                const raw = e.target.value;
+                                                const parsed = Number(raw);
+                                                if (!Number.isFinite(parsed)) {
+                                                    setTargetLengthInput(raw);
+                                                    return;
+                                                }
+                                                const clamped = clampTargetLength(parsed);
+                                                setTargetLengthInput(String(clamped));
+                                                updatePref({ targetLength: clamped });
+                                            }}
+                                            onBlur={() => {
+                                                setTargetLengthInput(String(normalizedTargetLength));
                                             }}
                                             className="w-20 p-2 text-right font-mono text-sm font-bold bg-transparent outline-none border-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                                         />
@@ -466,10 +484,10 @@ export default function SummaryWizard({
                                     </div>
                                 </div>
                                 <BrutalSlider
-                                    value={preferences.targetLength}
-                                    min={200}
-                                    max={5000}
-                                    step={50}
+                                    value={normalizedTargetLength}
+                                    min={TARGET_LENGTH_MIN_WORDS}
+                                    max={TARGET_LENGTH_MAX_WORDS}
+                                    step={TARGET_LENGTH_STEP_WORDS}
                                     onChange={(val) => updatePref({ targetLength: val })}
                                 />
                             </div>
@@ -664,7 +682,7 @@ export default function SummaryWizard({
                                 )}
                                 <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
                                     <span className="font-bold uppercase text-sm">Target Length</span>
-                                    <span className="font-mono text-sm">{preferences.targetLength} words</span>
+                                    <span className="font-mono text-sm">{normalizedTargetLength} words</span>
                                 </div>
                                 <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
                                     <span className="font-bold uppercase text-sm">Complexity</span>

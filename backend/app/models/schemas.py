@@ -1,9 +1,10 @@
 """Pydantic schemas for API models."""
+
 from __future__ import annotations
 
 from datetime import datetime, date
 from typing import Optional, List, Dict, Any, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from uuid import UUID
 
 
@@ -98,22 +99,22 @@ class RatiosData(BaseModel):
     net_margin: Optional[float] = None
     roa: Optional[float] = None
     roe: Optional[float] = None
-    
+
     # Liquidity
     current_ratio: Optional[float] = None
     quick_ratio: Optional[float] = None
     dso: Optional[float] = None
     inventory_turnover: Optional[float] = None
-    
+
     # Leverage
     debt_to_equity: Optional[float] = None
     net_debt_to_ebitda: Optional[float] = None
     interest_coverage: Optional[float] = None
-    
+
     # Cash Flow
     fcf: Optional[float] = None
     fcf_margin: Optional[float] = None
-    
+
     # Distress
     altman_z_score: Optional[float] = None
 
@@ -215,9 +216,22 @@ class FilingSummaryPreferences(BaseModel):
     tone: Optional[str] = Field(default=None, max_length=50)
     detail_level: Optional[str] = Field(default=None, max_length=50)
     output_style: Optional[str] = Field(default=None, max_length=50)
-    target_length: Optional[int] = Field(default=None, ge=50, le=5000)
+    # Word budget cap (kept in sync with backend/app/api/filings.py TARGET_LENGTH_MAX_WORDS).
+    target_length: Optional[int] = Field(default=None, ge=1, le=3000)
     complexity: Literal["simple", "intermediate", "expert"] = "intermediate"
     health_rating: Optional[HealthRatingPreferences] = None
+
+    @field_validator("target_length", mode="before")
+    @classmethod
+    def clamp_target_length(cls, value: Any) -> Any:
+        """Clamp legacy/over-limit clients into the supported [1, 3000] word range."""
+        if value is None:
+            return None
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            return value
+        return max(1, min(3000, numeric))
 
 
 class HealthScoreBreakdown(BaseModel):
@@ -225,16 +239,3 @@ class HealthScoreBreakdown(BaseModel):
     score_band: str
     components: Dict[str, float]
     percentile_ranks: Dict[str, float]
-
-
-
-
-
-
-
-
-
-
-
-
-

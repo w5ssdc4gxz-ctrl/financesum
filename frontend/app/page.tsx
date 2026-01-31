@@ -12,6 +12,7 @@ import BottomPopup from '@/components/BottomPopup'
 import { FAQChat } from '@/components/FAQChat'
 import PricingSection from '@/components/PricingSection'
 import { Float, TextRotator, StackingCards, StackingCardItem, LogoLoop } from '@/components/fancy'
+import Hero3D from '@/components/Hero3D'
 
 // Rotating words for the hero
 const rotatingWords = ['reimagined.', 'simplified.', 'automated.', 'transformed.']
@@ -112,129 +113,10 @@ export default function Home() {
         ref={heroRef}
         className="relative min-h-screen flex items-center justify-center pt-16 overflow-hidden"
       >
-        {/* Floating Images - Behind Content */}
-        <div className="absolute inset-0 pointer-events-none z-10">
-          {/* Top Left */}
-          <motion.div
-            initial={{ opacity: 0, y: 60, scale: 0.8 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            transition={{ duration: 1, delay: 0.3, ease: [0.25, 0.46, 0.45, 0.94] }}
-            className="absolute top-[12%] left-[6%] sm:left-[8%] pointer-events-auto"
-          >
-            <Float rotationRange={[2, 2, 1]} amplitude={[3, 5, 0]} speed={0.3} timeOffset={0}>
-              <div className="w-36 sm:w-52 md:w-64 rounded-2xl shadow-hero overflow-hidden bg-white">
-                <Image
-                  src="/hero/hero-1.png"
-                  alt="Financial dashboard preview"
-                  width={256}
-                  height={180}
-                  sizes="(min-width: 768px) 256px, (min-width: 640px) 208px, 144px"
-                  placeholder="blur"
-                  blurDataURL={IMAGE_BLUR_DATA_URL}
-                  priority
-                  className="w-full h-auto object-cover"
-                />
-              </div>
-            </Float>
-          </motion.div>
+        {/* Full 3D Scene Background - Includes Floating Screens */}
+        <Hero3D />
 
-          {/* Top Right */}
-          <motion.div
-            initial={{ opacity: 0, y: 80, scale: 0.8 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            transition={{ duration: 1, delay: 0.5, ease: [0.25, 0.46, 0.45, 0.94] }}
-            className="absolute top-[8%] right-[4%] sm:right-[6%] pointer-events-auto"
-          >
-            <Float rotationRange={[2, 3, 1]} amplitude={[4, 6, 0]} speed={0.25} timeOffset={2}>
-              <div className="w-40 sm:w-56 md:w-72 rounded-2xl shadow-hero overflow-hidden bg-white">
-                <Image
-                  src="/hero/hero-2.png"
-                  alt="Analysis interface"
-                  width={288}
-                  height={200}
-                  sizes="(min-width: 768px) 288px, (min-width: 640px) 224px, 160px"
-                  placeholder="blur"
-                  blurDataURL={IMAGE_BLUR_DATA_URL}
-                  priority
-                  className="w-full h-auto object-cover"
-                />
-              </div>
-            </Float>
-          </motion.div>
-
-          {/* Middle Left */}
-          <motion.div
-            initial={{ opacity: 0, y: 50, scale: 0.8 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            transition={{ duration: 1, delay: 0.7, ease: [0.25, 0.46, 0.45, 0.94] }}
-            className="absolute top-[42%] left-[2%] sm:left-[4%] pointer-events-auto"
-          >
-            <Float rotationRange={[3, 3, 1]} amplitude={[4, 7, 0]} speed={0.28} timeOffset={4}>
-              <div className="w-44 sm:w-60 md:w-80 rounded-2xl shadow-hero overflow-hidden bg-white">
-                <Image
-                  src="/hero/hero-3.png"
-                  alt="Research memo"
-                  width={320}
-                  height={220}
-                  sizes="(min-width: 768px) 320px, (min-width: 640px) 240px, 176px"
-                  placeholder="blur"
-                  blurDataURL={IMAGE_BLUR_DATA_URL}
-                  priority
-                  className="w-full h-auto object-cover"
-                />
-              </div>
-            </Float>
-          </motion.div>
-
-          {/* Bottom Right */}
-          <motion.div
-            initial={{ opacity: 0, y: 70, scale: 0.8 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            transition={{ duration: 1, delay: 0.9, ease: [0.25, 0.46, 0.45, 0.94] }}
-            className="absolute top-[58%] right-[2%] sm:right-[5%] pointer-events-auto"
-          >
-            <Float rotationRange={[2, 2, 1]} amplitude={[3, 5, 0]} speed={0.32} timeOffset={6}>
-              <div className="w-48 sm:w-64 md:w-88 rounded-2xl shadow-hero overflow-hidden bg-white">
-                <Image
-                  src="/hero/hero-4.png"
-                  alt="Summary generation"
-                  width={352}
-                  height={240}
-                  sizes="(min-width: 768px) 352px, (min-width: 640px) 256px, 192px"
-                  placeholder="blur"
-                  blurDataURL={IMAGE_BLUR_DATA_URL}
-                  priority
-                  className="w-full h-auto object-cover"
-                />
-              </div>
-            </Float>
-          </motion.div>
-
-          {/* Bottom Left (Desktop only) */}
-          <motion.div
-            initial={{ opacity: 0, y: 60, scale: 0.8 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            transition={{ duration: 1, delay: 1.1, ease: [0.25, 0.46, 0.45, 0.94] }}
-            className="hidden lg:block absolute bottom-[8%] left-[8%] pointer-events-auto"
-          >
-            <Float rotationRange={[2, 2, 1]} amplitude={[3, 5, 0]} speed={0.35} timeOffset={8}>
-              <div className="w-48 md:w-56 rounded-2xl shadow-hero overflow-hidden bg-white">
-                <Image
-                  src="/hero/hero-5.png"
-                  alt="Key metrics"
-                  width={224}
-                  height={160}
-                  sizes="(min-width: 1024px) 224px, 0px"
-                  placeholder="blur"
-                  blurDataURL={IMAGE_BLUR_DATA_URL}
-                  className="w-full h-auto object-cover"
-                />
-              </div>
-            </Float>
-          </motion.div>
-        </div>
-
-        {/* Hero Content */}
+        {/* Hero Content - Overlay */}
         <motion.div
           className="relative z-20 container-tight text-center"
           style={{ opacity: heroOpacity, y: heroY }}

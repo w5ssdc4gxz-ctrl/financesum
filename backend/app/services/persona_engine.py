@@ -1,6 +1,10 @@
 """Premium Investor Persona Engine - Radically Distinctive Voice Implementation."""
 from typing import Dict, List, Optional, Any, Tuple
 from app.services.gemini_client import GeminiClient
+from app.services.summary_length import (
+    clamp_summary_target_length,
+    enforce_summary_target_length,
+)
 import re
 from uuid import uuid4
 
@@ -3352,6 +3356,8 @@ class PersonaEngine:
         Returns:
             Dictionary with persona analysis including summary, stance, reasoning, key_points
         """
+        target_length = clamp_summary_target_length(target_length)
+
         # Normalize persona ID
         normalized_id = normalize_persona_id(persona_id)
         
@@ -3393,10 +3399,14 @@ class PersonaEngine:
             prompt=prompt,
             persona_name=persona_info.get("name", persona_id)
         )
-        
+
         # Post-process: sanitize output
         if result.get("summary"):
             result["summary"] = sanitize_persona_output(result["summary"], company_context)
+            if target_length:
+                result["summary"] = enforce_summary_target_length(
+                    result["summary"], target_length
+                )
         
         return result
     
@@ -3471,8 +3481,12 @@ Example: "From my perspective, this is a HOLD with medium conviction - strong bu
 ## 2. Executive Summary
 [2-3 paragraphs in YOUR unique voice:
 - Your conviction and why
+- State ONE clear spine for the memo: operating strength (pricing/margins) versus cash conversion durability (OCF→FCF, capex, working capital), and keep the thesis aligned to it
 - Core investment thesis through YOUR analytical lens
 - What matters most to YOU as {persona_name}
+- Conviction tone MUST match the action: if your stance is PASS/WATCH/HOLD, explicitly explain the restraint (what blocks action now) and temper language accordingly
+- Do NOT describe your process ("here is how I think...", "my framework is..."). State conclusions; let structure imply process
+- Include ONE explicit "what changed vs prior comparable period" sentence (QoQ for quarterly, YoY for annual) and do not repeat that same change later
 Write in flowing prose. NO bullet lists of "Monitor X".]
 
 ## 3. Financial Performance
@@ -3480,6 +3494,7 @@ Write in flowing prose. NO bullet lists of "Monitor X".]
 - Cite specific figures with $ and %
 - Explain what the numbers MEAN, not just what they ARE
 - If operating margin and net margin diverge significantly, explain WHY (one-time items, non-operating income, etc.)
+- Explicitly compare this period vs the prior comparable period (QoQ for quarterly, YoY for annual): what improved, what deteriorated, and why
 Every metric must have interpretation, not just data.]
 
 ## 4. Management Discussion & Analysis
@@ -3487,13 +3502,16 @@ Every metric must have interpretation, not just data.]
 - Capital allocation - does it align with {persona_name}'s principles?
 - Earnings quality concerns
 - What would YOU want management to do differently?
+- Explicitly call out what changed versus the prior comparable period in posture (capex pacing, cost discipline, capital return) and whether numbers corroborate it
 Do NOT speculate about "management commentary" not in filings.]
 
 ## 5. Risk Factors
 [3-5 SPECIFIC risks that concern YOU as {persona_name}:
-- Each risk must have a clear name and 2-3 sentence explanation
+- Each risk must have a clear name and 2-4 sentence explanation
 - Be company-specific, not generic
 - Quantify impact where possible
+- Include explicit weighting: severity/likelihood (High/Med/Low) and one sentence on why it does NOT dominate your thesis yet (and what would make it dominate)
+- Include a change signal: one concrete sign the risk is getting worse versus the prior comparable period
 Format: "**Risk Name**: Explanation."
 Do NOT use generic risks without specific context.]
 
