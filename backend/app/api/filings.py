@@ -11099,6 +11099,15 @@ def _ensure_local_document(
         )
 
     source_doc_url = filing.get("source_doc_url")
+    if not source_doc_url:
+        # Some legacy rows store the SEC URL in `url` instead of `source_doc_url`.
+        candidate_url = filing.get("url")
+        if candidate_url and _is_sec_document_url(str(candidate_url)):
+            source_doc_url = str(candidate_url)
+            filing["source_doc_url"] = source_doc_url
+            _persist_filing_field_updates(
+                context, filing_id_str, {"source_doc_url": source_doc_url}
+            )
     if source_doc_url and not _is_sec_document_url(str(source_doc_url)):
         logger.warning(
             "Ignoring non-SEC source_doc_url for filing %s: %s",
@@ -11129,11 +11138,14 @@ def _ensure_local_document(
 
         filing_types_to_try = _infer_sec_filing_types()
         if cik_value and filing_types_to_try and (filing_date or period_end):
+            target = filing_date or period_end
             try:
                 sec_filings = get_company_filings(
                     cik=cik_value,
                     filing_types=filing_types_to_try,
                     max_results=200,
+                    target_date=str(target) if target else None,
+                    include_historical=True,
                 )
                 if sec_filings:
                     candidates = [
@@ -11141,7 +11153,6 @@ def _ensure_local_document(
                         for c in sec_filings
                         if c.get("filing_type") in filing_types_to_try
                     ]
-                    target = filing_date or period_end
                     matched = _pick_best_sec_filing_match(
                         candidates, target_date=target
                     )
@@ -11176,6 +11187,8 @@ def _ensure_local_document(
                         cik=cik_value,
                         filing_types=filing_types_to_try,
                         max_results=200,
+                        target_date=str(target) if target else None,
+                        include_historical=True,
                     )
                     if sec_filings:
                         candidates = [

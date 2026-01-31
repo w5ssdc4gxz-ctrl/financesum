@@ -6,7 +6,7 @@ import re
 from functools import lru_cache
 import requests  # Used for synchronous SEC calls
 from typing import List, Dict, Optional
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from urllib.parse import urlparse
 from app.config import get_settings
 from app.services.eodhd_client import (
@@ -382,7 +382,11 @@ def resolve_country_from_sec_submission(cik: str) -> Optional[str]:
 def get_company_filings(
     cik: str,
     filing_types: Optional[List[str]] = None,
-    max_results: int = 100
+    max_results: int = 100,
+    *,
+    target_date: Optional[str] = None,
+    include_historical: bool = False,
+    max_historical_files: int = 3,
 ) -> List[Dict]:
     """
     Get filings for a company from SEC EDGAR.
@@ -390,6 +394,8 @@ def get_company_filings(
     but ideally should be async too.
     """
     cik_padded = str(cik).zfill(10)
+    max_results = max(1, int(max_results))
+    max_historical_files = max(0, int(max_historical_files))
     
     # SEC EDGAR Submissions API
     submissions_url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
@@ -397,8 +403,75 @@ def get_company_filings(
     headers = {
         "User-Agent": settings.edgar_user_agent,
         "Accept-Encoding": "gzip, deflate",
-        "Host": "data.sec.gov"
+        "Host": "data.sec.gov",
+        "Accept": "application/json",
     }
+
+    def _parse_iso_date(value: Optional[str]) -> Optional[date]:
+        raw = (value or "").strip()[:10]
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw).date()
+        except ValueError:
+            return None
+
+    def _extract_filing_arrays(payload: Dict) -> Dict[str, List]:
+        """Return the dict that contains the filings arrays (accessionNumber, filingDate...)."""
+        if not isinstance(payload, dict):
+            return {}
+
+        filings = payload.get("filings")
+        if isinstance(filings, dict):
+            recent = filings.get("recent")
+            if isinstance(recent, dict) and any(k in recent for k in ("accessionNumber", "filingDate", "form")):
+                return recent
+            if any(k in filings for k in ("accessionNumber", "filingDate", "form")):
+                return filings
+
+        if any(k in payload for k in ("accessionNumber", "filingDate", "form")):
+            return payload
+
+        return {}
+
+    def _build_filing_rows(section: Dict[str, List]) -> List[Dict]:
+        accession_numbers = section.get("accessionNumber", []) or []
+        filing_dates = section.get("filingDate", []) or []
+        report_dates = section.get("reportDate", []) or []
+        forms = section.get("form", []) or []
+        primary_docs = section.get("primaryDocument", []) or []
+
+        rows: List[Dict] = []
+        for i, form_type in enumerate(forms):
+            if filing_types and form_type not in filing_types:
+                continue
+
+            accession_raw = accession_numbers[i] if i < len(accession_numbers) else ""
+            filing_date_val = filing_dates[i] if i < len(filing_dates) else None
+            report_date_val = report_dates[i] if i < len(report_dates) else None
+            primary_doc = primary_docs[i] if i < len(primary_docs) else ""
+
+            if not accession_raw or not filing_date_val or not primary_doc:
+                continue
+
+            accession = str(accession_raw).replace("-", "")
+            doc_url = (
+                f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
+            )
+            rows.append(
+                {
+                    "filing_type": form_type,
+                    "filing_date": filing_date_val,
+                    "period_end": report_date_val,
+                    "url": doc_url,
+                    "accession_number": accession_raw,
+                }
+            )
+            if len(rows) >= max_results:
+                break
+        return rows
+
+    target_dt = _parse_iso_date(target_date)
     
     try:
         # Using requests here as this function wasn't marked async in the interface
@@ -407,45 +480,85 @@ def get_company_filings(
         response = requests.get(submissions_url, headers=headers, timeout=10)
         response.raise_for_status()
         
-        data = response.json()
-        recent_filings = data.get("filings", {}).get("recent", {})
-        
-        filings = []
-        
-        # Get arrays of filing data
-        accession_numbers = recent_filings.get("accessionNumber", [])
-        filing_dates = recent_filings.get("filingDate", [])
-        report_dates = recent_filings.get("reportDate", [])
-        forms = recent_filings.get("form", [])
-        primary_docs = recent_filings.get("primaryDocument", [])
-        
-        for i in range(len(forms)):
-            form_type = forms[i]
-            
-            # Filter by filing type if specified
-            if filing_types and form_type not in filing_types:
-                continue
-            
-            accession = accession_numbers[i].replace("-", "")
-            filing_date = filing_dates[i]
-            report_date = report_dates[i] if i < len(report_dates) else None
-            primary_doc = primary_docs[i] if i < len(primary_docs) else ""
-            
-            # Construct document URL
-            doc_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
-            
-            filings.append({
-                "filing_type": form_type,
-                "filing_date": filing_date,
-                "period_end": report_date,
-                "url": doc_url,
-                "accession_number": accession_numbers[i]
-            })
-            
-            if len(filings) >= max_results:
-                break
-        
-        return filings
+        data = response.json() or {}
+
+        recent_section = _extract_filing_arrays(data)
+        filings = _build_filing_rows(recent_section)
+
+        should_fetch_historical = bool(include_historical)
+        if target_dt and filings:
+            oldest = None
+            for row in filings:
+                dt = _parse_iso_date(str(row.get("filing_date") or ""))
+                if dt is None:
+                    continue
+                oldest = dt if oldest is None else min(oldest, dt)
+            # If the target is meaningfully older than what `recent` contains, pull from historical files.
+            if oldest and target_dt < (oldest - timedelta(days=30)):
+                should_fetch_historical = True
+
+        if should_fetch_historical and max_historical_files > 0 and len(filings) < max_results:
+            # SEC submissions can paginate older filings into separate JSON files under `filings.files`.
+            # Fetch only the file(s) that likely contain the target date.
+            files_meta = (data.get("filings") or {}).get("files") if isinstance(data.get("filings"), dict) else None
+            if isinstance(files_meta, list) and files_meta:
+                picked: List[Dict] = []
+                for meta in files_meta:
+                    if not isinstance(meta, dict):
+                        continue
+                    name = str(meta.get("name") or "").strip()
+                    if not name:
+                        continue
+                    if not target_dt:
+                        picked.append(meta)
+                        continue
+                    from_dt = _parse_iso_date(str(meta.get("filingFrom") or ""))
+                    to_dt = _parse_iso_date(str(meta.get("filingTo") or ""))
+                    if from_dt and to_dt:
+                        # Use a generous buffer because `target_date` might be a period end, not a filing date.
+                        if (from_dt - timedelta(days=450)) <= target_dt <= (to_dt + timedelta(days=450)):
+                            picked.append(meta)
+
+                # Prefer the most relevant (latest) ranges first.
+                def _to_sort_key(meta: Dict) -> date:
+                    to_dt = _parse_iso_date(str(meta.get("filingTo") or "")) or date(1900, 1, 1)
+                    return to_dt
+
+                picked.sort(key=_to_sort_key, reverse=True)
+
+                fetched = 0
+                seen_accessions = {str(row.get("accession_number") or "").strip() for row in filings}
+                for meta in picked:
+                    if len(filings) >= max_results:
+                        break
+                    if fetched >= max_historical_files:
+                        break
+                    name = str(meta.get("name") or "").strip()
+                    if not name:
+                        continue
+
+                    try:
+                        url = f"https://data.sec.gov/submissions/{name}"
+                        extra_resp = requests.get(url, headers=headers, timeout=10)
+                        if extra_resp.status_code >= 400:
+                            continue
+                        extra_payload = extra_resp.json() or {}
+                    except Exception:
+                        continue
+
+                    extra_section = _extract_filing_arrays(extra_payload)
+                    extra_rows = _build_filing_rows(extra_section)
+                    for row in extra_rows:
+                        acc = str(row.get("accession_number") or "").strip()
+                        if acc and acc in seen_accessions:
+                            continue
+                        seen_accessions.add(acc)
+                        filings.append(row)
+                        if len(filings) >= max_results:
+                            break
+                    fetched += 1
+
+        return filings[:max_results]
     
     except Exception as e:
         print(f"Error fetching filings: {e}")
