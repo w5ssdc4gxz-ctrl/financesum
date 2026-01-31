@@ -10792,6 +10792,38 @@ def _looks_like_sec_cover_doc(
     return True
 
 
+def _looks_like_ixbrl_noise_document(text_head: str, *, file_size: Optional[int] = None) -> bool:
+    """Heuristic: detect cached iXBRL-heavy SEC HTML that is mostly taxonomy noise."""
+    if not text_head:
+        return False
+
+    head = (text_head or "")[:120_000]
+    lower = head.lower()
+
+    # Only consider it iXBRL-noisy if iXBRL markers appear early.
+    if ("<ix:" not in lower) and ("xmlns:ix" not in lower) and ("ixt:" not in lower):
+        return False
+
+    # Avoid re-downloading very small docs (likely cover docs handled elsewhere).
+    if isinstance(file_size, int) and file_size < 25_000:
+        return False
+
+    us_gaap = lower.count("us-gaap") + lower.count("ifrs-full") + lower.count("dei:")
+    contextref = lower.count("contextref=")
+    unitref = lower.count("unitref=")
+    ix_tags = lower.count("<ix:") + lower.count("<ix ") + lower.count("xmlns:ix")
+    tokens = us_gaap + contextref + unitref + ix_tags
+
+    alpha = sum(1 for ch in lower if ch.isalpha())
+    digit = sum(1 for ch in lower if ch.isdigit())
+
+    if ix_tags >= 20 and tokens >= 140 and alpha < 80_000 and digit >= 400:
+        return True
+    if tokens >= 450 and alpha < 120_000:
+        return True
+    return False
+
+
 def _persist_filing_field_updates(
     context: Dict[str, Any], filing_id: str, updates: Dict[str, Any]
 ) -> None:
@@ -10995,6 +11027,31 @@ def _ensure_local_document(
                     except Exception:  # noqa: BLE001
                         pass
                 # If we can't upgrade, clear so we can re-resolve the SEC document URL.
+                filing.pop("local_document_path", None)
+                _persist_filing_field_updates(
+                    context, filing_id_str, {"local_document_path": None}
+                )
+            elif _looks_like_ixbrl_noise_document(head, file_size=file_size):
+                if not allow_network:
+                    return None
+                # Inline XBRL noise can dominate cached HTML, especially for older filings.
+                # Re-download so our EDGAR fetcher can pick a better artifact (often .txt).
+                cached_url = filing.get("source_doc_url")
+                if cached_url and _is_sec_document_url(str(cached_url)):
+                    try:
+                        if download_filing(str(cached_url), str(path_obj)):
+                            upgraded_head = _read_text_head(path_obj)
+                            try:
+                                upgraded_size = int(path_obj.stat().st_size)
+                            except Exception:
+                                upgraded_size = None
+                            if not _looks_like_ixbrl_noise_document(
+                                upgraded_head, file_size=upgraded_size
+                            ):
+                                return path_obj
+                    except Exception:  # noqa: BLE001
+                        pass
+
                 filing.pop("local_document_path", None)
                 _persist_filing_field_updates(
                     context, filing_id_str, {"local_document_path": None}

@@ -648,6 +648,44 @@ def download_filing(url: str, output_path: str) -> bool:
             return True
         return False
 
+    def _looks_ixbrl_noise_filing(body: bytes) -> bool:
+        """Heuristic: detect iXBRL-heavy HTML where taxonomy metadata dominates.
+
+        Many older SEC HTML filings embed large quantities of Inline XBRL markup.
+        This can make downstream text extraction/model prompting miss operating KPIs.
+        When detected, we prefer fetching the full submission .txt (or other exhibits)
+        from the accession directory.
+        """
+        if not body:
+            return False
+        head = body[:240_000]
+        try:
+            text = head.decode("utf-8", errors="ignore")
+        except Exception:
+            return False
+
+        lower = text.lower()
+        # Only treat as iXBRL-noisy when we see iXBRL markers.
+        if ("<ix:" not in lower) and ("xmlns:ix" not in lower) and ("ixt:" not in lower):
+            return False
+
+        # Count common taxonomy/context patterns.
+        us_gaap = lower.count("us-gaap") + lower.count("ifrs-full") + lower.count("dei:")
+        contextref = lower.count("contextref=")
+        unitref = lower.count("unitref=")
+        ix_tags = lower.count("<ix:") + lower.count("<ix ") + lower.count("xmlns:ix")
+
+        # If markup dominates and there isn't much natural prose early, treat as noisy.
+        alpha = sum(1 for ch in lower if "a" <= ch <= "z")
+        digit = sum(1 for ch in lower if "0" <= ch <= "9")
+        tokens = us_gaap + contextref + unitref + ix_tags
+
+        if ix_tags >= 25 and tokens >= 160 and alpha < 80_000 and digit >= 500:
+            return True
+        if tokens >= 500 and alpha < 120_000:
+            return True
+        return False
+
     def _dir_index_json_url(original_url: str) -> Optional[str]:
         try:
             parsed_local = urlparse(original_url)
@@ -726,7 +764,7 @@ def download_filing(url: str, output_path: str) -> bool:
             # Prefer full submission TXT as a reliable fallback for extraction
             # (often contains narrative + KPIs even when HTML is messy).
             if lower.endswith(".txt"):
-                bonus += 9
+                bonus += 18
             # Allow PDFs (investor decks / exhibits). Keep a small preference for HTML
             # so we don't accidentally select image-heavy presentations when a press
             # release HTML is available.
@@ -767,7 +805,7 @@ def download_filing(url: str, output_path: str) -> bool:
 
         # If the downloaded doc is likely just a cover page, try to replace it with
         # the most relevant exhibit/attachment in the accession directory.
-        if _looks_low_signal_filing(response.content):
+        if _looks_low_signal_filing(response.content) or _looks_ixbrl_noise_filing(response.content):
             upgraded_url = _choose_best_exhibit_url(url)
             if upgraded_url and upgraded_url != url:
                 try:
