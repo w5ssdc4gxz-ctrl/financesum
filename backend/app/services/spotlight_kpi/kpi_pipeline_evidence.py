@@ -279,6 +279,36 @@ def _is_generic_financial_metric(name: str) -> bool:
         "capital expenditures",
         "cash",
         "debt",
+        # Generic accounting / financial statement line items (NOT operating KPIs)
+        "stock-based compensation",
+        "stock based compensation",
+        "share-based compensation",
+        "share based compensation",
+        "share-based payment",
+        "share based payment",
+        "excess tax benefit",
+        "excess tax benefits",
+        "tax benefit on stock-based compensation",
+        "tax benefits on stock-based compensation",
+        "excess tax benefit on stock-based compensation",
+        "excess tax benefits on stock-based compensation",
+        "income tax",
+        "income taxes",
+        "effective tax rate",
+        "deferred tax",
+        "valuation allowance",
+        "depreciation",
+        "amortization",
+        "interest expense",
+        "interest income",
+        "accounts receivable",
+        "accounts payable",
+        "inventory",
+        "working capital",
+        "deferred revenue",
+        "contract liabilit",
+        "goodwill",
+        "intangible asset",
     )
 
     return any(phrase in n for phrase in banned_phrases)
@@ -290,10 +320,14 @@ You are an expert financial document analyst. Your job is to find company-specif
 
 Constraints:
 - Do NOT choose generic metrics (revenue, net income, EPS, gross margin, EBITDA, free cash flow, capex, cash, debt).
+- Do NOT choose generic accounting/GAAP line items or policy/tax disclosures (e.g., stock-based compensation, excess tax benefits,
+  deferred taxes, effective tax rate, depreciation/amortization, interest expense, working capital, balance sheet line items).
 - The KPI MUST be explicitly mentioned in the filing and MUST include evidence.
 - You MUST provide page numbers and short quotes from the document that contain:
   - a reported value (most recent value), and
   - (if present) a definition (how the KPI is calculated / what it means).
+- Prefer TRUE operating KPIs that describe the business (usage/volume/capacity), such as: customers/subscribers, orders/transactions,
+  units shipped/delivered, bookings/backlog, AUM, GMV/TPV, churn/retention, occupancy/utilization, store count, etc.
 - For EACH candidate, `evidence` MUST include at least ONE item with type = "value"
   (must contain the KPI name and a numeric value). Include definition evidence when available.
 - If you cannot find a company-specific KPI with evidence, return `candidates: []` and set `failure_reason`.
@@ -331,6 +365,8 @@ You are an expert financial document analyst. Your job is to select ONE company-
 
 Hard rules:
 - Do NOT choose generic metrics (revenue, net income, EPS, gross margin, EBITDA, free cash flow, capex, cash, debt).
+- Do NOT choose generic accounting/GAAP line items (e.g., stock-based compensation, excess tax benefits, taxes, depreciation/amortization,
+  interest expense, working capital, balance sheet line items). These are not operating KPIs.
 - If you cannot prove the KPI exists with evidence, you MUST return `"selected_kpi": null`.
 - Evidence requirements for a non-null KPI:
   - at least ONE "value" evidence quote + page (must contain the KPI name and a numeric value).
@@ -652,6 +688,8 @@ You are given excerpts from specific pages of the filing. You MUST use ONLY the 
 
 Constraints:
 - Do NOT choose generic metrics (revenue, net income, EPS, gross margin, EBITDA, free cash flow, capex, cash, debt).
+- Do NOT choose generic accounting/GAAP line items or policy/tax disclosures (e.g., stock-based compensation, excess tax benefits,
+  deferred taxes, effective tax rate, depreciation/amortization, interest expense, working capital, balance sheet line items).
 - The KPI MUST be explicitly mentioned in the provided page text and MUST include evidence.
 - You MUST provide page numbers and short quotes from the page text that contain:
   - a reported value (most recent value), and
@@ -659,6 +697,8 @@ Constraints:
 - For EACH candidate, `evidence` MUST include at least ONE item with type = "value"
   (must contain the KPI name and a numeric value).
 - Quotes MUST be verbatim substrings of the corresponding PAGE text.
+- Prefer TRUE operating KPIs that describe the business (usage/volume/capacity), such as: customers/subscribers, orders/transactions,
+  units shipped/delivered, bookings/backlog, AUM, GMV/TPV, churn/retention, occupancy/utilization, store count, etc.
 - If you cannot find a company-specific KPI with evidence in the provided pages, return `candidates: []` and set `failure_reason`.
 - Do not guess.
 

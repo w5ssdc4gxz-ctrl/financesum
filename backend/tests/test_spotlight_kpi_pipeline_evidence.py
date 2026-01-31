@@ -131,3 +131,178 @@ def test_evidence_pipeline_infers_value_evidence_from_numeric_definition_quote()
 
     assert "[p. 1]" in str(candidate.get("source_quote") or "")
 
+
+class _FakeGeminiBannedMetricClient(_FakeGeminiEvidenceClient):
+    def stream_generate_content_with_file_uri(  # type: ignore[override]
+        self,
+        *,
+        file_uri: str,
+        file_mime_type: str,
+        prompt: str,
+        stage_name: str = "",
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> str:
+        _ = (generation_config_override,)
+        assert file_uri
+        assert file_mime_type
+        assert prompt
+        self.calls.append(stage_name or "pass1")
+
+        return json.dumps(
+            {
+                "candidates": [
+                    {
+                        "name": "Excess tax benefits on stock-based compensation",
+                        "why_company_specific": "Accounting disclosure for the quarter.",
+                        "what_it_measures": "Tax effects related to stock-based compensation.",
+                        "how_calculated_or_defined": "GAAP line item.",
+                        "most_recent_value": "42",
+                        "period": "Q1 2017",
+                        "unit": "",
+                        "evidence": [
+                            {
+                                "page": 1,
+                                "quote": "Excess tax benefits on stock-based compensation were 42 in Q1 2017.",
+                                "type": "value",
+                            }
+                        ],
+                    }
+                ],
+                "failure_reason": None,
+            }
+        )
+
+
+def test_evidence_pipeline_rejects_gaap_line_item_kpis():
+    client = _FakeGeminiBannedMetricClient()
+    config = EvidencePipelineConfig(total_timeout_seconds=20.0)
+    doc_text = "Excess tax benefits on stock-based compensation were 42 in Q1 2017."
+
+    candidate, debug = extract_kpi_with_evidence_from_file(
+        client,
+        file_bytes=doc_text.encode("utf-8"),
+        company_name="Example Corp",
+        mime_type="text/plain",
+        config=config,
+    )
+
+    assert candidate is None
+    assert debug.get("reason") in {"pass1_no_valid_candidates", "selected_kpi_banned_or_missing_name"}
+
+
+class _FakeGeminiPass2InventsBannedClient(_FakeGeminiEvidenceClient):
+    def stream_generate_content_with_file_uri(  # type: ignore[override]
+        self,
+        *,
+        file_uri: str,
+        file_mime_type: str,
+        prompt: str,
+        stage_name: str = "",
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> str:
+        _ = (generation_config_override,)
+        assert file_uri
+        assert file_mime_type
+        assert prompt
+        self.calls.append(stage_name or "pass1")
+
+        return json.dumps(
+            {
+                "candidates": [
+                    {
+                        "name": "Excess tax benefits on stock-based compensation",
+                        "why_company_specific": "Accounting disclosure for the quarter.",
+                        "what_it_measures": "Tax effects related to stock-based compensation.",
+                        "how_calculated_or_defined": "GAAP line item.",
+                        "most_recent_value": "42",
+                        "period": "Q1 2017",
+                        "unit": "",
+                        "evidence": [
+                            {
+                                "page": 1,
+                                "quote": "Excess tax benefits on stock-based compensation were 42 in Q1 2017.",
+                                "type": "value",
+                            }
+                        ],
+                    },
+                    {
+                        "name": "Widget MAUs",
+                        "why_company_specific": "Management-defined metric for widget engagement.",
+                        "what_it_measures": "Monthly active widget usage.",
+                        "how_calculated_or_defined": "Defined as widgets active at least once per month.",
+                        "most_recent_value": "1,234",
+                        "period": "Q4",
+                        "unit": "widgets",
+                        "evidence": [
+                            {
+                                "page": 1,
+                                "quote": (
+                                    "We define Widget MAUs as the number of widgets active at least once in the month. "
+                                    "Widget MAUs were 1,234 in Q4."
+                                ),
+                                "type": "definition",
+                            }
+                        ],
+                    },
+                ],
+                "failure_reason": None,
+            }
+        )
+
+    def stream_generate_content(  # type: ignore[override]
+        self,
+        prompt: str,
+        *,
+        stage_name: str = "",
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> str:
+        _ = (prompt, generation_config_override)
+        self.calls.append(stage_name or "pass2")
+
+        # Pass 2 violates instructions and selects a banned GAAP line item.
+        return json.dumps(
+            {
+                "selected_kpi": {
+                    "name": "Excess tax benefits on stock-based compensation",
+                    "why_company_specific": "This is disclosed in the filing.",
+                    "what_it_measures": "Tax effects.",
+                    "how_calculated_or_defined": "GAAP line item.",
+                    "most_recent_value": "42",
+                    "period": "Q1 2017",
+                    "unit": "",
+                    "evidence": [
+                        {
+                            "page": 1,
+                            "quote": "Excess tax benefits on stock-based compensation were 42 in Q1 2017.",
+                            "type": "value",
+                        }
+                    ],
+                    "confidence": 0.95,
+                },
+                "failure_reason": None,
+            }
+        )
+
+
+def test_evidence_pipeline_falls_back_when_pass2_selects_banned_metric():
+    client = _FakeGeminiPass2InventsBannedClient()
+    config = EvidencePipelineConfig(total_timeout_seconds=20.0)
+    doc_text = (
+        "Excess tax benefits on stock-based compensation were 42 in Q1 2017.\n"
+        "We define Widget MAUs as the number of widgets active at least once in the month. Widget MAUs were 1,234 in Q4."
+    )
+
+    candidate, debug = extract_kpi_with_evidence_from_file(
+        client,
+        file_bytes=doc_text.encode("utf-8"),
+        company_name="Example Corp",
+        mime_type="text/plain",
+        config=config,
+    )
+
+    assert candidate is not None, debug
+    assert candidate.get("name") == "Widget MAUs"
+    assert debug.get("fallback_used") == "pass1_candidate"

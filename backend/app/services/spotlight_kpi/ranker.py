@@ -33,6 +33,13 @@ _GENERIC_FINANCIAL_NAME_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"\boperating\s+income\b", re.I),
     re.compile(r"\bfree\s+cash\s+flow\b", re.I),
     re.compile(r"\bEPS\b", re.I),
+    # Accounting / GAAP line items frequently mistaken as "KPIs"
+    re.compile(r"\bstock[- ]based\s+compensation\b", re.I),
+    re.compile(r"\bshare[- ]based\s+(compensation|payment)\b", re.I),
+    re.compile(r"\bexcess\s+tax\s+benefits?\b", re.I),
+    re.compile(r"\b(deferred\s+tax|valuation\s+allowance|effective\s+tax\s+rate)\b", re.I),
+    re.compile(r"\b(depreciation|amortization)\b", re.I),
+    re.compile(r"\binterest\s+(expense|income)\b", re.I),
 )
 
 # Names that are often too generic to serve as the single "Spotlight KPI" unless
