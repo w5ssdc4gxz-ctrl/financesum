@@ -502,7 +502,7 @@ def extract_kpis_with_regex(
             scale = match.group("scale") if "scale" in match.groupdict() else None
             
             value = _parse_value(value_raw, scale)
-            if value is None or value <= 0:
+            if value is None:
                 continue
             
             # Skip if we already have this KPI type
@@ -589,7 +589,7 @@ def extract_kpis_with_regex_by_page(
                 scale = match.group("scale") if "scale" in match.groupdict() else None
 
                 value = _parse_value(value_raw, scale)
-                if value is None or value <= 0:
+                if value is None:
                     continue
 
                 name_key = name_template.lower()
