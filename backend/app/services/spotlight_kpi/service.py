@@ -97,12 +97,41 @@ def _load_spotlight_context_text(path: Path, *, limit: int) -> str:
 
             pdf_bytes = path.read_bytes()
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            page_count = int(getattr(doc, "page_count", 0) or 0)
+
+            # PDFs can be long; KPIs often appear in highlights/MD&A near the front,
+            # but sometimes only appear in later sections. Sample across the document
+            # so our text/regex fallbacks still have a chance when the evidence pipeline
+            # fails (rate-limit/outage).
+            if page_count <= 0:
+                return ""
+
+            max_pages = 18
+            if page_count <= max_pages:
+                indices = list(range(page_count))
+            else:
+                take = 6
+                head = list(range(min(take, page_count)))
+                tail = list(range(max(0, page_count - take), page_count))
+                mid_start = max(0, (page_count // 2) - (take // 2))
+                mid_end = min(page_count, mid_start + take)
+                mid = list(range(mid_start, mid_end))
+
+                seen: set[int] = set()
+                indices = []
+                for idx in head + mid + tail:
+                    if idx in seen:
+                        continue
+                    seen.add(idx)
+                    indices.append(idx)
+
             parts: List[str] = []
             total = 0
-            for page in doc:
+            for idx in indices:
                 if total >= limit:
                     break
                 try:
+                    page = doc.load_page(int(idx))
                     text = page.get_text("text") or ""
                 except Exception:  # noqa: BLE001
                     text = ""
@@ -596,7 +625,13 @@ def _cache_set(filing_id: str, payload: Dict[str, Any], *, reason: Optional[str]
     transient_reasons = {
         # Missing local document is not stable; the filing can be downloaded later.
         "no_local_document",
+        # Evidence pipeline transient failures (network/model instability).
+        "no_file_uri",
+        "timeout_before_pass1",
+        "timeout_before_pass2",
+        "pass1_failed",
         "pass1_invalid_json",
+        "pass2_failed",
         "pass2_invalid_json",
         "pass3_invalid_json",
         "pass4_invalid_json",
@@ -757,6 +792,7 @@ async def build_spotlight_payload_for_filing(
 
     # 1) Preferred: evidence-backed pipeline (PDF/bytes upload) when Gemini configured.
     pipeline_dbg: Optional[Dict[str, Any]] = None
+    evidence_pipeline_reason: Optional[str] = None
     if pipeline_file_bytes and pipeline_file_mime and gemini_client:
         try:
             timeout_s = 20.0
@@ -782,6 +818,8 @@ async def build_spotlight_payload_for_filing(
         except Exception as exc:  # noqa: BLE001
             kpi_candidate, pipeline_dbg = None, {"reason": "spotlight_evidence_exception", "error": str(exc)[:500]}
 
+        evidence_pipeline_reason = str((pipeline_dbg or {}).get("reason") or "").strip() or None
+
         if debug:
             debug_info["evidence_pipeline"] = pipeline_dbg
 
@@ -796,11 +834,26 @@ async def build_spotlight_payload_for_filing(
     # 2) Text-only pipeline when Gemini configured and local text exists, but we cannot
     # upload bytes (disabled/too-large). This pipeline still requires verbatim excerpts
     # and should return None when evidence is weak.
+    evidence_pipeline_fallback_reasons = {
+        "upload_failed",
+        "no_file_uri",
+        "timeout_before_pass1",
+        "pass1_failed",
+        "pass1_invalid_json",
+        "timeout_before_pass2",
+        "pass2_failed",
+        "pass2_invalid_json",
+        "spotlight_evidence_exception",
+        "spotlight_evidence_timeout",
+    }
     if (
         not best_kpi
         and gemini_client
         and (document_text or "").strip()
-        and not (pipeline_file_bytes and pipeline_file_mime)
+        and (
+            not (pipeline_file_bytes and pipeline_file_mime)
+            or (evidence_pipeline_reason in evidence_pipeline_fallback_reasons)
+        )
     ):
         try:
             with anyio.fail_after(18.0):
@@ -829,8 +882,10 @@ async def build_spotlight_payload_for_filing(
             if debug:
                 debug_info["text_pipeline_error"] = str(exc)[:300]
 
-    # 3) Deterministic regex fallback when Gemini unavailable (safe + verifiable quote).
-    if not best_kpi and not gemini_client and (document_text or "").strip():
+    # 3) Deterministic regex fallback (safe + verifiable quote).
+    # Use even when Gemini is configured: this is our last-resort path when the
+    # model is rate-limited/unavailable but the filing text contains a clear KPI.
+    if not best_kpi and (document_text or "").strip():
         candidates = extract_kpis_with_regex(document_text, company_name, max_results=5)
         picked: Optional[SpotlightKpiCandidate] = None
         for cand in candidates:

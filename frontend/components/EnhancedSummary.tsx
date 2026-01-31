@@ -935,6 +935,44 @@ function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData;
       : []
   const spotlightTier: 'loading' | 'spotlight' | 'none' =
     awaitingRemote ? 'loading' : charts.length > 0 ? 'spotlight' : 'none'
+  const remoteReasonLower = (remoteReason || '').toLowerCase()
+  const spotlightNoKpiMessage = (() => {
+    if (!remoteReasonLower) {
+      return "This filing didn't contain an extractable company-specific operating metric with a clear numeric value."
+    }
+
+    if (remoteReasonLower.includes('timeout')) {
+      return 'KPI extraction timed out while reading this filing. Try again, or try a smaller/alternate filing.'
+    }
+
+    const infrastructureFailureReasons = [
+      'pass1_failed',
+      'pass2_failed',
+      'timeout_before_pass1',
+      'timeout_before_pass2',
+      'spotlight_evidence_exception',
+      'spotlight_evidence_timeout',
+      'upload_failed',
+      'no_file_uri',
+      'no_local_document',
+    ]
+    if (infrastructureFailureReasons.some(r => remoteReasonLower.includes(r))) {
+      return 'KPI extraction hit a temporary issue while reading this filing. Try again (or try an alternate filing).'
+    }
+
+    const limitationReasons = [
+      'file_pipeline_file_too_large',
+      'file_pipeline_upload_disabled',
+      'file_pipeline_empty_file',
+      'file_pipeline_read_failed',
+      'no_text_layer',
+    ]
+    if (limitationReasons.some(r => remoteReasonLower.includes(r))) {
+      return 'KPI extraction could not analyze this filing content reliably (file too large / unreadable text). Try a different filing.'
+    }
+
+    return "This filing didn't contain an extractable company-specific operating metric with a clear numeric value."
+  })()
 
   useEffect(() => {
     if (!shouldFetchRemoteSpotlight) {
@@ -1100,17 +1138,15 @@ function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData;
             </span>
           </div>
 
-            <div className="rounded-2xl border border-slate-200/60 dark:border-gray-800 bg-white/70 dark:bg-gray-900/40 p-5">
-            <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">No company-specific KPI found</p>
-            <p className="mt-2 text-xs text-slate-600 dark:text-gray-300 leading-relaxed">
-              {remoteReason && remoteReason.toLowerCase().includes('timeout')
-                ? "KPI extraction timed out while reading this filing. Try again, or try a smaller/alternate filing."
-                : "This filing didn&apos;t contain an extractable company-specific operating metric with a clear numeric value."}
-            </p>
-            {remoteLoading && (
-              <p className="mt-2 text-xs text-slate-500 dark:text-gray-400">
-                Checking recent filings for a disclosed company-specific KPI…
-              </p>
+	            <div className="rounded-2xl border border-slate-200/60 dark:border-gray-800 bg-white/70 dark:bg-gray-900/40 p-5">
+	            <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">No company-specific KPI found</p>
+	            <p className="mt-2 text-xs text-slate-600 dark:text-gray-300 leading-relaxed">
+	              {spotlightNoKpiMessage}
+	            </p>
+	            {remoteLoading && (
+	              <p className="mt-2 text-xs text-slate-500 dark:text-gray-400">
+	                Checking recent filings for a disclosed company-specific KPI…
+	              </p>
             )}
             {remoteReason && !remoteLoading && (
               <p className="mt-2 text-[11px] text-slate-400 dark:text-gray-500">

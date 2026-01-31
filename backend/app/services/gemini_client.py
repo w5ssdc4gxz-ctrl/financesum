@@ -23,6 +23,7 @@ from tenacity import (
 
 from app.config import get_settings
 from app.services.gemini_exceptions import (
+    GeminiClientError,
     GeminiRateLimitError,
     GeminiAPIError,
     GeminiTimeoutError,
@@ -389,6 +390,102 @@ class GeminiClient:
 
         return text_response
 
+    def _http_generate_content_with_parts_with_retry(
+        self,
+        *,
+        parts: List[Dict[str, Any]],
+        prompt_for_usage: str,
+        use_persona_model: bool = False,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        stage_name: str = "Generating",
+        usage_context: Optional[Dict[str, Any]] = None,
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> str:
+        """Retry wrapper for generateContent with structured parts (fileData + text).
+
+        This mirrors `_http_generate_content_with_retry` behavior so the file-backed
+        Spotlight KPI pipeline is resilient to transient 429/timeout/5xx failures.
+
+        `timeout_seconds` is treated as an overall budget across attempts.
+        """
+
+        def _should_retry(exc: BaseException) -> bool:
+            if isinstance(exc, (GeminiRateLimitError, GeminiTimeoutError)):
+                return True
+            if isinstance(exc, GeminiAPIError) and exc.status_code and exc.status_code >= 500:
+                return True
+            return False
+
+        attempts = max(1, int(self.max_retries))
+        try:
+            overall_budget = (
+                float(timeout_seconds)
+                if timeout_seconds is not None
+                else float(self.request_timeout + 5)
+            )
+        except Exception:
+            overall_budget = float(self.request_timeout + 5)
+        overall_budget = max(1.0, float(overall_budget))
+
+        deadline = time.monotonic() + overall_budget
+        last_exc: Optional[BaseException] = None
+
+        for attempt_idx in range(attempts):
+            remaining_budget = deadline - time.monotonic()
+            if remaining_budget <= 0:
+                break
+
+            remaining_attempts = max(1, attempts - attempt_idx)
+            per_attempt_timeout = max(1.0, float(remaining_budget) / float(remaining_attempts))
+
+            try:
+                return self._http_generate_content_with_parts(
+                    parts=parts,
+                    prompt_for_usage=prompt_for_usage,
+                    use_persona_model=use_persona_model,
+                    progress_callback=progress_callback,
+                    stage_name=stage_name,
+                    usage_context=usage_context,
+                    generation_config_override=generation_config_override,
+                    timeout_seconds=per_attempt_timeout,
+                )
+            except (GeminiRateLimitError, GeminiTimeoutError, GeminiAPIError) as exc:
+                last_exc = exc
+                if (attempt_idx + 1) >= attempts or not _should_retry(exc):
+                    raise
+
+                # Exponential backoff with optional Retry-After support.
+                wait_seconds: float = float(self.initial_wait) * (
+                    float(DEFAULT_EXPONENTIAL_MULTIPLIER) ** float(attempt_idx)
+                )
+                wait_seconds = min(float(wait_seconds), float(self.max_wait))
+                retry_after = getattr(exc, "retry_after", None)
+                if isinstance(retry_after, int) and retry_after > 0:
+                    wait_seconds = float(retry_after)
+
+                remaining_budget = deadline - time.monotonic()
+                # Keep at least 1s for the next attempt.
+                max_wait = max(0.0, float(remaining_budget) - 1.0)
+                wait_seconds = max(0.0, min(float(wait_seconds), float(max_wait)))
+
+                if wait_seconds > 0:
+                    logger.warning(
+                        "Gemini API transient failure (%s). Retrying in %.1fs (attempt %s/%s).",
+                        exc.__class__.__name__,
+                        float(wait_seconds),
+                        attempt_idx + 1,
+                        attempts,
+                    )
+                    time.sleep(float(wait_seconds))
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                raise
+
+        if isinstance(last_exc, GeminiClientError):
+            raise last_exc
+        raise GeminiTimeoutError("Gemini API request timed out")
+
     def stream_generate_content_with_file_uri(
         self,
         *,
@@ -402,6 +499,7 @@ class GeminiClient:
         usage_context: Optional[Dict[str, Any]] = None,
         generation_config_override: Optional[Dict[str, Any]] = None,
         timeout_seconds: Optional[float] = None,
+        retry: bool = True,
     ) -> str:
         """Generate content using an uploaded file reference (fileUri)."""
         _ = expected_tokens  # kept for signature parity with `stream_generate_content`
@@ -409,6 +507,18 @@ class GeminiClient:
             {"fileData": {"fileUri": str(file_uri), "mimeType": str(file_mime_type)}},
             {"text": str(prompt or "")},
         ]
+        if retry:
+            return self._http_generate_content_with_parts_with_retry(
+                parts=parts,
+                prompt_for_usage=prompt,
+                use_persona_model=use_persona_model,
+                progress_callback=progress_callback,
+                stage_name=stage_name,
+                usage_context=usage_context,
+                generation_config_override=generation_config_override,
+                timeout_seconds=timeout_seconds,
+            )
+
         return self._http_generate_content_with_parts(
             parts=parts,
             prompt_for_usage=prompt,
