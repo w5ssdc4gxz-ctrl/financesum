@@ -471,6 +471,224 @@ _DEFINITION_HINTS = (
 )
 
 
+_KPI_PAGE_HINTS = (
+    # Common headings
+    "key metrics",
+    "operating metrics",
+    "operating metric",
+    "key performance indicators",
+    "kpis",
+    # Very common operational KPI tokens
+    "mau",
+    "dau",
+    "active users",
+    "active customers",
+    "subscribers",
+    "paid subscribers",
+    "members",
+    "accounts",
+    "merchants",
+    "arr",
+    "mrr",
+    "arpu",
+    "arpa",
+    "arppu",
+    "aov",
+    "asp",
+    "bookings",
+    "gross bookings",
+    "orders",
+    "transactions",
+    "gmv",
+    "tpv",
+    "aum",
+    "churn",
+    "retention",
+    "occupancy",
+    "utilization",
+    "load factor",
+    "revpar",
+    "same-store",
+    "comparable sales",
+    "deliveries",
+    "shipments",
+    "units",
+    "store count",
+    "locations",
+    "employees",
+)
+
+
+def _score_page_for_kpi_hints(text: str) -> int:
+    if not text:
+        return 0
+    lower = text.lower()
+    score = 0
+
+    # KPI/definition hints
+    for tok in _KPI_PAGE_HINTS:
+        if tok and tok in lower:
+            score += 10
+    for tok in _DEFINITION_HINTS:
+        if tok and tok in lower:
+            score += 6
+
+    # Numeric density hints
+    digits = sum(1 for ch in lower if ch.isdigit())
+    if digits >= 60:
+        score += 10
+    elif digits >= 30:
+        score += 6
+    elif digits >= 15:
+        score += 3
+
+    if "%" in text:
+        score += 3
+    if any(sym in text for sym in ("$", "€", "£")):
+        score += 2
+
+    # Prefer pages with "table-ish" structure (common for operating metrics)
+    if "\t" in text:
+        score += 2
+    if text.count("\n") >= 30:
+        score += 2
+
+    return int(score)
+
+
+def _extract_page_snippet(text: str, *, max_chars: int) -> str:
+    """Return a compact excerpt of a page, biased toward KPI keyword regions."""
+    if not text:
+        return ""
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return ""
+    if len(normalized) <= int(max_chars):
+        return normalized
+
+    lower = normalized.lower()
+    hit_positions: List[int] = []
+    for tok in _KPI_PAGE_HINTS:
+        if not tok:
+            continue
+        pos = lower.find(tok)
+        if pos >= 0:
+            hit_positions.append(int(pos))
+        if len(hit_positions) >= 4:
+            break
+
+    if hit_positions:
+        windows: List[str] = []
+        for pos in hit_positions[:4]:
+            start = max(0, pos - 700)
+            end = min(len(normalized), pos + 1100)
+            windows.append(normalized[start:end])
+        combined = re.sub(r"\s+", " ", " … ".join(windows)).strip()
+        if len(combined) <= int(max_chars):
+            return combined
+        return combined[: int(max_chars)].rstrip() + "..."
+
+    return normalized[: int(max_chars)].rstrip() + "..."
+
+
+def _select_pages_for_text_pass(
+    page_texts: List[str], *, max_pages: int = 12, max_chars_per_page: int = 2600
+) -> List[Tuple[int, str]]:
+    """Pick a small set of pages that are likely to contain KPI disclosures."""
+    if not page_texts:
+        return []
+
+    scored: List[Tuple[int, int]] = []
+    for idx, text in enumerate(page_texts):
+        scored.append((int(idx), _score_page_for_kpi_hints(text or "")))
+
+    scored.sort(key=lambda t: t[1], reverse=True)
+    core = [idx for idx, score in scored if score > 0][: max(1, int(max_pages // 2))]
+    if not core:
+        core = [0]
+
+    selected: List[int] = []
+    seen: set[int] = set()
+
+    # Always include the first page for context if available.
+    if 0 not in seen:
+        selected.append(0)
+        seen.add(0)
+
+    # Add top-scoring pages and their neighbors to capture table headers.
+    for idx in core:
+        for j in (idx - 1, idx, idx + 1):
+            if j < 0 or j >= len(page_texts) or j in seen:
+                continue
+            selected.append(int(j))
+            seen.add(int(j))
+            if len(selected) >= int(max_pages):
+                break
+        if len(selected) >= int(max_pages):
+            break
+
+    selected.sort()
+
+    out: List[Tuple[int, str]] = []
+    for idx in selected[: int(max_pages)]:
+        snippet = _extract_page_snippet(page_texts[idx] or "", max_chars=int(max_chars_per_page))
+        if not snippet:
+            continue
+        out.append((int(idx) + 1, snippet))
+    return out
+
+
+def _build_pass1_prompt_from_page_excerpts(
+    company_name: str,
+    *,
+    max_candidates: int,
+    pages: List[Tuple[int, str]],
+) -> str:
+    pages_blob = "\n\n".join([f"PAGE {p}:\n{txt}" for p, txt in pages if txt])
+    return f"""
+You are an expert financial document analyst. Your job is to find company-specific KPIs / operating metrics from the provided filing for {company_name}.
+
+You are given excerpts from specific pages of the filing. You MUST use ONLY the text provided below.
+
+Constraints:
+- Do NOT choose generic metrics (revenue, net income, EPS, gross margin, EBITDA, free cash flow, capex, cash, debt).
+- The KPI MUST be explicitly mentioned in the provided page text and MUST include evidence.
+- You MUST provide page numbers and short quotes from the page text that contain:
+  - a reported value (most recent value), and
+  - (if present) a definition (how the KPI is calculated / what it means).
+- For EACH candidate, `evidence` MUST include at least ONE item with type = "value"
+  (must contain the KPI name and a numeric value).
+- Quotes MUST be verbatim substrings of the corresponding PAGE text.
+- If you cannot find a company-specific KPI with evidence in the provided pages, return `candidates: []` and set `failure_reason`.
+- Do not guess.
+
+Return up to {int(max_candidates)} candidates, best first.
+Output MUST be valid JSON only. No extra text.
+
+PAGES:
+{pages_blob}
+
+Return JSON with this shape:
+{{
+  "candidates": [
+    {{
+      "name": "string",
+      "why_company_specific": "string",
+      "what_it_measures": "string",
+      "how_calculated_or_defined": "string",
+      "most_recent_value": "string",
+      "period": "string",
+      "unit": "string",
+      "evidence": [
+        {{ "page": 1, "quote": "string", "type": "definition|value|context" }}
+      ]
+    }}
+  ],
+  "failure_reason": "string|null"
+}}
+""".strip()
+
+
 def _looks_like_definition_quote(quote: str) -> bool:
     q = (quote or "").strip().lower()
     if not q:
@@ -796,17 +1014,75 @@ def extract_kpi_with_evidence_from_file(
 
     pass1_raw, _ = _call_with_compat_retry(fn=_do_pass1, gen_cfg=gen_cfg_pass1, pass_name="pass1")
     if not pass1_raw:
-        debug["reason"] = "pass1_failed"
-        return None, debug
+        # Fallback: avoid fileUri calls (which can be flaky/rate-limited) by running
+        # Pass 1 against a small set of high-signal page excerpts.
+        pages = _select_pages_for_text_pass(page_texts)
+        if pages and _remaining_time() >= 2.5:
+            debug["pass1_fallback_attempted"] = "page_excerpts"
+            pass1_prompt_text = _build_pass1_prompt_from_page_excerpts(
+                company_name,
+                max_candidates=int(config.max_candidates),
+                pages=pages,
+            )
+
+            def _do_pass1_text(cfg: Dict[str, Any]) -> str:
+                timeout = min(float(config.pass1_timeout_seconds), _remaining_time())
+                try:
+                    return gemini_client.stream_generate_content(
+                        pass1_prompt_text,
+                        stage_name="KPI Evidence Pass 1 (Candidates Text Fallback)",
+                        expected_tokens=int(config.pass1_max_output_tokens),
+                        generation_config_override=cfg,
+                        timeout_seconds=timeout,
+                        retry=False,
+                    )
+                except TypeError:
+                    return gemini_client.stream_generate_content(
+                        pass1_prompt_text,
+                        stage_name="KPI Evidence Pass 1 (Candidates Text Fallback)",
+                        expected_tokens=int(config.pass1_max_output_tokens),
+                        generation_config_override=cfg,
+                        timeout_seconds=timeout,
+                    )
+
+            pass1_raw2, _ = _call_with_compat_retry(
+                fn=_do_pass1_text, gen_cfg=gen_cfg_pass1, pass_name="pass1_text_fallback"
+            )
+            if pass1_raw2:
+                pass1_raw = pass1_raw2
+                debug["pass1_fallback_used"] = True
+
+        if not pass1_raw:
+            debug["reason"] = "pass1_failed"
+            return None, debug
 
     pass1 = parse_json_object(pass1_raw)
     if not pass1:
         if _remaining_time() > 1.5:
             retry_prompt = safe_json_retry_prompt("Pass 1", bad_output=pass1_raw)
             pass1_prompt_retry = retry_prompt
+            pass1_used_text = bool(debug.get("pass1_fallback_used"))
 
             def _do_pass1_retry(cfg: Dict[str, Any]) -> str:
                 timeout = min(float(config.pass1_timeout_seconds), _remaining_time())
+                if pass1_used_text:
+                    try:
+                        return gemini_client.stream_generate_content(
+                            pass1_prompt_retry,
+                            stage_name="KPI Evidence Pass 1 (Retry)",
+                            expected_tokens=int(config.pass1_max_output_tokens),
+                            generation_config_override=cfg,
+                            timeout_seconds=timeout,
+                            retry=False,
+                        )
+                    except TypeError:
+                        return gemini_client.stream_generate_content(
+                            pass1_prompt_retry,
+                            stage_name="KPI Evidence Pass 1 (Retry)",
+                            expected_tokens=int(config.pass1_max_output_tokens),
+                            generation_config_override=cfg,
+                            timeout_seconds=timeout,
+                        )
                 return gemini_client.stream_generate_content_with_file_uri(
                     file_uri=file_uri,
                     file_mime_type=file_mime,
