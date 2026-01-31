@@ -541,6 +541,97 @@ def extract_kpis_with_regex(
     return [c for _, c in candidates[:max_results]]
 
 
+def extract_kpis_with_regex_by_page(
+    page_texts: List[str],
+    company_name: str,
+    max_results: int = 5,
+) -> List[SpotlightKpiCandidate]:
+    """Extract KPIs using regex patterns, preserving page evidence.
+
+    This is intended for PDF workflows where we have page-scoped extracted text and
+    need a verifiable (page, quote) evidence item.
+    """
+    if not page_texts:
+        return []
+
+    def _build_quote(page_text: str, match: re.Match[str], *, max_chars: int = 260) -> str:
+        if not page_text:
+            return ""
+        match_start = int(match.start())
+        match_end = int(match.end())
+        if match_start < 0 or match_end <= match_start:
+            raw = str(match.group(0) or "")
+            return re.sub(r"\s+", " ", raw).strip()
+
+        # Keep the full match while providing limited surrounding context.
+        match_center = int((match_start + match_end) / 2)
+        start = max(0, match_center - int(max_chars / 2))
+        end = min(len(page_text), start + max_chars)
+        if end < match_end:
+            end = min(len(page_text), match_end)
+            start = max(0, end - max_chars)
+        excerpt = page_text[start:end].strip()
+        # Collapse whitespace for readability; verification normalizes whitespace too.
+        return re.sub(r"\s+", " ", excerpt).strip()
+
+    candidates: List[Tuple[int, SpotlightKpiCandidate]] = []
+    seen_names: set[str] = set()
+
+    for page_idx, page_text in enumerate(page_texts):
+        text = page_text or ""
+        if not text.strip():
+            continue
+        page_num = page_idx + 1  # 1-indexed for UI/evidence
+
+        for pattern, name_template, unit, priority in _KPI_PATTERNS:
+            for match in pattern.finditer(text):
+                value_raw = match.group("value") if "value" in match.groupdict() else None
+                scale = match.group("scale") if "scale" in match.groupdict() else None
+
+                value = _parse_value(value_raw, scale)
+                if value is None or value <= 0:
+                    continue
+
+                name_key = name_template.lower()
+                if name_key in seen_names:
+                    continue
+                seen_names.add(name_key)
+
+                quote = _build_quote(text, match)
+                if not quote:
+                    continue
+
+                most_recent_value = (value_raw or "").strip()
+                if scale and str(scale).strip():
+                    most_recent_value = f"{most_recent_value} {str(scale).strip()}"
+                if unit == "%":
+                    most_recent_value = f"{most_recent_value}%".strip()
+                elif unit == "$" and most_recent_value and not most_recent_value.startswith("$"):
+                    most_recent_value = f"${most_recent_value}"
+
+                candidate: SpotlightKpiCandidate = {
+                    "name": name_template,
+                    "value": float(value),
+                    "unit": unit,
+                    "prior_value": None,
+                    "chart_type": "metric",
+                    "description": None,
+                    "source_quote": f"[p. {page_num}] {quote}",
+                    "why_company_specific": "Disclosed as an operating metric in the company's filing.",
+                    "how_calculated_or_defined": None,
+                    "most_recent_value": most_recent_value or None,
+                    "period": None,
+                    "confidence": 0.72,
+                    "evidence": [{"page": page_num, "quote": quote, "type": "value"}],
+                    "ban_flags": ["regex_page_fallback"],
+                }
+
+                candidates.append((priority, candidate))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in candidates[:max_results]]
+
+
 def extract_single_best_kpi_with_regex(
     text: str,
     company_name: str,

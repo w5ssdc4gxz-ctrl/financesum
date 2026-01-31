@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from .regex_fallback import extract_kpis_with_regex_by_page
 from .json_parse import parse_json_object
 from .pipeline_utils import safe_json_retry_prompt, thinking_config
 from .types import SpotlightKpiCandidate
@@ -997,6 +998,80 @@ def extract_kpi_with_evidence_from_file(
         return None, debug
     debug["verification_pages"] = len(page_texts)
 
+    def _try_regex_page_fallback(reason: str) -> Optional[SpotlightKpiCandidate]:
+        """Deterministic last-resort KPI extraction using page-scoped regex patterns."""
+        try:
+            candidates = extract_kpis_with_regex_by_page(
+                page_texts, company_name, max_results=int(config.max_candidates)
+            )
+        except Exception as exc:  # noqa: BLE001
+            debug[f"{reason}_regex_page_error"] = str(exc)[:200]
+            return None
+
+        debug[f"{reason}_regex_page_candidates"] = len(candidates)
+
+        for cand in candidates:
+            if not isinstance(cand, dict):
+                continue
+            name = str(cand.get("name") or "").strip()
+            if not name or _is_generic_financial_metric(name):
+                continue
+
+            ev_raw = cand.get("evidence")
+            ev_list = ev_raw if isinstance(ev_raw, list) else []
+            if not ev_list:
+                continue
+
+            verified, _ = _verify_evidence_against_document(ev_list, page_texts=page_texts, kpi_name=name)
+            if not verified:
+                continue
+
+            verified = _dedupe_evidence(verified)
+            verified, has_value, has_definition = _enrich_evidence_types(
+                verified,
+                require_value=bool(config.require_value_evidence),
+                require_definition=bool(config.require_definition_evidence),
+            )
+
+            if config.require_value_evidence and not has_value:
+                continue
+            if config.require_definition_evidence and not has_definition:
+                continue
+
+            value_f = _coerce_number(cand.get("value"))
+            if value_f is None:
+                value_f = _coerce_number(cand.get("most_recent_value"))
+            if value_f is None:
+                continue
+
+            out = dict(cand)
+            out["name"] = name
+            out["value"] = float(value_f)
+            out["confidence"] = max(float(config.min_confidence), float(out.get("confidence") or 0.72))
+            out["evidence"] = verified
+
+            existing_flags = out.get("ban_flags")
+            flags = list(existing_flags) if isinstance(existing_flags, list) else []
+            if "regex_page_fallback" not in flags:
+                flags.append("regex_page_fallback")
+            out["ban_flags"] = flags
+
+            if not str(out.get("why_company_specific") or "").strip():
+                out["why_company_specific"] = "Disclosed as an operating metric in the company's filing."
+
+            source_quote = str(out.get("source_quote") or "").strip()
+            if not source_quote and verified:
+                try:
+                    page_i = int(verified[0].get("page") or 1)
+                except Exception:  # noqa: BLE001
+                    page_i = 1
+                source_quote = f"[p. {page_i}] {str(verified[0].get('quote') or '').strip()}"
+                out["source_quote"] = source_quote
+
+            return out
+
+        return None
+
     # Total timeout (env override)
     try:
         total_timeout = float(
@@ -1028,10 +1103,20 @@ def extract_kpi_with_evidence_from_file(
     except Exception as exc:  # noqa: BLE001
         debug["reason"] = "upload_failed"
         debug["upload_error"] = str(exc)[:500]
+        kpi = _try_regex_page_fallback("upload_failed")
+        if kpi:
+            debug["fallback_used"] = "regex_page"
+            debug["fallback_reason"] = "upload_failed"
+            return kpi, debug
         return None, debug
 
     if not file_uri:
         debug["reason"] = "no_file_uri"
+        kpi = _try_regex_page_fallback("no_file_uri")
+        if kpi:
+            debug["fallback_used"] = "regex_page"
+            debug["fallback_reason"] = "no_file_uri"
+            return kpi, debug
         return None, debug
 
     debug["file_uploaded"] = True
@@ -1135,6 +1220,11 @@ def extract_kpi_with_evidence_from_file(
 
         if not pass1_raw:
             debug["reason"] = "pass1_failed"
+            kpi = _try_regex_page_fallback("pass1_failed")
+            if kpi:
+                debug["fallback_used"] = "regex_page"
+                debug["fallback_reason"] = "pass1_failed"
+                return kpi, debug
             return None, debug
 
     pass1 = parse_json_object(pass1_raw)
@@ -1184,6 +1274,11 @@ def extract_kpi_with_evidence_from_file(
     if not pass1 or not isinstance(pass1.get("candidates"), list):
         debug["reason"] = "pass1_invalid_json"
         debug["pass1_raw_head"] = (pass1_raw or "")[:800]
+        kpi = _try_regex_page_fallback("pass1_invalid_json")
+        if kpi:
+            debug["fallback_used"] = "regex_page"
+            debug["fallback_reason"] = "pass1_invalid_json"
+            return kpi, debug
         return None, debug
 
     raw_candidates = [c for c in (pass1.get("candidates") or []) if isinstance(c, dict)]
@@ -1242,6 +1337,11 @@ def extract_kpi_with_evidence_from_file(
         if not raw_candidates:
             debug["reason"] = "pass1_no_candidates"
             debug["failure_reason"] = str(pass1.get("failure_reason") or "").strip() or None
+            kpi = _try_regex_page_fallback("pass1_no_candidates")
+            if kpi:
+                debug["fallback_used"] = "regex_page"
+                debug["fallback_reason"] = "pass1_no_candidates"
+                return kpi, debug
             return None, debug
 
     def _canon_name_key(text: str) -> str:
@@ -1375,6 +1475,11 @@ def extract_kpi_with_evidence_from_file(
 
     if not sanitized_candidates:
         debug["reason"] = "pass1_no_valid_candidates"
+        kpi = _try_regex_page_fallback("pass1_no_valid_candidates")
+        if kpi:
+            debug["fallback_used"] = "regex_page"
+            debug["fallback_reason"] = "pass1_no_valid_candidates"
+            return kpi, debug
         return None, debug
 
     # ---------------------------------------------------------------------
@@ -1382,6 +1487,14 @@ def extract_kpi_with_evidence_from_file(
     # ---------------------------------------------------------------------
     if _remaining_time() <= 0:
         debug["reason"] = "timeout_before_pass2"
+        if pass1_fallback_candidate:
+            debug["fallback_used"] = "pass1_candidate"
+            return pass1_fallback_candidate, debug
+        kpi = _try_regex_page_fallback("timeout_before_pass2")
+        if kpi:
+            debug["fallback_used"] = "regex_page"
+            debug["fallback_reason"] = "timeout_before_pass2"
+            return kpi, debug
         return None, debug
 
     pass2_prompt = _build_pass2_prompt(company_name, candidates=sanitized_candidates)

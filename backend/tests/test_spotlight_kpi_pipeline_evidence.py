@@ -306,3 +306,136 @@ def test_evidence_pipeline_falls_back_when_pass2_selects_banned_metric():
     assert candidate is not None, debug
     assert candidate.get("name") == "Widget MAUs"
     assert debug.get("fallback_used") == "pass1_candidate"
+
+
+class _FakeGeminiOnlyGenericCandidates:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def upload_file_bytes(self, *, data: bytes, mime_type: str, **_kwargs: Any) -> Dict[str, Any]:
+        assert data
+        assert mime_type
+        self.calls.append("upload_file_bytes")
+        return {"uri": "files/FAKE", "mimeType": mime_type}
+
+    def stream_generate_content_with_file_uri(  # type: ignore[override]
+        self,
+        *,
+        file_uri: str,
+        file_mime_type: str,
+        prompt: str,
+        stage_name: str = "",
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> str:
+        _ = (generation_config_override,)
+        assert file_uri
+        assert file_mime_type
+        assert prompt
+        self.calls.append(stage_name or "pass1")
+        # Only generic financial metrics -> should be filtered out.
+        return json.dumps(
+            {
+                "candidates": [
+                    {
+                        "name": "Total revenue",
+                        "why_company_specific": "Generic financial statement line item.",
+                        "what_it_measures": "Revenue.",
+                        "how_calculated_or_defined": "GAAP.",
+                        "most_recent_value": "$10.0 million",
+                        "period": "Q1",
+                        "unit": "$",
+                        "evidence": [
+                            {"page": 1, "quote": "Total revenue was $10.0 million.", "type": "value"}
+                        ],
+                    }
+                ],
+                "failure_reason": None,
+            }
+        )
+
+    def stream_generate_content(self, *args: Any, **kwargs: Any) -> str:  # noqa: ARG002
+        raise AssertionError("Pass 2 should not run when all Pass 1 candidates are generic.")
+
+
+def test_evidence_pipeline_page_regex_fallback_when_pass1_only_generic_candidates():
+    client = _FakeGeminiOnlyGenericCandidates()
+    config = EvidencePipelineConfig(total_timeout_seconds=20.0)
+    doc_text = "Backlog was $1.2 million as of December 31.\nTotal revenue was $10.0 million."
+
+    candidate, debug = extract_kpi_with_evidence_from_file(
+        client,
+        file_bytes=doc_text.encode("utf-8"),
+        company_name="Example Corp",
+        mime_type="text/plain",
+        config=config,
+    )
+
+    assert candidate is not None, debug
+    assert candidate.get("name") == "Backlog"
+    assert float(candidate.get("value")) == 1_200_000.0
+    assert debug.get("fallback_used") == "regex_page"
+    assert debug.get("fallback_reason") == "pass1_no_valid_candidates"
+
+
+class _FakeGeminiNoCandidates:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def upload_file_bytes(self, *, data: bytes, mime_type: str, **_kwargs: Any) -> Dict[str, Any]:
+        assert data
+        assert mime_type
+        self.calls.append("upload_file_bytes")
+        return {"uri": "files/FAKE", "mimeType": mime_type}
+
+    def stream_generate_content_with_file_uri(  # type: ignore[override]
+        self,
+        *,
+        file_uri: str,
+        file_mime_type: str,
+        prompt: str,
+        stage_name: str = "",
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> str:
+        _ = (generation_config_override,)
+        assert file_uri
+        assert file_mime_type
+        assert prompt
+        self.calls.append(stage_name or "pass1")
+        return json.dumps({"candidates": [], "failure_reason": "no_operating_metrics_found"})
+
+    def stream_generate_content(
+        self,
+        prompt: str,
+        *,
+        stage_name: str = "",
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> str:
+        _ = (prompt, generation_config_override)
+        self.calls.append(stage_name or "pass_text")
+        # Pass 1 text fallback also returns no candidates. Pass 2 should not run.
+        if "Pass 1" in (stage_name or ""):
+            return json.dumps({"candidates": [], "failure_reason": "no_operating_metrics_found"})
+        raise AssertionError(f"Unexpected stage: {stage_name}")
+
+
+def test_evidence_pipeline_page_regex_fallback_when_pass1_returns_no_candidates():
+    client = _FakeGeminiNoCandidates()
+    config = EvidencePipelineConfig(total_timeout_seconds=20.0)
+    doc_text = "Backlog was $1.2 million as of December 31."
+
+    candidate, debug = extract_kpi_with_evidence_from_file(
+        client,
+        file_bytes=doc_text.encode("utf-8"),
+        company_name="Example Corp",
+        mime_type="text/plain",
+        config=config,
+    )
+
+    assert candidate is not None, debug
+    assert candidate.get("name") == "Backlog"
+    assert float(candidate.get("value")) == 1_200_000.0
+    assert debug.get("fallback_used") == "regex_page"
+    assert debug.get("fallback_reason") == "pass1_no_candidates"
