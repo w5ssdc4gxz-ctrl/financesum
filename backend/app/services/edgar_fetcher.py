@@ -723,6 +723,10 @@ def download_filing(url: str, output_path: str) -> bool:
             # Prefer HTML content.
             if lower.endswith((".htm", ".html")):
                 bonus += 10
+            # Prefer full submission TXT as a reliable fallback for extraction
+            # (often contains narrative + KPIs even when HTML is messy).
+            if lower.endswith(".txt"):
+                bonus += 9
             # Allow PDFs (investor decks / exhibits). Keep a small preference for HTML
             # so we don't accidentally select image-heavy presentations when a press
             # release HTML is available.
@@ -736,7 +740,7 @@ def download_filing(url: str, output_path: str) -> bool:
             if isinstance(it, dict)
             and str(it.get("name") or "")
             .lower()
-            .endswith((".htm", ".html", ".pdf"))
+            .endswith((".htm", ".html", ".pdf", ".txt"))
         ]
         if not candidate_items:
             return None

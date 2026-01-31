@@ -26,15 +26,18 @@ def test_download_filing_upgrades_cover_doc_to_press_release(tmp_path, monkeypat
     cover_url = "https://www.sec.gov/Archives/edgar/data/937966/000162828025045043/form6-kquarterlyfilings.htm"
     index_url = "https://www.sec.gov/Archives/edgar/data/937966/000162828025045043/index.json"
     press_url = "https://www.sec.gov/Archives/edgar/data/937966/000162828025045043/pressreleasequarterlyresul.htm"
+    txt_url = "https://www.sec.gov/Archives/edgar/data/937966/000162828025045043/fullsubmission.txt"
 
     cover_bytes = (b"SECURITIES AND EXCHANGE COMMISSION\n" b"FORM 6-K\n" b"Indicate by check mark\n")
     press_bytes = (b"Quarterly results\nNet bookings were \xe2\x82\xac5.0 billion\n" + (b"x" * 50_000))
+    txt_bytes = (b"Complete submission text\nNet bookings were \xe2\x82\xac5.0 billion\n" + (b"y" * 70_000))
 
     index_payload = {
         "directory": {
             "item": [
                 {"name": "form6-kquarterlyfilings.htm", "type": "text.gif", "size": "11745"},
                 {"name": "pressreleasequarterlyresul.htm", "type": "text.gif", "size": "50019"},
+                {"name": "fullsubmission.txt", "type": "text.gif", "size": "80000"},
             ]
         }
     }
@@ -46,6 +49,8 @@ def test_download_filing_upgrades_cover_doc_to_press_release(tmp_path, monkeypat
             return _Resp(json_data=index_payload)
         if url == press_url:
             return _Resp(content=press_bytes)
+        if url == txt_url:
+            return _Resp(content=txt_bytes)
         raise AssertionError(f"Unexpected URL fetched: {url}")
 
     monkeypatch.setattr(edgar_fetcher.requests, "get", fake_get)

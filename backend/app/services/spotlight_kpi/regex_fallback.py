@@ -447,6 +447,586 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
         "customers",
         70,
     ),
+    
+    # =========================================================================
+    # INSURANCE METRICS
+    # =========================================================================
+    (
+        re.compile(
+            r"(?:gross\s+written\s+premiums?(?:\s*\(GWP\))?|GWP)" + _CONNECTOR +
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
+            re.IGNORECASE,
+        ),
+        "Gross Written Premiums (GWP)",
+        "$",
+        88,
+    ),
+    (
+        re.compile(
+            r"(?:net\s+written\s+premiums?(?:\s*\(NWP\))?|NWP)" + _CONNECTOR +
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
+            re.IGNORECASE,
+        ),
+        "Net Written Premiums (NWP)",
+        "$",
+        87,
+    ),
+    (
+        re.compile(
+            r"(?:combined\s+ratio)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "Combined Ratio",
+        "%",
+        86,
+    ),
+    (
+        re.compile(
+            r"(?:loss\s+ratio)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "Loss Ratio",
+        "%",
+        84,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
+            r"(?:policies?|policyholders?)\s*(?:in\s+force)?",
+            re.IGNORECASE,
+        ),
+        "Policies in Force",
+        "policies",
+        85,
+    ),
+    
+    # =========================================================================
+    # HEALTHCARE/PHARMA METRICS
+    # =========================================================================
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B|thousand|K)?\s*"
+            r"(?:patients?|members?|enrollees?|lives?)",
+            re.IGNORECASE,
+        ),
+        "Members/Patients",
+        "members",
+        78,
+    ),
+    (
+        re.compile(
+            r"(?:medical\s+loss\s+ratio|MLR)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "Medical Loss Ratio (MLR)",
+        "%",
+        84,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B|thousand|K)?\s*"
+            r"prescriptions?\s+(?:filled|processed|dispensed)",
+            re.IGNORECASE,
+        ),
+        "Prescriptions Filled",
+        "prescriptions",
+        82,
+    ),
+    
+    # =========================================================================
+    # REAL ESTATE METRICS
+    # =========================================================================
+    (
+        re.compile(
+            r"(?:occupancy\s+rate)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "Occupancy Rate",
+        "%",
+        85,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%\s*"
+            r"(?:occupancy|occupied)",
+            re.IGNORECASE,
+        ),
+        "Occupancy Rate",
+        "%",
+        85,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|thousand|M|K)?\s*"
+            r"(?:square\s+feet|sq\.?\s*ft\.?|SF)",
+            re.IGNORECASE,
+        ),
+        "Square Footage",
+        "sq ft",
+        75,
+    ),
+    (
+        re.compile(
+            r"(?:funds?\s+from\s+operations?(?:\s*\(FFO\))?|FFO)" + _CONNECTOR +
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
+            re.IGNORECASE,
+        ),
+        "Funds from Operations (FFO)",
+        "$",
+        86,
+    ),
+    (
+        re.compile(
+            r"(?:net\s+operating\s+income(?:\s*\(NOI\))?|NOI)" + _CONNECTOR +
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
+            re.IGNORECASE,
+        ),
+        "Net Operating Income (NOI)",
+        "$",
+        84,
+    ),
+    
+    # =========================================================================
+    # TELECOM METRICS
+    # =========================================================================
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
+            r"(?:wireless|mobile|cellular)\s+(?:subscribers?|connections?|customers?)",
+            re.IGNORECASE,
+        ),
+        "Wireless Subscribers",
+        "subscribers",
+        88,
+    ),
+    (
+        re.compile(
+            r"(?:average\s+revenue\s+per\s+user(?:\s*\(ARPU\))?|ARPU)" + _CONNECTOR +
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)",
+            re.IGNORECASE,
+        ),
+        "Average Revenue Per User (ARPU)",
+        "$",
+        86,
+    ),
+    (
+        re.compile(
+            r"(?:churn\s+rate)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "Churn Rate",
+        "%",
+        84,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%\s*"
+            r"(?:churn|customer\s+churn)",
+            re.IGNORECASE,
+        ),
+        "Churn Rate",
+        "%",
+        84,
+    ),
+    
+    # =========================================================================
+    # GAMING/ENTERTAINMENT METRICS
+    # =========================================================================
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
+            r"(?:registered\s+)?players?",
+            re.IGNORECASE,
+        ),
+        "Registered Players",
+        "players",
+        82,
+    ),
+    (
+        re.compile(
+            r"(?:net\s+bookings)" + _CONNECTOR +
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
+            re.IGNORECASE,
+        ),
+        "Net Bookings",
+        "$",
+        85,
+    ),
+    (
+        re.compile(
+            r"(?:daily\s+average\s+users?(?:\s*\(DAU\))?)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
+            re.IGNORECASE,
+        ),
+        "Daily Active Users (DAUs)",
+        "users",
+        92,
+    ),
+    
+    # =========================================================================
+    # ENERGY/UTILITIES METRICS
+    # =========================================================================
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|thousand|M|B|K)?\s*"
+            r"(?:megawatt\s+hours?|MWh)",
+            re.IGNORECASE,
+        ),
+        "Energy Generated (MWh)",
+        "MWh",
+        82,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>thousand|K)?\s*"
+            r"(?:megawatts?|MW)\s*(?:of\s+)?(?:capacity|installed)?",
+            re.IGNORECASE,
+        ),
+        "Installed Capacity (MW)",
+        "MW",
+        84,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
+            r"(?:barrels?|bbls?)(?:\s+of\s+oil)?(?:\s+equivalent)?(?:\s*\(BOE\))?",
+            re.IGNORECASE,
+        ),
+        "Production (BOE)",
+        "BOE",
+        85,
+    ),
+    
+    # =========================================================================
+    # LOGISTICS/TRANSPORTATION METRICS
+    # =========================================================================
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
+            r"(?:packages?|parcels?|shipments?)\s*(?:delivered|shipped)?",
+            re.IGNORECASE,
+        ),
+        "Packages Delivered",
+        "packages",
+        85,
+    ),
+    (
+        re.compile(
+            r"(?:on[- ]time\s+delivery(?:\s+rate)?)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "On-Time Delivery Rate",
+        "%",
+        82,
+    ),
+    (
+        re.compile(
+            r"(?:load\s+factor)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "Load Factor",
+        "%",
+        84,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%\s*"
+            r"load\s+factor",
+            re.IGNORECASE,
+        ),
+        "Load Factor",
+        "%",
+        84,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
+            r"(?:revenue\s+)?(?:passenger|seat)\s+miles?",
+            re.IGNORECASE,
+        ),
+        "Revenue Passenger Miles",
+        "miles",
+        83,
+    ),
+    
+    # =========================================================================
+    # FINTECH/BANKING METRICS
+    # =========================================================================
+    (
+        re.compile(
+            r"(?:loan\s+originations?|originations?)" + _CONNECTOR +
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
+            re.IGNORECASE,
+        ),
+        "Loan Originations",
+        "$",
+        85,
+    ),
+    (
+        re.compile(
+            r"(?:net\s+interest\s+margin(?:\s*\(NIM\))?|NIM)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "Net Interest Margin (NIM)",
+        "%",
+        84,
+    ),
+    (
+        re.compile(
+            r"(?:deposits?)" + _CONNECTOR +
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|trillion|M|B|T)?",
+            re.IGNORECASE,
+        ),
+        "Total Deposits",
+        "$",
+        78,
+    ),
+    (
+        re.compile(
+            r"(?:loans?\s+under\s+management|serviced\s+loans?)" + _CONNECTOR +
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
+            re.IGNORECASE,
+        ),
+        "Loans Under Management",
+        "$",
+        82,
+    ),
+    
+    # =========================================================================
+    # ADVERTISING/MEDIA METRICS
+    # =========================================================================
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
+            r"(?:impressions?|ad\s+impressions?)",
+            re.IGNORECASE,
+        ),
+        "Ad Impressions",
+        "impressions",
+        80,
+    ),
+    (
+        re.compile(
+            r"(?:click[- ]through\s+rate(?:\s*\(CTR\))?|CTR)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "Click-Through Rate (CTR)",
+        "%",
+        82,
+    ),
+    (
+        re.compile(
+            r"(?:cost\s+per\s+(?:click|acquisition)(?:\s*\(CPC|CPA\))?|CPC|CPA)" + _CONNECTOR +
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)",
+            re.IGNORECASE,
+        ),
+        "Cost Per Click/Acquisition",
+        "$",
+        80,
+    ),
+    
+    # =========================================================================
+    # MARKETPLACE/PLATFORM METRICS
+    # =========================================================================
+    (
+        re.compile(
+            r"(?:take\s+rate)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "Take Rate",
+        "%",
+        88,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%\s*"
+            r"take\s+rate",
+            re.IGNORECASE,
+        ),
+        "Take Rate",
+        "%",
+        88,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B|thousand|K)?\s*"
+            r"(?:active\s+)?(?:buyers?|sellers?|merchants?)",
+            re.IGNORECASE,
+        ),
+        "Active Buyers/Sellers",
+        "users",
+        76,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
+            r"listings?",
+            re.IGNORECASE,
+        ),
+        "Active Listings",
+        "listings",
+        78,
+    ),
+    
+    # =========================================================================
+    # CLOUD/INFRASTRUCTURE METRICS
+    # =========================================================================
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B|thousand|K)?\s*"
+            r"(?:compute\s+)?instances?",
+            re.IGNORECASE,
+        ),
+        "Compute Instances",
+        "instances",
+        82,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>petabytes?|terabytes?|PB|TB)?\s*"
+            r"(?:of\s+)?(?:data\s+)?(?:stored|storage|managed)",
+            re.IGNORECASE,
+        ),
+        "Data Stored",
+        "TB",
+        80,
+    ),
+    (
+        re.compile(
+            r"(?:uptime|availability)" + _CONNECTOR +
+            r"(?P<value>\d{2,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "Uptime/Availability",
+        "%",
+        78,
+    ),
+    
+    # =========================================================================
+    # EDUCATION/EDTECH METRICS
+    # =========================================================================
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B|thousand|K)?\s*"
+            r"(?:students?|learners?|enrollments?)",
+            re.IGNORECASE,
+        ),
+        "Students/Learners",
+        "students",
+        82,
+    ),
+    (
+        re.compile(
+            r"(?:course\s+completions?|completion\s+rate)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "Course Completion Rate",
+        "%",
+        80,
+    ),
+    
+    # =========================================================================
+    # CYBERSECURITY METRICS
+    # =========================================================================
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B|thousand|K)?\s*"
+            r"(?:endpoints?|devices?)\s*(?:protected|secured|managed)?",
+            re.IGNORECASE,
+        ),
+        "Endpoints Protected",
+        "endpoints",
+        84,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
+            r"(?:threats?|attacks?)\s*(?:blocked|detected|prevented)",
+            re.IGNORECASE,
+        ),
+        "Threats Blocked",
+        "threats",
+        82,
+    ),
+    
+    # =========================================================================
+    # FOOD/RESTAURANT METRICS
+    # =========================================================================
+    (
+        re.compile(
+            r"(?:average\s+check|average\s+ticket|AUV)" + _CONNECTOR +
+            r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)",
+            re.IGNORECASE,
+        ),
+        "Average Check/Ticket",
+        "$",
+        82,
+    ),
+    (
+        re.compile(
+            r"(?:restaurant[- ]level\s+margin)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "Restaurant-Level Margin",
+        "%",
+        84,
+    ),
+    
+    # =========================================================================
+    # GENERIC QUALIFIED METRICS (lower priority fallbacks)
+    # =========================================================================
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B|thousand|K)?\s*"
+            r"(?:registered\s+)?users?",
+            re.IGNORECASE,
+        ),
+        "Registered Users",
+        "users",
+        65,
+    ),
+    (
+        re.compile(
+            r"(?:customer\s+retention(?:\s+rate)?)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "Customer Retention Rate",
+        "%",
+        75,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%\s*"
+            r"(?:customer\s+)?retention",
+            re.IGNORECASE,
+        ),
+        "Customer Retention Rate",
+        "%",
+        75,
+    ),
+    (
+        re.compile(
+            r"(?:gross\s+profit\s+margin)" + _CONNECTOR +
+            r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
+            re.IGNORECASE,
+        ),
+        "Gross Profit Margin",
+        "%",
+        60,
+    ),
 ]
 
 

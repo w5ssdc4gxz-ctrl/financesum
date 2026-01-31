@@ -420,8 +420,10 @@ def _extract_verification_pages(
                 pages.append(txt)
                 total_chars += len(txt or "")
 
-            # Heuristic: scanned/no-text PDFs yield almost no extractable text.
             if total_chars < 800:
+                # Defer OCR to later escalation: we want to avoid doing OCR on every
+                # scanned PDF up-front. The main pipeline will attempt model+regex first
+                # (for text-layer PDFs), then escalate to OCR only when needed.
                 return [], "no_text_layer"
             return pages, None
         except Exception:  # noqa: BLE001
@@ -450,12 +452,26 @@ def _find_pages_for_quote(quote: str, *, page_texts_norm: List[str]) -> List[int
         if qn in page_norm:
             hits.append(idx + 1)
             continue
-        # Contiguous fallback that ignores whitespace differences.
-        # This stays strict (no token-overlap fuzzy matching) to avoid false positives.
-        if len(qn_compact) >= 80:
+        if len(qn_compact) >= 40:
             page_compact = page_norm.replace(" ", "")
             if qn_compact and qn_compact in page_compact:
                 hits.append(idx + 1)
+                continue
+        if len(qn) >= 60:
+            prefix = qn[:40]
+            suffix = qn[-40:]
+            if prefix in page_norm or suffix in page_norm:
+                hits.append(idx + 1)
+                continue
+        if len(qn) >= 30:
+            words = qn.split()
+            if len(words) >= 4:
+                sig_words = [w for w in words if len(w) >= 4][:6]
+                if sig_words:
+                    matches = sum(1 for w in sig_words if w in page_norm)
+                    if matches >= len(sig_words) * 0.7:
+                        hits.append(idx + 1)
+                        continue
     return hits
 
 
@@ -989,10 +1005,34 @@ def extract_kpi_with_evidence_from_file(
         debug["max_bytes"] = int(config.max_upload_bytes)
         return None, debug
 
-    # Extract text layer up-front so we can fail fast on scanned PDFs / unverifiable docs.
+    # Extract verification text up-front so we can verify model quotes.
+    # For PDFs: per-page text layer (and optionally OCR later).
+    # For plain text/HTML: treat as a single "page" so we can still verify excerpts.
     page_texts, unverifiable_reason = _extract_verification_pages(
         file_bytes=file_bytes, mime_type=mime_type
     )
+    if unverifiable_reason:
+        if (mime_type or "").startswith("text/"):
+            # Never fail early for text inputs; we can always verify against the full text.
+            unverifiable_reason = None
+            try:
+                text = file_bytes.decode("utf-8", errors="ignore")
+            except Exception:  # noqa: BLE001
+                text = ""
+            page_texts = [text]
+        elif str(unverifiable_reason) == "no_text_layer":
+            # Defer OCR to escalation. For scanned PDFs we try OCR + regex before giving up.
+            try:
+                from .ocr_fallback import extract_text_with_ocr_from_pdf
+
+                ocr_pages, ocr_debug = extract_text_with_ocr_from_pdf(file_bytes)
+                debug["ocr_debug"] = ocr_debug
+                if ocr_pages and sum(len(t or "") for t in ocr_pages) >= 800:
+                    page_texts = ocr_pages
+                    unverifiable_reason = None
+            except Exception as exc:  # noqa: BLE001
+                debug["ocr_exception"] = str(exc)[:200]
+
     if unverifiable_reason:
         debug["reason"] = unverifiable_reason
         return None, debug

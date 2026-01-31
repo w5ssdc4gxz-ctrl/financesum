@@ -5,6 +5,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from html import unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -79,14 +80,106 @@ def _infer_local_document_mime_type(path: Path) -> str:
 
 
 def _strip_html_to_text(raw_html: str) -> str:
+    """Convert SEC HTML (incl. iXBRL) into plain-ish text for extraction.
+
+    Some filings (especially older iXBRL) contain huge amounts of taxonomy metadata
+    as text nodes. That noise can dominate the extracted text and make KPI
+    extraction fail. We aggressively strip common iXBRL patterns while preserving
+    enough structure (newlines/tabs) for table-like KPI rows.
+    """
     if not raw_html:
         return ""
-    # Keep this intentionally simple: tests write plain text to ".html" files.
-    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\\1>", " ", raw_html)
-    text = re.sub(r"(?is)<[^>]+>", " ", text)
-    text = text.replace("&nbsp;", " ").replace("&amp;", "&")
-    text = re.sub(r"\\s+", " ", text)
-    return text.strip()
+
+    cleaned = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw_html)
+    cleaned = re.sub(r"(?is)<!--.*?-->", " ", cleaned)
+
+    # iXBRL/taxonomy noise before tag stripping.
+    cleaned = re.sub(r"https?://\S{10,}", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"www\.\S{8,}", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"\b(?:us-gaap|dei|srt|ifrs-full|xbrli|xbrldi|xbrldt|iso4217|xlink|link|ref|xsd|ix|ixt):[A-Za-z0-9_.-]+\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"\b[a-z]{2,10}:[A-Za-z][A-Za-z0-9_.-]{2,}\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
+    # Preserve basic structure before stripping tags.
+    cleaned = re.sub(r"(?is)</tr\s*>", "\n", cleaned)
+    cleaned = re.sub(r"(?is)</td\s*>", "\t", cleaned)
+    cleaned = re.sub(r"(?is)</th\s*>", "\t", cleaned)
+    cleaned = re.sub(r"(?is)</p\s*>", "\n", cleaned)
+    cleaned = re.sub(r"(?is)</div\s*>", "\n", cleaned)
+    cleaned = re.sub(r"(?is)</li\s*>", "\n", cleaned)
+    cleaned = re.sub(r"(?is)<br\s*/?\s*>", "\n", cleaned)
+    cleaned = re.sub(r"(?is)<[^>]+>", " ", cleaned)
+
+    # Unescape entities.
+    cleaned = unescape(cleaned)
+
+    # Repeat iXBRL stripping after unescape (some filings encode `us-gaap:` etc).
+    cleaned = re.sub(r"https?://\S{8,}", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"www\.\S{8,}", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"\b(?:us-gaap|dei|srt|ifrs-full|xbrli|xbrldi|xbrldt|iso4217|xlink|link|ref|xsd|ix|ixt):[A-Za-z0-9_.-]+\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r'\bcontextRef="[^"]{1,80}"', " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\bunitRef="[^"]{1,40}"', " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\bname="[^"]{1,140}"', " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\bid="[^"]{1,120}"', " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\bdecimals="[^"]{1,20}"', " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\bscale="[^"]{1,20}"', " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\bformat="[^"]{1,40}"', " ", cleaned, flags=re.IGNORECASE)
+
+    # Normalize whitespace but preserve newlines for section/table readability.
+    cleaned = re.sub(r"[ \t\f\v]+", " ", cleaned)
+    cleaned = re.sub(r"\r\n?", "\n", cleaned)
+    cleaned = re.sub(r" *\n *", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+    # Drop ultra-noisy lines that look like XBRL context dumps.
+    lines_out: List[str] = []
+    for line in (cleaned or "").splitlines():
+        s = line.strip()
+        if not s:
+            lines_out.append("")
+            continue
+
+        upper = s.upper()
+        if (
+            "ITEM " in upper
+            or "MANAGEMENT DISCUSSION" in upper
+            or "RISK FACTORS" in upper
+            or "FINANCIAL STATEMENTS" in upper
+            or "TABLE OF CONTENTS" in upper
+        ):
+            lines_out.append(s)
+            continue
+
+        tokens = s.split()
+        if len(tokens) >= 10:
+            noise_tokens = sum(1 for t in tokens if (":" in t or "/" in t))
+            noise_ratio = noise_tokens / max(1, len(tokens))
+            alpha = sum(1 for ch in s if ch.isalpha())
+            digit = sum(1 for ch in s if ch.isdigit())
+            if noise_ratio >= 0.35 and alpha < 40 and digit >= 10:
+                continue
+            if noise_ratio >= 0.55 and alpha < 80:
+                continue
+
+        lines_out.append(s)
+
+    cleaned = "\n".join(lines_out)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _load_spotlight_context_text(path: Path, *, limit: int) -> str:
@@ -583,7 +676,7 @@ async def _build_history(
 
 
 def _cache_config() -> Tuple[str, int, int]:
-    version = (os.getenv("SPOTLIGHT_CACHE_VERSION") or "").strip() or "spotlight-cache-evidence-20260131-4"
+    version = (os.getenv("SPOTLIGHT_CACHE_VERSION") or "").strip() or "spotlight-cache-evidence-20260131-5"
     ttl_s = _int_env("SPOTLIGHT_CACHE_TTL_SECONDS", 604800)
     ttl_s = max(0, int(ttl_s))
     max_items = _int_env("SPOTLIGHT_CACHE_MAX_ITEMS", 4000)
@@ -767,6 +860,8 @@ async def build_spotlight_payload_for_filing(
             pipeline_file_bytes = (document_text or "").encode("utf-8", errors="ignore")
             pipeline_file_mime = "text/plain"
 
+
+
     if debug:
         debug_info.update(
             {
@@ -840,6 +935,8 @@ async def build_spotlight_payload_for_filing(
         "timeout_before_pass1",
         "pass1_failed",
         "pass1_invalid_json",
+        "pass1_no_candidates",
+        "pass1_no_valid_candidates",
         "timeout_before_pass2",
         "pass2_failed",
         "pass2_invalid_json",
@@ -899,6 +996,36 @@ async def build_spotlight_payload_for_filing(
             spotlight_used_fallbacks = True
             picked["company_specific"] = True
             best_kpi = picked
+
+    # 4) Table-based KPI extraction fallback.
+    # Handles structured "Key Metrics" tables that regex patterns may miss.
+    if not best_kpi and (document_text or "").strip():
+        try:
+            from .table_kpi_extractor import extract_kpis_from_text_tables
+            table_candidates = extract_kpis_from_text_tables(document_text, company_name, max_results=5)
+            for cand in table_candidates:
+                if not isinstance(cand, dict):
+                    continue
+                quote = str(cand.get("source_quote") or "").strip()
+                if not quote or len(quote) <= 10:
+                    continue
+                if not _quote_in_context(quote, document_text):
+                    continue
+
+                spotlight_used_fallbacks = True
+                cand_item = dict(cand)
+                cand_item["company_specific"] = True
+
+                validated = pick_best_spotlight_kpi([cand_item], context_text=document_text)
+                if validated:
+                    best_kpi = dict(validated)
+                    best_kpi["company_specific"] = True
+                    if debug:
+                        debug_info["table_extraction_used"] = True
+                    break
+        except Exception as exc:  # noqa: BLE001
+            if debug:
+                debug_info["table_extraction_error"] = str(exc)[:200]
 
     if debug:
         debug_info["spotlight_used_fallbacks"] = spotlight_used_fallbacks
