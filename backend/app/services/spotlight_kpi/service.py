@@ -33,6 +33,11 @@ _DISALLOWED_SPOTLIGHT_KPI_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"\bheadquarters?\b", re.IGNORECASE),
     re.compile(r"\bprincipal\s+executive\s+offices?\b", re.IGNORECASE),
     re.compile(r"\bcorporate\s+(headquarters?|offices?|campus)\b", re.IGNORECASE),
+    re.compile(r"\b(telephone|phone|fax)\b", re.IGNORECASE),
+    re.compile(r"\b(address|zip|postal)\b", re.IGNORECASE),
+    re.compile(r"\bcommission\s+file\s+number\b", re.IGNORECASE),
+    re.compile(r"\bcik\b", re.IGNORECASE),
+    re.compile(r"\bincorporat(?:ed|ion)\b", re.IGNORECASE),
     re.compile(r"\boffice\s+space\b", re.IGNORECASE),
     re.compile(r"\bsquare\s+(foot|feet|footage)\b", re.IGNORECASE),
     re.compile(r"\bsq\.?\s*ft\.?\b", re.IGNORECASE),
@@ -733,7 +738,7 @@ async def _build_history(
 
 
 def _cache_config() -> Tuple[str, int, int]:
-    version = (os.getenv("SPOTLIGHT_CACHE_VERSION") or "").strip() or "spotlight-cache-evidence-20260131-6"
+    version = (os.getenv("SPOTLIGHT_CACHE_VERSION") or "").strip() or "spotlight-cache-evidence-20260201-1"
     ttl_s = _int_env("SPOTLIGHT_CACHE_TTL_SECONDS", 604800)
     ttl_s = max(0, int(ttl_s))
     max_items = _int_env("SPOTLIGHT_CACHE_MAX_ITEMS", 4000)
@@ -741,8 +746,10 @@ def _cache_config() -> Tuple[str, int, int]:
     return version, ttl_s, max_items
 
 
-def _cache_get(filing_id: str, *, debug: bool) -> Optional[Dict[str, Any]]:
-    if debug or os.getenv("PYTEST_CURRENT_TEST"):
+def _cache_get(
+    filing_id: str, *, debug: bool, bypass_cache: bool
+) -> Optional[Dict[str, Any]]:
+    if bypass_cache or debug or os.getenv("PYTEST_CURRENT_TEST"):
         return None
     cache_key = str(filing_id)
     version, ttl_s, _max_items = _cache_config()
@@ -839,6 +846,7 @@ async def build_spotlight_payload_for_filing(
     settings: Any,
     context_source: str = "",
     debug: bool = False,
+    bypass_cache: bool = False,
 ) -> Dict[str, Any]:
     """Authoritative Spotlight KPI extraction pipeline.
 
@@ -850,7 +858,7 @@ async def build_spotlight_payload_for_filing(
     """
     start_ts = time.monotonic()
 
-    cached = _cache_get(filing_id, debug=debug)
+    cached = _cache_get(filing_id, debug=debug, bypass_cache=bool(bypass_cache))
     if cached is not None:
         return cached
 

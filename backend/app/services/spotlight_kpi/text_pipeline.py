@@ -110,6 +110,91 @@ def _extract_number_from_excerpt(excerpt: str) -> Optional[float]:
     return float(filtered[0][0])
 
 
+_SCALE_UNIT_TOKENS: set[str] = {
+    "k",
+    "m",
+    "b",
+    "t",
+    "thousand",
+    "million",
+    "billion",
+    "trillion",
+    "mn",
+    "bn",
+    "mm",
+}
+
+
+def _infer_unit_from_excerpt(excerpt: str) -> Optional[str]:
+    text = str(excerpt or "")
+    if not text:
+        return None
+    if "$" in text:
+        return "$"
+    if "€" in text:
+        return "€"
+    if "£" in text:
+        return "£"
+    if "%" in text:
+        return "%"
+    if re.search(r"\bpercent(?:age)?\b", text, re.IGNORECASE):
+        return "%"
+    return None
+
+
+def _infer_unit_from_name(name: str) -> Optional[str]:
+    n = re.sub(r"\s+", " ", (name or "").strip().lower())
+    if not n:
+        return None
+    if any(tok in n for tok in ("margin", "rate", "ratio", "churn", "retention", "occupancy", "utilization", "load factor")):
+        return "%"
+    if "transaction" in n:
+        return "transactions"
+    if "order" in n:
+        return "orders"
+    if "subscriber" in n or "membership" in n or "member" in n:
+        return "subscribers"
+    if "mau" in n or "dau" in n or "active user" in n or n.endswith(" users"):
+        return "users"
+    if "customer" in n or "account" in n or "merchant" in n:
+        return "customers"
+    if "trip" in n:
+        return "trips"
+    if "ride" in n:
+        return "rides"
+    if any(tok in n for tok in ("shipment", "shipped", "deliver", "delivered", "units")):
+        return "units"
+    if any(tok in n for tok in ("store", "location", "restaurant")):
+        return "locations"
+    return None
+
+
+def _sanitize_unit(unit: Optional[str], *, kpi_name: str, excerpt: str) -> Optional[str]:
+    inferred = _infer_unit_from_excerpt(excerpt)
+    if inferred:
+        return inferred
+
+    raw = str(unit or "").strip()
+    lower = raw.lower().strip()
+    if not lower:
+        return _infer_unit_from_name(kpi_name)
+
+    if lower in {"%", "percent", "percentage", "pct"}:
+        return "%"
+    if lower in {"$", "usd", "us$", "dollar", "dollars", "us dollars"}:
+        return "$"
+    if lower in {"€", "eur", "euro", "euros"}:
+        return "€"
+    if lower in {"£", "gbp", "pound", "pounds", "sterling"}:
+        return "£"
+
+    # Never treat magnitude/scales as units (prevents "2000B" display bugs).
+    if lower in _SCALE_UNIT_TOKENS:
+        return _infer_unit_from_name(kpi_name)
+
+    return raw[:48].strip() or _infer_unit_from_name(kpi_name)
+
+
 def extract_company_specific_spotlight_kpi_from_text(
     gemini_client: Any,
     *,
@@ -551,7 +636,11 @@ KPI + EXCERPT:
         return None, debug
 
     unit = kpi_obj.get("unit")
-    unit_s = str(unit).strip() if unit is not None and str(unit).strip() else None
+    unit_s = _sanitize_unit(
+        str(unit).strip() if unit is not None and str(unit).strip() else None,
+        kpi_name=name,
+        excerpt=excerpt,
+    )
 
     scores = kpi_obj.get("scores") if isinstance(kpi_obj.get("scores"), dict) else {}
     try:

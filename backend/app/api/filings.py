@@ -16243,6 +16243,7 @@ async def get_filing_summary_progress(filing_id: str):
 async def get_filing_spotlight_kpi(
     filing_id: str,
     debug: bool = False,
+    refresh: bool = False,
     user: CurrentUser = Depends(get_current_user),
 ):
     """Return the best available company-specific Spotlight KPI without regenerating the full summary."""
@@ -16281,6 +16282,7 @@ async def get_filing_spotlight_kpi(
         settings=settings,
         context_source=str(context.get("source") or ""),
         debug=debug,
+        bypass_cache=bool(refresh),
     )
     return JSONResponse(content=jsonable_encoder(payload))
 

@@ -187,8 +187,10 @@ export const filingsApi = {
   exportSummary: (filingId: string, payload: SummaryExportPayload) =>
     apiClient.post(`/api/v1/filings/${filingId}/summary/export`, payload, { responseType: 'blob' }),
 
-  getSpotlightKpi: (filingId: string) =>
-    apiClient.get(`/api/v1/filings/${filingId}/spotlight`),
+  getSpotlightKpi: (filingId: string, opts?: { refresh?: boolean }) =>
+    apiClient.get(`/api/v1/filings/${filingId}/spotlight`, {
+      params: opts?.refresh ? { refresh: true } : undefined,
+    }),
 }
 
 // Analysis API

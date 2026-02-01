@@ -60,6 +60,18 @@ EvidenceType = str
 _ALLOWED_EVIDENCE_TYPES: set[str] = {"definition", "value", "context"}
 
 
+def _strip_page_header_prefix(text: str) -> str:
+    """Remove common page-marker prefixes that models sometimes include in quotes."""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    # Examples:
+    # - "PAGE 12: ...", "Page 12 - ...", "[PAGE 12] ..."
+    s = re.sub(r"^\[?\s*page\s+\d+\s*\]?\s*[:\\-–—]?\\s*", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"^\\s*={2,}\\s*page\\s+\\d+\\s*={2,}\\s*", "", s, flags=re.IGNORECASE)
+    return s.strip()
+
+
 def _strip_unsupported_generation_fields(
     gen_cfg: Dict[str, Any], *, error_text: str
 ) -> Tuple[Dict[str, Any], List[str]]:
@@ -315,6 +327,16 @@ def _is_generic_financial_metric(name: str) -> bool:
         "principal executive office",
         "principal executive offices",
         "corporate headquarters",
+        "commission file",
+        "file number",
+        "cik",
+        "telephone",
+        "phone",
+        "fax",
+        "address",
+        "zip",
+        "postal",
+        "incorporat",
         "office space",
         "square footage",
         "square feet",
@@ -334,6 +356,11 @@ Constraints:
   deferred taxes, effective tax rate, depreciation/amortization, interest expense, working capital, balance sheet line items).
 - Do NOT choose corporate-fact disclosures (headquarters location/address, principal executive offices, phone numbers, building square footage,
   office space size, number of facilities/buildings). These are not operating KPIs.
+- Do NOT treat phone numbers, addresses, CIK/commission file numbers, or zip/postal codes as KPIs.
+- Do NOT choose corporate-fact disclosures (headquarters location/address, principal executive offices, phone numbers, building square footage,
+  office space size, number of facilities/buildings). These are not operating KPIs.
+- Do NOT treat phone numbers, addresses, CIK/commission file numbers, or zip/postal codes as KPIs.
+- Do NOT treat phone numbers, addresses, CIK/commission file numbers, or zip/postal codes as KPIs.
 - "Company-specific" means the metric is explicitly disclosed for this company; it does NOT need to be unique across companies.
 - The KPI `name` MUST match the wording used in the filing (do not rename "Transactions" to "Orders", do not add/remove words).
 - The KPI MUST be explicitly mentioned in the filing and MUST include evidence.
@@ -347,6 +374,8 @@ Constraints:
     (a) quote the full table row (KPI label + value), OR
     (b) provide TWO evidence quotes on the SAME page: one with the KPI name (type "context") and one with the numeric value (type "value").
   - Quotes MUST be verbatim excerpts from the filing (include enough surrounding text to be uniquely matchable).
+- If the filing content includes page markers like `PAGE 12:` (plain-text extraction), use those numbers for `evidence.page`.
+  Do NOT include the `PAGE N:` marker text in the `quote` field.
 - `unit` MUST be the actual unit (e.g., "users", "transactions", "orders", "$", "%"). Do NOT use magnitude/scales as units
   ("million", "billion", "M", "B"). If the filing reports values "in millions/billions", put that in `most_recent_value`
   (e.g., "250 million") and keep `unit` as the real unit (e.g., "users").
@@ -399,6 +428,8 @@ Hard rules:
 - `unit` MUST be the actual unit (e.g., "users", "transactions", "orders", "$", "%"). Do NOT use magnitude/scales as units
   ("million", "billion", "M", "B"). If the filing reports values "in millions/billions", put that in `most_recent_value`
   (e.g., "250 million") and keep `unit` as the real unit (e.g., "users").
+- If the filing content includes page markers like `PAGE 12:` (plain-text extraction), use those numbers for `evidence.page`.
+  Do NOT include the `PAGE N:` marker text in the `quote` field.
 - Do not guess.
 - Output MUST be valid JSON matching the schema below. No extra text.
 
@@ -677,6 +708,27 @@ _KPI_PAGE_HINTS = (
     "store count",
     "locations",
     "employees",
+    # Industrial / commodity / regulated volume indicators
+    "production",
+    "throughput",
+    "capacity",
+    "proved reserves",
+    "proven reserves",
+    "reserves",
+    "barrels",
+    "boe",
+    "bpd",
+    "mcf",
+    "mmcf",
+    "tons",
+    "ounces",
+    "megawatts",
+    "mw",
+    "gwh",
+    "mwh",
+    "passengers",
+    "asm",
+    "rpm",
 )
 
 
@@ -776,6 +828,18 @@ def _select_pages_for_text_pass(
         selected.append(0)
         seen.add(0)
 
+    # Also include mid/last anchors to cover long filings where KPIs appear far
+    # from the cover/ToC (common for older 10-Ks).
+    if len(page_texts) >= 3:
+        mid = max(0, (len(page_texts) // 2))
+        for anchor in (mid, len(page_texts) - 1):
+            if anchor in seen:
+                continue
+            selected.append(int(anchor))
+            seen.add(int(anchor))
+            if len(selected) >= int(max_pages):
+                break
+
     # Add top-scoring pages and their neighbors to capture table headers.
     for idx in core:
         for j in (idx - 1, idx, idx + 1):
@@ -787,6 +851,25 @@ def _select_pages_for_text_pass(
                 break
         if len(selected) >= int(max_pages):
             break
+
+    # If we still have room, add a few high-digit-density pages even if they lack
+    # explicit KPI keywords (tables sometimes omit the obvious headings).
+    if len(selected) < int(max_pages):
+        density: List[Tuple[int, int]] = []
+        for idx, text in enumerate(page_texts):
+            if idx in seen:
+                continue
+            digits = sum(1 for ch in (text or "") if ch.isdigit())
+            if digits >= 25:
+                density.append((int(idx), int(digits)))
+        density.sort(key=lambda t: t[1], reverse=True)
+        for idx, _d in density[: max(0, int(max_pages) - len(selected))]:
+            if idx in seen:
+                continue
+            selected.append(int(idx))
+            seen.add(int(idx))
+            if len(selected) >= int(max_pages):
+                break
 
     selected.sort()
 
@@ -1199,6 +1282,7 @@ def _sanitize_evidence_item(item: Any) -> Optional[Dict[str, Any]]:
     if not isinstance(item, dict):
         return None
     quote = str(item.get("quote") or "").replace("…", "...").strip()
+    quote = _strip_page_header_prefix(quote)
     if quote.endswith("..."):
         quote = quote[:-3].rstrip()
     if quote.startswith("..."):
@@ -1439,6 +1523,29 @@ def extract_kpi_with_evidence_from_file(
         return None, debug
     debug["verification_pages"] = len(page_texts)
 
+    # ---------------------------------------------------------------------
+    # Model input selection
+    # ---------------------------------------------------------------------
+    # Gemini can be inconsistent at extracting metrics directly from binary PDFs,
+    # especially for scanned filings and iXBRL-heavy artifacts. Since we already
+    # extracted per-page text (and ran OCR when needed) for strict verification,
+    # prefer uploading a plain-text, page-marked representation to the model.
+    upload_bytes = file_bytes
+    upload_mime = str(mime_type or "")
+    if str(mime_type or "") == "application/pdf" and page_texts and sum(len(t or "") for t in page_texts) >= 800:
+        try:
+            paged_text = "\n\n".join(
+                [f"PAGE {idx + 1}:\n{page_texts[idx] or ''}".rstrip() for idx in range(len(page_texts))]
+            ).strip()
+        except Exception:  # noqa: BLE001
+            paged_text = ""
+        if paged_text:
+            paged_bytes = paged_text.encode("utf-8", errors="ignore")
+            if 0 < len(paged_bytes) <= int(config.max_upload_bytes):
+                upload_bytes = paged_bytes
+                upload_mime = "text/plain"
+                debug["model_upload_mode"] = "paged_text_from_pdf"
+
     def _try_regex_page_fallback(reason: str) -> Optional[SpotlightKpiCandidate]:
         """Deterministic last-resort KPI extraction using page-scoped regex patterns."""
         try:
@@ -1534,13 +1641,13 @@ def extract_kpi_with_evidence_from_file(
     try:
         upload_timeout = min(12.0, _remaining_time())
         file_obj = gemini_client.upload_file_bytes(
-            data=file_bytes,
-            mime_type=str(mime_type),
+            data=upload_bytes,
+            mime_type=str(upload_mime),
             display_name=f"{company_name[:50]}-filing",
             timeout_seconds=upload_timeout,
         )
         file_uri = str(file_obj.get("uri") or "")
-        file_mime = str(file_obj.get("mimeType") or file_obj.get("mime_type") or str(mime_type))
+        file_mime = str(file_obj.get("mimeType") or file_obj.get("mime_type") or str(upload_mime))
     except Exception as exc:  # noqa: BLE001
         debug["reason"] = "upload_failed"
         debug["upload_error"] = str(exc)[:500]

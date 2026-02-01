@@ -12,6 +12,88 @@ from typing import Any, Dict, List, Optional, Tuple
 from .types import SpotlightKpiCandidate
 
 
+# Keep regex fallback conservative; false positives are worse than "no KPI".
+_GARBLED_ALLOWED_PUNCT = set("_.;,:%$()[]'\"-+/&")
+
+
+def _looks_like_garbled_text(text: str) -> bool:
+    """Heuristic: detect extracted text that is present but unreadable."""
+    s = (
+        (text or "")
+        .replace("\u00a0", " ")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .strip()
+    )
+    if not s:
+        return True
+
+    sample = s[:1200]
+    non_space = re.sub(r"\s+", "", sample)
+    if not non_space:
+        return True
+
+    weird = sum(
+        1
+        for ch in non_space
+        if not (ch.isalnum() or ch in _GARBLED_ALLOWED_PUNCT)
+    )
+    weird_ratio = weird / max(1, len(non_space))
+
+    tokens = re.findall(r"\S+", sample)
+    token_cap = min(len(tokens), 120)
+    good_words = 0
+    for tok in tokens[:token_cap]:
+        cleaned = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", tok)
+        if re.fullmatch(r"[A-Za-z]{3,}", cleaned or ""):
+            good_words += 1
+    good_ratio = good_words / max(1, token_cap)
+
+    if weird_ratio >= 0.18:
+        return True
+    if weird_ratio >= 0.08 and good_ratio <= 0.18:
+        return True
+    return False
+
+
+_NON_OPERATING_CONTEXT_HINTS = (
+    # Footnotes / accounting disclosures commonly misread as "KPIs"
+    "related party",
+    "share-based",
+    "stock-based",
+    "excess tax",
+    "income tax",
+    "deferred tax",
+    "compensation",
+    "lease",
+    "valuation allowance",
+    "effective tax rate",
+    "depreciation",
+    "amortization",
+    "interest expense",
+    "interest income",
+    # Corporate facts / boilerplate
+    "principal executive",
+    "headquarters",
+    "office space",
+    "square feet",
+    "square foot",
+    "square footage",
+    "telephone",
+    "phone",
+    "fax",
+    "commission file number",
+    "cik",
+)
+
+
+def _looks_like_non_operating_context(quote: str) -> bool:
+    q = (quote or "").lower()
+    return any(tok in q for tok in _NON_OPERATING_CONTEXT_HINTS)
+
+
 # Flexible connector pattern to handle various formats:
 # "GMV of $X", "GMV: $X", "GMV reached $X", "GMV was $X", "GMV totaled $X", etc.
 _CONNECTOR = r"(?:\s+(?:of|at|is|was|were|reached|totaled|totalled|hit|grew\s+to|increased\s+to|stood\s+at)|\s*[:\-])?(?:\s+approximately|\s+about|\s+roughly)?\s*"
@@ -1185,6 +1267,10 @@ def extract_kpis_with_regex_by_page(
 
                 quote = _build_quote(text, match)
                 if not quote:
+                    continue
+                if _looks_like_garbled_text(quote):
+                    continue
+                if _looks_like_non_operating_context(quote):
                     continue
 
                 most_recent_value = (value_raw or "").strip()

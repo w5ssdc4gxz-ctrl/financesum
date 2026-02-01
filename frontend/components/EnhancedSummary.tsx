@@ -248,8 +248,9 @@ function normalizeKpiUnit(value?: string | null): string | undefined {
   if (['usd', '$', 'dollars', 'us$', 'us dollars'].includes(lower)) return '$'
   if (['eur', '€', 'euro', 'euros'].includes(lower)) return '€'
   if (['gbp', '£', 'pound', 'pounds', 'sterling'].includes(lower)) return '£'
-  if (['million', 'millions', 'm'].includes(lower)) return 'M'
-  if (['billion', 'billions', 'b'].includes(lower)) return 'B'
+  // Avoid mapping single-letter units like "m"/"b" to magnitudes; they are ambiguous.
+  if (['million', 'millions'].includes(lower)) return 'M'
+  if (['billion', 'billions'].includes(lower)) return 'B'
   return normalized
 }
 
@@ -978,6 +979,10 @@ function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData;
   })()
 
   useEffect(() => {
+    setSpotlightRetryKey(0)
+  }, [filingId])
+
+  useEffect(() => {
     if (!shouldFetchRemoteSpotlight) {
       setRemoteCharts(null)
       setRemoteLoading(false)
@@ -1009,7 +1014,7 @@ function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData;
     }, 120_000)
 
     filingsApi
-      .getSpotlightKpi(filingId)
+      .getSpotlightKpi(filingId, { refresh: spotlightRetryKey > 0 })
       .then((res) => {
         if (spotlightRequestSeq.current !== seq) return
         const reason = typeof res?.data?.reason === 'string' ? res.data.reason : null
