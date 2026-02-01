@@ -923,6 +923,9 @@ function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData;
   const [remoteCharts, setRemoteCharts] = useState<CompanyKPI[] | null>(null)
   const [remoteLoading, setRemoteLoading] = useState(false)
   const [remoteReason, setRemoteReason] = useState<string | null>(null)
+  const [remoteSlow, setRemoteSlow] = useState(false)
+  const [remoteVerySlow, setRemoteVerySlow] = useState(false)
+  const [spotlightRetryKey, setSpotlightRetryKey] = useState(0)
   const spotlightRequestSeq = useRef(0)
   const baseHasCompanySpecific = baseCharts.some((kpi) => kpi.company_specific === true)
   const shouldFetchRemoteSpotlight = Boolean(filingId && !baseHasCompanySpecific)
@@ -978,6 +981,9 @@ function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData;
     if (!shouldFetchRemoteSpotlight) {
       setRemoteCharts(null)
       setRemoteLoading(false)
+      setRemoteReason(null)
+      setRemoteSlow(false)
+      setRemoteVerySlow(false)
       return
     }
     if (!filingId) return
@@ -986,16 +992,21 @@ function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData;
     setRemoteCharts(null)
     setRemoteLoading(true)
     setRemoteReason(null)
+    setRemoteSlow(false)
+    setRemoteVerySlow(false)
 
-    // Defensive timeout: avoid a stuck "Finding KPI..." state if the request never resolves.
-    // Important: invalidate the in-flight request so a late response doesn't "flip" the KPI mid-render.
-    const timeoutId = window.setTimeout(() => {
+    // Soft timeout: show "still working" but keep waiting for the response.
+    const softTimeoutId = window.setTimeout(() => {
       if (spotlightRequestSeq.current !== seq) return
-      spotlightRequestSeq.current += 1
-      setRemoteCharts([])
-      setRemoteReason('spotlight_timeout')
-      setRemoteLoading(false)
+      setRemoteSlow(true)
     }, 45_000)
+
+    // Longer filings can take a while (EDGAR download, OCR, multi-pass extraction).
+    // Keep waiting, but update the UI so users know it's not stuck.
+    const verySlowTimeoutId = window.setTimeout(() => {
+      if (spotlightRequestSeq.current !== seq) return
+      setRemoteVerySlow(true)
+    }, 120_000)
 
     filingsApi
       .getSpotlightKpi(filingId)
@@ -1023,11 +1034,18 @@ function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData;
         setRemoteReason('spotlight_error')
       })
       .finally(() => {
-        window.clearTimeout(timeoutId)
+        window.clearTimeout(softTimeoutId)
+        window.clearTimeout(verySlowTimeoutId)
         if (spotlightRequestSeq.current !== seq) return
         setRemoteLoading(false)
       })
-  }, [filingId, shouldFetchRemoteSpotlight])
+
+    return () => {
+      window.clearTimeout(softTimeoutId)
+      window.clearTimeout(verySlowTimeoutId)
+      spotlightRequestSeq.current += 1
+    }
+  }, [filingId, shouldFetchRemoteSpotlight, spotlightRetryKey])
 
   const highlightPrimary = charts.length > 2
   const gridLayout =
@@ -1054,8 +1072,24 @@ function CompanyInsightsSection({ chartData, filingId }: { chartData: ChartData;
           </div>
 
           <p className="mb-4 text-xs text-slate-500 dark:text-gray-400 leading-relaxed">
-            Scanning the filing text for a company-specific operating KPI…
+            {remoteVerySlow
+              ? 'Still working… older filings can take a couple minutes to analyze (downloads + OCR + verification).'
+              : remoteSlow
+                ? "Still working… this filing is taking longer than usual to analyze."
+                : 'Scanning the filing text for a company-specific operating KPI…'}
           </p>
+
+          {remoteVerySlow ? (
+            <div className="mb-4">
+              <button
+                type="button"
+                onClick={() => setSpotlightRetryKey((v) => v + 1)}
+                className="inline-flex items-center gap-2 rounded-full border border-slate-200/80 dark:border-gray-700 bg-white/80 dark:bg-gray-900/80 px-3 py-1 text-[10px] font-semibold uppercase tracking-widest text-slate-500 dark:text-gray-400 hover:text-slate-700 dark:hover:text-gray-200"
+              >
+                Retry
+              </button>
+            </div>
+          ) : null}
 
           <div className={cn("grid gap-4", displayCharts.length === 2 ? 'md:grid-cols-2' : 'grid-cols-1 md:grid-cols-2 lg:grid-cols-3')}>
             {Array.from({ length: 3 }).map((_, idx) => (

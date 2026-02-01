@@ -1273,16 +1273,37 @@ async def build_spotlight_payload_for_filing(
             kpi_obj.pop("segments", None)
 
         # History is best-effort and bounded.
-        history = await _build_history(
-            kpi=kpi_obj,
-            company=company,
-            company_name=company_name,
-            current_filing=filing,
-            current_filing_id=str(filing_id),
-            context_source=str(context_source or ""),
-            gemini_client=gemini_client,
-            max_points=8,
-        )
+        history: List[Dict[str, Any]] = []
+        history_timeout_s = 12.0
+        raw_history_timeout = (os.getenv("SPOTLIGHT_HISTORY_TIMEOUT_SECONDS") or "").strip()
+        if raw_history_timeout:
+            try:
+                history_timeout_s = float(raw_history_timeout)
+            except ValueError:
+                history_timeout_s = 12.0
+        history_timeout_s = max(0.0, min(history_timeout_s, 25.0))
+
+        if history_timeout_s > 0:
+            try:
+                with anyio.fail_after(history_timeout_s):
+                    history = await _build_history(
+                        kpi=kpi_obj,
+                        company=company,
+                        company_name=company_name,
+                        current_filing=filing,
+                        current_filing_id=str(filing_id),
+                        context_source=str(context_source or ""),
+                        gemini_client=gemini_client,
+                        max_points=8,
+                    )
+            except TimeoutError:
+                history = []
+                if debug:
+                    debug_info["history_error"] = "timeout"
+            except Exception as exc:  # noqa: BLE001
+                history = []
+                if debug:
+                    debug_info["history_error"] = str(exc)[:200]
         if history:
             kpi_obj["history"] = history
 
