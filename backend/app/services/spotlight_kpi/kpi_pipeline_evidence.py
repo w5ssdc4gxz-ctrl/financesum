@@ -75,6 +75,49 @@ def _strip_page_header_prefix(text: str) -> str:
     return s.strip()
 
 
+def _build_compact_kpi_description(
+    *, what_it_measures: str = "", why_company_specific: str = "", max_chars: int = 180
+) -> Optional[str]:
+    """Create a 1-2 line blurb for the UI from model-provided fields.
+
+    Prefer concise, company-relevant explanations and avoid leaking long quotes.
+    """
+
+    def _clean(text: str) -> str:
+        cleaned = re.sub(r"\s+", " ", (text or "").strip())
+        cleaned = cleaned.strip().strip('"').strip("'").strip()
+        return cleaned
+
+    def _ensure_sentence(text: str) -> str:
+        s = _clean(text)
+        if not s:
+            return ""
+        if s[-1] not in ".!?":
+            s = f"{s}."
+        return s
+
+    what = _ensure_sentence(what_it_measures)
+    why_raw = _clean(why_company_specific)
+    why = ""
+    if why_raw:
+        prefix = ""
+        lowered = why_raw.lower()
+        if not any(token in lowered for token in ("because", "important", "matters", "key", "core")):
+            prefix = "Matters because "
+        why = _ensure_sentence(f"{prefix}{why_raw}")
+
+    parts = [p for p in (what, why) if p]
+    if not parts:
+        return None
+
+    out = " ".join(parts)
+    out = re.sub(r"\s+", " ", out).strip()
+    if max_chars and len(out) > int(max_chars):
+        clipped = out[: max(0, int(max_chars) - 1)].rstrip()
+        out = f"{clipped}…"
+    return out or None
+
+
 def _strip_unsupported_generation_fields(
     gen_cfg: Dict[str, Any], *, error_text: str
 ) -> Tuple[Dict[str, Any], List[str]]:
@@ -2325,7 +2368,10 @@ def extract_kpi_with_evidence_from_file(
             "unit": unit,
             "prior_value": None,
             "chart_type": "metric",
-            "description": str(c.get("what_it_measures") or "").strip() or None,
+            "description": _build_compact_kpi_description(
+                what_it_measures=str(c.get("what_it_measures") or ""),
+                why_company_specific=str(c.get("why_company_specific") or ""),
+            ),
             "source_quote": source_quote,
             "why_company_specific": str(c.get("why_company_specific") or "").strip()[:400] or None,
             "how_calculated_or_defined": str(c.get("how_calculated_or_defined") or "").strip()[:700]
@@ -2858,7 +2904,12 @@ Return JSON:
         "unit": unit,
         "prior_value": None,
         "chart_type": "metric",
-        "description": str(selected.get("what_it_measures") or "").strip() if has_definition else None,
+        "description": _build_compact_kpi_description(
+            what_it_measures=str(selected.get("what_it_measures") or ""),
+            why_company_specific=str(selected.get("why_company_specific") or ""),
+        )
+        if has_definition
+        else None,
         "source_quote": source_quote,
         # Extra fields (frontend ignores if unused)
         "why_company_specific": str(selected.get("why_company_specific") or "").strip() or None,

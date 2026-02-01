@@ -507,6 +507,71 @@ def _quote_in_context(source_quote: str, context_text: str) -> bool:
     return qn in ctx
 
 
+def _build_spotlight_description(candidate: Dict[str, Any], *, max_chars: int = 180) -> Optional[str]:
+    """Return a short 1-2 line explanation for the UI.
+
+    Prefer model-provided descriptions, but fall back to company-specific rationale
+    or lightweight heuristics when missing (e.g., regex-only fallback).
+    """
+
+    def clean(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").strip()).strip()
+
+    def clip(text: str) -> str:
+        s = clean(text)
+        if not s:
+            return ""
+        if max_chars and len(s) > int(max_chars):
+            s = s[: max(0, int(max_chars) - 1)].rstrip() + "…"
+        return s
+
+    desc = clean(str(candidate.get("description") or ""))
+    why = clean(str(candidate.get("why_company_specific") or ""))
+
+    if desc:
+        # If the description doesn't explain importance, optionally append a very short why.
+        if why and not any(t in desc.lower() for t in ("matters", "important", "key", "because")):
+            why_short = re.split(r"[.!?]", why, maxsplit=1)[0].strip()
+            if why_short:
+                if not why_short.lower().startswith(("because", "as ", "since ")):
+                    why_short = f"Matters because {why_short}"
+                combined = f"{desc.rstrip('.')}."
+                combined = f"{combined} {why_short.rstrip('.')}."
+                return clip(combined)
+        return clip(desc)
+
+    if why:
+        if not any(t in why.lower() for t in ("matters", "important", "key", "because")):
+            why = f"Matters because {why}"
+        return clip(why)
+
+    # Heuristic last resort (keeps UI consistent even without Gemini).
+    name = clean(str(candidate.get("name") or ""))
+    lowered = name.lower()
+    if any(token in lowered for token in ("monthly active users", "mau")):
+        return "Tracks active users, indicating engagement and platform scale."
+    if any(token in lowered for token in ("daily active users", "dau")):
+        return "Tracks daily usage, indicating engagement and product stickiness."
+    if "subscriber" in lowered or "membership" in lowered:
+        return "Tracks subscriber base size, a key driver of recurring revenue."
+    if "customer" in lowered or "account" in lowered:
+        return "Tracks customer base scale, reflecting product adoption."
+    if "order" in lowered or "transaction" in lowered:
+        return "Tracks activity volume, reflecting demand and business throughput."
+    if any(token in lowered for token in ("ship", "deliver", "unit", "volume")):
+        return "Tracks operational volume, reflecting demand and execution."
+    if "arr" in lowered or "annual recurring revenue" in lowered:
+        return "Tracks recurring revenue base, reflecting subscription momentum."
+    if "mrr" in lowered or "monthly recurring revenue" in lowered:
+        return "Tracks monthly recurring revenue, reflecting subscription scale."
+    if "gmv" in lowered or "tpv" in lowered:
+        return "Tracks transaction volume, reflecting marketplace/payment scale."
+    if "aum" in lowered:
+        return "Tracks assets under management, a key driver of fee revenue."
+
+    return "Reported operating metric from the filing, chosen to represent the business."
+
+
 def _kpi_to_frontend_shape(candidate: SpotlightKpiCandidate) -> Dict[str, Any]:
     allowed = {
         "name",
@@ -1332,6 +1397,7 @@ async def build_spotlight_payload_for_filing(
             )
         kpi_obj.setdefault("source_filing_id", str(filing_id))
         kpi_obj["company_specific"] = True
+        kpi_obj["description"] = _build_spotlight_description(kpi_obj) or None
 
         segments = _sanitize_segments(kpi_obj.get("segments"), company_name=company_name)
         if segments:

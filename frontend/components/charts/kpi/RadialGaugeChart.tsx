@@ -309,29 +309,19 @@ export function RadialGaugeChart({
                 </motion.div>
               )}
               
-              {kpi.description && (
-                <motion.p
-                  className="text-xs text-gray-500 dark:text-gray-400 leading-relaxed line-clamp-3"
-                  initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  transition={{ delay: 0.8 }}
-                >
-                  {kpi.description}
-                </motion.p>
-              )}
             </div>
           </div>
 
-          {/* Source */}
-          {kpi.source_quote && (
+          {/* KPI explanation */}
+          {kpi.description && (
             <motion.div
               className="mt-4 pt-3 border-t border-gray-100 dark:border-gray-800"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               transition={{ delay: 1.2 }}
             >
-              <p className="text-[10px] text-slate-500 dark:text-gray-400 leading-snug line-clamp-2">
-                Source: &ldquo;{kpi.source_quote.slice(0, 120)}...&rdquo;
+              <p className="text-[11px] text-slate-500 dark:text-gray-400 leading-snug line-clamp-2">
+                {kpi.description}
               </p>
             </motion.div>
           )}

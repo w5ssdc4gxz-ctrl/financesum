@@ -48,7 +48,9 @@ Goal:
 Hard requirements:
 - The KPI MUST be explicitly stated in the provided text with a numeric value.
 - `source_quote` MUST be copied EXACTLY from the provided text (no ellipses, no paraphrasing).
+- Use the exact metric label from the filing text; do NOT rename it (e.g., don't change "transactions" to "orders").
 - If a table/header says values are "in thousands" / "in millions" / "in billions", convert to the real absolute value in dollars (do NOT leave it in thousands).
+- `unit` must be a real unit (e.g., "%", "$", "users", "subscribers", "transactions"). Do NOT use scale words like "million"/"billion" as the unit.
 - Prefer a LEVEL metric (e.g., "Paid Subscribers", "Monthly Active Users", "Vehicles Delivered") over a pure % change metric.
 - If you cannot find a true company-specific operating KPI, prefer business-model KPIs (ARR/MRR/retention/churn/ARPU/take-rate, then GMV/TPV/AUM/bookings). If you still cannot find a valid KPI, return no candidates.
 
@@ -75,7 +77,7 @@ Output rules:
   - unit (null OR a short unit string like "%", "$", "users", "subscribers", "customers", "accounts", "units", "orders", "transactions", "rides", "trips")
   - prior_value (null if not explicitly given)
   - chart_type: one of "metric" | "bar" | "trend" | "gauge" | "donut"
-  - description (1 short sentence)
+  - description (1-2 short lines explaining what it measures and why it matters for the business; keep it concise)
   - source_quote (exact)
   - segments (null OR a list of {{"label": str, "value": number}} ONLY when chart_type is "donut")
   - representativeness_score (0-100)

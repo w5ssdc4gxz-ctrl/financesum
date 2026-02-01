@@ -295,28 +295,16 @@ export function TrendKPIChart({
             </motion.div>
           </div>
 
-          {/* Description */}
+          {/* KPI explanation */}
           {kpi.description && (
-            <motion.p
-              className="mt-4 text-xs text-gray-500 dark:text-gray-400 leading-relaxed"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              transition={{ delay: 0.8 }}
-            >
-              {kpi.description}
-            </motion.p>
-          )}
-
-          {/* Source */}
-          {kpi.source_quote && (
             <motion.div
               className="mt-3 pt-3 border-t border-gray-100 dark:border-gray-800"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               transition={{ delay: 1 }}
             >
-              <p className="text-[10px] text-slate-500 dark:text-gray-400 leading-snug line-clamp-2">
-                Source: &ldquo;{kpi.source_quote.slice(0, 120)}...&rdquo;
+              <p className="text-[11px] text-slate-500 dark:text-gray-400 leading-snug line-clamp-2">
+                {kpi.description}
               </p>
             </motion.div>
           )}
