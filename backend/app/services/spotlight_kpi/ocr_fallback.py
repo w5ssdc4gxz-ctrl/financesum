@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 from typing import List, Optional, Tuple
 
 _OCR_AVAILABLE = False
@@ -49,6 +50,52 @@ def _get_ocr_max_pages() -> int:
         return int(os.getenv("SPOTLIGHT_OCR_MAX_PAGES") or "25")
     except ValueError:
         return 25
+
+
+_GARBLED_ALLOWED_PUNCT = set("_.;,:%$()[]'\"-+/&")
+
+
+def _looks_like_garbled_text(text: str) -> bool:
+    """Detect broken PDF text layers (font-encoding gibberish)."""
+    s = (
+        (text or "")
+        .replace("\u00a0", " ")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .strip()
+    )
+    if not s:
+        return True
+
+    sample = s[:3000]
+    non_space = re.sub(r"\s+", "", sample)
+    if not non_space:
+        return True
+
+    tokens = re.findall(r"\S+", sample)
+    if not tokens:
+        return True
+
+    good_words = 0
+    token_cap = min(len(tokens), 250)
+    for tok in tokens[:token_cap]:
+        cleaned = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", tok)
+        if re.fullmatch(r"[A-Za-z]{3,}", cleaned or ""):
+            good_words += 1
+    good_ratio = good_words / max(1, token_cap)
+
+    weird = sum(
+        1 for ch in non_space if not (ch.isalnum() or ch in _GARBLED_ALLOWED_PUNCT)
+    )
+    weird_ratio = weird / max(1, len(non_space))
+
+    if weird_ratio >= 0.18:
+        return True
+    if weird_ratio >= 0.08 and good_ratio <= 0.18:
+        return True
+    return False
 
 
 def extract_text_with_ocr_from_pdf(
@@ -103,7 +150,7 @@ def extract_text_with_ocr_from_pdf(
                 
                 native_text = page.get_text("text") or ""
                 
-                if len(native_text.strip()) >= 200:
+                if len(native_text.strip()) >= 200 and not _looks_like_garbled_text(native_text):
                     page_texts.append(native_text)
                     continue
                 
@@ -120,7 +167,10 @@ def extract_text_with_ocr_from_pdf(
                     config="--psm 6 --oem 3"
                 )
                 
-                combined_text = (native_text + "\n" + ocr_text).strip()
+                if _looks_like_garbled_text(native_text) and ocr_text and ocr_text.strip():
+                    combined_text = ocr_text.strip()
+                else:
+                    combined_text = (native_text + "\n" + ocr_text).strip()
                 page_texts.append(combined_text)
                 ocr_page_count += 1
                 

@@ -27,7 +27,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     (
         re.compile(
             r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
-            r"(?:monthly\s+active\s+users?|MAUs?)",
+            r"(?:monthly\s+active\s+users?\b|\bMAU(?:s)?\b)",
             re.IGNORECASE,
         ),
         "Monthly Active Users (MAUs)",
@@ -36,7 +36,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     ),
     (
         re.compile(
-            r"(?:monthly\s+active\s+users?|MAUs?)\s*(?:of|:)?\s*"
+            r"(?:monthly\s+active\s+users?\b|\bMAU(?:s)?\b)\s*(?:of|:)?\s*"
             r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
             re.IGNORECASE,
         ),
@@ -47,7 +47,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     (
         re.compile(
             r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
-            r"(?:daily\s+active\s+users?|DAUs?)",
+            r"(?:daily\s+active\s+users?\b|\bDAU(?:s)?\b)",
             re.IGNORECASE,
         ),
         "Daily Active Users (DAUs)",
@@ -100,7 +100,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     # =========================================================================
     (
         re.compile(
-            r"(?:gross\s+merchandise\s+volume(?:\s*\(GMV\))?|GMV)" + _CONNECTOR +
+            r"(?:gross\s+merchandise\s+volume(?:\s*\(GMV\))?|\bGMV\b)" + _CONNECTOR +
             r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
             re.IGNORECASE,
         ),
@@ -111,7 +111,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     (
         re.compile(
             r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
-            r"(?:in\s+)?(?:gross\s+merchandise\s+volume|GMV)",
+            r"(?:in\s+)?(?:gross\s+merchandise\s+volume|\bGMV\b)",
             re.IGNORECASE,
         ),
         "Gross Merchandise Volume (GMV)",
@@ -120,7 +120,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     ),
     (
         re.compile(
-            r"(?:total\s+payment\s+volume(?:\s*\(TPV\))?|TPV)" + _CONNECTOR +
+            r"(?:total\s+payment\s+volume(?:\s*\(TPV\))?|\bTPV\b)" + _CONNECTOR +
             r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
             re.IGNORECASE,
         ),
@@ -131,7 +131,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     (
         re.compile(
             r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
-            r"(?:in\s+)?(?:total\s+payment\s+volume|TPV)",
+            r"(?:in\s+)?(?:total\s+payment\s+volume|\bTPV\b)",
             re.IGNORECASE,
         ),
         "Total Payment Volume (TPV)",
@@ -160,7 +160,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     ),
     (
         re.compile(
-            r"(?:remaining\s+performance\s+obligations(?:\s*\(RPO\))?|RPO)" + _CONNECTOR +
+            r"(?:remaining\s+performance\s+obligations(?:\s*\(RPO\))?|\bRPO\b)" + _CONNECTOR +
             r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
             re.IGNORECASE,
         ),
@@ -234,7 +234,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     # =========================================================================
     (
         re.compile(
-            r"(?:annual\s+recurring\s+revenue(?:\s*\(ARR\))?|ARR)" + _CONNECTOR +
+            r"(?:annual\s+recurring\s+revenue(?:\s*\(ARR\))?|\bARR\b)" + _CONNECTOR +
             r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
             re.IGNORECASE,
         ),
@@ -245,7 +245,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     (
         re.compile(
             r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
-            r"(?:in\s+)?(?:annual\s+recurring\s+revenue|ARR)",
+            r"(?:in\s+)?(?:annual\s+recurring\s+revenue|\bARR\b)",
             re.IGNORECASE,
         ),
         "Annual Recurring Revenue (ARR)",
@@ -254,7 +254,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     ),
     (
         re.compile(
-            r"(?:net\s+revenue\s+retention(?:\s*\(NRR\))?|NRR|net\s+dollar\s+retention(?:\s*\(NDR\))?|NDR)" + _CONNECTOR +
+            r"(?:net\s+revenue\s+retention(?:\s*\(NRR\))?|\bNRR\b|net\s+dollar\s+retention(?:\s*\(NDR\))?|\bNDR\b)" + _CONNECTOR +
             r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%",
             re.IGNORECASE,
         ),
@@ -265,7 +265,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     (
         re.compile(
             r"(?P<value>\d{1,3}(?:\.\d+)?)\s*%\s*"
-            r"(?:net\s+revenue\s+retention|NRR|net\s+dollar\s+retention)",
+            r"(?:net\s+revenue\s+retention|\bNRR\b|net\s+dollar\s+retention)",
             re.IGNORECASE,
         ),
         "Net Revenue Retention (NRR)",
@@ -581,7 +581,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     ),
     (
         re.compile(
-            r"(?:funds?\s+from\s+operations?(?:\s*\(FFO\))?|FFO)" + _CONNECTOR +
+            r"(?:funds?\s+from\s+operations?(?:\s*\(FFO\))?|\bFFO\b)" + _CONNECTOR +
             r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
             re.IGNORECASE,
         ),
@@ -591,7 +591,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     ),
     (
         re.compile(
-            r"(?:net\s+operating\s+income(?:\s*\(NOI\))?|NOI)" + _CONNECTOR +
+            r"(?:net\s+operating\s+income(?:\s*\(NOI\))?|\bNOI\b)" + _CONNECTOR +
             r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
             re.IGNORECASE,
         ),
@@ -615,7 +615,7 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     ),
     (
         re.compile(
-            r"(?:average\s+revenue\s+per\s+user(?:\s*\(ARPU\))?|ARPU)" + _CONNECTOR +
+            r"(?:average\s+revenue\s+per\s+user(?:\s*\(ARPU\))?|\bARPU\b)" + _CONNECTOR +
             r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)",
             re.IGNORECASE,
         ),

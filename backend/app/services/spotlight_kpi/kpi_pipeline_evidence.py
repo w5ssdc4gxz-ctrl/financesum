@@ -412,6 +412,82 @@ Output JSON EXACTLY with this schema:
 """.strip()
 
 
+_GARBLED_ALLOWED_PUNCT = set("_.;,:%$()[]'\"-+/&")
+
+
+def _looks_like_garbled_text(text: str) -> bool:
+    """Heuristic: detect PDF text layers that are present but unreadable."""
+    s = (
+        (text or "")
+        .replace("\u00a0", " ")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .strip()
+    )
+    if not s:
+        return True
+
+    sample = s[:4000]
+    non_space = re.sub(r"\s+", "", sample)
+    if not non_space:
+        return True
+
+    tokens = re.findall(r"\S+", sample)
+    if not tokens:
+        return True
+
+    good_words = 0
+    token_cap = min(len(tokens), 350)
+    for tok in tokens[:token_cap]:
+        cleaned = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", tok)
+        if re.fullmatch(r"[A-Za-z]{3,}", cleaned or ""):
+            good_words += 1
+    good_ratio = good_words / max(1, token_cap)
+
+    weird = sum(
+        1 for ch in non_space if not (ch.isalnum() or ch in _GARBLED_ALLOWED_PUNCT)
+    )
+    weird_ratio = weird / max(1, len(non_space))
+
+    if weird_ratio >= 0.18:
+        return True
+    if weird_ratio >= 0.08 and good_ratio <= 0.18:
+        return True
+    if good_ratio <= 0.10 and weird_ratio >= 0.03 and len(tokens) >= 40:
+        return True
+    return False
+
+
+def _looks_like_garbled_pdf_text_layer(page_texts: List[str]) -> bool:
+    if not page_texts:
+        return True
+
+    n = len(page_texts)
+    idxs: List[int] = []
+    for i in (0, 1, 2, n // 2, max(0, n - 3), n - 2, n - 1):
+        if 0 <= i < n and i not in idxs:
+            idxs.append(i)
+
+    parts: List[str] = []
+    total = 0
+    for i in idxs:
+        t = str(page_texts[i] or "").strip()
+        if not t:
+            continue
+        take = t[:1200]
+        parts.append(take)
+        total += len(take)
+        if total >= 5000:
+            break
+
+    sample = "\n".join(parts).strip()
+    if not sample:
+        return True
+    return _looks_like_garbled_text(sample)
+
+
 def _extract_verification_pages(
     *, file_bytes: bytes, mime_type: str
 ) -> Tuple[List[str], Optional[str]]:
@@ -437,6 +513,11 @@ def _extract_verification_pages(
                 # scanned PDF up-front. The main pipeline will attempt model+regex first
                 # (for text-layer PDFs), then escalate to OCR only when needed.
                 return [], "no_text_layer"
+            if _looks_like_garbled_pdf_text_layer(pages):
+                # Some SEC PDFs have a "text layer" that is technically present but
+                # effectively unreadable due to font encoding. Treat this as
+                # unverifiable so we can OCR the rendered page images.
+                return [], "garbled_text_layer"
             return pages, None
         except Exception:  # noqa: BLE001
             return [], "pdf_text_extract_failed"
@@ -1111,6 +1192,8 @@ def _sanitize_evidence_item(item: Any) -> Optional[Dict[str, Any]]:
         quote = quote[3:].lstrip()
     if not quote:
         return None
+    if _looks_like_garbled_text(quote):
+        return None
     ev_type = str(item.get("type") or "").strip().lower() or None
     if ev_type is not None and ev_type not in _ALLOWED_EVIDENCE_TYPES:
         ev_type = None
@@ -1325,7 +1408,7 @@ def extract_kpi_with_evidence_from_file(
             except Exception:  # noqa: BLE001
                 text = ""
             page_texts = [text]
-        elif str(unverifiable_reason) == "no_text_layer":
+        elif str(unverifiable_reason) in ("no_text_layer", "garbled_text_layer"):
             # Defer OCR to escalation. For scanned PDFs we try OCR + regex before giving up.
             try:
                 from .ocr_fallback import extract_text_with_ocr_from_pdf
