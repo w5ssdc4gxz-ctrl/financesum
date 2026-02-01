@@ -528,6 +528,10 @@ def _build_spotlight_description(candidate: Dict[str, Any], *, max_chars: int = 
     desc = clean(str(candidate.get("description") or ""))
     why = clean(str(candidate.get("why_company_specific") or ""))
 
+    # Ignore boilerplate descriptions from deterministic fallbacks.
+    if desc.lower().startswith("extracted via pattern matching"):
+        desc = ""
+
     if desc:
         # If the description doesn't explain importance, optionally append a very short why.
         if why and not any(t in desc.lower() for t in ("matters", "important", "key", "because")):
