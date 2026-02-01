@@ -42,6 +42,12 @@ _DISALLOWED_SPOTLIGHT_KPI_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"\bsquare\s+(foot|feet|footage)\b", re.IGNORECASE),
     re.compile(r"\bsq\.?\s*ft\.?\b", re.IGNORECASE),
     re.compile(r"(?s)\bitem\s*2\b.*\bproperties\b", re.IGNORECASE),
+    # Footnote / one-off disclosure schedules often mistaken as "KPIs".
+    re.compile(r"\brelated\s+party\b", re.IGNORECASE),
+    re.compile(r"\btransactions?\s+related\s+to\s+our\b", re.IGNORECASE),
+    re.compile(r"\bshare[- ]based\b|\bstock[- ]based\b", re.IGNORECASE),
+    re.compile(r"\bcompensation\b", re.IGNORECASE),
+    re.compile(r"\b(excess\s+tax|income\s+tax|deferred\s+tax|effective\s+tax\s+rate)\b", re.IGNORECASE),
 )
 
 
@@ -738,7 +744,7 @@ async def _build_history(
 
 
 def _cache_config() -> Tuple[str, int, int]:
-    version = (os.getenv("SPOTLIGHT_CACHE_VERSION") or "").strip() or "spotlight-cache-evidence-20260201-1"
+    version = (os.getenv("SPOTLIGHT_CACHE_VERSION") or "").strip() or "spotlight-cache-evidence-20260201-2"
     ttl_s = _int_env("SPOTLIGHT_CACHE_TTL_SECONDS", 604800)
     ttl_s = max(0, int(ttl_s))
     max_items = _int_env("SPOTLIGHT_CACHE_MAX_ITEMS", 4000)

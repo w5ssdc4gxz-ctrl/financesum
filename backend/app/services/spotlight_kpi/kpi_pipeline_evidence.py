@@ -357,10 +357,7 @@ Constraints:
 - Do NOT choose corporate-fact disclosures (headquarters location/address, principal executive offices, phone numbers, building square footage,
   office space size, number of facilities/buildings). These are not operating KPIs.
 - Do NOT treat phone numbers, addresses, CIK/commission file numbers, or zip/postal codes as KPIs.
-- Do NOT choose corporate-fact disclosures (headquarters location/address, principal executive offices, phone numbers, building square footage,
-  office space size, number of facilities/buildings). These are not operating KPIs.
-- Do NOT treat phone numbers, addresses, CIK/commission file numbers, or zip/postal codes as KPIs.
-- Do NOT treat phone numbers, addresses, CIK/commission file numbers, or zip/postal codes as KPIs.
+- Do NOT choose footnote/one-off disclosure tables (related party transactions, stock/option activity, compensation/tax schedules).
 - "Company-specific" means the metric is explicitly disclosed for this company; it does NOT need to be unique across companies.
 - The KPI `name` MUST match the wording used in the filing (do not rename "Transactions" to "Orders", do not add/remove words).
 - The KPI MUST be explicitly mentioned in the filing and MUST include evidence.
@@ -418,6 +415,8 @@ Hard rules:
   interest expense, working capital, balance sheet line items). These are not operating KPIs.
 - Do NOT choose corporate-fact disclosures (headquarters location/address, principal executive offices, phone numbers, building square footage,
   office space size, number of facilities/buildings). These are not operating KPIs.
+- Do NOT treat phone numbers, addresses, CIK/commission file numbers, or zip/postal codes as KPIs.
+- Do NOT choose footnote/one-off disclosure tables (related party transactions, stock/option activity, compensation/tax schedules).
 - "Company-specific" means the metric is disclosed for this company; it does NOT need to be unique across companies.
 - The KPI `name` MUST match the wording used in the filing (do not rename "Transactions" to "Orders", do not add/remove words).
 - If you cannot prove the KPI exists with evidence, you MUST return `"selected_kpi": null`.
@@ -898,6 +897,10 @@ Constraints:
 - Do NOT choose generic metrics (revenue, net income, EPS, gross margin, EBITDA, free cash flow, capex, cash, debt).
 - Do NOT choose generic accounting/GAAP line items or policy/tax disclosures (e.g., stock-based compensation, excess tax benefits,
   deferred taxes, effective tax rate, depreciation/amortization, interest expense, working capital, balance sheet line items).
+- Do NOT choose corporate-fact disclosures (headquarters location/address, principal executive offices, phone numbers, building square footage,
+  office space size, number of facilities/buildings). These are not operating KPIs.
+- Do NOT treat phone numbers, addresses, CIK/commission file numbers, or zip/postal codes as KPIs.
+- Do NOT choose footnote/one-off disclosure tables (related party transactions, stock/option activity, compensation/tax schedules).
 - "Company-specific" means the metric is explicitly disclosed for this company; it does NOT need to be unique across companies.
 - The KPI `name` MUST match the wording used in the page text (do not rename "Transactions" to "Orders", do not add/remove words).
 - The KPI MUST be explicitly mentioned in the provided page text and MUST include evidence.
@@ -989,6 +992,137 @@ def _kpi_name_variants(name: str) -> List[str]:
     out = [v for v in variants if v and len(v) >= 3]
     out.sort(key=len, reverse=True)
     return out
+
+
+_TOO_GENERIC_SPOTLIGHT_NAME_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"^\s*(total\s+)?customers?\s*$", re.I),
+    re.compile(r"^\s*(total\s+)?users?\s*$", re.I),
+    re.compile(r"^\s*(total\s+)?subscribers?\s*$", re.I),
+    re.compile(r"^\s*(total\s+)?members?\s*$", re.I),
+    re.compile(r"^\s*(total\s+)?accounts?\s*$", re.I),
+    re.compile(r"^\s*(total\s+)?orders?\s*$", re.I),
+    re.compile(r"^\s*(total\s+)?transactions?\s*$", re.I),
+    re.compile(r"^\s*(total\s+)?shipments?\s*$", re.I),
+    re.compile(r"^\s*(total\s+)?deliver(?:y|ies)\s*$", re.I),
+    re.compile(r"^\s*(total\s+)?units?\s*$", re.I),
+)
+
+_STRONG_OPERATIONAL_NAME_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"\bmonthly\s+active\s+users?\b|\bMAUs?\b", re.I),
+    re.compile(r"\bdaily\s+active\s+users?\b|\bDAUs?\b", re.I),
+    re.compile(r"\bpaid\s+subscribers?\b|\bpaid\s+members\b", re.I),
+    re.compile(r"\b(ARR|MRR)\b|\b(recurring\s+revenue)\b", re.I),
+    re.compile(r"\b(net|dollar[- ]based)\s+retention\b|\b(NRR|NDR)\b", re.I),
+    re.compile(r"\bchurn\b", re.I),
+    re.compile(r"\bARPU\b|\bARPA\b|\bARPPU\b|\bASP\b|\bAOV\b|\baverage\s+revenue\s+per\b", re.I),
+    re.compile(r"\b(GMV|GMS|GTV)\b|\bgross\s+merchandise\s+volume\b", re.I),
+    re.compile(r"\bTPV\b|\b(total\s+payment\s+volume|payment\s+volume|processed\s+volume)\b", re.I),
+    re.compile(r"\bAUM\b|\bassets\s+under\s+management\b", re.I),
+    re.compile(r"\bvehicles?\s+delivered\b", re.I),
+    re.compile(r"\bunits?\s+(?:shipped|sold|delivered)\b", re.I),
+    re.compile(r"\boccupancy\b|\butilization\b|\bload\s+factor\b", re.I),
+    re.compile(r"\brevpar\b|\bsame[- ]store\b|\bcomparable\s+sales\b", re.I),
+)
+
+_NON_OPERATING_EVIDENCE_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"\brelated\s+party\b", re.I),
+    re.compile(r"\btransactions?\s+related\s+to\s+our\b", re.I),
+    re.compile(r"\bshare[- ]based\b|\bstock[- ]based\b", re.I),
+    re.compile(r"\bcompensation\b", re.I),
+    re.compile(r"\b(excess\s+tax|income\s+tax|deferred\s+tax|effective\s+tax\s+rate)\b", re.I),
+    re.compile(r"\b(vesting|grant\s+date|exercise\s+price|restricted\s+stock|rsu)\b", re.I),
+)
+
+
+def _looks_like_non_operating_kpi(
+    name: str, *, evidence: List[Dict[str, Any]]
+) -> bool:
+    """Reject 'metrics' that are clearly footnote/one-off disclosures, not operating KPIs."""
+    nm = (name or "").strip()
+    if not nm:
+        return True
+
+    text = " \n ".join(
+        [nm]
+        + [
+            str(ev.get("quote") or "").strip()
+            for ev in (evidence or [])[:8]
+            if isinstance(ev, dict)
+        ]
+    ).strip()
+    lower = text.lower()
+
+    if any(p.search(lower) for p in _NON_OPERATING_EVIDENCE_PATTERNS):
+        return True
+
+    # Special-case: bare "Transactions"/"Orders" with tiny values are frequently from
+    # schedules/footnotes rather than core operating metrics.
+    if any(p.search(nm) for p in _TOO_GENERIC_SPOTLIGHT_NAME_PATTERNS):
+        if "related to our" in lower or "related to the" in lower:
+            return True
+
+    return False
+
+
+def _candidate_importance_score(
+    *,
+    name: str,
+    unit: Optional[str],
+    value: Optional[float],
+    evidence: List[Dict[str, Any]],
+) -> int:
+    """Heuristic representativeness score for picking the single Spotlight KPI."""
+    score = 0
+    nm = (name or "").strip()
+    if not nm:
+        return -10_000
+
+    if any(p.search(nm) for p in _STRONG_OPERATIONAL_NAME_PATTERNS):
+        score += 40
+    # Still give credit for generic operational tokens (users/orders/etc.)
+    if re.search(
+        r"\b(users|subscribers|customers|accounts|orders|transactions|shipments|deliveries|units)\b",
+        nm,
+        re.I,
+    ):
+        score += 15
+    if any(p.search(nm) for p in _TOO_GENERIC_SPOTLIGHT_NAME_PATTERNS):
+        score -= 22
+
+    if evidence:
+        if any(str(ev.get("type") or "") == "definition" for ev in evidence):
+            score += 5
+        joined = " ".join(str(ev.get("quote") or "") for ev in evidence[:6]).lower()
+        if any(tok in joined for tok in ("active", "paid", "monthly", "daily")):
+            score += 6
+        if any(tok in joined for tok in ("total", "ended", "as of", "period")):
+            score += 2
+
+    unit_lower = (unit or "").strip().lower() if unit else ""
+    if unit_lower in ("users", "subscribers", "customers", "accounts", "orders", "transactions", "units", "trips", "rides", "stores", "locations"):
+        score += 6
+    elif unit_lower in ("$", "€", "£", "usd", "eur", "gbp"):
+        # Currency totals are often less representative than operational volumes unless they
+        # are clearly business-model KPIs (GMV/TPV/AUM/Bookings/etc.).
+        if any(p.search(nm) for p in _STRONG_OPERATIONAL_NAME_PATTERNS):
+            score += 4
+        else:
+            score -= 10
+
+    if value is not None:
+        try:
+            abs_v = abs(float(value))
+        except Exception:  # noqa: BLE001
+            abs_v = 0.0
+        if abs_v >= 1_000_000:
+            score += 4
+        elif abs_v >= 10_000:
+            score += 2
+        # Penalize extremely tiny totals for generic names (often footnotes/schedules).
+        if abs_v < 5 and any(p.search(nm) for p in _TOO_GENERIC_SPOTLIGHT_NAME_PATTERNS):
+            score -= 15
+
+    return int(score)
 
 
 _SCALE_UNIT_TOKENS: set[str] = {
@@ -1204,6 +1338,60 @@ def _extract_value_number_from_quote_near_name(
         return float(fallback[0][1])
 
     return _extract_number_from_excerpt(quote)
+
+
+def _extract_value_number_from_page_near_name(
+    page_text: str,
+    *,
+    kpi_name: str,
+    window_chars: int = 1400,
+) -> Optional[float]:
+    """Extract a KPI value from the full page text when table cells omit the KPI name.
+
+    We locate the KPI name on the page and then apply the same "nearest-number"
+    heuristic within a bounded window. This avoids picking unrelated numbers from
+    the value cell (dates/currencies) when the KPI name is only present in the
+    row/column header.
+    """
+    if not page_text:
+        return None
+
+    variants = _kpi_name_variants(kpi_name)
+    if not variants:
+        return None
+
+    page_norm = _normalize_for_matching(page_text)
+    if not page_norm:
+        return None
+
+    positions: List[int] = []
+    for v in variants:
+        if not v:
+            continue
+        start = 0
+        while True:
+            pos = page_norm.find(v, start)
+            if pos < 0:
+                break
+            positions.append(int(pos))
+            start = pos + max(1, len(v))
+            if len(positions) >= 8:
+                break
+        if len(positions) >= 8:
+            break
+
+    if not positions:
+        return None
+
+    for pos in positions[:8]:
+        start = max(0, int(pos) - int(window_chars))
+        end = min(len(page_norm), int(pos) + int(window_chars))
+        snippet = page_norm[start:end]
+        value = _extract_value_number_from_quote_near_name(snippet, kpi_name=kpi_name)
+        if value is not None:
+            return float(value)
+
+    return None
 
 
 def _has_name_backed_value_evidence(
@@ -1586,6 +1774,9 @@ def extract_kpi_with_evidence_from_file(
             if config.require_definition_evidence and not has_definition:
                 continue
 
+            if _looks_like_non_operating_kpi(name, evidence=verified):
+                continue
+
             value_f = _coerce_number(cand.get("value"))
             if value_f is None:
                 value_f = _coerce_number(cand.get("most_recent_value"))
@@ -1900,6 +2091,7 @@ def extract_kpi_with_evidence_from_file(
     # - repair missing evidence when Pass 2 drops/garbles definition/value quotes.
     pass1_verified_by_name: Dict[str, List[Dict[str, Any]]] = {}
     pass1_fallback_candidate: Optional[SpotlightKpiCandidate] = None
+    pass1_scored_candidates: List[Tuple[int, SpotlightKpiCandidate]] = []
 
     for c in raw_candidates[: int(config.max_candidates)]:
         name = str(c.get("name") or "").strip()
@@ -1927,53 +2119,99 @@ def extract_kpi_with_evidence_from_file(
         if not _has_name_backed_value_evidence(name, evidence=verified, page_texts=page_texts):
             continue
 
-        pass1_verified_by_name[_canon_name_key(name)] = verified
+        # Reject footnote/one-off disclosure tables (e.g., related party transactions).
+        if _looks_like_non_operating_kpi(name, evidence=verified):
+            continue
 
-        if pass1_fallback_candidate is not None:
-            continue
-        if config.require_value_evidence and not has_value:
-            continue
-        if config.require_definition_evidence and not has_definition:
-            continue
+        pass1_verified_by_name[_canon_name_key(name)] = verified
 
         unit = str(c.get("unit") or "").strip() or None
         unit = _sanitize_unit(unit, kpi_name=name, evidence=verified)
         period = str(c.get("period") or "").strip() or ""
         most_recent_value = str(c.get("most_recent_value") or "").strip()
 
+        name_variants = _kpi_name_variants(name)
+
         value_f: Optional[float] = None
+        value_page_hint: Optional[int] = None
         for ev in verified:
             if str(ev.get("type") or "") == "value":
-                value_f = _extract_value_number_from_quote_near_name(
-                    str(ev.get("quote") or ""), kpi_name=name
+                quote_text = str(ev.get("quote") or "")
+                try:
+                    value_page_hint = int(ev.get("page") or 0) or None
+                except Exception:  # noqa: BLE001
+                    value_page_hint = None
+
+                value_f = _extract_value_number_from_quote_near_name(quote_text, kpi_name=name)
+                quote_norm = _normalize_for_matching(quote_text)
+                quote_has_name = bool(
+                    name_variants and any(v and v in quote_norm for v in name_variants)
                 )
+                if (
+                    value_f is not None
+                    and not quote_has_name
+                    and isinstance(value_page_hint, int)
+                    and 1 <= value_page_hint <= len(page_texts)
+                ):
+                    page_value = _extract_value_number_from_page_near_name(
+                        page_texts[value_page_hint - 1] or "", kpi_name=name
+                    )
+                    if page_value is not None:
+                        value_f = page_value
                 if value_f is not None:
                     break
         if value_f is None:
             value_f = _coerce_number(most_recent_value)
+        if (
+            value_f is None
+            and isinstance(value_page_hint, int)
+            and 1 <= value_page_hint <= len(page_texts)
+        ):
+            value_f = _extract_value_number_from_page_near_name(
+                page_texts[value_page_hint - 1] or "", kpi_name=name
+            )
         if value_f is None:
             continue
 
-        source_quote = ""
-        source_page: Optional[int] = None
+        def _quote_has_name_and_number(q: str) -> bool:
+            qn = _normalize_for_matching(q or "")
+            if not qn:
+                return False
+            if name_variants and not any(v and v in qn for v in name_variants):
+                return False
+            return _extract_number_from_excerpt(q or "") is not None
+
+        picked_ev: Optional[Dict[str, Any]] = None
         for ev in verified:
-            if str(ev.get("type") or "") == "value":
-                source_quote = str(ev.get("quote") or "").strip()
-                try:
-                    source_page = int(ev.get("page"))
-                except Exception:  # noqa: BLE001
-                    source_page = None
+            if str(ev.get("type") or "") == "value" and _quote_has_name_and_number(
+                str(ev.get("quote") or "")
+            ):
+                picked_ev = ev
                 break
-        if not source_quote and verified:
-            source_quote = str(verified[0].get("quote") or "").strip()
-            try:
-                source_page = int(verified[0].get("page"))
-            except Exception:  # noqa: BLE001
-                source_page = None
+        if picked_ev is None:
+            for ev in verified:
+                if str(ev.get("type") or "") in ("value", "context") and _quote_has_name_and_number(
+                    str(ev.get("quote") or "")
+                ):
+                    picked_ev = ev
+                    break
+        if picked_ev is None:
+            for ev in verified:
+                if str(ev.get("type") or "") == "value":
+                    picked_ev = ev
+                    break
+        if picked_ev is None and verified:
+            picked_ev = verified[0]
+
+        source_quote = str((picked_ev or {}).get("quote") or "").strip()
+        try:
+            source_page = int((picked_ev or {}).get("page") or 0) or None
+        except Exception:  # noqa: BLE001
+            source_page = None
         if source_quote and source_page:
             source_quote = f"[p. {source_page}] {source_quote}"
 
-        pass1_fallback_candidate = {
+        candidate_obj: SpotlightKpiCandidate = {
             "name": name,
             "value": float(value_f),
             "unit": unit,
@@ -1991,9 +2229,28 @@ def extract_kpi_with_evidence_from_file(
             "ban_flags": [],
         }
 
+        score = _candidate_importance_score(
+            name=name, unit=unit, value=float(value_f), evidence=verified
+        )
+        pass1_scored_candidates.append((int(score), candidate_obj))
+
+    if pass1_scored_candidates:
+        pass1_scored_candidates.sort(key=lambda t: t[0], reverse=True)
+        pass1_fallback_candidate = pass1_scored_candidates[0][1]
+
+    debug["pass1_candidate_ranked_count"] = len(pass1_scored_candidates)
     debug["pass1_verified_fallback_available"] = bool(pass1_fallback_candidate)
 
     # Sanitize candidates (keep prompts bounded for Pass 2)
+    score_by_name: Dict[str, int] = {}
+    for score, cand in pass1_scored_candidates:
+        key = _canon_name_key(str(cand.get("name") or ""))
+        if not key:
+            continue
+        prev = score_by_name.get(key)
+        if prev is None or int(score) > int(prev):
+            score_by_name[key] = int(score)
+
     sanitized_candidates: List[Dict[str, Any]] = []
     for c in raw_candidates[: int(config.max_candidates)]:
         name = str(c.get("name") or "").strip()
@@ -2030,6 +2287,12 @@ def extract_kpi_with_evidence_from_file(
                 "unit": str(c.get("unit") or "").strip()[:32],
                 "evidence": trimmed_evidence,
             }
+        )
+
+    if sanitized_candidates and score_by_name:
+        sanitized_candidates.sort(
+            key=lambda c: score_by_name.get(_canon_name_key(str(c.get("name") or "")), -9999),
+            reverse=True,
         )
 
     if not sanitized_candidates:
@@ -2358,6 +2621,14 @@ Return JSON:
             return pass1_fallback_candidate, debug
         return None, debug
 
+    # Reject obvious footnote/schedule disclosures even if verifiable.
+    if _looks_like_non_operating_kpi(name, evidence=verified_evidence):
+        debug["reason"] = "non_operating_metric"
+        if pass1_fallback_candidate:
+            debug["fallback_used"] = "pass1_candidate"
+            return pass1_fallback_candidate, debug
+        return None, debug
+
     if config.require_value_evidence and not has_value:
         debug["reason"] = "missing_value_evidence"
         if pass1_fallback_candidate:
@@ -2377,17 +2648,53 @@ Return JSON:
     period = str(selected.get("period") or "").strip() or ""
     most_recent_value = str(selected.get("most_recent_value") or "").strip()
 
+    name_variants = _kpi_name_variants(name)
+
     value_f: Optional[float] = None
     # Prefer the value quote(s) if present: they are verifiable evidence.
-    value_quotes = [
-        ev.get("quote") for ev in verified_evidence if ev.get("type") == "value"
+    value_page_hint: Optional[int] = None
+    value_evidence = [
+        ev for ev in verified_evidence if str(ev.get("type") or "") == "value"
     ]
-    for q in value_quotes:
-        value_f = _extract_value_number_from_quote_near_name(str(q or ""), kpi_name=name)
+    for ev in value_evidence:
+        quote_text = str(ev.get("quote") or "")
+        try:
+            page_hint = int(ev.get("page") or 0) or None
+        except Exception:  # noqa: BLE001
+            page_hint = None
+
+        if value_page_hint is None and isinstance(page_hint, int):
+            value_page_hint = page_hint
+
+        value_f = _extract_value_number_from_quote_near_name(quote_text, kpi_name=name)
+        quote_norm = _normalize_for_matching(quote_text)
+        quote_has_name = bool(
+            name_variants and any(v and v in quote_norm for v in name_variants)
+        )
+        if (
+            value_f is not None
+            and not quote_has_name
+            and isinstance(page_hint, int)
+            and 1 <= page_hint <= len(page_texts)
+        ):
+            page_value = _extract_value_number_from_page_near_name(
+                page_texts[page_hint - 1] or "", kpi_name=name
+            )
+            if page_value is not None:
+                value_f = page_value
+
         if value_f is not None:
             break
     if value_f is None:
         value_f = _coerce_number(most_recent_value)
+    if (
+        value_f is None
+        and isinstance(value_page_hint, int)
+        and 1 <= value_page_hint <= len(page_texts)
+    ):
+        value_f = _extract_value_number_from_page_near_name(
+            page_texts[value_page_hint - 1] or "", kpi_name=name
+        )
     if value_f is None:
         debug["reason"] = "unparseable_value"
         if pass1_fallback_candidate:
@@ -2396,22 +2703,41 @@ Return JSON:
         return None, debug
 
     # Prefer a "value" evidence quote for the UI source quote.
-    source_quote = ""
-    source_page: Optional[int] = None
+    def _quote_has_name_and_number(q: str) -> bool:
+        qn = _normalize_for_matching(q or "")
+        if not qn:
+            return False
+        if name_variants and not any(v and v in qn for v in name_variants):
+            return False
+        return _extract_number_from_excerpt(q or "") is not None
+
+    picked_ev: Optional[Dict[str, Any]] = None
     for ev in verified_evidence:
-        if str(ev.get("type") or "") == "value":
-            source_quote = str(ev.get("quote") or "").strip()
-            try:
-                source_page = int(ev.get("page"))
-            except Exception:  # noqa: BLE001
-                source_page = None
+        if str(ev.get("type") or "") == "value" and _quote_has_name_and_number(
+            str(ev.get("quote") or "")
+        ):
+            picked_ev = ev
             break
-    if not source_quote:
-        source_quote = str(verified_evidence[0].get("quote") or "").strip()
-        try:
-            source_page = int(verified_evidence[0].get("page"))
-        except Exception:  # noqa: BLE001
-            source_page = None
+    if picked_ev is None:
+        for ev in verified_evidence:
+            if str(ev.get("type") or "") in ("value", "context") and _quote_has_name_and_number(
+                str(ev.get("quote") or "")
+            ):
+                picked_ev = ev
+                break
+    if picked_ev is None:
+        for ev in verified_evidence:
+            if str(ev.get("type") or "") == "value":
+                picked_ev = ev
+                break
+    if picked_ev is None and verified_evidence:
+        picked_ev = verified_evidence[0]
+
+    source_quote = str((picked_ev or {}).get("quote") or "").strip()
+    try:
+        source_page = int((picked_ev or {}).get("page") or 0) or None
+    except Exception:  # noqa: BLE001
+        source_page = None
 
     if source_quote and source_page:
         source_quote = f"[p. {source_page}] {source_quote}"
@@ -2435,6 +2761,21 @@ Return JSON:
         "evidence": verified_evidence,
         "ban_flags": [],
     }
+
+    selected_score = _candidate_importance_score(
+        name=name, unit=unit, value=float(value_f), evidence=verified_evidence
+    )
+    debug["selected_importance_score"] = int(selected_score)
+    if pass1_scored_candidates and pass1_fallback_candidate:
+        try:
+            best_score = int(pass1_scored_candidates[0][0])
+        except Exception:  # noqa: BLE001
+            best_score = int(selected_score)
+        debug["pass1_best_importance_score"] = int(best_score)
+        if best_score >= int(selected_score) + 18:
+            debug["fallback_used"] = "pass1_candidate"
+            debug["fallback_reason"] = "prefer_higher_importance_candidate"
+            return pass1_fallback_candidate, debug
 
     debug["total_time_ms"] = int((time.monotonic() - started) * 1000)
     return candidate, debug
