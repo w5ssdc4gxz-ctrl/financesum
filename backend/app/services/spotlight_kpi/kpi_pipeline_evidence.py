@@ -310,6 +310,15 @@ def _is_generic_financial_metric(name: str) -> bool:
         "contract liabilit",
         "goodwill",
         "intangible asset",
+        # Corporate-fact disclosures (not operating KPIs)
+        "headquarters",
+        "principal executive office",
+        "principal executive offices",
+        "corporate headquarters",
+        "office space",
+        "square footage",
+        "square feet",
+        "sq ft",
     )
 
     return any(phrase in n for phrase in banned_phrases)
@@ -323,6 +332,8 @@ Constraints:
 - Do NOT choose generic metrics (revenue, net income, EPS, gross margin, EBITDA, free cash flow, capex, cash, debt).
 - Do NOT choose generic accounting/GAAP line items or policy/tax disclosures (e.g., stock-based compensation, excess tax benefits,
   deferred taxes, effective tax rate, depreciation/amortization, interest expense, working capital, balance sheet line items).
+- Do NOT choose corporate-fact disclosures (headquarters location/address, principal executive offices, phone numbers, building square footage,
+  office space size, number of facilities/buildings). These are not operating KPIs.
 - "Company-specific" means the metric is explicitly disclosed for this company; it does NOT need to be unique across companies.
 - The KPI `name` MUST match the wording used in the filing (do not rename "Transactions" to "Orders", do not add/remove words).
 - The KPI MUST be explicitly mentioned in the filing and MUST include evidence.
@@ -376,6 +387,8 @@ Hard rules:
 - Do NOT choose generic metrics (revenue, net income, EPS, gross margin, EBITDA, free cash flow, capex, cash, debt).
 - Do NOT choose generic accounting/GAAP line items (e.g., stock-based compensation, excess tax benefits, taxes, depreciation/amortization,
   interest expense, working capital, balance sheet line items). These are not operating KPIs.
+- Do NOT choose corporate-fact disclosures (headquarters location/address, principal executive offices, phone numbers, building square footage,
+  office space size, number of facilities/buildings). These are not operating KPIs.
 - "Company-specific" means the metric is disclosed for this company; it does NOT need to be unique across companies.
 - The KPI `name` MUST match the wording used in the filing (do not rename "Transactions" to "Orders", do not add/remove words).
 - If you cannot prove the KPI exists with evidence, you MUST return `"selected_kpi": null`.

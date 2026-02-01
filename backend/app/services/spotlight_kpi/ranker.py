@@ -18,6 +18,12 @@ _NEGATIVE_NAME_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(r"\bcommitments?\b", re.I),
     re.compile(r"\bliabilit", re.I),
     re.compile(r"\bleases?\b", re.I),
+    # Corporate-fact disclosures (not operating KPIs)
+    re.compile(r"\bheadquarters?\b", re.I),
+    re.compile(r"\bprincipal\s+executive\s+offices?\b", re.I),
+    re.compile(r"\bcorporate\s+(headquarters?|offices?|campus)\b", re.I),
+    re.compile(r"\boffice\s+space\b", re.I),
+    re.compile(r"\bsquare\s+(foot|feet|footage)\b|\bsq\.?\s*ft\.?\b", re.I),
     re.compile(r"\bdebt\b", re.I),
 )
 

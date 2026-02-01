@@ -571,16 +571,6 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     ),
     (
         re.compile(
-            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|thousand|M|K)?\s*"
-            r"(?:square\s+feet|sq\.?\s*ft\.?|SF)",
-            re.IGNORECASE,
-        ),
-        "Square Footage",
-        "sq ft",
-        75,
-    ),
-    (
-        re.compile(
             r"(?:funds?\s+from\s+operations?(?:\s*\(FFO\))?|\bFFO\b)" + _CONNECTOR +
             r"\$?\s*(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?",
             re.IGNORECASE,

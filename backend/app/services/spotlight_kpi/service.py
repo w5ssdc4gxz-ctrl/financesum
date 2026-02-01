@@ -28,6 +28,50 @@ from .text_pipeline import extract_company_specific_spotlight_kpi_from_text
 from .types import SpotlightKpiCandidate
 
 
+_DISALLOWED_SPOTLIGHT_KPI_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    # Corporate facts / properties disclosures that are not operating KPIs.
+    re.compile(r"\bheadquarters?\b", re.IGNORECASE),
+    re.compile(r"\bprincipal\s+executive\s+offices?\b", re.IGNORECASE),
+    re.compile(r"\bcorporate\s+(headquarters?|offices?|campus)\b", re.IGNORECASE),
+    re.compile(r"\boffice\s+space\b", re.IGNORECASE),
+    re.compile(r"\bsquare\s+(foot|feet|footage)\b", re.IGNORECASE),
+    re.compile(r"\bsq\.?\s*ft\.?\b", re.IGNORECASE),
+    re.compile(r"(?s)\bitem\s*2\b.*\bproperties\b", re.IGNORECASE),
+)
+
+
+def _spotlight_kpi_reject_reason(candidate: Dict[str, Any]) -> Optional[str]:
+    """Return a rejection reason for non-operating 'KPIs' (headquarters, addresses, etc.)."""
+    name = str(candidate.get("name") or "").strip()
+    if not name:
+        return "missing_name"
+
+    text_parts: List[str] = [name]
+    source_quote = str(candidate.get("source_quote") or "").strip()
+    if source_quote:
+        text_parts.append(source_quote)
+
+    evidence = candidate.get("evidence")
+    if isinstance(evidence, list):
+        for ev in evidence[:6]:
+            if isinstance(ev, dict):
+                q = str(ev.get("quote") or "").strip()
+                if q:
+                    text_parts.append(q)
+
+    haystack = " \n ".join(text_parts)
+    if not haystack:
+        return None
+
+    lowered = haystack.lower()
+
+    # If this looks like a corporate-facts disclosure, reject it even if it is "verifiable".
+    if any(p.search(lowered) for p in _DISALLOWED_SPOTLIGHT_KPI_PATTERNS):
+        return "corporate_fact_metric"
+
+    return None
+
+
 @dataclass(frozen=True)
 class SpotlightPayload:
     filing_id: str
@@ -927,6 +971,7 @@ async def build_spotlight_payload_for_filing(
             kpi_candidate, pipeline_dbg = None, {"reason": "spotlight_evidence_exception", "error": str(exc)[:500]}
 
         evidence_pipeline_reason = str((pipeline_dbg or {}).get("reason") or "").strip() or None
+        pipeline_dbg = pipeline_dbg or {}
 
         if debug:
             debug_info["evidence_pipeline"] = pipeline_dbg
@@ -935,14 +980,22 @@ async def build_spotlight_payload_for_filing(
             item = dict(kpi_candidate)
             item["company_specific"] = True
 
-            # The evidence pipeline already verifies quotes against the full document.
-            # Avoid rejecting on a truncated `document_text` excerpt (common for long PDFs).
-            best_kpi = item
+            reject_reason = _spotlight_kpi_reject_reason(item)
+            if reject_reason:
+                spotlight_used_fallbacks = True
+                pipeline_dbg["rejected_reason"] = reject_reason
+                pipeline_dbg["reason"] = "candidate_banned"
+                evidence_pipeline_reason = "candidate_banned"
+            else:
+                # The evidence pipeline already verifies quotes against the full document.
+                # Avoid rejecting on a truncated `document_text` excerpt (common for long PDFs).
+                best_kpi = item
 
     # 2) Text-only pipeline when Gemini configured and local text exists, but we cannot
     # upload bytes (disabled/too-large). This pipeline still requires verbatim excerpts
     # and should return None when evidence is weak.
     evidence_pipeline_fallback_reasons = {
+        "candidate_banned",
         "upload_failed",
         "no_file_uri",
         "timeout_before_pass1",
