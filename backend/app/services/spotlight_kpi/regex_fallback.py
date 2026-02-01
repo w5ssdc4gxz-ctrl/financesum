@@ -191,12 +191,22 @@ _KPI_PATTERNS: List[Tuple[re.Pattern[str], str, str, int]] = [
     (
         re.compile(
             r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
-            r"(?:orders?|transactions?)",
+            r"orders?\b",
             re.IGNORECASE,
         ),
         "Orders",
         "orders",
         75,
+    ),
+    (
+        re.compile(
+            r"(?P<value>\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?P<scale>million|billion|M|B)?\s*"
+            r"transactions?\b",
+            re.IGNORECASE,
+        ),
+        "Transactions",
+        "transactions",
+        78,
     ),
     (
         re.compile(
@@ -1071,8 +1081,7 @@ def extract_kpis_with_regex(
     if not text:
         return []
     
-    candidates: List[Tuple[int, SpotlightKpiCandidate]] = []
-    seen_names: set[str] = set()
+    best_by_name: Dict[str, Tuple[int, SpotlightKpiCandidate]] = {}
     
     # Search entire text
     for pattern, name_template, unit, priority in _KPI_PATTERNS:
@@ -1085,11 +1094,7 @@ def extract_kpis_with_regex(
             if value is None:
                 continue
             
-            # Skip if we already have this KPI type
             name_key = name_template.lower()
-            if name_key in seen_names:
-                continue
-            seen_names.add(name_key)
             
             # Extract context around match for source quote
             start = max(0, match.start() - 50)
@@ -1099,6 +1104,19 @@ def extract_kpis_with_regex(
             excerpt = re.sub(r"\s+", " ", excerpt)
             if len(excerpt) > 200:
                 excerpt = excerpt[:200] + "..."
+
+            bonus = 0
+            excerpt_lower = excerpt.lower()
+            if "total" in excerpt_lower:
+                bonus += 6
+            if any(tok in excerpt_lower for tok in ("ended", "ending", "as of", "at ")):
+                bonus += 2
+            try:
+                bonus += min(10, int(abs(float(value))))
+            except Exception:  # noqa: BLE001
+                pass
+
+            score = int(priority) + int(bonus)
             
             candidate: SpotlightKpiCandidate = {
                 "name": name_template,
@@ -1113,10 +1131,12 @@ def extract_kpis_with_regex(
                 "verifiability_score": 70,  # Lower confidence for regex extraction
                 "ban_flags": ["regex_fallback"],
             }
-            
-            candidates.append((priority, candidate))
+
+            existing = best_by_name.get(name_key)
+            if existing is None or score > int(existing[0]):
+                best_by_name[name_key] = (score, candidate)
     
-    # Sort by priority (highest first) and return top N
+    candidates = list(best_by_name.values())
     candidates.sort(key=lambda x: x[0], reverse=True)
     return [c for _, c in candidates[:max_results]]
 
@@ -1154,8 +1174,7 @@ def extract_kpis_with_regex_by_page(
         # Collapse whitespace for readability; verification normalizes whitespace too.
         return re.sub(r"\s+", " ", excerpt).strip()
 
-    candidates: List[Tuple[int, SpotlightKpiCandidate]] = []
-    seen_names: set[str] = set()
+    best_by_name: Dict[str, Tuple[int, SpotlightKpiCandidate]] = {}
 
     for page_idx, page_text in enumerate(page_texts):
         text = page_text or ""
@@ -1173,9 +1192,6 @@ def extract_kpis_with_regex_by_page(
                     continue
 
                 name_key = name_template.lower()
-                if name_key in seen_names:
-                    continue
-                seen_names.add(name_key)
 
                 quote = _build_quote(text, match)
                 if not quote:
@@ -1206,8 +1222,23 @@ def extract_kpis_with_regex_by_page(
                     "ban_flags": ["regex_page_fallback"],
                 }
 
-                candidates.append((priority, candidate))
+                bonus = 0
+                quote_lower = quote.lower()
+                if "total" in quote_lower:
+                    bonus += 6
+                if any(tok in quote_lower for tok in ("ended", "ending", "as of", "at ")):
+                    bonus += 2
+                try:
+                    bonus += min(10, int(abs(float(value))))
+                except Exception:  # noqa: BLE001
+                    pass
 
+                score = int(priority) + int(bonus)
+                existing = best_by_name.get(name_key)
+                if existing is None or score > int(existing[0]):
+                    best_by_name[name_key] = (score, candidate)
+
+    candidates = list(best_by_name.values())
     candidates.sort(key=lambda x: x[0], reverse=True)
     return [c for _, c in candidates[:max_results]]
 

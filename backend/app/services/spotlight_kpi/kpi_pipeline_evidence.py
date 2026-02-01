@@ -324,6 +324,7 @@ Constraints:
 - Do NOT choose generic accounting/GAAP line items or policy/tax disclosures (e.g., stock-based compensation, excess tax benefits,
   deferred taxes, effective tax rate, depreciation/amortization, interest expense, working capital, balance sheet line items).
 - "Company-specific" means the metric is explicitly disclosed for this company; it does NOT need to be unique across companies.
+- The KPI `name` MUST match the wording used in the filing (do not rename "Transactions" to "Orders", do not add/remove words).
 - The KPI MUST be explicitly mentioned in the filing and MUST include evidence.
 - You MUST provide page numbers and short quotes from the document that contain:
   - a reported value (most recent value), and
@@ -335,6 +336,9 @@ Constraints:
     (a) quote the full table row (KPI label + value), OR
     (b) provide TWO evidence quotes on the SAME page: one with the KPI name (type "context") and one with the numeric value (type "value").
   - Quotes MUST be verbatim excerpts from the filing (include enough surrounding text to be uniquely matchable).
+- `unit` MUST be the actual unit (e.g., "users", "transactions", "orders", "$", "%"). Do NOT use magnitude/scales as units
+  ("million", "billion", "M", "B"). If the filing reports values "in millions/billions", put that in `most_recent_value`
+  (e.g., "250 million") and keep `unit` as the real unit (e.g., "users").
 - If you cannot find a company-specific KPI with evidence, return `candidates: []` and set `failure_reason`.
 - Do not guess.
 
@@ -373,11 +377,15 @@ Hard rules:
 - Do NOT choose generic accounting/GAAP line items (e.g., stock-based compensation, excess tax benefits, taxes, depreciation/amortization,
   interest expense, working capital, balance sheet line items). These are not operating KPIs.
 - "Company-specific" means the metric is disclosed for this company; it does NOT need to be unique across companies.
+- The KPI `name` MUST match the wording used in the filing (do not rename "Transactions" to "Orders", do not add/remove words).
 - If you cannot prove the KPI exists with evidence, you MUST return `"selected_kpi": null`.
 - Evidence requirements for a non-null KPI:
   - at least ONE "value" evidence quote + page that contains a numeric value.
     If the value appears in a TABLE cell without the KPI name, include an additional "context" quote on the SAME page that contains the KPI name.
   - Include "definition" evidence if the filing explicitly defines the metric. If not defined, still return the KPI if value evidence exists.
+- `unit` MUST be the actual unit (e.g., "users", "transactions", "orders", "$", "%"). Do NOT use magnitude/scales as units
+  ("million", "billion", "M", "B"). If the filing reports values "in millions/billions", put that in `most_recent_value`
+  (e.g., "250 million") and keep `unit` as the real unit (e.g., "users").
 - Do not guess.
 - Output MUST be valid JSON matching the schema below. No extra text.
 
@@ -714,6 +722,7 @@ Constraints:
 - Do NOT choose generic accounting/GAAP line items or policy/tax disclosures (e.g., stock-based compensation, excess tax benefits,
   deferred taxes, effective tax rate, depreciation/amortization, interest expense, working capital, balance sheet line items).
 - "Company-specific" means the metric is explicitly disclosed for this company; it does NOT need to be unique across companies.
+- The KPI `name` MUST match the wording used in the page text (do not rename "Transactions" to "Orders", do not add/remove words).
 - The KPI MUST be explicitly mentioned in the provided page text and MUST include evidence.
 - You MUST provide page numbers and short quotes from the page text that contain:
   - a reported value (most recent value), and
@@ -723,6 +732,9 @@ Constraints:
     (a) quote the full table row (KPI label + value), OR
     (b) provide TWO evidence quotes on the SAME page: one with the KPI name (type "context") and one with the numeric value (type "value").
 - Quotes MUST be verbatim substrings of the corresponding PAGE text.
+- `unit` MUST be the actual unit (e.g., "users", "transactions", "orders", "$", "%"). Do NOT use magnitude/scales as units
+  ("million", "billion", "M", "B"). If the page reports values "in millions/billions", put that in `most_recent_value`
+  (e.g., "250 million") and keep `unit` as the real unit (e.g., "users").
 - Prefer TRUE operating KPIs that describe the business (usage/volume/capacity), such as: customers/subscribers, orders/transactions,
   units shipped/delivered, bookings/backlog, AUM, GMV/TPV, churn/retention, occupancy/utilization, store count, etc.
 - If you cannot find a company-specific KPI with evidence in the provided pages, return `candidates: []` and set `failure_reason`.
@@ -800,6 +812,293 @@ def _kpi_name_variants(name: str) -> List[str]:
     out = [v for v in variants if v and len(v) >= 3]
     out.sort(key=len, reverse=True)
     return out
+
+
+_SCALE_UNIT_TOKENS: set[str] = {
+    "k",
+    "m",
+    "b",
+    "t",
+    "thousand",
+    "million",
+    "billion",
+    "trillion",
+    "mn",
+    "bn",
+    "mm",
+}
+
+
+def _infer_unit_from_kpi_name(name: str) -> Optional[str]:
+    n = re.sub(r"\s+", " ", (name or "").strip().lower())
+    if not n:
+        return None
+
+    if any(tok in n for tok in ("margin", "rate", "ratio", "churn", "retention", "occupancy", "utilization", "load factor")):
+        return "%"
+
+    if "transaction" in n:
+        return "transactions"
+    if "order" in n:
+        return "orders"
+    if "subscriber" in n or "membership" in n or "member" in n:
+        return "subscribers"
+    if "mau" in n or "dau" in n or "active user" in n or n.endswith(" users"):
+        return "users"
+    if "customer" in n or "account" in n or "merchant" in n:
+        return "customers"
+    if "trip" in n:
+        return "trips"
+    if "ride" in n:
+        return "rides"
+    if any(tok in n for tok in ("shipment", "shipped", "deliver", "delivered", "units")):
+        return "units"
+    if any(tok in n for tok in ("store", "location", "restaurant")):
+        return "locations"
+
+    return None
+
+
+def _infer_unit_from_evidence_quotes(evidence: List[Dict[str, Any]]) -> Optional[str]:
+    for ev in evidence or []:
+        quote = str(ev.get("quote") or "")
+        if not quote:
+            continue
+        if "$" in quote:
+            return "$"
+        if "€" in quote:
+            return "€"
+        if "£" in quote:
+            return "£"
+        if "%" in quote:
+            return "%"
+        if re.search(r"\bpercent(?:age)?\b", quote, re.IGNORECASE):
+            return "%"
+    return None
+
+
+def _sanitize_unit(
+    unit: Optional[str],
+    *,
+    kpi_name: str,
+    evidence: List[Dict[str, Any]],
+) -> Optional[str]:
+    inferred = _infer_unit_from_evidence_quotes(evidence)
+    if inferred:
+        return inferred
+
+    raw = str(unit or "").strip()
+    lower = raw.lower().strip()
+    if not lower:
+        return _infer_unit_from_kpi_name(kpi_name)
+
+    if lower in {"%", "percent", "percentage", "pct"}:
+        return "%"
+    if lower in {"$", "usd", "us$", "dollar", "dollars", "us dollars"}:
+        return "$"
+    if lower in {"€", "eur", "euro", "euros"}:
+        return "€"
+    if lower in {"£", "gbp", "pound", "pounds", "sterling"}:
+        return "£"
+
+    # Never treat magnitude/scales as units (prevents "2000B" display bugs).
+    if lower in _SCALE_UNIT_TOKENS:
+        return _infer_unit_from_kpi_name(kpi_name)
+
+    # Clamp to keep payloads compact and avoid accidental blobs.
+    raw = raw[:48].strip()
+    return raw or _infer_unit_from_kpi_name(kpi_name)
+
+
+def _extract_value_number_from_quote_near_name(
+    quote: str,
+    *,
+    kpi_name: str,
+) -> Optional[float]:
+    """Extract a KPI value from a quote, preferring numbers near the KPI name.
+
+    Table rows often contain multiple numbers. We bias toward the number closest
+    to the KPI name/token, which reduces errors like picking a date or a currency
+    column instead of the KPI value.
+    """
+    if not quote:
+        return None
+
+    variants = _kpi_name_variants(kpi_name)
+    if not variants:
+        return _extract_number_from_excerpt(quote)
+
+    normalized = _normalize_for_matching(quote)
+    if not normalized:
+        return _extract_number_from_excerpt(quote)
+
+    positions: List[int] = []
+    for v in variants:
+        if not v:
+            continue
+        start = 0
+        while True:
+            pos = normalized.find(v, start)
+            if pos < 0:
+                break
+            positions.append(int(pos))
+            start = pos + max(1, len(v))
+            if len(positions) >= 24:
+                break
+        if len(positions) >= 24:
+            break
+
+    # Only apply default multipliers when explicitly stated ("in millions/billions").
+    lower = normalized.lower()
+    default_mult = 1.0
+    if "in billions" in lower:
+        default_mult = 1_000_000_000.0
+    elif "in millions" in lower:
+        default_mult = 1_000_000.0
+    elif "in thousands" in lower:
+        default_mult = 1_000.0
+
+    pattern = re.compile(
+        r"(?P<cur>[$€£])?\s*(?P<num>\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(?P<suf>%|[kKmMbBtT]|bn|mn|billion|million|thousand|trillion)?",
+        re.IGNORECASE,
+    )
+
+    scored: List[Tuple[int, int, float]] = []  # (distance, -score, value)
+    fallback: List[Tuple[int, float]] = []  # (-score, value)
+
+    for m in pattern.finditer(normalized):
+        num_raw = (m.group("num") or "").strip()
+        if not num_raw:
+            continue
+        try:
+            base = float(num_raw.replace(",", ""))
+        except ValueError:
+            continue
+
+        # Skip likely years
+        if 1900 <= base <= 2100 and num_raw.isdigit() and len(num_raw) == 4:
+            continue
+
+        suf = (m.group("suf") or "").strip().lower()
+        mult = default_mult
+        is_percent = False
+        if suf in {"b", "bn", "billion"}:
+            mult = 1_000_000_000.0
+        elif suf in {"m", "mn", "million"}:
+            mult = 1_000_000.0
+        elif suf in {"k", "thousand"}:
+            mult = 1_000.0
+        elif suf in {"t", "trillion"}:
+            mult = 1_000_000_000_000.0
+        elif suf == "%":
+            mult = 1.0
+            is_percent = True
+
+        value = float(base * mult)
+
+        score = 0
+        if "," in num_raw:
+            score += 6
+        if abs(value) >= 1_000_000:
+            score += 6
+        elif abs(value) >= 1000:
+            score += 5
+        elif abs(value) >= 100:
+            score += 3
+        elif abs(value) >= 10:
+            score += 1
+        if mult != 1.0:
+            score += 2
+        if is_percent:
+            score += 1
+
+        if positions:
+            distance = min(abs(int(m.start()) - int(p)) for p in positions)
+            scored.append((int(distance), -int(score), float(value)))
+        else:
+            fallback.append((-int(score), float(value)))
+
+    if scored:
+        scored.sort(key=lambda t: (t[0], t[1], -abs(t[2])))
+        return float(scored[0][2])
+
+    if fallback:
+        fallback.sort(key=lambda t: (t[0], -abs(t[1])))
+        return float(fallback[0][1])
+
+    return _extract_number_from_excerpt(quote)
+
+
+def _has_name_backed_value_evidence(
+    name: str, *, evidence: List[Dict[str, Any]], page_texts: List[str]
+) -> bool:
+    """Return True if the KPI name appears in/near the value evidence.
+
+    Prevents mislabeling like returning KPI name "Orders" when the filing clearly
+    says "Transactions" on the same page.
+    """
+    variants = _kpi_name_variants(name)
+    if not variants:
+        return False
+
+    value_evidence = [ev for ev in (evidence or []) if str(ev.get("type") or "") == "value"]
+    if not value_evidence:
+        return False
+
+    # If any evidence quote contains the name, we’re good (works for text filings too).
+    for ev in evidence or []:
+        quote = str(ev.get("quote") or "")
+        qn = _normalize_for_matching(quote)
+        if any(v and v in qn for v in variants):
+            return True
+
+    # For PDFs, allow table cases where the value cell lacks the name but the page contains it.
+    if len(page_texts) < 2:
+        return False
+
+    for ev in value_evidence:
+        try:
+            page = int(ev.get("page") or 0)
+        except Exception:  # noqa: BLE001
+            continue
+        if page < 1 or page > len(page_texts):
+            continue
+        page_norm = _normalize_for_matching(page_texts[page - 1] or "")
+        if not page_norm:
+            continue
+        if not any(v and v in page_norm for v in variants):
+            continue
+
+        quote_norm = _normalize_for_matching(str(ev.get("quote") or ""))
+        if not quote_norm or len(quote_norm) < 10:
+            return True
+
+        pos_quote = page_norm.find(quote_norm)
+        if pos_quote < 0:
+            return True
+
+        positions: List[int] = []
+        for v in variants:
+            start = 0
+            while True:
+                pos = page_norm.find(v, start)
+                if pos < 0:
+                    break
+                positions.append(int(pos))
+                start = pos + max(1, len(v))
+                if len(positions) >= 24:
+                    break
+            if len(positions) >= 24:
+                break
+
+        if not positions:
+            return True
+
+        nearest = min(abs(int(pos_quote) - int(p)) for p in positions)
+        if nearest <= 1600:
+            return True
+
+    return False
 
 
 def _sanitize_evidence_item(item: Any) -> Optional[Dict[str, Any]]:
@@ -1421,6 +1720,10 @@ def extract_kpi_with_evidence_from_file(
             require_definition=bool(config.require_definition_evidence),
         )
 
+        # Reject candidates where the KPI name is not actually present in/near the evidence.
+        if not _has_name_backed_value_evidence(name, evidence=verified, page_texts=page_texts):
+            continue
+
         pass1_verified_by_name[_canon_name_key(name)] = verified
 
         if pass1_fallback_candidate is not None:
@@ -1431,16 +1734,20 @@ def extract_kpi_with_evidence_from_file(
             continue
 
         unit = str(c.get("unit") or "").strip() or None
+        unit = _sanitize_unit(unit, kpi_name=name, evidence=verified)
         period = str(c.get("period") or "").strip() or ""
         most_recent_value = str(c.get("most_recent_value") or "").strip()
 
-        value_f = _coerce_number(most_recent_value)
+        value_f: Optional[float] = None
+        for ev in verified:
+            if str(ev.get("type") or "") == "value":
+                value_f = _extract_value_number_from_quote_near_name(
+                    str(ev.get("quote") or ""), kpi_name=name
+                )
+                if value_f is not None:
+                    break
         if value_f is None:
-            for ev in verified:
-                if str(ev.get("type") or "") == "value":
-                    value_f = _extract_number_from_excerpt(str(ev.get("quote") or ""))
-                    if value_f is not None:
-                        break
+            value_f = _coerce_number(most_recent_value)
         if value_f is None:
             continue
 
@@ -1490,6 +1797,9 @@ def extract_kpi_with_evidence_from_file(
         if not name:
             continue
         if _is_generic_financial_metric(name):
+            continue
+        if _canon_name_key(name) not in pass1_verified_by_name:
+            # Only keep candidates whose evidence was verified against the document.
             continue
 
         evidence_raw = c.get("evidence")
@@ -1835,6 +2145,16 @@ Return JSON:
         else:
             debug["definition_repair_success"] = False
 
+    # Hard guard: KPI name must be supported by the evidence (prevents mislabeled KPIs).
+    if has_value and not _has_name_backed_value_evidence(
+        name, evidence=verified_evidence, page_texts=page_texts
+    ):
+        debug["reason"] = "kpi_name_not_in_evidence_context"
+        if pass1_fallback_candidate:
+            debug["fallback_used"] = "pass1_candidate"
+            return pass1_fallback_candidate, debug
+        return None, debug
+
     if config.require_value_evidence and not has_value:
         debug["reason"] = "missing_value_evidence"
         if pass1_fallback_candidate:
@@ -1850,17 +2170,21 @@ Return JSON:
         return None, debug
 
     unit = str(selected.get("unit") or "").strip() or None
+    unit = _sanitize_unit(unit, kpi_name=name, evidence=verified_evidence)
     period = str(selected.get("period") or "").strip() or ""
     most_recent_value = str(selected.get("most_recent_value") or "").strip()
 
-    value_f = _coerce_number(most_recent_value)
+    value_f: Optional[float] = None
+    # Prefer the value quote(s) if present: they are verifiable evidence.
+    value_quotes = [
+        ev.get("quote") for ev in verified_evidence if ev.get("type") == "value"
+    ]
+    for q in value_quotes:
+        value_f = _extract_value_number_from_quote_near_name(str(q or ""), kpi_name=name)
+        if value_f is not None:
+            break
     if value_f is None:
-        # Prefer the value quote if present
-        value_quotes = [ev.get("quote") for ev in verified_evidence if ev.get("type") == "value"]
-        for q in value_quotes:
-            value_f = _extract_number_from_excerpt(str(q or ""))
-            if value_f is not None:
-                break
+        value_f = _coerce_number(most_recent_value)
     if value_f is None:
         debug["reason"] = "unparseable_value"
         if pass1_fallback_candidate:
