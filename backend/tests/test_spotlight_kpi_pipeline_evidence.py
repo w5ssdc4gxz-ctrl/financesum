@@ -378,6 +378,101 @@ def test_evidence_pipeline_page_regex_fallback_when_pass1_only_generic_candidate
     assert debug.get("fallback_reason") == "pass1_no_valid_candidates"
 
 
+class _FakeGeminiDateValueMixClient:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def upload_file_bytes(self, *, data: bytes, mime_type: str, **_kwargs: Any) -> Dict[str, Any]:
+        assert data
+        assert mime_type
+        self.calls.append("upload_file_bytes")
+        return {"uri": "files/FAKE", "mimeType": mime_type}
+
+    def stream_generate_content_with_file_uri(
+        self,
+        *,
+        file_uri: str,
+        file_mime_type: str,
+        prompt: str,
+        stage_name: str = "",
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> str:
+        _ = (generation_config_override,)
+        assert file_uri
+        assert file_mime_type
+        assert prompt
+        self.calls.append(stage_name or "pass1")
+
+        quote = "As of January 30, 2022, our remaining performance obligations were $2.82 billion."
+
+        return json.dumps(
+            {
+                "candidates": [
+                    {
+                        "name": "Remaining performance obligations",
+                        "why_company_specific": "Disclosed as a metric in the filing.",
+                        "what_it_measures": "Remaining performance obligations.",
+                        "how_calculated_or_defined": "Accounting disclosure.",
+                        "most_recent_value": "$2.82 billion",
+                        "period": "Q1 2022",
+                        "unit": "$",
+                        "evidence": [{"page": 1, "quote": quote, "type": "value"}],
+                    }
+                ],
+                "failure_reason": None,
+            }
+        )
+
+    def stream_generate_content(
+        self,
+        prompt: str,
+        *,
+        stage_name: str = "",
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> str:
+        _ = (prompt, generation_config_override)
+        self.calls.append(stage_name or "pass2")
+
+        quote = "As of January 30, 2022, our remaining performance obligations were $2.82 billion."
+
+        return json.dumps(
+            {
+                "selected_kpi": {
+                    "name": "Remaining performance obligations",
+                    "why_company_specific": "Disclosed as a metric in the filing.",
+                    "what_it_measures": "Remaining performance obligations.",
+                    "how_calculated_or_defined": "Accounting disclosure.",
+                    "most_recent_value": "$2.82 billion",
+                    "period": "Q1 2022",
+                    "unit": "$",
+                    "evidence": [{"page": 1, "quote": quote, "type": "value"}],
+                    "confidence": 0.9,
+                },
+                "failure_reason": None,
+            }
+        )
+
+
+def test_evidence_pipeline_prefers_currency_value_over_date_day_number():
+    client = _FakeGeminiDateValueMixClient()
+    config = EvidencePipelineConfig(total_timeout_seconds=20.0)
+    doc_text = "As of January 30, 2022, our remaining performance obligations were $2.82 billion."
+
+    candidate, debug = extract_kpi_with_evidence_from_file(
+        client,
+        file_bytes=doc_text.encode("utf-8"),
+        company_name="Example Corp",
+        mime_type="text/plain",
+        config=config,
+    )
+
+    assert candidate is not None, debug
+    assert candidate.get("name") == "Remaining performance obligations"
+    assert float(candidate.get("value")) == 2_820_000_000.0
+
+
 class _FakeGeminiNoCandidates:
     def __init__(self) -> None:
         self.calls = []

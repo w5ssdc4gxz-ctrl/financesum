@@ -1225,6 +1225,7 @@ def _extract_value_number_from_quote_near_name(
     quote: str,
     *,
     kpi_name: str,
+    unit_hint: Optional[str] = None,
 ) -> Optional[float]:
     """Extract a KPI value from a quote, preferring numbers near the KPI name.
 
@@ -1269,13 +1270,25 @@ def _extract_value_number_from_quote_near_name(
     elif "in thousands" in lower:
         default_mult = 1_000.0
 
-    pattern = re.compile(
-        r"(?P<cur>[$€£])?\s*(?P<num>\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(?P<suf>%|[kKmMbBtT]|bn|mn|billion|million|thousand|trillion)?",
+    unit_lower = (str(unit_hint or "").strip().lower() if unit_hint else "").strip()
+    prefer_currency = unit_lower in {"$", "€", "£", "usd", "eur", "gbp"}
+    prefer_percent = unit_lower in {"%", "percent", "percentage", "pct"}
+
+    month_re = re.compile(
+        r"\b(?:"
+        r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+        r"aug(?:ust)?|sep(?:tember)?|sept|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+        r")\b",
         re.IGNORECASE,
     )
 
-    scored: List[Tuple[int, int, float]] = []  # (distance, -score, value)
-    fallback: List[Tuple[int, float]] = []  # (-score, value)
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9])(?P<cur>[$€£])?\s*(?P<num>\d{1,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(?P<suf>%|[kKmMbBtT]|bn|mn|billion|million|thousand|trillion)?",
+        re.IGNORECASE,
+    )
+
+    scored: List[Tuple[int, int, float, bool, bool, bool]] = []  # (distance, -score, value, has_cur, is_pct, is_date)
+    fallback: List[Tuple[int, float, bool, bool, bool]] = []  # (-score, value, has_cur, is_pct, is_date)
 
     for m in pattern.finditer(normalized):
         num_raw = (m.group("num") or "").strip()
@@ -1289,6 +1302,20 @@ def _extract_value_number_from_quote_near_name(
         # Skip likely years
         if 1900 <= base <= 2100 and num_raw.isdigit() and len(num_raw) == 4:
             continue
+
+        has_cur = bool((m.group("cur") or "").strip())
+
+        # Skip date-day numbers (e.g., "January 30, 2022") to avoid picking the day
+        # instead of the KPI value when the KPI name appears after the date.
+        is_date_day = False
+        if 1 <= base <= 31 and float(base).is_integer():
+            before = normalized[max(0, int(m.start()) - 20) : int(m.start())]
+            after = normalized[int(m.end()) : min(len(normalized), int(m.end()) + 20)]
+            # "January 30" or "30 January" style date fragments.
+            if re.search(r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|sept|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s*$", before, re.IGNORECASE):
+                is_date_day = True
+            elif month_re.match(after.lstrip()[:12] or ""):
+                is_date_day = True
 
         suf = (m.group("suf") or "").strip().lower()
         mult = default_mult
@@ -1322,19 +1349,53 @@ def _extract_value_number_from_quote_near_name(
             score += 2
         if is_percent:
             score += 1
+        if has_cur:
+            score += 3
 
         if positions:
             distance = min(abs(int(m.start()) - int(p)) for p in positions)
-            scored.append((int(distance), -int(score), float(value)))
+            scored.append((int(distance), -int(score), float(value), has_cur, is_percent, is_date_day))
         else:
-            fallback.append((-int(score), float(value)))
+            fallback.append((-int(score), float(value), has_cur, is_percent, is_date_day))
 
     if scored:
-        scored.sort(key=lambda t: (t[0], t[1], -abs(t[2])))
+        # Filter date-like numbers first.
+        scored = [t for t in scored if not t[5]]
+        if not scored:
+            return _extract_number_from_excerpt(quote)
+
+        def _match_pref_tuple(t: Tuple[int, int, float, bool, bool, bool]) -> Tuple[int, int, int, float]:
+            distance, neg_score, value, has_cur, is_pct, _is_date = t
+            if prefer_percent:
+                pref_ok = bool(is_pct)
+            elif prefer_currency:
+                pref_ok = bool(has_cur) or abs(value) >= 1_000  # scaled totals often represent currency KPIs
+            else:
+                pref_ok = (not has_cur) and (not is_pct)
+            # Prefer matches aligned with expected unit class, then distance/score.
+            pref_rank = 0 if pref_ok else 1
+            return (pref_rank, int(distance), int(neg_score), -abs(float(value)))
+
+        scored.sort(key=_match_pref_tuple)
         return float(scored[0][2])
 
     if fallback:
-        fallback.sort(key=lambda t: (t[0], -abs(t[1])))
+        fallback = [t for t in fallback if not t[4]]
+        if not fallback:
+            return _extract_number_from_excerpt(quote)
+
+        def _fallback_pref_tuple(t: Tuple[int, float, bool, bool, bool]) -> Tuple[int, int, float]:
+            neg_score, value, has_cur, is_pct, _is_date = t
+            if prefer_percent:
+                pref_ok = bool(is_pct)
+            elif prefer_currency:
+                pref_ok = bool(has_cur) or abs(value) >= 1_000
+            else:
+                pref_ok = (not has_cur) and (not is_pct)
+            pref_rank = 0 if pref_ok else 1
+            return (pref_rank, int(neg_score), -abs(float(value)))
+
+        fallback.sort(key=_fallback_pref_tuple)
         return float(fallback[0][1])
 
     return _extract_number_from_excerpt(quote)
@@ -1344,6 +1405,7 @@ def _extract_value_number_from_page_near_name(
     page_text: str,
     *,
     kpi_name: str,
+    unit_hint: Optional[str] = None,
     window_chars: int = 1400,
 ) -> Optional[float]:
     """Extract a KPI value from the full page text when table cells omit the KPI name.
@@ -1387,7 +1449,9 @@ def _extract_value_number_from_page_near_name(
         start = max(0, int(pos) - int(window_chars))
         end = min(len(page_norm), int(pos) + int(window_chars))
         snippet = page_norm[start:end]
-        value = _extract_value_number_from_quote_near_name(snippet, kpi_name=kpi_name)
+        value = _extract_value_number_from_quote_near_name(
+            snippet, kpi_name=kpi_name, unit_hint=unit_hint
+        )
         if value is not None:
             return float(value)
 
@@ -2142,7 +2206,9 @@ def extract_kpi_with_evidence_from_file(
                 except Exception:  # noqa: BLE001
                     value_page_hint = None
 
-                value_f = _extract_value_number_from_quote_near_name(quote_text, kpi_name=name)
+                value_f = _extract_value_number_from_quote_near_name(
+                    quote_text, kpi_name=name, unit_hint=unit
+                )
                 quote_norm = _normalize_for_matching(quote_text)
                 quote_has_name = bool(
                     name_variants and any(v and v in quote_norm for v in name_variants)
@@ -2154,7 +2220,7 @@ def extract_kpi_with_evidence_from_file(
                     and 1 <= value_page_hint <= len(page_texts)
                 ):
                     page_value = _extract_value_number_from_page_near_name(
-                        page_texts[value_page_hint - 1] or "", kpi_name=name
+                        page_texts[value_page_hint - 1] or "", kpi_name=name, unit_hint=unit
                     )
                     if page_value is not None:
                         value_f = page_value
@@ -2168,7 +2234,7 @@ def extract_kpi_with_evidence_from_file(
             and 1 <= value_page_hint <= len(page_texts)
         ):
             value_f = _extract_value_number_from_page_near_name(
-                page_texts[value_page_hint - 1] or "", kpi_name=name
+                page_texts[value_page_hint - 1] or "", kpi_name=name, unit_hint=unit
             )
         if value_f is None:
             continue
@@ -2666,7 +2732,9 @@ Return JSON:
         if value_page_hint is None and isinstance(page_hint, int):
             value_page_hint = page_hint
 
-        value_f = _extract_value_number_from_quote_near_name(quote_text, kpi_name=name)
+        value_f = _extract_value_number_from_quote_near_name(
+            quote_text, kpi_name=name, unit_hint=unit
+        )
         quote_norm = _normalize_for_matching(quote_text)
         quote_has_name = bool(
             name_variants and any(v and v in quote_norm for v in name_variants)
@@ -2678,7 +2746,7 @@ Return JSON:
             and 1 <= page_hint <= len(page_texts)
         ):
             page_value = _extract_value_number_from_page_near_name(
-                page_texts[page_hint - 1] or "", kpi_name=name
+                page_texts[page_hint - 1] or "", kpi_name=name, unit_hint=unit
             )
             if page_value is not None:
                 value_f = page_value
@@ -2693,7 +2761,7 @@ Return JSON:
         and 1 <= value_page_hint <= len(page_texts)
     ):
         value_f = _extract_value_number_from_page_near_name(
-            page_texts[value_page_hint - 1] or "", kpi_name=name
+            page_texts[value_page_hint - 1] or "", kpi_name=name, unit_hint=unit
         )
     if value_f is None:
         debug["reason"] = "unparseable_value"
