@@ -10885,6 +10885,11 @@ _SEC_PERIOD_OF_REPORT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+_AS_OF_DATE_YEAR_PATTERN = re.compile(
+    r"\b(?:as\s+of|as\s+at)\s+[A-Za-z]{3,9}\s+\d{1,2},?\s+(19\d{2}|20\d{2})\b",
+    re.IGNORECASE,
+)
+
 
 def _extract_sec_period_of_report(text: str) -> Optional[date]:
     """Best-effort parse of SEC header "period of report" from filing content."""
@@ -10898,6 +10903,23 @@ def _extract_sec_period_of_report(text: str) -> Optional[date]:
         return datetime.strptime(raw, "%Y%m%d").date()
     except Exception:
         return None
+
+
+def _extract_as_of_year(text: str) -> Optional[int]:
+    """Best-effort extraction of an "As of Month Day, YYYY" year hint from a filing."""
+    if not text:
+        return None
+    head = (text or "")[:120_000]
+    match = _AS_OF_DATE_YEAR_PATTERN.search(head)
+    if not match:
+        return None
+    try:
+        year = int(match.group(1))
+    except Exception:
+        return None
+    if year < 1900 or year > 2100:
+        return None
+    return year
 
 
 def _pick_best_sec_filing_match(
@@ -11085,6 +11107,29 @@ def _ensure_local_document(
                         filing_id_str,
                         {"local_document_path": None, "source_doc_url": None},
                     )
+                elif expected_date and not doc_period:
+                    # Some cached artifacts (exhibits/HTML) omit the SEC header, but we can
+                    # still detect gross mismatches when an "as of" year is far from the
+                    # filing's expected period (e.g., 2016 filing pointing to 2024 doc).
+                    as_of_year = _extract_as_of_year(head)
+                    if as_of_year and abs(int(as_of_year) - int(expected_date.year)) > 3:
+                        if not allow_network:
+                            return None
+                        logger.warning(
+                            "Cached filing document for %s appears to be a different period (expected_year=%s as_of_year=%s); re-resolving",
+                            filing_id_str or "<unknown>",
+                            expected_date.year,
+                            as_of_year,
+                        )
+                        filing.pop("local_document_path", None)
+                        filing.pop("source_doc_url", None)
+                        _persist_filing_field_updates(
+                            context,
+                            filing_id_str,
+                            {"local_document_path": None, "source_doc_url": None},
+                        )
+                    else:
+                        return path_obj
                 else:
                     return path_obj
         else:
@@ -11240,6 +11285,7 @@ def _ensure_local_document(
             filing_types_to_try = _infer_sec_filing_types()
             if cik_value and filing_types_to_try and (filing_date or period_end):
                 try:
+                    target = filing_date or period_end
                     sec_filings = get_company_filings(
                         cik=cik_value,
                         filing_types=filing_types_to_try,
@@ -11253,7 +11299,6 @@ def _ensure_local_document(
                             for c in sec_filings
                             if c.get("filing_type") in filing_types_to_try
                         ]
-                        target = filing_date or period_end
                         matched = _pick_best_sec_filing_match(
                             candidates, target_date=target
                         )
