@@ -1319,6 +1319,183 @@ def extract_kpis_with_regex_by_page(
     return [c for _, c in candidates[:max_results]]
 
 
+# ---------------------------------------------------------------------------
+# Loose table-row scan fallback (page-scoped)
+# ---------------------------------------------------------------------------
+
+_KPI_TABLE_SECTION_HINTS = (
+    "key metrics",
+    "operating metrics",
+    "operating metric",
+    "key performance indicators",
+    "selected operating data",
+    "key operating data",
+    "operating statistics",
+    "business metrics",
+    "operating highlights",
+    "supplemental data",
+)
+
+
+def _infer_unit_from_label(label: str) -> str:
+    lower = (label or "").lower()
+    if any(tok in lower for tok in ("user", "dau", "mau", "active")):
+        return "users"
+    if "subscriber" in lower:
+        return "subscribers"
+    if any(tok in lower for tok in ("customer", "account", "merchant")):
+        return "customers"
+    if "order" in lower:
+        return "orders"
+    if "transaction" in lower:
+        return "transactions"
+    if any(tok in lower for tok in ("shipment", "deliver", "unit", "package", "parcel")):
+        return "units"
+    if any(tok in lower for tok in ("store", "location", "restaurant", "outlet")):
+        return "stores"
+    if "member" in lower:
+        return "members"
+    if "employee" in lower:
+        return "employees"
+    if "policy" in lower:
+        return "policies"
+    if "room night" in lower or "roomnights" in lower:
+        return "nights"
+    if any(tok in lower for tok in ("occupancy", "margin", "rate", "ratio", "churn", "retention", "growth")):
+        return "%"
+    return ""
+
+
+def extract_kpis_with_key_metrics_table_scan_by_page(
+    page_texts: List[str],
+    company_name: str,
+    max_results: int = 5,
+) -> List[SpotlightKpiCandidate]:
+    """Best-effort extraction of arbitrary KPI rows from "Key metrics" tables.
+
+    This is intentionally looser than `_KPI_PATTERNS` and is only used as a
+    last-resort when the model returns no candidates and the curated regex list
+    finds nothing. To reduce false positives, it only scans pages that look like
+    they contain a key metrics/operating metrics section.
+    """
+    if not page_texts:
+        return []
+
+    best_by_name: Dict[str, Tuple[int, SpotlightKpiCandidate]] = {}
+
+    in_section_pages_remaining = 0
+
+    row_re = re.compile(
+        r"(?P<val>\$?\s*\(?\d{1,3}(?:,\d{3})*(?:\.\d+)?\)?)\s*"
+        r"(?P<scale>million|billion|trillion|thousand|M|B|T|K|bn|mn)?\s*"
+        r"(?P<pct>%?)",
+        re.IGNORECASE,
+    )
+
+    for page_idx, page_text in enumerate(page_texts):
+        text = page_text or ""
+        if not text.strip():
+            continue
+
+        lower = text.lower()
+        if any(h in lower for h in _KPI_TABLE_SECTION_HINTS):
+            in_section_pages_remaining = 2
+        elif in_section_pages_remaining <= 0:
+            continue
+
+        in_section_pages_remaining = max(0, in_section_pages_remaining - 1)
+
+        page_num = page_idx + 1
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            continue
+
+        # Find the first header line; start scanning right after it.
+        start_line = 0
+        for i, ln in enumerate(lines[:120]):
+            ln_low = ln.lower()
+            if any(h in ln_low for h in _KPI_TABLE_SECTION_HINTS):
+                start_line = i + 1
+                break
+
+        for ln in lines[start_line : start_line + 120]:
+            if len(ln) < 8:
+                continue
+            if _looks_like_garbled_text(ln):
+                continue
+            if _looks_like_non_operating_context(ln):
+                continue
+
+            m = row_re.search(ln)
+            if not m:
+                continue
+
+            label_raw = ln[: m.start()].strip(" \t:;-–—")
+            label = re.sub(r"\s+", " ", label_raw).strip()
+            if not label or len(label) < 3 or len(label) > 80:
+                continue
+            # Avoid obviously-non-metric labels.
+            if re.fullmatch(r"(?:q[1-4]|fy|year|quarter|period|ended|as of)\b.*", label, re.IGNORECASE):
+                continue
+
+            value_raw = (m.group("val") or "").strip()
+            scale = (m.group("scale") or "").strip()
+            value = _parse_value(value_raw, scale)
+            if value is None:
+                continue
+
+            quote = re.sub(r"\s+", " ", ln).strip()
+            if len(quote) > 260:
+                quote = quote[:260].rstrip()
+
+            unit = "%" if (m.group("pct") or "").strip() == "%" else ""
+            if not unit:
+                unit = "$" if "$" in value_raw else _infer_unit_from_label(label)
+
+            most_recent_value = value_raw
+            if scale:
+                most_recent_value = f"{most_recent_value} {scale}".strip()
+            if unit == "%":
+                most_recent_value = f"{most_recent_value}%".strip()
+            elif unit == "$" and most_recent_value and not most_recent_value.startswith("$"):
+                most_recent_value = f"${most_recent_value}"
+
+            priority = 60
+            label_low = label.lower()
+            if any(tok in label_low for tok in ("mau", "dau", "active users", "paid subscribers", "arr", "mrr", "gmv", "tpv", "aum", "churn", "retention", "occupancy", "utilization")):
+                priority += 25
+            if unit in ("users", "subscribers", "customers", "orders", "transactions", "units", "stores"):
+                priority += 8
+            if unit in ("$", "%"):
+                priority += 3
+
+            candidate: SpotlightKpiCandidate = {
+                "name": label,
+                "value": float(value),
+                "unit": unit,
+                "prior_value": None,
+                "chart_type": "metric",
+                "description": None,
+                "source_quote": f"[p. {page_num}] {quote}",
+                "why_company_specific": "Operating metric disclosed in the company's filing.",
+                "how_calculated_or_defined": None,
+                "most_recent_value": most_recent_value or None,
+                "period": None,
+                "confidence": 0.7,
+                "evidence": [{"page": page_num, "quote": quote, "type": "value"}],
+                "ban_flags": ["key_metrics_table_scan"],
+            }
+
+            name_key = label_low
+            existing = best_by_name.get(name_key)
+            if existing is None or int(priority) > int(existing[0]):
+                best_by_name[name_key] = (int(priority), candidate)
+
+    candidates = list(best_by_name.values())
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in candidates[:max_results]]
+
+
 def extract_single_best_kpi_with_regex(
     text: str,
     company_name: str,

@@ -534,3 +534,24 @@ def test_evidence_pipeline_page_regex_fallback_when_pass1_returns_no_candidates(
     assert float(candidate.get("value")) == 1_200_000.0
     assert debug.get("fallback_used") == "regex_page"
     assert debug.get("fallback_reason") == "pass1_no_candidates"
+
+
+def test_evidence_pipeline_key_metrics_table_scan_fallback_when_regex_finds_no_matches():
+    client = _FakeGeminiNoCandidates()
+    config = EvidencePipelineConfig(total_timeout_seconds=20.0)
+    doc_text = "Key metrics\nWidget engagement score 123\n"
+
+    candidate, debug = extract_kpi_with_evidence_from_file(
+        client,
+        file_bytes=doc_text.encode("utf-8"),
+        company_name="Example Corp",
+        mime_type="text/plain",
+        config=config,
+    )
+
+    assert candidate is not None, debug
+    assert candidate.get("name") == "Widget engagement score"
+    assert float(candidate.get("value")) == 123.0
+    assert debug.get("fallback_used") == "regex_page"
+    assert debug.get("fallback_reason") == "pass1_no_candidates"
+    assert int(debug.get("pass1_no_candidates_key_metrics_table_candidates") or 0) >= 1

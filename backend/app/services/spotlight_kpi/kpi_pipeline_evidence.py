@@ -18,7 +18,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from .regex_fallback import extract_kpis_with_regex_by_page
+from .regex_fallback import (
+    extract_kpis_with_key_metrics_table_scan_by_page,
+    extract_kpis_with_regex_by_page,
+)
 from .json_parse import parse_json_object
 from .pipeline_utils import safe_json_retry_prompt, thinking_config
 from .types import SpotlightKpiCandidate
@@ -1800,17 +1803,56 @@ def extract_kpi_with_evidence_from_file(
 
     def _try_regex_page_fallback(reason: str) -> Optional[SpotlightKpiCandidate]:
         """Deterministic last-resort KPI extraction using page-scoped regex patterns."""
+        candidates: List[Dict[str, Any]] = []
         try:
-            candidates = extract_kpis_with_regex_by_page(
+            regex_candidates = extract_kpis_with_regex_by_page(
                 page_texts, company_name, max_results=int(config.max_candidates)
             )
+            candidates.extend(regex_candidates)
         except Exception as exc:  # noqa: BLE001
             debug[f"{reason}_regex_page_error"] = str(exc)[:200]
             return None
 
         debug[f"{reason}_regex_page_candidates"] = len(candidates)
 
+        # If the curated regex list yields nothing, try a looser table-row scan on
+        # pages that look like they contain "Key metrics" / "Operating metrics".
+        if not candidates:
+            try:
+                table_candidates = extract_kpis_with_key_metrics_table_scan_by_page(
+                    page_texts, company_name, max_results=int(config.max_candidates)
+                )
+                debug[f"{reason}_key_metrics_table_candidates"] = len(table_candidates)
+                candidates.extend(table_candidates)
+            except Exception as exc:  # noqa: BLE001
+                debug[f"{reason}_key_metrics_table_error"] = str(exc)[:200]
+
+        if not candidates:
+            return None
+
+        # Prefer more representative KPIs when multiple fallbacks exist.
+        ranked: List[Tuple[int, Dict[str, Any]]] = []
         for cand in candidates:
+            if not isinstance(cand, dict):
+                continue
+            name = str(cand.get("name") or "").strip()
+            if not name:
+                continue
+            unit = str(cand.get("unit") or "").strip() or None
+            value_f = _coerce_number(cand.get("value"))
+            if value_f is None:
+                value_f = _coerce_number(cand.get("most_recent_value"))
+            if value_f is None:
+                continue
+            ev_raw = cand.get("evidence")
+            ev_list = ev_raw if isinstance(ev_raw, list) else []
+            score = _candidate_importance_score(
+                name=name, unit=unit, value=float(value_f), evidence=ev_list
+            )
+            ranked.append((int(score), cand))
+        ranked.sort(key=lambda t: t[0], reverse=True)
+
+        for _score, cand in ranked:
             if not isinstance(cand, dict):
                 continue
             name = str(cand.get("name") or "").strip()
