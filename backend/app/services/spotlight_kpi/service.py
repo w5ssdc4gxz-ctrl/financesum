@@ -848,7 +848,25 @@ def _cache_get(
         if (now - created_dt).total_seconds() > float(ttl_s):
             return None
     payload = cached.get("payload")
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        return None
+
+    # Backfill improved KPI explanations on older cached payloads so users
+    # immediately see the 1-2 line summary without waiting for cache expiry.
+    try:
+        company_kpi = payload.get("company_kpi")
+        if isinstance(company_kpi, dict):
+            company_kpi["description"] = _build_spotlight_description(company_kpi) or None
+
+        charts = payload.get("company_charts")
+        if isinstance(charts, list):
+            for entry in charts:
+                if isinstance(entry, dict):
+                    entry["description"] = _build_spotlight_description(entry) or None
+    except Exception:  # noqa: BLE001
+        pass
+
+    return payload
 
 
 def _cache_set(filing_id: str, payload: Dict[str, Any], *, reason: Optional[str], debug: bool) -> None:
