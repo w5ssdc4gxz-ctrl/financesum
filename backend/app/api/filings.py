@@ -11133,6 +11133,10 @@ def _ensure_local_document(
                 else:
                     return path_obj
         else:
+            if not allow_network:
+                # Spotlight calls this with allow_network=False and must not mutate
+                # persisted paths (nor attempt network recovery).
+                return None
             filing.pop("local_document_path", None)
             _persist_filing_field_updates(
                 context, filing_id_str, {"local_document_path": None}
@@ -11141,9 +11145,69 @@ def _ensure_local_document(
         # Spotlight should be fast and must not trigger SEC resolution + downloads.
         return None
 
+    # If the filing has a stored raw file in Supabase Storage (user-uploaded PDFs or
+    # ingestion artifacts), download it as the local document for Spotlight.
+    raw_file_path = filing.get("raw_file_path")
+    if (
+        allow_network
+        and raw_file_path
+        and context.get("source") == "supabase"
+        and filing_id_str
+    ):
+        try:
+            raw_str = str(raw_file_path).strip()
+        except Exception:
+            raw_str = ""
+
+        if raw_str:
+            # If `raw_file_path` is already a local path, use it directly.
+            try:
+                raw_local = Path(raw_str)
+            except Exception:
+                raw_local = None
+
+            if raw_local is not None and raw_local.exists():
+                filing["local_document_path"] = str(raw_local)
+                _persist_filing_field_updates(
+                    context, filing_id_str, {"local_document_path": str(raw_local)}
+                )
+                return raw_local
+
+            # Avoid expensive storage calls for placeholder keys (e.g., `eodhd_*`).
+            if "/" not in raw_str and "." not in raw_str:
+                raw_str = ""
+
+            if raw_str:
+                try:
+                    supabase = get_supabase_client()
+                    blob = supabase.storage.from_("filings").download(raw_str)
+                    if blob:
+                        target_path = _build_local_document_path(
+                            storage_dir, filing_id_str
+                        )
+                        try:
+                            target_path.write_bytes(blob)
+                            filing["local_document_path"] = str(target_path)
+                            _persist_filing_field_updates(
+                                context,
+                                filing_id_str,
+                                {"local_document_path": str(target_path)},
+                            )
+                            return target_path
+                        except Exception:  # noqa: BLE001
+                            pass
+                except Exception:  # noqa: BLE001
+                    pass
+
     filing_type = (filing.get("filing_type") or "").upper()
     filing_date = filing.get("filing_date")
     period_end = filing.get("period_end") or filing.get("report_date")
+    sec_max_results_raw = (os.getenv("SPOTLIGHT_SEC_MAX_RESULTS") or "").strip() or "1500"
+    try:
+        sec_max_results = int(sec_max_results_raw)
+    except ValueError:
+        sec_max_results = 1500
+    sec_max_results = max(200, min(5000, int(sec_max_results)))
 
     def _infer_sec_filing_types() -> List[str]:
         """Infer SEC form types when our filing record isn't itself an SEC form.
@@ -11245,9 +11309,9 @@ def _ensure_local_document(
                 sec_filings = get_company_filings(
                     cik=cik_value,
                     filing_types=filing_types_to_try,
-                    max_results=200,
+                    max_results=sec_max_results,
                     target_date=str(target) if target else None,
-                    include_historical=True,
+                    include_historical=False,
                 )
                 if sec_filings:
                     candidates = [
@@ -11289,9 +11353,9 @@ def _ensure_local_document(
                     sec_filings = get_company_filings(
                         cik=cik_value,
                         filing_types=filing_types_to_try,
-                        max_results=200,
+                        max_results=sec_max_results,
                         target_date=str(target) if target else None,
-                        include_historical=True,
+                        include_historical=False,
                     )
                     if sec_filings:
                         candidates = [
@@ -16309,7 +16373,14 @@ async def get_filing_spotlight_kpi(
 
     if allow_spotlight_network and (not local_document or not local_document.exists()):
         try:
-            with anyio.fail_after(25.0):
+            raw_timeout = (os.getenv("SPOTLIGHT_DOCUMENT_RESOLVE_TIMEOUT_SECONDS") or "").strip() or "60"
+            try:
+                resolve_timeout = float(raw_timeout)
+            except ValueError:
+                resolve_timeout = 60.0
+            resolve_timeout = max(5.0, float(resolve_timeout))
+
+            with anyio.fail_after(resolve_timeout):
                 local_document = await anyio.to_thread.run_sync(
                     lambda: _ensure_local_document(context, settings, allow_network=True),
                     cancellable=True,

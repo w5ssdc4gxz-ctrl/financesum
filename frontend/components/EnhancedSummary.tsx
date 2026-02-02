@@ -248,9 +248,8 @@ function normalizeKpiUnit(value?: string | null): string | undefined {
   if (['usd', '$', 'dollars', 'us$', 'us dollars'].includes(lower)) return '$'
   if (['eur', '€', 'euro', 'euros'].includes(lower)) return '€'
   if (['gbp', '£', 'pound', 'pounds', 'sterling'].includes(lower)) return '£'
-  // Avoid mapping single-letter units like "m"/"b" to magnitudes; they are ambiguous.
-  if (['million', 'millions'].includes(lower)) return 'M'
-  if (['billion', 'billions'].includes(lower)) return 'B'
+  // Never treat scale words as the unit; the backend should encode scale in the value itself.
+  if (['thousand', 'thousands', 'million', 'millions', 'billion', 'billions', 'trillion', 'trillions'].includes(lower)) return undefined
   return normalized
 }
 

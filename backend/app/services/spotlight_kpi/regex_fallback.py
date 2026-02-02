@@ -1165,6 +1165,19 @@ def extract_kpis_with_regex(
             value = _parse_value(value_raw, scale)
             if value is None:
                 continue
+
+            # Guardrails: avoid obvious false positives where a small number embedded in a
+            # product name/label is misread as the KPI value (e.g., "365" in a product name).
+            scale_lower = (scale or "").strip().lower()
+            unit_lower = (unit or "").strip().lower()
+            raw_digits = (value_raw or "").replace(",", "").strip()
+            is_small_plain_number = bool(raw_digits.isdigit() and len(raw_digits) <= 3 and "," not in (value_raw or ""))
+            abs_value = abs(float(value))
+            if not scale_lower and is_small_plain_number:
+                if unit_lower in ("users", "subscribers", "customers", "accounts") and abs_value < 1000:
+                    continue
+                if unit_lower in ("orders", "transactions", "shipments", "deliveries", "units") and abs_value < 10:
+                    continue
             
             name_key = name_template.lower()
             

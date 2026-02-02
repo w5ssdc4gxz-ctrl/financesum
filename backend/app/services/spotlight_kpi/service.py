@@ -563,10 +563,14 @@ def _build_spotlight_description(candidate: Dict[str, Any], *, max_chars: int = 
         n = (name_text or "").lower()
         u = (unit_text or "").lower()
         # Use both name/unit signals to choose a safe, explainable template.
-        if any(tok in n for tok in ("monthly active users", "mau")) or u in ("mau", "users"):
+        if any(tok in n for tok in ("monthly active users", "mau")) or u == "mau":
             return "mau"
-        if any(tok in n for tok in ("daily active users", "dau")) or u in ("dau",):
+        if any(tok in n for tok in ("daily active users", "dau")) or u == "dau":
             return "dau"
+        if "active user" in n:
+            return "active_users"
+        if "user" in n or u in ("user", "users"):
+            return "users"
         if any(tok in n for tok in ("subscriber", "membership")) or "subscriber" in u:
             return "subscribers"
         if any(tok in n for tok in ("customer", "account")) or any(tok in u for tok in ("customers", "customer", "accounts", "account")):
@@ -575,6 +579,14 @@ def _build_spotlight_description(candidate: Dict[str, Any], *, max_chars: int = 
             return "activity"
         if any(tok in n for tok in ("ship", "deliver", "units", "unit", "volume")) or any(tok in u for tok in ("units", "unit", "shipments", "deliveries", "volume")):
             return "volume"
+        if any(tok in n for tok in ("store count", "stores", "locations", "restaurants")) or u in ("stores", "locations"):
+            return "footprint"
+        if any(tok in n for tok in ("arpu", "arpa", "arppu", "asp", "aov", "average revenue per", "average selling price", "average order value")):
+            return "unit_economics"
+        if any(tok in n for tok in ("net retention", "dollar-based net retention", "nrr", "ndr", "churn", "retention")):
+            return "retention"
+        if any(tok in n for tok in ("backlog", "remaining performance obligations", "rpo", "bookings", "gross bookings", "net bookings")):
+            return "bookings"
         if "arr" in n or "annual recurring revenue" in n:
             return "arr"
         if "mrr" in n or "monthly recurring revenue" in n:
@@ -593,6 +605,10 @@ def _build_spotlight_description(candidate: Dict[str, Any], *, max_chars: int = 
             return "What it is: monthly active users — a measure of how many people used the product in the month. Why it matters: indicates engagement and platform scale."
         if metric_type == "dau":
             return "What it is: daily active users — a measure of how many people used the product each day. Why it matters: indicates engagement and product stickiness."
+        if metric_type == "active_users":
+            return "What it is: active users — a measure of people using the product over the stated period. Why it matters: indicates engagement and product adoption."
+        if metric_type == "users":
+            return "What it is: users — the size of the product’s user base as reported. Why it matters: helps gauge adoption and potential monetization."
         if metric_type == "subscribers":
             return "What it is: subscribers — the size of the paying user base. Why it matters: a key driver of recurring revenue and retention."
         if metric_type == "customers":
@@ -601,6 +617,14 @@ def _build_spotlight_description(candidate: Dict[str, Any], *, max_chars: int = 
             return "What it is: activity volume (orders/transactions) — how much business flowed through the company. Why it matters: higher activity typically supports revenue and signals demand."
         if metric_type == "volume":
             return "What it is: operational volume (units shipped/delivered/produced) — what the company physically moved or delivered. Why it matters: reflects demand and execution capacity."
+        if metric_type == "footprint":
+            return "What it is: operating footprint (stores/locations) — how many sites the company runs. Why it matters: a proxy for reach and capacity to generate sales."
+        if metric_type == "unit_economics":
+            return "What it is: unit economics (e.g., ARPU/ASP/AOV) — monetization per user/unit/order. Why it matters: links product demand to profitability and pricing power."
+        if metric_type == "retention":
+            return "What it is: retention/churn (NRR/churn) — how well the company keeps and expands customers. Why it matters: a key signal for durable growth and unit economics."
+        if metric_type == "bookings":
+            return "What it is: bookings/backlog/RPO — contracted or committed demand not yet recognized as revenue. Why it matters: signals forward demand and near-term revenue visibility."
         if metric_type == "arr":
             return "What it is: annual recurring revenue (ARR) — the annualized value of contracted recurring revenue. Why it matters: indicates subscription scale and durability."
         if metric_type == "mrr":
@@ -621,6 +645,13 @@ def _build_spotlight_description(candidate: Dict[str, Any], *, max_chars: int = 
             return ""
         return _ensure_period(f"Why it matters: {m.group(1).strip().rstrip('.')}")
 
+    def _default_what_only(name_text: str, unit_text: str) -> str:
+        exp = _default_explanation(name_text, unit_text)
+        parts = re.split(r"\bwhy it matters:\s*", exp, maxsplit=1, flags=re.IGNORECASE)
+        if not parts:
+            return ""
+        return _ensure_period(parts[0].strip().rstrip("."))
+
     if desc:
         # If the description doesn't explain importance, optionally append a very short why.
         base = _ensure_period(desc)
@@ -639,7 +670,10 @@ def _build_spotlight_description(candidate: Dict[str, Any], *, max_chars: int = 
         return clip(combined)
 
     if why:
-        return clip(_why_sentence(why))
+        name = clean(str(candidate.get("name") or ""))
+        unit_text = str(candidate.get("unit") or "").strip()
+        base = _default_what_only(name, unit_text)
+        return clip(_append_generic_why(base, _why_sentence(why)))
 
     # Heuristic last resort (keeps UI consistent even without Gemini).
     name = clean(str(candidate.get("name") or ""))

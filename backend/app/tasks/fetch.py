@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import logging
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.config import get_settings
 from app.models.database import get_supabase_client
+from app.services.edgar_fetcher import get_company_filings, resolve_cik_from_ticker_sync
 from app.services.eodhd_client import get_eodhd_client
 from app.tasks.celery_app import celery_app
 
@@ -206,6 +208,124 @@ def _run_eodhd_ingestion(
     return saved, duplicates
 
 
+def _backfill_sec_filings(
+    supabase,
+    *,
+    company_id: str,
+    ticker: str,
+    cik: Optional[str],
+    filing_types: Optional[List[str]],
+    cutoff: Optional[date],
+) -> int:
+    """Best-effort: ensure the filings table includes older SEC periods.
+
+    The primary fetch task uses EODHD financial statements, which can be sparse for
+    older history. Users still expect to be able to select much older 10-K/10-Q
+    filings. This backfill inserts filing metadata (period_end-based) from EDGAR
+    so the UI can list + analyze older filings, even when EODHD statements are absent.
+    """
+
+    normalized = _normalize_filing_types(filing_types)
+    include_all = not normalized
+    forms: List[str] = []
+    if include_all or "10-Q" in normalized:
+        forms.append("10-Q")
+    if include_all or "10-K" in normalized:
+        forms.append("10-K")
+    if not forms:
+        return 0
+
+    cik_value = "".join(ch for ch in str(cik or "") if ch.isdigit()).zfill(10)
+    if not cik_value.strip("0"):
+        cik_value = resolve_cik_from_ticker_sync(ticker) or ""
+    cik_value = str(cik_value or "").strip()
+    if not cik_value:
+        return 0
+
+    max_results_raw = (os.getenv("SEC_BACKFILL_MAX_RESULTS") or "").strip() or "4000"
+    max_hist_raw = (os.getenv("SEC_BACKFILL_MAX_HISTORICAL_FILES") or "").strip() or "12"
+    try:
+        max_results = max(100, min(8000, int(max_results_raw)))
+    except ValueError:
+        max_results = 4000
+    try:
+        max_historical = max(0, min(40, int(max_hist_raw)))
+    except ValueError:
+        max_historical = 12
+
+    try:
+        sec_filings = get_company_filings(
+            cik_value,
+            filing_types=forms,
+            max_results=max_results,
+            include_historical=True,
+            max_historical_files=max_historical,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("SEC backfill failed for %s: %s", ticker, exc)
+        return 0
+
+    if not sec_filings:
+        return 0
+
+    existing_resp = (
+        supabase.table("filings")
+        .select("filing_type,filing_date")
+        .eq("company_id", company_id)
+        .in_("filing_type", forms)
+        .execute()
+    )
+    existing_pairs: set[tuple[str, str]] = set()
+    for row in list(existing_resp.data or []):
+        if not isinstance(row, dict):
+            continue
+        ft = str(row.get("filing_type") or "").upper()
+        dt = str(row.get("filing_date") or "")[:10]
+        if ft and dt:
+            existing_pairs.add((ft, dt))
+
+    inserted = 0
+    for row in sec_filings:
+        if not isinstance(row, dict):
+            continue
+        ft = str(row.get("filing_type") or "").upper()
+        report_dt = str(row.get("period_end") or "")[:10]
+        filing_dt = str(row.get("filing_date") or "")[:10]
+        url = str(row.get("url") or "").strip()
+        if not ft or ft not in forms or not url:
+            continue
+
+        # Use period_end (reportDate) as the "filing_date" key in our DB so it
+        # aligns with EODHD's period-based ingestion and dedupe logic.
+        date_key = report_dt or filing_dt
+        if not date_key:
+            continue
+        if cutoff and _is_before_cutoff(date_key, cutoff):
+            continue
+
+        key = (ft, date_key)
+        if key in existing_pairs:
+            continue
+
+        filing_data = {
+            "company_id": company_id,
+            "filing_type": ft,
+            "filing_date": date_key,
+            "period_end": report_dt or date_key,
+            "url": url,
+            "status": "parsed",
+        }
+        try:
+            resp = supabase.table("filings").insert(filing_data).execute()
+            if resp.data:
+                inserted += 1
+                existing_pairs.add(key)
+        except Exception:  # noqa: BLE001
+            continue
+
+    return int(inserted)
+
+
 def run_fetch_filings_inline(
     *,
     company_id: str,
@@ -304,6 +424,19 @@ def fetch_filings_task(
             saved_count += new_saved
             duplicate_count += skipped
 
+        # Best-effort: backfill older SEC filing metadata so users can select very old filings.
+        try:
+            backfilled = _backfill_sec_filings(
+                supabase,
+                company_id=company_id,
+                ticker=ticker,
+                cik=cik,
+                filing_types=filing_types,
+                cutoff=cutoff,
+            )
+        except Exception:  # noqa: BLE001
+            backfilled = 0
+
         supabase.table("task_status").update({"status": "completed", "progress": 100}).eq(
             "task_id", self.request.id
         ).execute()
@@ -312,10 +445,12 @@ def fetch_filings_task(
             "status": "completed",
             "message": (
                 f"Successfully fetched and processed {saved_count} financial statements "
-                f"from SEC filings (skipped {duplicate_count} duplicates)."
+                f"(skipped {duplicate_count} duplicates)."
+                + (f" Backfilled {backfilled} older SEC filings." if backfilled else "")
             ),
             "filings_count": saved_count,
             "duplicates_skipped": duplicate_count,
+            "sec_backfilled": backfilled,
         }
 
     except Exception as e:  # noqa: BLE001

@@ -164,3 +164,74 @@ def test_ensure_local_document_rejects_cached_doc_with_wrong_as_of_year(
         for u in persisted_updates
     )
     assert "2024" not in resolved.read_text(encoding="utf-8")
+
+
+def test_ensure_local_document_downloads_from_supabase_storage_raw_file_path(
+    tmp_path, monkeypatch
+):
+    settings = SimpleNamespace(data_dir=str(tmp_path))
+    persisted_updates: list[dict] = []
+
+    def fake_persist(_context, _filing_id_str, updates):
+        persisted_updates.append(dict(updates or {}))
+
+    monkeypatch.setattr(filings_api, "_persist_filing_field_updates", fake_persist)
+
+    class _Bucket:
+        def download(self, path: str):  # noqa: ARG002
+            return b"%PDF-1.4\n% Fake PDF bytes\n"
+
+    class _Storage:
+        def from_(self, name: str):  # noqa: ARG002
+            return _Bucket()
+
+    class _Supabase:
+        storage = _Storage()
+
+    monkeypatch.setattr(filings_api, "get_supabase_client", lambda: _Supabase())
+
+    context = {
+        "source": "supabase",
+        "company": {"id": "c1", "ticker": "TEST", "cik": "0000000001", "country": "US"},
+        "filing": {
+            "id": "f-storage",
+            "filing_type": "10-K",
+            "filing_date": "2017-02-01",
+            "period_end": "2016-12-31",
+            "raw_file_path": "filings/c1/f-storage.pdf",
+        },
+    }
+
+    resolved = filings_api._ensure_local_document(context, settings, allow_network=True)
+    assert resolved and resolved.exists()
+    assert resolved.read_bytes().startswith(b"%PDF-")
+    assert any(u.get("local_document_path") for u in persisted_updates)
+
+
+def test_ensure_local_document_does_not_clear_missing_cached_path_when_network_disabled(
+    tmp_path, monkeypatch
+):
+    settings = SimpleNamespace(data_dir=str(tmp_path))
+    persisted_updates: list[dict] = []
+
+    def fake_persist(_context, _filing_id_str, updates):
+        persisted_updates.append(dict(updates or {}))
+
+    monkeypatch.setattr(filings_api, "_persist_filing_field_updates", fake_persist)
+
+    missing_path = tmp_path / "missing.html"
+    context = {
+        "company": {"id": "c1", "ticker": "TEST", "cik": "0000000001", "country": "US"},
+        "filing": {
+            "id": "f-missing",
+            "filing_type": "10-K",
+            "filing_date": "2017-02-01",
+            "period_end": "2016-12-31",
+            "local_document_path": str(missing_path),
+        },
+    }
+
+    resolved = filings_api._ensure_local_document(context, settings, allow_network=False)
+    assert resolved is None
+    assert context["filing"].get("local_document_path") == str(missing_path)
+    assert persisted_updates == []

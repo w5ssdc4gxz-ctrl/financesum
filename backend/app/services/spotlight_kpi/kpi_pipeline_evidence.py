@@ -96,15 +96,23 @@ def _build_compact_kpi_description(
             s = f"{s}."
         return s
 
-    what = _ensure_sentence(what_it_measures)
+    what_raw = _clean(what_it_measures)
+    what = ""
+    if what_raw:
+        lowered = what_raw.lower()
+        if lowered.startswith(("what it is", "what it measures", "it measures", "this measures")):
+            what = _ensure_sentence(what_raw)
+        else:
+            what = _ensure_sentence(f"What it is: {what_raw}")
+
     why_raw = _clean(why_company_specific)
     why = ""
     if why_raw:
-        prefix = ""
         lowered = why_raw.lower()
-        if not any(token in lowered for token in ("because", "important", "matters", "key", "core")):
-            prefix = "Matters because "
-        why = _ensure_sentence(f"{prefix}{why_raw}")
+        if lowered.startswith(("why it matters", "matters because", "important because")):
+            why = _ensure_sentence(why_raw)
+        else:
+            why = _ensure_sentence(f"Why it matters: {why_raw}")
 
     parts = [p for p in (what, why) if p]
     if not parts:
@@ -2016,15 +2024,85 @@ def extract_kpi_with_evidence_from_file(
             if _looks_like_non_operating_kpi(name, evidence=verified):
                 continue
 
-            value_f = _coerce_number(cand.get("value"))
+            unit = str(cand.get("unit") or "").strip() or None
+            unit = _sanitize_unit(unit, kpi_name=name, evidence=verified)
+
+            name_variants = _kpi_name_variants(name)
+
+            value_f: Optional[float] = None
+            value_page_hint: Optional[int] = None
+            for ev in verified:
+                if str(ev.get("type") or "") != "value":
+                    continue
+                quote_text = str(ev.get("quote") or "")
+                try:
+                    value_page_hint = int(ev.get("page") or 0) or None
+                except Exception:  # noqa: BLE001
+                    value_page_hint = None
+
+                value_f = _extract_value_number_from_quote_near_name(
+                    quote_text, kpi_name=name, unit_hint=unit
+                )
+                quote_norm = _normalize_for_matching(quote_text)
+                quote_has_name = bool(
+                    name_variants and any(v and v in quote_norm for v in name_variants)
+                )
+                if (
+                    value_f is not None
+                    and not quote_has_name
+                    and isinstance(value_page_hint, int)
+                    and 1 <= value_page_hint <= len(page_texts)
+                ):
+                    page_value = _extract_value_number_from_page_near_name(
+                        page_texts[value_page_hint - 1] or "",
+                        kpi_name=name,
+                        unit_hint=unit,
+                    )
+                    if page_value is not None:
+                        value_f = float(page_value)
+                if value_f is not None:
+                    break
+
             if value_f is None:
-                value_f = _coerce_number(cand.get("most_recent_value"))
+                pages_to_try: List[int] = []
+                seen_pages: set[int] = set()
+                for typ in ("value", "definition", "context"):
+                    for ev in verified:
+                        if str(ev.get("type") or "") != typ:
+                            continue
+                        try:
+                            p = int(ev.get("page") or 0)
+                        except Exception:  # noqa: BLE001
+                            continue
+                        if p < 1 or p > len(page_texts) or p in seen_pages:
+                            continue
+                        seen_pages.add(p)
+                        pages_to_try.append(p)
+
+                tried_pages: set[int] = set()
+                for p in pages_to_try:
+                    for page in (p, p - 1, p + 1):
+                        if page in tried_pages:
+                            continue
+                        tried_pages.add(page)
+                        if page < 1 or page > len(page_texts):
+                            continue
+                        page_value = _extract_value_number_from_page_near_name(
+                            page_texts[page - 1] or "", kpi_name=name, unit_hint=unit
+                        )
+                        if page_value is not None:
+                            value_f = float(page_value)
+                            break
+                    if value_f is not None:
+                        break
+
             if value_f is None:
                 continue
 
             out = dict(cand)
             out["name"] = name
             out["value"] = float(value_f)
+            out["unit"] = unit
             out["confidence"] = max(float(config.min_confidence), float(out.get("confidence") or 0.72))
             out["evidence"] = verified
 
@@ -3059,8 +3137,7 @@ Return JSON:
             what_it_measures=str(selected.get("what_it_measures") or ""),
             why_company_specific=str(selected.get("why_company_specific") or ""),
         )
-        if has_definition
-        else None,
+        or None,
         "source_quote": source_quote,
         # Extra fields (frontend ignores if unused)
         "why_company_specific": str(selected.get("why_company_specific") or "").strip() or None,
