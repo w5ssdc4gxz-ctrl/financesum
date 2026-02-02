@@ -559,6 +559,95 @@ def test_evidence_pipeline_does_not_use_name_embedded_numbers_as_values():
     assert float(candidate.get("value")) == 67_400_000.0
 
 
+class _FakeGeminiSinglePageTableValueClient(_FakeGeminiEvidenceClient):
+    def stream_generate_content_with_file_uri(  # type: ignore[override]
+        self,
+        *,
+        file_uri: str,
+        file_mime_type: str,
+        prompt: str,
+        stage_name: str = "",
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> str:
+        _ = (generation_config_override,)
+        assert file_uri
+        assert file_mime_type
+        assert prompt
+        self.calls.append(stage_name or "pass1")
+
+        # Evidence quote intentionally omits the KPI name (simulating a table value cell).
+        quote = "1,234 users in Q4."
+
+        return json.dumps(
+            {
+                "candidates": [
+                    {
+                        "name": "Widget MAUs",
+                        "why_company_specific": "Management-defined engagement KPI for widgets.",
+                        "what_it_measures": "Monthly active widget usage.",
+                        "how_calculated_or_defined": "Defined as widgets active at least once per month.",
+                        "most_recent_value": "1,234",
+                        "period": "Q4",
+                        "unit": "widgets",
+                        "evidence": [{"page": 1, "quote": quote, "type": "value"}],
+                    }
+                ],
+                "failure_reason": None,
+            }
+        )
+
+    def stream_generate_content(  # type: ignore[override]
+        self,
+        prompt: str,
+        *,
+        stage_name: str = "",
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> str:
+        _ = (prompt, generation_config_override)
+        self.calls.append(stage_name or "pass2")
+
+        quote = "1,234 users in Q4."
+
+        return json.dumps(
+            {
+                "selected_kpi": {
+                    "name": "Widget MAUs",
+                    "why_company_specific": "Management-defined engagement KPI for widgets.",
+                    "what_it_measures": "Monthly active widget usage.",
+                    "how_calculated_or_defined": "Defined as widgets active at least once per month.",
+                    "most_recent_value": "1,234",
+                    "period": "Q4",
+                    "unit": "widgets",
+                    "evidence": [{"page": 1, "quote": quote, "type": "value"}],
+                    "confidence": 0.9,
+                },
+                "failure_reason": None,
+            }
+        )
+
+
+def test_evidence_pipeline_accepts_single_page_table_value_without_name_in_quote():
+    client = _FakeGeminiSinglePageTableValueClient()
+    config = EvidencePipelineConfig(total_timeout_seconds=20.0)
+
+    # Single-page text filing: name and value are nearby, but evidence quote only has the value.
+    doc_text = "Key metrics: Widget MAUs | 1,234 users in Q4."
+
+    candidate, debug = extract_kpi_with_evidence_from_file(
+        client,
+        file_bytes=doc_text.encode("utf-8"),
+        company_name="Example Corp",
+        mime_type="text/plain",
+        config=config,
+    )
+
+    assert candidate is not None, debug
+    assert candidate.get("name") == "Widget MAUs"
+    assert float(candidate.get("value")) == 1234.0
+
+
 class _FakeGeminiNoCandidates:
     def __init__(self) -> None:
         self.calls = []

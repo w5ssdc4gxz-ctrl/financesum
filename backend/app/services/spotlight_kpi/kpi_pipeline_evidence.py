@@ -1556,7 +1556,57 @@ def _has_name_backed_value_evidence(
             return True
 
     # For PDFs, allow table cases where the value cell lacks the name but the page contains it.
-    if len(page_texts) < 2:
+    if len(page_texts) < 1:
+        return False
+
+    # For text/HTML filings we treat the document as a single "page". In tables, the value
+    # evidence quote can omit the KPI name (e.g., quoting just the numeric cell). Allow this
+    # ONLY when the KPI name appears close-by in the same document.
+    if len(page_texts) == 1:
+        page_norm = _normalize_for_matching(page_texts[0] or "")
+        if not page_norm:
+            return False
+
+        # Precompute name positions (bounded).
+        positions: List[int] = []
+        for v in variants:
+            if not v:
+                continue
+            start = 0
+            while True:
+                pos = page_norm.find(v, start)
+                if pos < 0:
+                    break
+                positions.append(int(pos))
+                start = pos + max(1, len(v))
+                if len(positions) >= 24:
+                    break
+            if len(positions) >= 24:
+                break
+        if not positions:
+            return False
+
+        for ev in value_evidence:
+            quote = str(ev.get("quote") or "")
+            qn = _normalize_for_matching(quote)
+            if not qn or len(qn) < 10:
+                continue
+            # Find up to a few occurrences of the quote in the document and check proximity.
+            found = 0
+            start = 0
+            while True:
+                pos_quote = page_norm.find(qn, start)
+                if pos_quote < 0:
+                    break
+                start = pos_quote + max(1, len(qn))
+                found += 1
+                nearest = min(abs(int(pos_quote) - int(p)) for p in positions)
+                # Single-page docs can be long; keep the proximity window tight to avoid false positives.
+                if nearest <= 2000:
+                    return True
+                if found >= 6:
+                    break
+
         return False
 
     for ev in value_evidence:
@@ -1675,8 +1725,12 @@ def _verify_evidence_against_document(
                 # accept value-like evidence when the KPI name appears close by on
                 # the SAME page. This keeps verification strict (still page-scoped)
                 # while avoiding false negatives.
-                if inferred_type == "value" and len(page_texts_norm) >= 2:
-                    page_norm = page_texts_norm[picked - 1] if (picked - 1) < len(page_texts_norm) else ""
+                if inferred_type == "value" and page_texts_norm:
+                    page_norm = (
+                        page_texts_norm[picked - 1]
+                        if (picked - 1) < len(page_texts_norm)
+                        else ""
+                    )
                     if page_norm and any(v and v in page_norm for v in name_variants):
                         pos_quote = page_norm.find(quote_norm)
                         if pos_quote < 0:
@@ -1699,7 +1753,8 @@ def _verify_evidence_against_document(
                                     break
                             if positions:
                                 nearest = min(abs(int(pos_quote) - int(p)) for p in positions)
-                                if nearest <= 1200:
+                                threshold = 1200 if len(page_texts_norm) >= 2 else 2000
+                                if nearest <= threshold:
                                     inferred_type = "value"
                                 else:
                                     inferred_type = "context"
