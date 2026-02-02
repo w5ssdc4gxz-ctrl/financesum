@@ -532,48 +532,119 @@ def _build_spotlight_description(candidate: Dict[str, Any], *, max_chars: int = 
     if desc.lower().startswith("extracted via pattern matching"):
         desc = ""
 
+    def _ensure_period(text: str) -> str:
+        s = clean(text)
+        if not s:
+            return ""
+        if s[-1] not in ".!?":
+            s = f"{s}."
+        return s
+
+    def _why_sentence(raw: str) -> str:
+        s = clean(raw)
+        if not s:
+            return ""
+        # Normalize into a short, user-facing sentence.
+        if s.lower().startswith(("why it matters", "importance", "matters because")):
+            # Already framed.
+            return _ensure_period(s)
+        s = re.sub(r"^\s*(because|since)\s+", "", s, flags=re.IGNORECASE)
+        return _ensure_period(f"Why it matters: {s}")
+
+    def _append_generic_why(base: str, why_sentence: str) -> str:
+        if not why_sentence:
+            return base
+        if not base:
+            return why_sentence
+        joined = f"{base.rstrip('.')}."
+        return f"{joined} {why_sentence}"
+
+    def _metric_class(name_text: str, unit_text: str) -> str:
+        n = (name_text or "").lower()
+        u = (unit_text or "").lower()
+        # Use both name/unit signals to choose a safe, explainable template.
+        if any(tok in n for tok in ("monthly active users", "mau")) or u in ("mau", "users"):
+            return "mau"
+        if any(tok in n for tok in ("daily active users", "dau")) or u in ("dau",):
+            return "dau"
+        if any(tok in n for tok in ("subscriber", "membership")) or "subscriber" in u:
+            return "subscribers"
+        if any(tok in n for tok in ("customer", "account")) or any(tok in u for tok in ("customers", "customer", "accounts", "account")):
+            return "customers"
+        if any(tok in n for tok in ("order", "transaction", "booking", "reservation")) or any(tok in u for tok in ("orders", "order", "transactions", "transaction", "bookings", "booking", "reservations", "reservation")):
+            return "activity"
+        if any(tok in n for tok in ("ship", "deliver", "units", "unit", "volume")) or any(tok in u for tok in ("units", "unit", "shipments", "deliveries", "volume")):
+            return "volume"
+        if "arr" in n or "annual recurring revenue" in n:
+            return "arr"
+        if "mrr" in n or "monthly recurring revenue" in n:
+            return "mrr"
+        if "gmv" in n or "tpv" in n:
+            return "gmv"
+        if "aum" in n:
+            return "aum"
+        if "%" == u or "margin" in n or "rate" in n:
+            return "rate"
+        return "generic"
+
+    def _default_explanation(name_text: str, unit_text: str) -> str:
+        metric_type = _metric_class(name_text, unit_text)
+        if metric_type == "mau":
+            return "What it is: monthly active users — a measure of how many people used the product in the month. Why it matters: indicates engagement and platform scale."
+        if metric_type == "dau":
+            return "What it is: daily active users — a measure of how many people used the product each day. Why it matters: indicates engagement and product stickiness."
+        if metric_type == "subscribers":
+            return "What it is: subscribers — the size of the paying user base. Why it matters: a key driver of recurring revenue and retention."
+        if metric_type == "customers":
+            return "What it is: customers/accounts — the size of the active customer base. Why it matters: reflects adoption and supports future revenue growth."
+        if metric_type == "activity":
+            return "What it is: activity volume (orders/transactions) — how much business flowed through the company. Why it matters: higher activity typically supports revenue and signals demand."
+        if metric_type == "volume":
+            return "What it is: operational volume (units shipped/delivered/produced) — what the company physically moved or delivered. Why it matters: reflects demand and execution capacity."
+        if metric_type == "arr":
+            return "What it is: annual recurring revenue (ARR) — the annualized value of contracted recurring revenue. Why it matters: indicates subscription scale and durability."
+        if metric_type == "mrr":
+            return "What it is: monthly recurring revenue (MRR) — recurring revenue generated per month. Why it matters: tracks subscription scale and near-term momentum."
+        if metric_type == "gmv":
+            return "What it is: transaction volume (GMV/TPV) — total value of transactions processed on the platform. Why it matters: indicates marketplace/payment scale and fee potential."
+        if metric_type == "aum":
+            return "What it is: assets under management (AUM) — client assets managed on the platform. Why it matters: often drives fee revenue and reflects client trust."
+        if metric_type == "rate":
+            return "What it is: a performance rate/percentage tied to core operations. Why it matters: helps explain unit economics and business efficiency."
+        return "What it is: a reported operating metric from the filing. Why it matters: helps explain the company’s scale, activity, or efficiency."
+
+    def _default_why_only(name_text: str, unit_text: str) -> str:
+        # Pull the "Why it matters" clause from the default explanation.
+        exp = _default_explanation(name_text, unit_text)
+        m = re.search(r"\bwhy it matters:\s*(.+)$", exp, flags=re.IGNORECASE)
+        if not m:
+            return ""
+        return _ensure_period(f"Why it matters: {m.group(1).strip().rstrip('.')}")
+
     if desc:
         # If the description doesn't explain importance, optionally append a very short why.
-        if why and not any(t in desc.lower() for t in ("matters", "important", "key", "because")):
-            why_short = re.split(r"[.!?]", why, maxsplit=1)[0].strip()
-            if why_short:
-                if not why_short.lower().startswith(("because", "as ", "since ")):
-                    why_short = f"Matters because {why_short}"
-                combined = f"{desc.rstrip('.')}."
-                combined = f"{combined} {why_short.rstrip('.')}."
-                return clip(combined)
-        return clip(desc)
+        base = _ensure_period(desc)
+        why_sentence = ""
+        if why and not any(t in base.lower() for t in ("why it matters", "matters", "important", "key", "because")):
+            why_sentence = _why_sentence(re.split(r"[.!?]", why, maxsplit=1)[0])
+        else:
+            # When description is too short, add a generic "why it matters" line.
+            if len(base) < 70 and "why it matters" not in base.lower():
+                unit_text = str(candidate.get("unit") or "").strip()
+                base = _append_generic_why(
+                    base,
+                    _default_why_only(str(candidate.get("name") or ""), unit_text),
+                )
+        combined = _append_generic_why(base, why_sentence)
+        return clip(combined)
 
     if why:
-        if not any(t in why.lower() for t in ("matters", "important", "key", "because")):
-            why = f"Matters because {why}"
-        return clip(why)
+        return clip(_why_sentence(why))
 
     # Heuristic last resort (keeps UI consistent even without Gemini).
     name = clean(str(candidate.get("name") or ""))
-    lowered = name.lower()
-    if any(token in lowered for token in ("monthly active users", "mau")):
-        return "Tracks active users, indicating engagement and platform scale."
-    if any(token in lowered for token in ("daily active users", "dau")):
-        return "Tracks daily usage, indicating engagement and product stickiness."
-    if "subscriber" in lowered or "membership" in lowered:
-        return "Tracks subscriber base size, a key driver of recurring revenue."
-    if "customer" in lowered or "account" in lowered:
-        return "Tracks customer base scale, reflecting product adoption."
-    if "order" in lowered or "transaction" in lowered:
-        return "Tracks activity volume, reflecting demand and business throughput."
-    if any(token in lowered for token in ("ship", "deliver", "unit", "volume")):
-        return "Tracks operational volume, reflecting demand and execution."
-    if "arr" in lowered or "annual recurring revenue" in lowered:
-        return "Tracks recurring revenue base, reflecting subscription momentum."
-    if "mrr" in lowered or "monthly recurring revenue" in lowered:
-        return "Tracks monthly recurring revenue, reflecting subscription scale."
-    if "gmv" in lowered or "tpv" in lowered:
-        return "Tracks transaction volume, reflecting marketplace/payment scale."
-    if "aum" in lowered:
-        return "Tracks assets under management, a key driver of fee revenue."
-
-    return "Reported operating metric from the filing, chosen to represent the business."
+    unit_text = str(candidate.get("unit") or "").strip()
+    return clip(_default_explanation(name, unit_text))
 
 
 def _kpi_to_frontend_shape(candidate: SpotlightKpiCandidate) -> Dict[str, Any]:

@@ -89,6 +89,9 @@ def test_spotlight_endpoint_returns_regex_kpi_when_no_gemini(tmp_path, monkeypat
         assert float(kpi.get("value")) == 250_000_000.0
         assert kpi.get("company_specific") is True
         assert kpi.get("source_filing_id") == filing_id
+        assert isinstance(kpi.get("description"), str)
+        assert "why it matters" in str(kpi.get("description") or "").lower()
+        assert not str(kpi.get("description") or "").lower().startswith("extracted via pattern matching")
     finally:
         local_cache.fallback_filings_by_id.pop(filing_id, None)
         local_cache.fallback_companies.pop(company_id, None)
