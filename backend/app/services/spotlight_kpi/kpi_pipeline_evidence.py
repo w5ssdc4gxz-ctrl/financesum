@@ -1000,7 +1000,21 @@ def _looks_like_definition_quote(quote: str) -> bool:
     return any(tok in q for tok in _DEFINITION_HINTS)
 
 
-def _looks_like_value_quote(quote: str) -> bool:
+def _looks_like_value_quote(
+    quote: str, *, kpi_name: str = "", unit_hint: Optional[str] = None
+) -> bool:
+    """Return True when the quote appears to contain a KPI value.
+
+    When `kpi_name` is provided, we avoid treating digits embedded in the KPI name
+    itself (e.g., product numbers like "365") as the KPI value.
+    """
+    if (kpi_name or "").strip():
+        return (
+            _extract_value_number_from_quote_near_name(
+                quote or "", kpi_name=kpi_name, unit_hint=unit_hint
+            )
+            is not None
+        )
     return _extract_number_from_excerpt(quote or "") is not None
 
 
@@ -1291,6 +1305,7 @@ def _extract_value_number_from_quote_near_name(
         return _extract_number_from_excerpt(quote)
 
     positions: List[int] = []
+    name_spans: List[Tuple[int, int]] = []
     for v in variants:
         if not v:
             continue
@@ -1300,6 +1315,7 @@ def _extract_value_number_from_quote_near_name(
             if pos < 0:
                 break
             positions.append(int(pos))
+            name_spans.append((int(pos), int(pos) + len(v)))
             start = pos + max(1, len(v))
             if len(positions) >= 24:
                 break
@@ -1337,6 +1353,14 @@ def _extract_value_number_from_quote_near_name(
     fallback: List[Tuple[int, float, bool, bool, bool]] = []  # (-score, value, has_cur, is_pct, is_date)
 
     for m in pattern.finditer(normalized):
+        if name_spans:
+            m_start = int(m.start())
+            m_end = int(m.end())
+            if any(span_start <= m_start and m_end <= span_end for span_start, span_end in name_spans):
+                # Avoid treating product/model numbers embedded in the KPI name
+                # (e.g., "365", "5G") as the KPI value.
+                continue
+
         num_raw = (m.group("num") or "").strip()
         if not num_raw:
             continue
@@ -1444,6 +1468,10 @@ def _extract_value_number_from_quote_near_name(
         fallback.sort(key=_fallback_pref_tuple)
         return float(fallback[0][1])
 
+    # If the KPI name is present but we couldn't extract a number outside the name
+    # itself, fail closed instead of falling back to a generic number extractor.
+    if positions:
+        return None
     return _extract_number_from_excerpt(quote)
 
 
@@ -1629,7 +1657,7 @@ def _verify_evidence_against_document(
             picked = hits[0]
         quote = str(ev.get("quote") or "").strip()
         def_like = _looks_like_definition_quote(quote)
-        value_like = _looks_like_value_quote(quote)
+        value_like = _looks_like_value_quote(quote, kpi_name=kpi_name)
 
         inferred_type: str
         if def_like:
@@ -1713,13 +1741,19 @@ def _enrich_evidence_types(
     *,
     require_value: bool,
     require_definition: bool,
+    kpi_name: str = "",
+    unit_hint: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], bool, bool]:
     """Infer/duplicate evidence types to satisfy (definition,value) requirements when possible."""
     has_value = any(str(ev.get("type") or "") == "value" for ev in verified_evidence)
     has_definition = any(str(ev.get("type") or "") == "definition" for ev in verified_evidence)
 
     value_like = [
-        ev for ev in verified_evidence if _looks_like_value_quote(str(ev.get("quote") or ""))
+        ev
+        for ev in verified_evidence
+        if _looks_like_value_quote(
+            str(ev.get("quote") or ""), kpi_name=kpi_name, unit_hint=unit_hint
+        )
     ]
     definition_like = [
         ev
@@ -1916,6 +1950,7 @@ def extract_kpi_with_evidence_from_file(
                 verified,
                 require_value=bool(config.require_value_evidence),
                 require_definition=bool(config.require_definition_evidence),
+                kpi_name=name,
             )
 
             if config.require_value_evidence and not has_value:
@@ -2262,6 +2297,7 @@ def extract_kpi_with_evidence_from_file(
             verified,
             require_value=bool(config.require_value_evidence),
             require_definition=bool(config.require_definition_evidence),
+            kpi_name=name,
         )
 
         # Reject candidates where the KPI name is not actually present in/near the evidence.
@@ -2312,15 +2348,41 @@ def extract_kpi_with_evidence_from_file(
                 if value_f is not None:
                     break
         if value_f is None:
-            value_f = _coerce_number(most_recent_value)
-        if (
-            value_f is None
-            and isinstance(value_page_hint, int)
-            and 1 <= value_page_hint <= len(page_texts)
-        ):
-            value_f = _extract_value_number_from_page_near_name(
-                page_texts[value_page_hint - 1] or "", kpi_name=name, unit_hint=unit
-            )
+            # If value evidence quotes omit the KPI name (common in tables), the numeric value
+            # may still exist on the same page near the KPI name. Search evidence pages first.
+            pages_to_try: List[int] = []
+            seen_pages: set[int] = set()
+            for typ in ("value", "definition", "context"):
+                for ev in verified:
+                    if str(ev.get("type") or "") != typ:
+                        continue
+                    try:
+                        p = int(ev.get("page") or 0)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if p < 1 or p > len(page_texts) or p in seen_pages:
+                        continue
+                    seen_pages.add(p)
+                    pages_to_try.append(p)
+
+            tried_pages: set[int] = set()
+            for p in pages_to_try:
+                for page in (p, p - 1, p + 1):
+                    if page in tried_pages:
+                        continue
+                    tried_pages.add(page)
+                    if page < 1 or page > len(page_texts):
+                        continue
+                    page_value = _extract_value_number_from_page_near_name(
+                        page_texts[page - 1] or "", kpi_name=name, unit_hint=unit
+                    )
+                    if page_value is not None:
+                        value_f = float(page_value)
+                        if value_page_hint is None:
+                            value_page_hint = int(page)
+                        break
+                if value_f is not None:
+                    break
         if value_f is None:
             continue
 
@@ -2330,7 +2392,12 @@ def extract_kpi_with_evidence_from_file(
                 return False
             if name_variants and not any(v and v in qn for v in name_variants):
                 return False
-            return _extract_number_from_excerpt(q or "") is not None
+            return (
+                _extract_value_number_from_quote_near_name(
+                    q or "", kpi_name=name, unit_hint=unit
+                )
+                is not None
+            )
 
         picked_ev: Optional[Dict[str, Any]] = None
         for ev in verified:
@@ -2622,6 +2689,7 @@ def extract_kpi_with_evidence_from_file(
         verified_evidence,
         require_value=bool(config.require_value_evidence),
         require_definition=bool(config.require_definition_evidence),
+        kpi_name=name,
     )
 
     # Repair missing evidence using Pass 1 verified quotes for the same KPI name.
@@ -2646,6 +2714,7 @@ def extract_kpi_with_evidence_from_file(
                 verified_evidence,
                 require_value=bool(config.require_value_evidence),
                 require_definition=bool(config.require_definition_evidence),
+                kpi_name=name,
             )
 
     # If we're missing definition evidence, do a small targeted repair pass that ONLY
@@ -2842,15 +2911,39 @@ Return JSON:
         if value_f is not None:
             break
     if value_f is None:
-        value_f = _coerce_number(most_recent_value)
-    if (
-        value_f is None
-        and isinstance(value_page_hint, int)
-        and 1 <= value_page_hint <= len(page_texts)
-    ):
-        value_f = _extract_value_number_from_page_near_name(
-            page_texts[value_page_hint - 1] or "", kpi_name=name, unit_hint=unit
-        )
+        pages_to_try: List[int] = []
+        seen_pages: set[int] = set()
+        for typ in ("value", "definition", "context"):
+            for ev in verified_evidence:
+                if str(ev.get("type") or "") != typ:
+                    continue
+                try:
+                    p = int(ev.get("page") or 0)
+                except Exception:  # noqa: BLE001
+                    continue
+                if p < 1 or p > len(page_texts) or p in seen_pages:
+                    continue
+                seen_pages.add(p)
+                pages_to_try.append(p)
+
+        tried_pages: set[int] = set()
+        for p in pages_to_try:
+            for page in (p, p - 1, p + 1):
+                if page in tried_pages:
+                    continue
+                tried_pages.add(page)
+                if page < 1 or page > len(page_texts):
+                    continue
+                page_value = _extract_value_number_from_page_near_name(
+                    page_texts[page - 1] or "", kpi_name=name, unit_hint=unit
+                )
+                if page_value is not None:
+                    value_f = float(page_value)
+                    if value_page_hint is None:
+                        value_page_hint = int(page)
+                    break
+            if value_f is not None:
+                break
     if value_f is None:
         debug["reason"] = "unparseable_value"
         if pass1_fallback_candidate:
@@ -2865,7 +2958,10 @@ Return JSON:
             return False
         if name_variants and not any(v and v in qn for v in name_variants):
             return False
-        return _extract_number_from_excerpt(q or "") is not None
+        return (
+            _extract_value_number_from_quote_near_name(q or "", kpi_name=name, unit_hint=unit)
+            is not None
+        )
 
     picked_ev: Optional[Dict[str, Any]] = None
     for ev in verified_evidence:

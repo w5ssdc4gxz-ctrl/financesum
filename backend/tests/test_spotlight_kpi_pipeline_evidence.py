@@ -473,6 +473,92 @@ def test_evidence_pipeline_prefers_currency_value_over_date_day_number():
     assert float(candidate.get("value")) == 2_820_000_000.0
 
 
+class _FakeGeminiNameNumberNotValueClient(_FakeGeminiEvidenceClient):
+    def stream_generate_content_with_file_uri(  # type: ignore[override]
+        self,
+        *,
+        file_uri: str,
+        file_mime_type: str,
+        prompt: str,
+        stage_name: str = "",
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> str:
+        _ = (generation_config_override,)
+        assert file_uri
+        assert file_mime_type
+        assert prompt
+        self.calls.append(stage_name or "pass1")
+
+        quote = "Product 365 subscribers were 67.4 million in Q1 2021."
+
+        return json.dumps(
+            {
+                "candidates": [
+                    {
+                        "name": "Product 365 subscribers",
+                        "why_company_specific": "This product-specific subscriber count is disclosed by management.",
+                        "what_it_measures": "The number of subscribers to the named product.",
+                        "how_calculated_or_defined": "Management-defined subscriber metric.",
+                        "most_recent_value": "67.4 million",
+                        "period": "Q1 2021",
+                        "unit": "subscribers",
+                        "evidence": [{"page": 1, "quote": quote, "type": "value"}],
+                    }
+                ],
+                "failure_reason": None,
+            }
+        )
+
+    def stream_generate_content(  # type: ignore[override]
+        self,
+        prompt: str,
+        *,
+        stage_name: str = "",
+        generation_config_override: Optional[Dict[str, Any]] = None,
+        **_kwargs: Any,
+    ) -> str:
+        _ = (prompt, generation_config_override)
+        self.calls.append(stage_name or "pass2")
+
+        quote = "Product 365 subscribers were 67.4 million in Q1 2021."
+
+        return json.dumps(
+            {
+                "selected_kpi": {
+                    "name": "Product 365 subscribers",
+                    "why_company_specific": "This product-specific subscriber count is disclosed by management.",
+                    "what_it_measures": "The number of subscribers to the named product.",
+                    "how_calculated_or_defined": "Management-defined subscriber metric.",
+                    "most_recent_value": "67.4 million",
+                    "period": "Q1 2021",
+                    "unit": "subscribers",
+                    "evidence": [{"page": 1, "quote": quote, "type": "value"}],
+                    "confidence": 0.9,
+                },
+                "failure_reason": None,
+            }
+        )
+
+
+def test_evidence_pipeline_does_not_use_name_embedded_numbers_as_values():
+    client = _FakeGeminiNameNumberNotValueClient()
+    config = EvidencePipelineConfig(total_timeout_seconds=20.0)
+    doc_text = "Product 365 subscribers were 67.4 million in Q1 2021."
+
+    candidate, debug = extract_kpi_with_evidence_from_file(
+        client,
+        file_bytes=doc_text.encode("utf-8"),
+        company_name="Example Corp",
+        mime_type="text/plain",
+        config=config,
+    )
+
+    assert candidate is not None, debug
+    assert candidate.get("name") == "Product 365 subscribers"
+    assert float(candidate.get("value")) == 67_400_000.0
+
+
 class _FakeGeminiNoCandidates:
     def __init__(self) -> None:
         self.calls = []
