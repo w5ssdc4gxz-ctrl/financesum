@@ -170,9 +170,16 @@ export const filingsApi = {
   getFiling: (filingId: string) =>
     apiClient.get(`/api/v1/filings/${filingId}`),
   
-  listCompanyFilings: (companyId: string, filingType?: string) =>
+  listCompanyFilings: (
+    companyId: string,
+    opts?: { filingType?: string; limit?: number; offset?: number },
+  ) =>
     apiClient.get(`/api/v1/filings/company/${companyId}`, {
-      params: { filing_type: filingType },
+      params: {
+        filing_type: opts?.filingType,
+        limit: opts?.limit,
+        offset: opts?.offset,
+      },
     }),
   
   parseFiling: (filingId: string) =>

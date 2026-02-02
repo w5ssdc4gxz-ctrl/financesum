@@ -1012,7 +1012,9 @@ export default function CompanyPage() {
   const { data: filings, isLoading: filingsLoading, error: filingsError } = useQuery({
     queryKey: ['filings', companyId],
     queryFn: async () => {
-      const response = await filingsApi.listCompanyFilings(companyId)
+      // Fetch enough history so the user can select the oldest available filings.
+      // Default backend pagination is 50 (≈10 years of 10-Q/10-K), which hides older history.
+      const response = await filingsApi.listCompanyFilings(companyId, { limit: 1000, offset: 0 })
       return response.data
     },
     retry: false,
@@ -1624,10 +1626,10 @@ export default function CompanyPage() {
                 animate={{ opacity: 1, x: 0 }}
                 className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-6 shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] dark:shadow-[4px_4px_0px_0px_rgba(255,255,255,1)]"
               >
-                <h2 className="text-xl font-black uppercase mb-6 flex items-center gap-3">
-                  <span className="w-4 h-4 bg-purple-600"></span>
-                  Recent Filings
-                </h2>
+                  <h2 className="text-xl font-black uppercase mb-6 flex items-center gap-3">
+                    <span className="w-4 h-4 bg-purple-600"></span>
+                    Filings
+                  </h2>
 
                 {filingsLoading ? (
                   <div className="text-center py-12 font-mono animate-pulse">Loading filings data...</div>
