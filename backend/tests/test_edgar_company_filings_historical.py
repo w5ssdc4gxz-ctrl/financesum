@@ -125,3 +125,39 @@ def test_get_company_filings_skips_historical_when_target_is_recent(monkeypatch)
     assert calls == [submissions_url]
     assert len(filings) == 1
     assert filings[0]["filing_date"] == "2024-02-01"
+
+
+def test_get_company_filings_falls_back_to_accession_txt_when_primary_document_missing(monkeypatch):
+    submissions_url = "https://data.sec.gov/submissions/CIK0000000001.json"
+
+    main_payload = {
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0000000001-10-000001"],
+                "filingDate": ["2010-02-01"],
+                "reportDate": ["2009-12-31"],
+                "form": ["10-K"],
+                "primaryDocument": [""],
+            }
+        }
+    }
+
+    def fake_get(url, headers=None, timeout=None):  # noqa: ARG001
+        if url == submissions_url:
+            return _Resp(json_data=main_payload)
+        raise AssertionError(f"Unexpected URL fetched: {url}")
+
+    monkeypatch.setattr(edgar_fetcher.requests, "get", fake_get)
+
+    filings = edgar_fetcher.get_company_filings(
+        "1",
+        filing_types=["10-K"],
+        max_results=10,
+        target_date="2010-02-01",
+    )
+
+    assert len(filings) == 1
+    assert (
+        filings[0]["url"]
+        == "https://www.sec.gov/Archives/edgar/data/1/000000000110000001/0000000001-10-000001.txt"
+    )

@@ -451,13 +451,18 @@ def get_company_filings(
             report_date_val = report_dates[i] if i < len(report_dates) else None
             primary_doc = primary_docs[i] if i < len(primary_docs) else ""
 
-            if not accession_raw or not filing_date_val or not primary_doc:
+            if not accession_raw or not filing_date_val:
                 continue
 
             accession = str(accession_raw).replace("-", "")
-            doc_url = (
-                f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{primary_doc}"
-            )
+            # Older SEC submissions frequently omit `primaryDocument`. In those cases,
+            # the accession directory still exposes the complete submission text file
+            # at `<accessionNumber>.txt` (with dashes). Use that as a stable fallback.
+            filename = str(primary_doc).strip() or f"{str(accession_raw).strip()}.txt"
+            if not filename:
+                continue
+
+            doc_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accession}/{filename}"
             rows.append(
                 {
                     "filing_type": form_type,
