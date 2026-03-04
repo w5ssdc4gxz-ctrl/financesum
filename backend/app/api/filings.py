@@ -395,10 +395,13 @@ DEFAULT_SUMMARY_LONGFORM_MODEL_NAME = "gpt-4.1-mini"
 DEFAULT_SUMMARY_LONGFORM_INPUT_RATE_PER_1M_USD = 0.40
 DEFAULT_SUMMARY_LONGFORM_OUTPUT_RATE_PER_1M_USD = 1.60
 FINAL_STRICT_WORD_BAND_TOLERANCE = 10
+SHORT_SECTIONED_WORD_BAND_TOLERANCE = 20
 
 
 def _effective_word_band_tolerance(target_length: Optional[int] = None) -> int:
     """Return the active memo word-band tolerance."""
+    if _is_short_quality_sensitive_target(target_length):
+        return int(SHORT_SECTIONED_WORD_BAND_TOLERANCE)
     if target_length and _summary_continuous_v2_enabled():
         return int(total_word_tolerance_words(int(target_length)))
     return int(FINAL_STRICT_WORD_BAND_TOLERANCE)
@@ -12443,6 +12446,187 @@ def _collect_section_body_word_counts(
     return counts
 
 
+def _short_underweight_section_guidance(
+    summary_text: str,
+    *,
+    target_length: int,
+    include_health_rating: bool,
+) -> Tuple[List[str], str]:
+    """Describe the most underweight narrative sections for short-form rescue rewrites."""
+    budgets = _calculate_section_word_budgets(
+        target_length, include_health_rating=include_health_rating
+    )
+    counts = _collect_section_body_word_counts(
+        summary_text, include_health_rating=include_health_rating
+    )
+    narrative_titles = [
+        "Financial Health Rating",
+        "Executive Summary",
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Risk Factors",
+        "Closing Takeaway",
+    ]
+    if not include_health_rating:
+        narrative_titles = [
+            title for title in narrative_titles if title != "Financial Health Rating"
+        ]
+
+    underweight_rows: List[Tuple[int, int, int, str]] = []
+    priority = {title: idx for idx, title in enumerate(narrative_titles)}
+    for title in narrative_titles:
+        budget = int(budgets.get(title, 0) or 0)
+        observed = int(counts.get(title, 0) or 0)
+        if budget <= 0:
+            continue
+        deficit = budget - observed
+        if deficit <= 0:
+            continue
+        underweight_rows.append((deficit, observed, budget, title))
+
+    if not underweight_rows:
+        return [], ""
+
+    underweight_rows.sort(
+        key=lambda item: (-int(item[0]), int(priority.get(item[3], 999)))
+    )
+    ordered_titles = [title for _deficit, _observed, _budget, title in underweight_rows]
+    guidance_lines = [
+        (
+            f"{title}: currently {observed} words versus a {budget}-word budget "
+            f"(expand by about {deficit} words)."
+        )
+        for deficit, observed, budget, title in underweight_rows[:4]
+    ]
+    return ordered_titles, "\n".join(guidance_lines)
+
+
+def _rescue_short_sectioned_underflow(
+    summary_text: str,
+    *,
+    target_length: int,
+    include_health_rating: bool,
+    calculated_metrics: Dict[str, Any],
+    company_name: str,
+    gemini_client: Optional[Any],
+    quality_validators: Optional[List[Callable[[str], Optional[str]]]],
+    generation_stats: Optional[Dict[str, Any]] = None,
+    strict_contract_required: bool = False,
+    token_budget: Optional[TokenBudget] = None,
+    cost_budget: Optional[SummaryCostBudget] = None,
+    max_output_tokens: int = DEFAULT_OPENAI_MAX_OUTPUT_TOKENS,
+    persona_intensity: str = "strong",
+) -> str:
+    """Run one short-form, section-aware rewrite when cleanup leaves the memo under target."""
+    if not summary_text or not _is_short_quality_sensitive_target(target_length):
+        return summary_text
+    if gemini_client is None:
+        return summary_text
+
+    target = int(target_length)
+    tolerance = _effective_word_band_tolerance(target)
+    lower = max(TARGET_LENGTH_MIN_WORDS, target - tolerance)
+    upper = min(TARGET_LENGTH_MAX_WORDS, target + tolerance)
+    split_wc = len((summary_text or "").split())
+    stripped_wc = _count_words(summary_text or "")
+    if split_wc >= lower and stripped_wc >= lower:
+        return summary_text
+    if split_wc > upper or stripped_wc > upper:
+        return summary_text
+
+    underweight_titles, guidance_block = _short_underweight_section_guidance(
+        summary_text,
+        target_length=target,
+        include_health_rating=include_health_rating,
+    )
+    section_focus = ", ".join(underweight_titles[:4]) or "the shortest narrative sections"
+    quality_hint = (
+        f"Short-form underflow rescue: the memo is {max(lower - split_wc, lower - stripped_wc, 0)} words short of the "
+        f"required {target} ±{tolerance} band. Expand filing-grounded causal analysis in these underweight sections first: "
+        f"{section_focus}. Preserve all headings, quotes, numeric facts, DATA_GRID/Key Metrics rows, and the final stance. "
+        "Do not add filler, process narration, or repeated framework sentences."
+    )
+    if guidance_block:
+        quality_hint += f"\nSection budget gaps:\n{guidance_block}"
+
+    emergency_rewrite_stats: Optional[Dict[str, Any]] = generation_stats
+    if generation_stats is not None:
+        rewrite_calls = int(generation_stats.get("rewrite_call_count", 0) or 0)
+        if rewrite_calls >= int(MAX_REWRITE_ATTEMPTS):
+            emergency_rewrite_stats = None
+
+    rewritten_text, _ = _rewrite_summary_to_length(
+        gemini_client,
+        summary_text,
+        target,
+        quality_validators,
+        current_words=max(split_wc, stripped_wc),
+        token_budget=token_budget,
+        cost_budget=cost_budget,
+        max_output_tokens=max_output_tokens,
+        generation_stats=emergency_rewrite_stats,
+        persona_intensity=persona_intensity,
+        quality_issue_hint=quality_hint,
+        allow_over_target_recovery=True,
+        ignore_max_rewrite_attempts=True,
+        timeout_seconds=_summary_rewrite_timeout_seconds(),
+    )
+    if not rewritten_text or not rewritten_text.strip():
+        return summary_text
+
+    if emergency_rewrite_stats is None and generation_stats is not None:
+        generation_stats["short_underflow_reserved_rewrite_used"] = True
+
+    summary_text = _run_summary_cleanup_pass(
+        rewritten_text,
+        include_health_rating=include_health_rating,
+        calculated_metrics=calculated_metrics,
+        company_name=company_name,
+    )
+    if strict_contract_required:
+        summary_text = _apply_contract_structural_repairs(
+            summary_text,
+            include_health_rating=include_health_rating,
+            target_length=target_length,
+            calculated_metrics=calculated_metrics,
+        )
+    summary_text = _remove_metric_echo_loops(summary_text)
+    summary_text = _merge_staccato_paragraphs(summary_text)
+    summary_text = _cap_closing_sentences_filings(
+        summary_text,
+        max_sentences=_closing_sentence_cap_for_target(
+            target_length, include_health_rating=include_health_rating
+        ),
+    )
+    summary_text = _merge_duplicate_canonical_sections(
+        summary_text, include_health_rating=include_health_rating
+    )
+    summary_text = _ensure_final_strict_word_band(
+        summary_text,
+        target,
+        include_health_rating=include_health_rating,
+        tolerance=tolerance,
+        generation_stats=generation_stats,
+        allow_padding=False,
+    )
+    summary_text = _enforce_whitespace_word_band(
+        summary_text,
+        target,
+        tolerance=tolerance,
+        allow_padding=False,
+        dedupe=True,
+    )
+
+    final_split_wc = len((summary_text or "").split())
+    final_stripped_wc = _count_words(summary_text or "")
+    if generation_stats is not None:
+        generation_stats["short_underflow_rescue_in_band"] = bool(
+            lower <= final_split_wc <= upper and lower <= final_stripped_wc <= upper
+        )
+        generation_stats["short_underflow_rescue_targets"] = list(underweight_titles[:4])
+    return summary_text
+
+
 def _parse_summary_contract_missing_requirements(
     missing_requirements: Optional[List[str]],
 ) -> Dict[str, Any]:
@@ -22834,6 +23018,33 @@ FLOW AND QUALITY RULES:
                         rewrite_count,
                         generation_stats.get("post_final_quality_rewrite_used"),
                     )
+
+        if (
+            target_length
+            and short_quality_mode
+            and not fast_summary_mode
+            and not one_shot_deterministic_policy
+            and not continuous_v2_route_mode
+        ):
+            summary_text = _rescue_short_sectioned_underflow(
+                summary_text,
+                target_length=int(target_length),
+                include_health_rating=include_health_rating,
+                calculated_metrics=calculated_metrics,
+                company_name=company_name,
+                gemini_client=gemini_client,
+                quality_validators=post_final_quality_validators or quality_validators,
+                generation_stats=generation_stats,
+                strict_contract_required=bool(strict_contract_required),
+                token_budget=token_budget,
+                cost_budget=cost_budget,
+                max_output_tokens=max_output_tokens,
+                persona_intensity=(
+                    "subtle"
+                    if generation_stats.get("persona_intensity_downgraded")
+                    else "strong"
+                ),
+            )
 
         if (
             target_length
