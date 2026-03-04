@@ -13,6 +13,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, date
+from difflib import SequenceMatcher
 from html import unescape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Callable, Literal, Set
@@ -79,30 +80,75 @@ from app.services.summary_progress import (
 )
 from app.services.billing_usage import get_summary_usage_status
 from app.services.summary_export import build_summary_docx, build_summary_pdf
-from app.services.gemini_client import get_gemini_client, generate_growth_assessment
+from app.services.summary_budget_controller import (
+    DEFAULT_SECTION_WEIGHTS_WITH_HEALTH,
+    KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS as CANONICAL_KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS,
+    KEY_METRICS_FIXED_BUDGET_WORDS as CANONICAL_KEY_METRICS_FIXED_BUDGET_WORDS,
+    KEY_METRICS_MAX_WORDS as CANONICAL_KEY_METRICS_MAX_WORDS,
+    SHORT_FORM_SECTIONED_TARGET_MAX_WORDS as CANONICAL_SHORT_FORM_SECTIONED_TARGET_MAX_WORDS,
+    SHORT_FORM_SECTIONED_TARGET_MIN_WORDS as CANONICAL_SHORT_FORM_SECTIONED_TARGET_MIN_WORDS,
+    calculate_section_word_budgets as canonical_calculate_section_word_budgets,
+    describe_paragraph_range,
+    describe_sentence_range,
+    get_closing_takeaway_shape,
+    get_financial_health_shape,
+    get_risk_factors_shape,
+    section_budget_tolerance_words as canonical_section_budget_tolerance_words,
+    total_word_tolerance_words,
+)
+from app.services.prompt_pack import (
+    assemble_structured_summary,
+    build_structured_output_contract,
+    extract_structured_section_payload,
+)
+from app.services.openai_client import (
+    get_openai_client,
+    generate_growth_assessment,
+    build_company_research_prompt,
+)
+from app.services.summary_contracts import (
+    count_summary_contract_words,
+    repair_summary_contract_deterministically,
+    validate_summary_contract,
+)
+from app.services.ai_usage import (
+    load_ai_usage_events,
+    aggregate_ai_usage_by_request_id,
+)
 from app.services.spotlight_kpi.service import build_spotlight_payload_for_filing
-from app.services.gemini_exceptions import (
-    GeminiRateLimitError,
-    GeminiAPIError,
-    GeminiTimeoutError,
+from app.services.ai_exceptions import AIRateLimitError, AIAPIError, AITimeoutError
+from app.services.summary_two_agent import (
+    TwoAgentSummaryPipelineResult,
+    run_two_agent_summary_pipeline,
+)
+from app.services.summary_agents import (
+    run_summary_agent_pipeline,
+    PipelineResult,
+    SummarySectionBalanceError,
 )
 from app.services.health_scorer import calculate_health_score
 from app.services.sample_data import sample_filings_by_ticker
 from app.utils.supabase_errors import is_supabase_table_missing_error
+from app.services.summary_post_processor import validate_summary
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# Backward-compat module alias for older tests/mocks.
+get_gemini_client = get_openai_client
 
 try:
     import fitz  # PyMuPDF
 except Exception:  # noqa: BLE001
     fitz = None  # type: ignore[assignment]
 
-# Gemini 2.0 Flash Lite supports up to ~1M tokens. Cap context to keep requests fast.
-MAX_GEMINI_CONTEXT_CHARS = 200_000
-# Summary quality can degrade quickly when we fall back to deterministic padding.
-# Reduced from 3 to 2 attempts to speed up generation.
-MAX_SUMMARY_ATTEMPTS = 2
+# GPT-5.2 supports large context. Cap to keep requests fast.
+MAX_OPENAI_CONTEXT_CHARS = 200_000
+MAX_GEMINI_CONTEXT_CHARS = MAX_OPENAI_CONTEXT_CHARS
+# Summary generation is single-shot for cost/latency discipline.
+# If quality/length drift remains, we allow one targeted rewrite pass.
+MAX_SUMMARY_ATTEMPTS = 1
+MICRO_PLAINTEXT_SUMMARY_MAX_TARGET_WORDS = 180
 
 
 def _extract_word_count_control(text: str) -> Tuple[str, Optional[int]]:
@@ -114,7 +160,7 @@ def _extract_word_count_control(text: str) -> Tuple[str, Optional[int]]:
     if not text:
         return text, None
 
-    match = re.search(r"\bWORD_COUNT\s*[:=]\s*(\d{1,6})\b", text)
+    match = re.search(r"\bWORD[_\s]*COUNT\s*[:=]\s*(\d{1,6})\b", text)
     if not match:
         return text, None
 
@@ -124,7 +170,7 @@ def _extract_word_count_control(text: str) -> Tuple[str, Optional[int]]:
     except (TypeError, ValueError):
         reported = None
 
-    cleaned = re.sub(r"\bWORD_COUNT\s*[:=]\s*\d{1,6}\b", "", text).strip()
+    cleaned = re.sub(r"\bWORD[_\s]*COUNT\s*[:=]\s*\d{1,6}\b", "", text).strip()
     return cleaned, reported
 
 
@@ -142,6 +188,10 @@ def _normalize_casing(text: str) -> str:
             continue
         if stripped.startswith("#"):
             out.append(line)
+            continue
+        # Preserve parser markers exactly; these are consumed by the frontend grid parser.
+        if stripped.upper() in {"DATA_GRID_START", "DATA_GRID_END"}:
+            out.append(stripped.upper())
             continue
 
         letters = [c for c in stripped if c.isalpha()]
@@ -161,35 +211,197 @@ def _normalize_casing(text: str) -> str:
     return "\n".join(out)
 
 
-# Allow a couple of rewrite passes so we hit the strict word band
-# without relying on low-quality deterministic padding.
-MAX_REWRITE_ATTEMPTS = 2  # Reduced from 3 to speed up generation
-SUMMARY_TOTAL_TIMEOUT_SECONDS = 60  # Reduced from 120s to keep UI responsive
+def _summary_output_format_for_target(target_length: Optional[int]) -> str:
+    """Classify output format by requested target length."""
+    if target_length and int(target_length) <= MICRO_PLAINTEXT_SUMMARY_MAX_TARGET_WORDS:
+        return "plain_text_micro"
+    return "markdown_sectioned"
+
+
+def _is_micro_plaintext_target(target_length: Optional[int]) -> bool:
+    return _summary_output_format_for_target(target_length) == "plain_text_micro"
+
+
+def _is_short_form_sectioned_target(target_length: Optional[int]) -> bool:
+    if _is_micro_plaintext_target(target_length):
+        return False
+    try:
+        target = int(target_length or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        int(SHORT_FORM_SECTIONED_TARGET_MIN_WORDS)
+        <= target
+        < int(SHORT_FORM_SECTIONED_TARGET_MAX_WORDS)
+    )
+
+
+def _is_short_quality_sensitive_target(target_length: Optional[int]) -> bool:
+    if not _is_short_form_sectioned_target(target_length):
+        return False
+    try:
+        return int(target_length or 0) <= 1200
+    except (TypeError, ValueError):
+        return False
+
+
+def _build_micro_plaintext_summary_prompt(
+    *,
+    identity_block: str,
+    company_name: str,
+    ticker: str,
+    filing_type: str,
+    filing_date: str,
+    tone: str,
+    detail_level: str,
+    output_style: str,
+    target_length: int,
+    context_excerpt: str,
+    truncated_note: str,
+    financial_snapshot: str,
+    metrics_lines: str,
+    prior_period_delta_block: str,
+    risk_factors_block: str,
+    preference_block: str,
+    company_profile_block: str = "",
+    company_research_block_placeholder: str = "__COMPANY_RESEARCH_BLOCK__",
+) -> str:
+    """Build a compact one-shot prompt for tiny exact-length summaries."""
+    return f"""
+{identity_block}
+Write a single-line investment summary for {company_name} ({ticker or 'N/A'}) based on this {filing_type} filed {filing_date}.
+{company_profile_block}
+{company_research_block_placeholder}
+
+TARGET CONTRACT (HARD):
+- Output EXACTLY {int(target_length)} words.
+- One line only. Plain text only. No markdown headings, bullets, or labels.
+- End with final punctuation.
+- Decision-oriented verdict plus the single biggest driver.
+- No repeated words, no filler padding, no counting commentary, no self-referential text.
+- Do not mention instructions or word counts.
+- If evidence is mixed, still choose a clear directional posture and name the key constraint.
+
+STYLE:
+- Tone: {tone.title()}
+- Detail Level: {detail_level.title()} (compress to essentials only)
+- Output Style: {output_style.title()} (but still plain text single line)
+
+{preference_block}
+
+CONTEXT:
+{context_excerpt}{truncated_note}
+
+FINANCIAL SNAPSHOT (Reference):
+{financial_snapshot}
+
+KEY METRICS (Reference):
+{metrics_lines}
+{prior_period_delta_block}
+{risk_factors_block}
+
+Return only the final {int(target_length)}-word summary line.
+""".strip()
+
+
+def _make_micro_plaintext_summary_validator(
+    target_length: int,
+) -> Callable[[str], Optional[str]]:
+    """Validate tiny one-line summaries for exact word count and anti-slop quality."""
+
+    def _validator(text: str) -> Optional[str]:
+        report = validate_summary_contract(
+            text or "",
+            target_words=max(1, int(target_length)),
+            require_single_line=True,
+            forbid_markdown_headings=True,
+        )
+        reasons = list(report.get("reasons") or [])
+        if not reasons:
+            return None
+        return "micro_summary_contract_failed: " + ", ".join(str(r) for r in reasons)
+
+    return _validator
+
+
+# Prefer a small number of targeted rewrites before deterministic padding.
+# This is especially important for long targets where deterministic addenda can
+# degrade narrative quality.
+MAX_REWRITE_ATTEMPTS = 3
+try:
+    SUMMARY_TOTAL_TIMEOUT_SECONDS = int(
+        os.getenv("SUMMARY_TOTAL_TIMEOUT_SECONDS", "180")
+    )
+except ValueError:
+    SUMMARY_TOTAL_TIMEOUT_SECONDS = 180
+
+# Fast summary mode defaults (latency/cost-first). Strict contract remains
+# available via request opt-in (`strict_contract=true`).
+DEFAULT_FAST_SUMMARY_MAX_RUNTIME_SECONDS = 90
+DEFAULT_FAST_SUMMARY_MAX_COST_USD = 0.20
+DEFAULT_FAST_SUMMARY_MAX_REWRITES = 0
+DEFAULT_FAST_SUMMARY_CACHE_TTL_SECONDS = 24 * 60 * 60
+
+# Process-local best-effort cache for fast summaries (Cloud Run instance scoped).
+_fast_summary_response_cache: Dict[str, Dict[str, Any]] = {}
+
+# ---------------------------------------------------------------------------
+# Three-agent pipeline feature flag
+# ---------------------------------------------------------------------------
+USE_THREE_AGENT_PIPELINE = bool(
+    os.getenv("USE_THREE_AGENT_PIPELINE", "").strip().lower() in ("1", "true", "yes")
+)
 
 # ---------------------------------------------------------------------------
 # Cost / token budget guardrails
 # ---------------------------------------------------------------------------
-# Pro plan economics: $10 / 100 summaries => $0.10 budget per summary.
+# Pro plan economics target: $0.20 budget per summary.
 #
-# Gemini pricing is typically quoted per 1K tokens. To keep a hard upper bound
-# on spend per summary, we estimate tokens from characters using a conservative
-# heuristic (1 token ~= 4 chars). This is not perfect tokenization, but it is
-# reliable enough for defensive budgeting.
-#
+# GPT-5.2 pricing: input ~$2.50/1M, output ~$10.00/1M.
 # Configure via env if you want to tweak without code changes:
-#   - GEMINI_COST_PER_SUMMARY_USD (default 0.10)
-#   - GEMINI_COST_PER_1K_TOKENS_USD (default 0.002)
-#   - GEMINI_MAX_OUTPUT_TOKENS (default 9000)
-#   - GEMINI_SUMMARY_TOKEN_RESERVE (default 0)
+#   - OPENAI_COST_PER_SUMMARY_USD (default 0.20)
+#   - OPENAI_COST_PER_1K_TOKENS_USD (default 0.005)
+#   - OPENAI_MAX_OUTPUT_TOKENS (default 9000)
+#   - OPENAI_SUMMARY_TOKEN_RESERVE (default 0)
 
-DEFAULT_SUMMARY_BUDGET_USD = 0.10
-DEFAULT_GEMINI_COST_PER_1K_TOKENS_USD = 0.002
-DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = 4500
+DEFAULT_SUMMARY_BUDGET_USD = 0.20
+DEFAULT_OPENAI_COST_PER_1K_TOKENS_USD = 0.005  # GPT-5.2 blended rate
+DEFAULT_OPENAI_MAX_OUTPUT_TOKENS = 9000
+DEFAULT_GEMINI_COST_PER_1K_TOKENS_USD = DEFAULT_OPENAI_COST_PER_1K_TOKENS_USD
+DEFAULT_GEMINI_MAX_OUTPUT_TOKENS = DEFAULT_OPENAI_MAX_OUTPUT_TOKENS
 DEFAULT_SUMMARY_TOKEN_RESERVE = 0
 CHARS_PER_TOKEN_ESTIMATE = 4
 DEFAULT_SPOTLIGHT_DOCUMENT_EXCERPT_CHARS = 650_000
 DEFAULT_SUMMARY_DOCUMENT_EXCERPT_CHARS = 240_000
 DEFAULT_SUMMARY_PDF_MAX_PAGES = 80
+DEFAULT_SUMMARY_PRIMARY_MODEL_NAME = "gpt-5.2"
+DEFAULT_SUMMARY_FALLBACK_MODEL_NAME = "gpt-5.2"
+DEFAULT_SUMMARY_PRIMARY_INPUT_RATE_PER_1M_USD = 2.50
+DEFAULT_SUMMARY_PRIMARY_OUTPUT_RATE_PER_1M_USD = 10.00
+DEFAULT_SUMMARY_FALLBACK_INPUT_RATE_PER_1M_USD = 2.50
+DEFAULT_SUMMARY_FALLBACK_OUTPUT_RATE_PER_1M_USD = 10.00
+DEFAULT_SUMMARY_AGENT1_MAX_OUTPUT_TOKENS = 700
+DEFAULT_SUMMARY_RESEARCH_MAX_WORDS = 350
+DEFAULT_SUMMARY_SNIPPETS_REDUCED_MAX_CHARS = 1200
+DEFAULT_SUMMARY_RISK_EXCERPT_REDUCED_MAX_CHARS = 5000
+DEFAULT_SUMMARY_PRIMARY_DOCS_TIMEOUT_SECONDS = 12
+DEFAULT_SUMMARY_MIN_VERIFIED_QUOTES = 3
+DEFAULT_SUMMARY_MAX_VERIFIED_QUOTES = 5
+DEFAULT_SUMMARY_PRO_MIN_TARGET_WORDS = 1500
+DEFAULT_SUMMARY_LONGFORM_TOKEN_BUDGET_TOKENS = 160_000
+DEFAULT_SUMMARY_OUTPUT_TOKENS_PER_WORD = 2.0
+DEFAULT_SUMMARY_OUTPUT_TOKENS_PER_WORD_LONGFORM = 2.0
+DEFAULT_SUMMARY_LONGFORM_MODEL_NAME = "gpt-4.1-mini"
+DEFAULT_SUMMARY_LONGFORM_INPUT_RATE_PER_1M_USD = 0.40
+DEFAULT_SUMMARY_LONGFORM_OUTPUT_RATE_PER_1M_USD = 1.60
+FINAL_STRICT_WORD_BAND_TOLERANCE = 10
+
+
+def _effective_word_band_tolerance(target_length: Optional[int] = None) -> int:
+    """Return the active memo word-band tolerance."""
+    if target_length and _summary_continuous_v2_enabled():
+        return int(total_word_tolerance_words(int(target_length)))
+    return int(FINAL_STRICT_WORD_BAND_TOLERANCE)
 
 
 def _float_env(name: str, default: float) -> float:
@@ -212,11 +424,695 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _summary_continuous_v2_enabled() -> bool:
+    return bool(_bool_env("SUMMARY_CONTINUOUS_V2", False))
+
+
+def _summary_continuous_v2_auto_longform_enabled() -> bool:
+    return bool(_bool_env("SUMMARY_CONTINUOUS_V2_AUTO_LONGFORM", True))
+
+
+def _summary_continuous_v2_requested_for_target(
+    target_length: Optional[int] = None,
+) -> bool:
+    if _summary_continuous_v2_enabled():
+        return True
+    return bool(
+        _summary_continuous_v2_auto_longform_enabled()
+        and _is_long_form_target(target_length)
+    )
+
+
+def _summary_flow_rewrite_v2_enabled() -> bool:
+    return bool(_bool_env("SUMMARY_FLOW_REWRITE_V2_ENABLED", False))
+
+
+def _summary_generation_policy_name(
+    *,
+    target_length: Optional[int],
+    one_shot_deterministic_policy: bool,
+    generation_stats: Optional[Dict[str, Any]] = None,
+    pipeline_mode: Optional[str] = None,
+) -> str:
+    stats = generation_stats or {}
+    resolved_pipeline_mode = str(
+        pipeline_mode or stats.get("pipeline_mode") or ""
+    ).strip()
+    if bool(stats.get("summary_continuous_v2")) or "sectioned" in resolved_pipeline_mode:
+        return "continuous_v2_sectioned"
+    if one_shot_deterministic_policy and target_length:
+        return "one_shot_deterministic"
+    return "legacy_multi_pass"
+
+
+def _summary_flow_rewrite_v2_flash_first() -> bool:
+    # Flash-first routing is retired for summaries. The two-agent summary path
+    # is hard-locked to GPT-5.2.
+    return False
+
+
+def _summary_longform_model_name() -> str:
+    return _summary_model_name_from_env(
+        "OPENAI_SUMMARY_LONGFORM_MODEL_NAME",
+        DEFAULT_SUMMARY_LONGFORM_MODEL_NAME,
+    )
+
+
+def _summary_longform_input_rate_per_1m() -> float:
+    return max(
+        0.0,
+        _float_env(
+            "OPENAI_SUMMARY_LONGFORM_INPUT_RATE_PER_1M_USD",
+            DEFAULT_SUMMARY_LONGFORM_INPUT_RATE_PER_1M_USD,
+        ),
+    )
+
+
+def _summary_longform_output_rate_per_1m() -> float:
+    return max(
+        0.0,
+        _float_env(
+            "OPENAI_SUMMARY_LONGFORM_OUTPUT_RATE_PER_1M_USD",
+            DEFAULT_SUMMARY_LONGFORM_OUTPUT_RATE_PER_1M_USD,
+        ),
+    )
+
+
+def _summary_locked_model_name(*, target_length: Optional[int] = None) -> str:
+    """Select summary model. Locked to GPT-5.2 for all target lengths."""
+    return "gpt-5.2"
+
+
+def _get_summary_openai_client(model_name: Optional[str] = None):
+    """Return the summary client with OpenAI-first routing.
+
+    Runtime path always uses `get_openai_client`. The legacy gemini alias check
+    is only for tests that monkeypatch `get_gemini_client`.
+    """
+    resolved = (model_name or "").strip() or _summary_locked_model_name()
+    legacy_factory = globals().get("get_gemini_client")
+    if legacy_factory is not None and legacy_factory is not get_openai_client:
+        try:
+            return legacy_factory(model_name=resolved)
+        except TypeError:
+            return legacy_factory()
+    return get_openai_client(model_name=resolved)
+
+
+def _summary_force_pro_only() -> bool:
+    return _bool_env("SUMMARY_FORCE_PRO_ONLY", False)
+
+
+def _summary_primary_docs_required() -> bool:
+    return _bool_env("SUMMARY_PRIMARY_DOCS_REQUIRED", True)
+
+
+def _summary_primary_docs_timeout_seconds() -> int:
+    return _int_env(
+        "SUMMARY_PRIMARY_DOCS_TIMEOUT_SECONDS",
+        DEFAULT_SUMMARY_PRIMARY_DOCS_TIMEOUT_SECONDS,
+    )
+
+
+def _summary_rewrite_timeout_seconds() -> float:
+    """Timeout for rewrite-only LLM passes.
+
+    Uses OPENAI_REQUEST_TIMEOUT_SECONDS when a summary-specific timeout is not set.
+    """
+    timeout = _float_env("SUMMARY_REWRITE_TIMEOUT_SECONDS", 0.0)
+    if timeout <= 0:
+        timeout = _float_env("OPENAI_REQUEST_TIMEOUT_SECONDS", 0.0)
+    if timeout <= 0:
+        timeout = 120.0
+    return max(8.0, float(timeout))
+
+
+def _summary_min_verified_quotes() -> int:
+    return max(
+        0, _int_env("SUMMARY_MIN_VERIFIED_QUOTES", DEFAULT_SUMMARY_MIN_VERIFIED_QUOTES)
+    )
+
+
+def _summary_max_verified_quotes() -> int:
+    return max(
+        _summary_min_verified_quotes(),
+        _int_env("SUMMARY_MAX_VERIFIED_QUOTES", DEFAULT_SUMMARY_MAX_VERIFIED_QUOTES),
+    )
+
+
+def _summary_pro_min_target_words() -> int:
+    return max(
+        1,
+        _int_env(
+            "SUMMARY_PRO_MIN_TARGET_WORDS",
+            DEFAULT_SUMMARY_PRO_MIN_TARGET_WORDS,
+        ),
+    )
+
+
+def _summary_longform_token_budget_tokens() -> int:
+    return max(
+        0,
+        _int_env(
+            "SUMMARY_LONGFORM_TOKEN_BUDGET_TOKENS",
+            DEFAULT_SUMMARY_LONGFORM_TOKEN_BUDGET_TOKENS,
+        ),
+    )
+
+
+def _summary_agent1_max_output_tokens() -> int:
+    return max(
+        100,
+        _int_env(
+            "SUMMARY_AGENT1_MAX_OUTPUT_TOKENS",
+            DEFAULT_SUMMARY_AGENT1_MAX_OUTPUT_TOKENS,
+        ),
+    )
+
+
+def _summary_research_max_words() -> int:
+    return max(
+        0,
+        _int_env("SUMMARY_RESEARCH_MAX_WORDS", DEFAULT_SUMMARY_RESEARCH_MAX_WORDS),
+    )
+
+
+def _summary_research_token_reserve_tokens() -> int:
+    raw = (os.getenv("SUMMARY_RESEARCH_TOKEN_RESERVE") or "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    max_words = _summary_research_max_words()
+    if max_words <= 0:
+        return 0
+    # Rough upper-bound reserve for Agent-1 block + framing text in Agent-2 prompt.
+    return max(80, int(max_words * 2))
+
+
+def _summary_snippets_reduced_max_chars() -> int:
+    return max(
+        0,
+        _int_env(
+            "SUMMARY_SNIPPETS_REDUCED_MAX_CHARS",
+            DEFAULT_SUMMARY_SNIPPETS_REDUCED_MAX_CHARS,
+        ),
+    )
+
+
+def _summary_risk_excerpt_reduced_max_chars() -> int:
+    return max(
+        0,
+        _int_env(
+            "SUMMARY_RISK_EXCERPT_REDUCED_MAX_CHARS",
+            DEFAULT_SUMMARY_RISK_EXCERPT_REDUCED_MAX_CHARS,
+        ),
+    )
+
+
+def _summary_output_tokens_per_word(*, target_length: Optional[int]) -> float:
+    is_long_form = _is_long_form_target(target_length)
+    env_name = (
+        "SUMMARY_OUTPUT_TOKENS_PER_WORD_LONGFORM"
+        if is_long_form
+        else "SUMMARY_OUTPUT_TOKENS_PER_WORD"
+    )
+    default = (
+        DEFAULT_SUMMARY_OUTPUT_TOKENS_PER_WORD_LONGFORM
+        if is_long_form
+        else DEFAULT_SUMMARY_OUTPUT_TOKENS_PER_WORD
+    )
+    return min(3.0, max(1.2, _float_env(env_name, default)))
+
+
+def _summary_strict_longform_contract_required() -> bool:
+    """Whether target-length contract violations should hard-fail the request."""
+    return _bool_env("SUMMARY_STRICT_LONGFORM_CONTRACT_REQUIRED", True)
+
+
+def _summary_strict_target_contract_required() -> bool:
+    """Compatibility alias for strict target-length contract enforcement.
+
+    The env var name is legacy; current behavior applies strict target-length
+    contract enforcement to all targets when enabled.
+    """
+    return _summary_strict_longform_contract_required()
+
+
+def _summary_fast_mode_default() -> bool:
+    return _bool_env("SUMMARY_FAST_MODE_DEFAULT", True)
+
+
+def _summary_allow_request_strict_contract() -> bool:
+    """Allow clients to opt into strict contract mode.
+
+    Disabled by default so stale frontend payloads cannot accidentally force
+    the slow/costly strict path for normal users.
+    """
+    return _bool_env("SUMMARY_ALLOW_REQUEST_STRICT_CONTRACT", False)
+
+
+def _fast_summary_max_runtime_seconds() -> int:
+    return max(
+        15,
+        _int_env(
+            "FAST_SUMMARY_MAX_RUNTIME_SECONDS",
+            DEFAULT_FAST_SUMMARY_MAX_RUNTIME_SECONDS,
+        ),
+    )
+
+
+def _fast_summary_max_cost_usd() -> float:
+    return max(
+        0.01,
+        _float_env("FAST_SUMMARY_MAX_COST_USD", DEFAULT_FAST_SUMMARY_MAX_COST_USD),
+    )
+
+
+def _fast_summary_max_rewrites() -> int:
+    return max(
+        0,
+        _int_env("FAST_SUMMARY_MAX_REWRITES", DEFAULT_FAST_SUMMARY_MAX_REWRITES),
+    )
+
+
+def _fast_summary_cache_ttl_seconds() -> int:
+    return max(
+        0,
+        _int_env(
+            "FAST_SUMMARY_CACHE_TTL_SECONDS",
+            DEFAULT_FAST_SUMMARY_CACHE_TTL_SECONDS,
+        ),
+    )
+
+
+def _fast_summary_context_max_chars(target_length: Optional[int]) -> int:
+    target = int(target_length or 0)
+    if target and target <= 250:
+        return 22_000
+    if target and target <= 800:
+        return 42_000
+    if target and target <= 1500:
+        return 65_000
+    if target and target > 1500:
+        return 85_000
+    return 42_000
+
+
+def _fast_summary_output_token_cap(
+    target_length: Optional[int], default_cap: int
+) -> int:
+    target = int(target_length or 0)
+    cap = int(default_cap or DEFAULT_OPENAI_MAX_OUTPUT_TOKENS)
+    if target and target <= 250:
+        return max(600, min(cap, 1400))
+    if target and target <= 800:
+        return max(1200, min(cap, 2600))
+    if target and target <= 1500:
+        return max(2000, min(cap, 4200))
+    if target and target > 1500:
+        return max(2600, min(cap, 5200))
+    return min(cap, 2600)
+
+
+def _summary_preferences_payload_for_cache(preferences: Optional[Any]) -> Dict[str, Any]:
+    if preferences is None:
+        return {}
+    try:
+        if hasattr(preferences, "model_dump"):
+            payload = preferences.model_dump(exclude_none=True)  # pydantic v2
+        elif hasattr(preferences, "dict"):
+            payload = preferences.dict(exclude_none=True)  # pydantic v1 fallback
+        else:
+            payload = {}
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        return {}
+    return payload
+
+
+def _build_fast_summary_cache_key(
+    *,
+    filing_id: str,
+    preferences: Optional[Any],
+    target_length: Optional[int],
+    quality_mode: str,
+) -> str:
+    payload = {
+        "filing_id": str(filing_id),
+        "target_length": int(target_length or 0),
+        "quality_mode": str(quality_mode or "fast"),
+        "preferences": _summary_preferences_payload_for_cache(preferences),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _get_fast_summary_cached_response(cache_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    key = str(cache_key or "").strip()
+    if not key:
+        return None
+    entry = _fast_summary_response_cache.get(key)
+    if not entry:
+        return None
+    expires_at = float(entry.get("expires_at") or 0.0)
+    if expires_at and expires_at < time.time():
+        _fast_summary_response_cache.pop(key, None)
+        return None
+    payload = entry.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    try:
+        # Defensive copy so per-request fields can be mutated safely.
+        return json.loads(json.dumps(payload))
+    except Exception:
+        return dict(payload)
+
+
+def _set_fast_summary_cached_response(
+    cache_key: Optional[str], response_payload: Dict[str, Any]
+) -> None:
+    key = str(cache_key or "").strip()
+    if not key:
+        return
+    ttl = _fast_summary_cache_ttl_seconds()
+    if ttl <= 0:
+        return
+    if not isinstance(response_payload, dict):
+        return
+    try:
+        payload_copy = json.loads(json.dumps(response_payload))
+    except Exception:
+        payload_copy = dict(response_payload)
+    _fast_summary_response_cache[key] = {
+        "expires_at": float(time.time() + ttl),
+        "payload": payload_copy,
+    }
+
+
+def _parse_key_metrics_data_grid_block(
+    text: str, *, require_markers: bool = True
+) -> Tuple[int, List[str]]:
+    """Parse DATA_GRID rows and return (numeric_row_count, invalid_lines)."""
+    raw = (text or "").strip()
+    if not raw:
+        return 0, []  # Let the min_rows check produce the correct error message
+
+    def _normalize_line(value: str) -> str:
+        line = (value or "").strip()
+        if not line:
+            return ""
+        line = line.replace("｜", "|").replace("¦", "|")
+        # Allow common markdown wrappers while keeping strict Label | Value semantics.
+        line = re.sub(r"^[\-*•]\s+", "", line)
+        line = line.strip().strip("`").strip()
+        if line.startswith("|") and line.endswith("|") and len(line) >= 2:
+            line = line.strip("|").strip()
+        return line
+
+    def _strip_markdown_wrappers(value: str) -> str:
+        token = (value or "").strip()
+        if not token:
+            return ""
+        wrappers = ("**", "__", "~~", "`", "*", "_")
+        for _ in range(4):
+            changed = False
+            for marker in wrappers:
+                mlen = len(marker)
+                if (
+                    token.startswith(marker)
+                    and token.endswith(marker)
+                    and len(token) > (mlen * 2)
+                ):
+                    token = token[mlen:-mlen].strip()
+                    changed = True
+            if not changed:
+                break
+        return token
+
+    def _is_numeric_row(value: str) -> bool:
+        line = _normalize_line(value)
+        if not line or "|" not in line:
+            return False
+        parts = [p.strip() for p in line.split("|", 1)]
+        if len(parts) != 2:
+            return False
+        label, metric_value = (
+            _strip_markdown_wrappers(parts[0]),
+            _strip_markdown_wrappers(parts[1]),
+        )
+        if not label or not metric_value:
+            return False
+        return bool(re.search(r"\d", metric_value))
+
+    body = raw
+    invalid_lines: List[str] = []
+    outside_numeric_rows = 0
+    marker_re = re.compile(
+        r"^\s*DATA_GRID_START\s*$([\s\S]*?)^\s*DATA_GRID_END\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    marker_match = marker_re.search(raw)
+    if marker_match:
+        body = marker_match.group(1)
+        outside = f"{raw[: marker_match.start()]}{raw[marker_match.end() :]}"
+        for line in outside.splitlines():
+            stripped = _normalize_line(line)
+            if not stripped:
+                continue
+            if stripped.upper() in {"DATA_GRID_START", "DATA_GRID_END"}:
+                continue
+            if _is_numeric_row(stripped):
+                outside_numeric_rows += 1
+                continue
+            invalid_lines.append(stripped)
+    elif require_markers:
+        return 0, ["Missing DATA_GRID_START/END markers"]
+
+    numeric_rows = int(outside_numeric_rows)
+    for line in body.splitlines():
+        stripped = _normalize_line(line)
+        if not stripped:
+            continue
+        if stripped.upper() in {"DATA_GRID_START", "DATA_GRID_END"}:
+            continue
+        if not _is_numeric_row(stripped):
+            invalid_lines.append(stripped)
+            continue
+        numeric_rows += 1
+    return numeric_rows, invalid_lines
+
+
+def _validate_key_metrics_numeric_block(
+    text: str,
+    *,
+    min_rows: int = 5,
+    require_markers: bool = True,
+) -> Tuple[Optional[str], int]:
+    numeric_rows, invalid_lines = _parse_key_metrics_data_grid_block(
+        text, require_markers=require_markers
+    )
+    if invalid_lines:
+        sample = invalid_lines[0][:120]
+        return (
+            f"Key Metrics must be numeric DATA_GRID rows only. Found invalid line: '{sample}'.",
+            numeric_rows,
+        )
+    if numeric_rows < int(min_rows):
+        return (
+            f"Key Metrics must include at least {int(min_rows)} numeric rows; found {numeric_rows}.",
+            numeric_rows,
+        )
+    return None, numeric_rows
+
+
+def _is_long_form_target(target_length: Optional[int]) -> bool:
+    if not target_length:
+        return False
+    try:
+        return int(target_length) >= int(_summary_pro_min_target_words())
+    except Exception:
+        return False
+
+
+def _allow_padding_for_target(
+    target_length: Optional[int], current_wc: Optional[int] = None
+) -> bool:
+    """Allow padding for short-form always; for long-form only when deficit is moderate (≤5%)."""
+    if target_length and _summary_continuous_v2_enabled():
+        return False
+    if _is_short_quality_sensitive_target(target_length):
+        return False
+    if not target_length or not _is_long_form_target(target_length):
+        return True
+    if current_wc is None:
+        return False  # Can't determine deficit, stay conservative
+    deficit = max(0, int(target_length) - int(current_wc))
+    return deficit <= int(int(target_length) * 0.05)
+
+
+def _is_flash_model_name(model_name: Optional[str]) -> bool:
+    return "flash" in str(model_name or "").strip().lower()
+
+
+class SummaryBudgetExceededError(Exception):
+    """Raised when strict per-summary budget cannot be satisfied."""
+
+    def __init__(self, detail: Dict[str, Any]):
+        super().__init__(str(detail.get("detail") or "Summary budget exceeded."))
+        self.detail = detail
+
+
+def _truncate_text_to_max_words(text: str, *, max_words: int) -> str:
+    if not text:
+        return ""
+    limit = max(0, int(max_words))
+    if limit <= 0:
+        return ""
+    matches = list(re.finditer(r"\S+", text))
+    if len(matches) <= limit:
+        return text.strip()
+    cutoff = matches[limit - 1].end()
+    return text[:cutoff].strip()
+
+
+def _budget_guidance_for_stage(stage: str) -> str:
+    normalized = str(stage or "").lower()
+    if "preflight" in normalized:
+        return (
+            "Estimated minimum cost is above the strict budget cap. "
+            "Retry with a shorter target length or less filing context."
+        )
+    if "rewrite" in normalized:
+        return (
+            "The rewrite step would exceed the strict budget cap. "
+            "Retry with a shorter target length or less filing context."
+        )
+    if "generation" in normalized:
+        return (
+            "Prompt budget adaptation was attempted before generation, but the request still "
+            "exceeds the strict cap. Retry with a shorter target length or less filing context."
+        )
+    return "Retry with a shorter target length or less filing context."
+
+
+def _suggest_budget_safe_target_length(
+    *,
+    target_length: Optional[int],
+    budget_cap_usd: Optional[float],
+    projected_cost_usd: Optional[float],
+) -> Optional[int]:
+    try:
+        target = int(target_length or 0)
+    except (TypeError, ValueError):
+        return None
+    if target <= 1:
+        return None
+
+    try:
+        cap = float(budget_cap_usd or 0.0)
+        projected = float(projected_cost_usd or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if cap <= 0 or projected <= cap:
+        return None
+
+    ratio = cap / projected
+    if ratio <= 0:
+        return None
+    suggested = int(max(1, round(target * ratio * 0.98)))
+    if suggested >= target:
+        suggested = max(1, target - 25)
+    if suggested <= 0:
+        return None
+    return suggested if suggested < target else None
+
+
+def _decorate_budget_exceeded_detail(
+    detail: Dict[str, Any],
+    *,
+    stage: str,
+    target_length: Optional[int] = None,
+    budget_adjustments_attempted: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    payload = dict(detail or {})
+    payload["failure_code"] = "SUMMARY_BUDGET_EXCEEDED"
+    payload["stage"] = str(stage or payload.get("stage") or "unknown")
+    if target_length:
+        payload["target_length"] = int(target_length)
+    elif payload.get("target_length") in {None, 0, "0"}:
+        payload.pop("target_length", None)
+
+    def _as_float(value: Any) -> Optional[float]:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not (parsed == parsed):  # NaN guard
+            return None
+        return parsed
+
+    budget_cap = _as_float(payload.get("budget_cap_usd"))
+    projected_candidates = (
+        payload.get("projected_cost_usd"),
+        payload.get("estimated_min_cost_usd"),
+        payload.get("actual_cost_usd"),
+    )
+    projected_cost = next(
+        (
+            candidate
+            for candidate in (_as_float(v) for v in projected_candidates)
+            if candidate is not None
+        ),
+        None,
+    )
+    suggested = _suggest_budget_safe_target_length(
+        target_length=int(payload.get("target_length"))
+        if payload.get("target_length") is not None
+        else None,
+        budget_cap_usd=budget_cap,
+        projected_cost_usd=projected_cost,
+    )
+    if suggested is not None:
+        payload["suggested_target_length"] = int(suggested)
+
+    attempts = budget_adjustments_attempted
+    if attempts is None and isinstance(
+        payload.get("budget_adjustments_attempted"), list
+    ):
+        attempts = payload.get("budget_adjustments_attempted")
+    normalized_attempts = [
+        str(item).strip() for item in (attempts or []) if str(item).strip()
+    ]
+    if normalized_attempts:
+        payload["budget_adjustments_attempted"] = list(
+            dict.fromkeys(normalized_attempts)
+        )
+
+    if not str(payload.get("guidance") or "").strip():
+        payload["guidance"] = _budget_guidance_for_stage(payload["stage"])
+    return payload
+
+
 @dataclass
 class TokenBudget:
     """Best-effort token budget tracker (defensive cost control).
 
-    We track remaining tokens across multiple Gemini calls in a single summary
+    We track remaining tokens across multiple AI calls in a single summary
     request. When the budget is insufficient, we skip additional LLM rewrites
     and fall back to deterministic trimming/padding.
     """
@@ -243,12 +1139,288 @@ class TokenBudget:
         return used
 
 
-def _summary_token_budget() -> TokenBudget:
-    budget_usd = _float_env("GEMINI_COST_PER_SUMMARY_USD", DEFAULT_SUMMARY_BUDGET_USD)
-    cost_per_1k = _float_env(
-        "GEMINI_COST_PER_1K_TOKENS_USD", DEFAULT_GEMINI_COST_PER_1K_TOKENS_USD
+@dataclass
+class SummaryCostBudget:
+    budget_cap_usd: float
+    input_rate_per_1m: float
+    output_rate_per_1m: float
+    spent_usd: float = 0.0
+
+    def estimate_tokens(self, text: Optional[str]) -> int:
+        if not text:
+            return 0
+        return max(1, int(len(text) / CHARS_PER_TOKEN_ESTIMATE))
+
+    def estimate_cost(
+        self,
+        *,
+        prompt_tokens: int,
+        output_tokens: int,
+    ) -> float:
+        return _estimate_summary_call_cost_usd(
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
+            input_rate_per_1m=self.input_rate_per_1m,
+            output_rate_per_1m=self.output_rate_per_1m,
+        )
+
+    def estimate_call(self, prompt: str, expected_output_tokens: int) -> float:
+        return self.estimate_cost(
+            prompt_tokens=self.estimate_tokens(prompt),
+            output_tokens=max(0, int(expected_output_tokens)),
+        )
+
+    def can_afford(self, prompt: str, expected_output_tokens: int) -> bool:
+        projected = self.spent_usd + self.estimate_call(prompt, expected_output_tokens)
+        return projected <= max(0.0, float(self.budget_cap_usd))
+
+    def charge(self, prompt: str, output: str) -> float:
+        cost = self.estimate_cost(
+            prompt_tokens=self.estimate_tokens(prompt),
+            output_tokens=self.estimate_tokens(output),
+        )
+        self.spent_usd += float(cost)
+        return float(cost)
+
+    @property
+    def remaining_usd(self) -> float:
+        return max(0.0, float(self.budget_cap_usd) - float(self.spent_usd))
+
+
+def _compute_generation_prompt_caps(
+    *,
+    token_budget: Optional[TokenBudget],
+    cost_budget: Optional[SummaryCostBudget],
+    expected_output_tokens: int,
+    epsilon_usd: float = 0.00025,
+    reserve_tokens: int = 0,
+) -> Dict[str, Optional[int]]:
+    """Compute deterministic prompt token/char caps shared by preflight and runtime."""
+    expected = max(0, int(expected_output_tokens))
+    reserve = max(0, int(reserve_tokens))
+    max_prompt_tokens_token_budget: Optional[int] = None
+    max_prompt_tokens_cost_budget: Optional[int] = None
+
+    if token_budget is not None:
+        max_prompt_tokens_token_budget = max(
+            0,
+            int(token_budget.remaining_tokens) - expected - reserve,
+        )
+
+    if cost_budget is not None:
+        input_rate = max(0.0, float(cost_budget.input_rate_per_1m))
+        output_rate = max(0.0, float(cost_budget.output_rate_per_1m))
+        if input_rate > 0:
+            generation_output_cost_usd = (expected / 1_000_000.0) * output_rate
+            available_input_cost_usd = (
+                float(cost_budget.budget_cap_usd)
+                - float(cost_budget.spent_usd)
+                - generation_output_cost_usd
+                - max(0.0, float(epsilon_usd))
+            )
+            if available_input_cost_usd <= 0:
+                max_prompt_tokens_cost_budget = 0
+            else:
+                max_prompt_tokens_cost_budget = max(
+                    0,
+                    int((available_input_cost_usd / input_rate) * 1_000_000.0)
+                    - reserve,
+                )
+
+    token_limits = [
+        value
+        for value in (max_prompt_tokens_token_budget, max_prompt_tokens_cost_budget)
+        if value is not None
+    ]
+    max_prompt_tokens_effective: Optional[int] = (
+        max(0, min(token_limits)) if token_limits else None
     )
-    reserve = _int_env("GEMINI_SUMMARY_TOKEN_RESERVE", DEFAULT_SUMMARY_TOKEN_RESERVE)
+    max_prompt_chars_effective: Optional[int] = (
+        max(0, int(max_prompt_tokens_effective * CHARS_PER_TOKEN_ESTIMATE))
+        if max_prompt_tokens_effective is not None
+        else None
+    )
+
+    return {
+        "max_prompt_tokens_token_budget": max_prompt_tokens_token_budget,
+        "max_prompt_tokens_cost_budget": max_prompt_tokens_cost_budget,
+        "max_prompt_tokens_effective": max_prompt_tokens_effective,
+        "max_prompt_chars_effective": max_prompt_chars_effective,
+    }
+
+
+def _summary_budget_cap_usd(*, target_length: Optional[int] = None) -> float:
+    base = max(
+        0.0,
+        float(_float_env("OPENAI_COST_PER_SUMMARY_USD", DEFAULT_SUMMARY_BUDGET_USD)),
+    )
+    if target_length and _is_long_form_target(target_length):
+        longform_cap = max(
+            0.0,
+            float(
+                _float_env(
+                    "OPENAI_COST_PER_LONGFORM_SUMMARY_USD",
+                    DEFAULT_SUMMARY_BUDGET_USD,
+                )
+            ),
+        )
+        return max(base, longform_cap)
+    return base
+
+
+def _summary_cost_input_rate_per_1m() -> float:
+    return max(
+        0.0,
+        float(
+            _float_env(
+                "OPENAI_COST_PER_1M_INPUT_TOKENS",
+                _float_env(
+                    "OPENAI_SUMMARY_PRIMARY_INPUT_RATE_PER_1M_USD",
+                    DEFAULT_SUMMARY_PRIMARY_INPUT_RATE_PER_1M_USD,
+                ),
+            )
+        ),
+    )
+
+
+def _summary_cost_output_rate_per_1m() -> float:
+    return max(
+        0.0,
+        float(
+            _float_env(
+                "OPENAI_COST_PER_1M_OUTPUT_TOKENS",
+                _float_env(
+                    "OPENAI_SUMMARY_PRIMARY_OUTPUT_RATE_PER_1M_USD",
+                    DEFAULT_SUMMARY_PRIMARY_OUTPUT_RATE_PER_1M_USD,
+                ),
+            )
+        ),
+    )
+
+
+def _summary_cost_budget(
+    *, model_name: Optional[str] = None, target_length: Optional[int] = None
+) -> SummaryCostBudget:
+    resolved = (model_name or "").strip()
+    if resolved and resolved == _summary_longform_model_name():
+        return SummaryCostBudget(
+            budget_cap_usd=_summary_budget_cap_usd(target_length=target_length),
+            input_rate_per_1m=_summary_longform_input_rate_per_1m(),
+            output_rate_per_1m=_summary_longform_output_rate_per_1m(),
+        )
+    return SummaryCostBudget(
+        budget_cap_usd=_summary_budget_cap_usd(target_length=target_length),
+        input_rate_per_1m=_summary_cost_input_rate_per_1m(),
+        output_rate_per_1m=_summary_cost_output_rate_per_1m(),
+    )
+
+
+def _estimate_two_agent_summary_cost_preflight(
+    *,
+    company_name: str,
+    ticker: str,
+    sector: str,
+    industry: str,
+    filing_type: str,
+    base_prompt: str,
+    target_length: Optional[int],
+    max_output_tokens: int,
+    rewrite_attempt_cap: int,
+    budget: SummaryCostBudget,
+    agent1_input_rate_per_1m: Optional[float] = None,
+    agent1_output_rate_per_1m: Optional[float] = None,
+) -> Dict[str, float]:
+    """Estimate minimum and bounded total cost for strict budget gating."""
+    expected_output_tokens = _estimate_summary_output_tokens(
+        target_length=target_length, max_output_tokens=max_output_tokens
+    )
+
+    research_prompt = build_company_research_prompt(
+        company_name=company_name,
+        ticker=ticker,
+        sector=sector,
+        industry=industry,
+        filing_type=filing_type,
+    )
+    research_prompt_tokens = _estimate_summary_tokens(research_prompt)
+    research_output_tokens = _summary_agent1_max_output_tokens()
+    research_prompt_reserve_tokens = _summary_research_token_reserve_tokens()
+
+    generation_prompt_tokens = _estimate_summary_tokens(base_prompt) + max(
+        0, int(research_prompt_reserve_tokens)
+    )
+    rewrite_prompt_tokens = _estimate_summary_tokens(
+        _strip_large_context_block(base_prompt)
+    )
+
+    # Agent 1 (research) may run on a different model than Agent 2. When
+    # explicit rates are provided, use them; otherwise fall back to the
+    # budget's (Agent 2) rates for backward compatibility.
+    a1_input = (
+        float(agent1_input_rate_per_1m)
+        if agent1_input_rate_per_1m is not None
+        else budget.input_rate_per_1m
+    )
+    a1_output = (
+        float(agent1_output_rate_per_1m)
+        if agent1_output_rate_per_1m is not None
+        else budget.output_rate_per_1m
+    )
+    agent1_cost = _estimate_summary_call_cost_usd(
+        prompt_tokens=research_prompt_tokens,
+        output_tokens=research_output_tokens,
+        input_rate_per_1m=a1_input,
+        output_rate_per_1m=a1_output,
+    )
+    agent2_generation_cost = budget.estimate_cost(
+        prompt_tokens=generation_prompt_tokens,
+        output_tokens=expected_output_tokens,
+    )
+    rewrite_cost_per_attempt = budget.estimate_cost(
+        prompt_tokens=rewrite_prompt_tokens,
+        output_tokens=expected_output_tokens,
+    )
+
+    min_path_usd = float(agent1_cost + agent2_generation_cost)
+    bounded_total_usd = float(
+        min_path_usd + (max(0, int(rewrite_attempt_cap)) * rewrite_cost_per_attempt)
+    )
+    return {
+        "agent1_cost_usd": float(agent1_cost),
+        "agent2_generation_cost_usd": float(agent2_generation_cost),
+        "rewrite_cost_per_attempt_usd": float(rewrite_cost_per_attempt),
+        "rewrite_attempt_cap": float(max(0, int(rewrite_attempt_cap))),
+        "minimum_path_usd": float(min_path_usd),
+        "bounded_total_usd": float(bounded_total_usd),
+        "expected_output_tokens": float(expected_output_tokens),
+        "research_prompt_reserve_tokens": float(
+            max(0, int(research_prompt_reserve_tokens))
+        ),
+    }
+
+
+def _summary_token_budget(
+    *, target_length: Optional[int] = None, model_name: Optional[str] = None
+) -> TokenBudget:
+    budget_usd = _summary_budget_cap_usd(target_length=target_length)
+    # Use model-specific rates for blended cost
+    resolved = (model_name or "").strip()
+    if resolved and resolved == _summary_longform_model_name():
+        input_rate = _summary_longform_input_rate_per_1m()
+        output_rate = _summary_longform_output_rate_per_1m()
+    else:
+        input_rate = _summary_cost_input_rate_per_1m()
+        output_rate = _summary_cost_output_rate_per_1m()
+
+    cost_per_1k = _float_env(
+        "OPENAI_COST_PER_1K_TOKENS_USD",
+        (
+            (input_rate + output_rate) / 2_000.0
+            if (input_rate > 0 or output_rate > 0)
+            else DEFAULT_OPENAI_COST_PER_1K_TOKENS_USD
+        ),
+    )
+    reserve = _int_env("OPENAI_SUMMARY_TOKEN_RESERVE", DEFAULT_SUMMARY_TOKEN_RESERVE)
 
     max_tokens = 0
     if budget_usd > 0 and cost_per_1k > 0:
@@ -258,7 +1430,327 @@ def _summary_token_budget() -> TokenBudget:
 
 
 def _summary_max_output_tokens() -> int:
-    return _int_env("GEMINI_MAX_OUTPUT_TOKENS", DEFAULT_GEMINI_MAX_OUTPUT_TOKENS)
+    return _int_env("OPENAI_MAX_OUTPUT_TOKENS", DEFAULT_OPENAI_MAX_OUTPUT_TOKENS)
+
+
+@dataclass
+class SummaryModelPlan:
+    selected_model: str
+    fallback_model: str
+    estimated_generation_cost_usd: float
+    estimated_rewrite_cost_usd: float
+    estimated_total_cost_usd: float
+    estimated_fallback_retry_cost_usd: float
+    estimated_fallback_total_cost_usd: float
+    budget_cap_usd: float
+    primary_model_affordable: bool
+    used_fallback: bool = False
+
+
+def _summary_model_name_from_env(name: str, default: str) -> str:
+    value = (os.getenv(name) or "").strip()
+    return value or default
+
+
+def _estimate_summary_tokens(text: Optional[str]) -> int:
+    if not text:
+        return 0
+    return max(1, int(len(text) / CHARS_PER_TOKEN_ESTIMATE))
+
+
+def _estimate_summary_call_cost_usd(
+    *,
+    prompt_tokens: int,
+    output_tokens: int,
+    input_rate_per_1m: float,
+    output_rate_per_1m: float,
+) -> float:
+    prompt_cost = (max(0, int(prompt_tokens)) / 1_000_000) * max(
+        0.0, float(input_rate_per_1m)
+    )
+    output_cost = (max(0, int(output_tokens)) / 1_000_000) * max(
+        0.0, float(output_rate_per_1m)
+    )
+    return float(prompt_cost + output_cost)
+
+
+def _estimate_summary_output_tokens(
+    *, target_length: Optional[int], max_output_tokens: int
+) -> int:
+    if target_length:
+        multiplier = _summary_output_tokens_per_word(target_length=target_length)
+        return min(max_output_tokens, max(500, int(int(target_length) * multiplier)))
+    return min(max_output_tokens, 4000)
+
+
+def _plan_summary_model_selection(
+    *,
+    base_prompt: str,
+    target_length: Optional[int],
+    max_output_tokens: int,
+) -> SummaryModelPlan:
+    budget_cap = _summary_budget_cap_usd(target_length=target_length)
+    selected_primary = _summary_model_name_from_env(
+        "OPENAI_SUMMARY_PRIMARY_MODEL_NAME", DEFAULT_SUMMARY_PRIMARY_MODEL_NAME
+    )
+    selected_fallback = _summary_model_name_from_env(
+        "OPENAI_SUMMARY_FALLBACK_MODEL_NAME", DEFAULT_SUMMARY_FALLBACK_MODEL_NAME
+    )
+    primary_input_rate = _float_env(
+        "OPENAI_SUMMARY_PRIMARY_INPUT_RATE_PER_1M_USD",
+        DEFAULT_SUMMARY_PRIMARY_INPUT_RATE_PER_1M_USD,
+    )
+    primary_output_rate = _float_env(
+        "OPENAI_SUMMARY_PRIMARY_OUTPUT_RATE_PER_1M_USD",
+        DEFAULT_SUMMARY_PRIMARY_OUTPUT_RATE_PER_1M_USD,
+    )
+    fallback_input_rate = _float_env(
+        "OPENAI_SUMMARY_FALLBACK_INPUT_RATE_PER_1M_USD",
+        DEFAULT_SUMMARY_FALLBACK_INPUT_RATE_PER_1M_USD,
+    )
+    fallback_output_rate = _float_env(
+        "OPENAI_SUMMARY_FALLBACK_OUTPUT_RATE_PER_1M_USD",
+        DEFAULT_SUMMARY_FALLBACK_OUTPUT_RATE_PER_1M_USD,
+    )
+
+    expected_output_tokens = _estimate_summary_output_tokens(
+        target_length=target_length, max_output_tokens=max_output_tokens
+    )
+    prompt_tokens = _estimate_summary_tokens(base_prompt)
+    rewrite_prompt = _strip_large_context_block(base_prompt)
+    rewrite_tokens = _estimate_summary_tokens(rewrite_prompt)
+
+    primary_generation_cost = _estimate_summary_call_cost_usd(
+        prompt_tokens=prompt_tokens,
+        output_tokens=expected_output_tokens,
+        input_rate_per_1m=primary_input_rate,
+        output_rate_per_1m=primary_output_rate,
+    )
+    primary_rewrite_cost = _estimate_summary_call_cost_usd(
+        prompt_tokens=rewrite_tokens,
+        output_tokens=expected_output_tokens,
+        input_rate_per_1m=primary_input_rate,
+        output_rate_per_1m=primary_output_rate,
+    )
+    primary_total = primary_generation_cost + primary_rewrite_cost
+    primary_affordable = primary_total <= max(0.0, budget_cap)
+
+    fallback_generation_cost = _estimate_summary_call_cost_usd(
+        prompt_tokens=prompt_tokens,
+        output_tokens=expected_output_tokens,
+        input_rate_per_1m=fallback_input_rate,
+        output_rate_per_1m=fallback_output_rate,
+    )
+    fallback_rewrite_cost = _estimate_summary_call_cost_usd(
+        prompt_tokens=rewrite_tokens,
+        output_tokens=expected_output_tokens,
+        input_rate_per_1m=fallback_input_rate,
+        output_rate_per_1m=fallback_output_rate,
+    )
+
+    # Policy lock: long-form requests use the same primary model as all other
+    # targets (GPT-5.2 in production), with no alternate long-form model path.
+    if _is_long_form_target(target_length):
+        return SummaryModelPlan(
+            selected_model=selected_primary,
+            fallback_model=selected_primary,
+            estimated_generation_cost_usd=primary_generation_cost,
+            estimated_rewrite_cost_usd=primary_rewrite_cost,
+            estimated_total_cost_usd=primary_total,
+            estimated_fallback_retry_cost_usd=0.0,
+            estimated_fallback_total_cost_usd=primary_total,
+            budget_cap_usd=budget_cap,
+            primary_model_affordable=primary_affordable,
+            used_fallback=False,
+        )
+
+    if _summary_force_pro_only():
+        forced_total = primary_generation_cost + primary_rewrite_cost
+        return SummaryModelPlan(
+            selected_model=selected_primary,
+            fallback_model=selected_primary,
+            estimated_generation_cost_usd=primary_generation_cost,
+            estimated_rewrite_cost_usd=primary_rewrite_cost,
+            estimated_total_cost_usd=forced_total,
+            estimated_fallback_retry_cost_usd=0.0,
+            estimated_fallback_total_cost_usd=forced_total,
+            budget_cap_usd=budget_cap,
+            primary_model_affordable=True,
+            used_fallback=False,
+        )
+
+    if primary_affordable:
+        return SummaryModelPlan(
+            selected_model=selected_primary,
+            fallback_model=selected_fallback,
+            estimated_generation_cost_usd=primary_generation_cost,
+            estimated_rewrite_cost_usd=primary_rewrite_cost,
+            estimated_total_cost_usd=primary_total,
+            estimated_fallback_retry_cost_usd=fallback_generation_cost,
+            estimated_fallback_total_cost_usd=(
+                fallback_generation_cost + fallback_rewrite_cost
+            ),
+            budget_cap_usd=budget_cap,
+            primary_model_affordable=True,
+        )
+
+    return SummaryModelPlan(
+        selected_model=selected_fallback,
+        fallback_model=selected_fallback,
+        estimated_generation_cost_usd=fallback_generation_cost,
+        estimated_rewrite_cost_usd=fallback_rewrite_cost,
+        estimated_total_cost_usd=fallback_generation_cost + fallback_rewrite_cost,
+        estimated_fallback_retry_cost_usd=fallback_generation_cost,
+        estimated_fallback_total_cost_usd=fallback_generation_cost
+        + fallback_rewrite_cost,
+        budget_cap_usd=budget_cap,
+        primary_model_affordable=False,
+        used_fallback=True,
+    )
+
+
+def _is_summary_model_retryable_error(exc: Exception) -> bool:
+    if isinstance(exc, (AIRateLimitError, AITimeoutError, AIAPIError)):
+        return True
+    message = str(exc or "").lower()
+    retry_terms = (
+        "model",
+        "not found",
+        "invalid",
+        "unavailable",
+        "timeout",
+        "rate limit",
+        "quota",
+    )
+    return any(term in message for term in retry_terms)
+
+
+def _is_primary_model_unavailable_error(exc: Exception) -> bool:
+    if isinstance(exc, AIAPIError):
+        # A 404/400/403 from the provider usually indicates an invalid or
+        # unavailable model selection for this environment.
+        if exc.status_code == 404:
+            return True
+        if exc.status_code in {400, 403}:
+            detail = f"{exc} {(exc.response_body or '')}".lower()
+            return any(
+                token in detail
+                for token in (
+                    "model",
+                    "not found",
+                    "unsupported",
+                    "not available",
+                    "invalid",
+                )
+            )
+        return False
+
+    message = str(exc or "").lower()
+    return "model" in message and any(
+        token in message
+        for token in ("not found", "invalid", "unsupported", "unavailable")
+    )
+
+
+def _allow_fallback_replacement_retry(
+    *,
+    selected_model_name: str,
+    fallback_model_name: str,
+    model_plan: SummaryModelPlan,
+    exc: Exception,
+) -> bool:
+    if selected_model_name == fallback_model_name:
+        return False
+    if model_plan.estimated_fallback_total_cost_usd > model_plan.budget_cap_usd:
+        return False
+    return _is_primary_model_unavailable_error(exc)
+
+
+def _init_summary_generation_telemetry(
+    token_budget: Optional[TokenBudget],
+) -> Dict[str, Any]:
+    return {
+        "generation_call_count": 0,
+        "rewrite_call_count": 0,
+        "rewrite_used": False,
+        "rewrite_skipped_budget_guard": False,
+        "persona_intensity_downgraded": False,
+        "fallback_retry_used": False,
+        "padding_words_added": 0,
+        "padding_sentences_added": 0,
+        "post_final_quality_issue": None,
+        "post_final_quality_rewrite_used": False,
+        "token_budget_remaining_tokens": token_budget.remaining_tokens
+        if token_budget
+        else None,
+    }
+
+
+def _record_padding_telemetry(
+    generation_stats: Optional[Dict[str, Any]],
+    *,
+    before_text: str,
+    after_text: str,
+) -> None:
+    """Track deterministic padding contribution for quality telemetry."""
+    if generation_stats is None:
+        return
+    before_wc = _count_words(before_text or "")
+    after_wc = _count_words(after_text or "")
+    added_words = max(0, after_wc - before_wc)
+    if added_words <= 0:
+        return
+
+    def _sentence_count(value: str) -> int:
+        return len(re.findall(r"(?<=[.!?])\s+", value or "")) + (
+            1 if (value or "").strip() else 0
+        )
+
+    before_sent = _sentence_count(before_text or "")
+    after_sent = _sentence_count(after_text or "")
+    added_sentences = max(1, after_sent - before_sent)
+
+    generation_stats["padding_words_added"] = int(
+        generation_stats.get("padding_words_added", 0)
+    ) + int(added_words)
+    generation_stats["padding_sentences_added"] = int(
+        generation_stats.get("padding_sentences_added", 0)
+    ) + int(added_sentences)
+
+
+def _should_soften_persona_for_rewrite(issue_message: Optional[str]) -> bool:
+    issue = (issue_message or "").lower()
+    if not issue:
+        return False
+    return any(
+        token in issue
+        for token in (
+            "repetition",
+            "instruction leak",
+            "voice",
+            "persona",
+            "conflicting stances",
+            "inconsistent",
+        )
+    )
+
+
+def _should_rewrite_without_target(issue_message: Optional[str]) -> bool:
+    issue = (issue_message or "").lower()
+    if not issue:
+        return False
+    return any(
+        token in issue
+        for token in (
+            "management discussion",
+            "section",
+            "missing",
+            "required",
+            "completeness",
+            "must include",
+            "not available",
+        )
+    )
 
 
 def _spotlight_document_excerpt_limit() -> int:
@@ -308,12 +1800,19 @@ def _truncate_prompt_to_token_budget(
     *,
     max_prompt_chars: int,
     budget_note: str = "",
+    trim_metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Truncate the CONTEXT block so the full prompt fits inside max_prompt_chars."""
     if not prompt or max_prompt_chars <= 0:
         return prompt
     if len(prompt) <= max_prompt_chars:
         return prompt
+
+    metadata = trim_metadata if isinstance(trim_metadata, dict) else None
+    if metadata is not None:
+        metadata["context_trimmed"] = False
+        metadata["data_window_trimmed"] = False
+        metadata["last_resort_compaction"] = False
 
     pattern = re.compile(
         r"(\n\s*CONTEXT:\s*\n)(.*?)(\n\s*FINANCIAL SNAPSHOT\b)",
@@ -328,8 +1827,454 @@ def _truncate_prompt_to_token_budget(
     context = match.group(2)
 
     allowance = max(0, max_prompt_chars - len(prefix) - len(suffix) - len(budget_note))
-    truncated_context = context[:allowance]
-    return prefix + truncated_context + budget_note + suffix
+    if allowance <= 0:
+        truncated_context = ""
+    elif len(context) <= allowance:
+        truncated_context = context
+    else:
+        # Keep filing-language snippets visible even when context is truncated,
+        # then allocate the remaining budget to a balanced excerpt.
+        snippets_marker = "FILING LANGUAGE SNIPPETS (verbatim lines available for short direct quotes):"
+        primary_context = context
+        snippets_block = ""
+        marker_idx = context.find(snippets_marker)
+        if marker_idx >= 0:
+            primary_context = context[:marker_idx].rstrip()
+            snippets_block = context[marker_idx:].strip()
+
+        reserved_snippets = ""
+        if snippets_block:
+            snippets_budget = min(
+                len(snippets_block),
+                max(450, int(allowance * 0.22)),
+            )
+            if snippets_budget >= len(snippets_block):
+                reserved_snippets = snippets_block
+            else:
+                kept_lines: List[str] = []
+                used_chars = 0
+                for line in snippets_block.splitlines():
+                    add = len(line) + 1
+                    if used_chars + add > snippets_budget and kept_lines:
+                        break
+                    kept_lines.append(line)
+                    used_chars += add
+                reserved_snippets = "\n".join(kept_lines).strip()
+
+        core_allowance = allowance
+        if reserved_snippets:
+            core_allowance = max(0, allowance - len(reserved_snippets) - 2)
+
+        if core_allowance <= 0:
+            truncated_core = ""
+        elif len(primary_context) <= core_allowance:
+            truncated_core = primary_context
+        else:
+            try:
+                truncated_core = _build_balanced_context_excerpt(
+                    primary_context,
+                    max_chars=core_allowance,
+                )
+            except Exception:
+                truncated_core = primary_context[:core_allowance]
+            if not truncated_core:
+                truncated_core = primary_context[:core_allowance]
+
+        if reserved_snippets:
+            parts = [truncated_core.strip(), reserved_snippets.strip()]
+            truncated_context = "\n\n".join(part for part in parts if part)
+        else:
+            truncated_context = truncated_core
+
+    if metadata is not None and truncated_context != context:
+        metadata["context_trimmed"] = True
+
+    candidate = prefix + truncated_context + budget_note + suffix
+    if len(candidate) <= max_prompt_chars:
+        return candidate
+
+    # If fixed filing-data blocks outside CONTEXT are still too large, trim the
+    # full data window up to INSTRUCTIONS while preserving instruction scaffolding.
+    data_window_pattern = re.compile(
+        r"(\n\s*CONTEXT:\s*\n)(.*?)(\n\s*INSTRUCTIONS:\s*\n)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    data_match = data_window_pattern.search(candidate)
+    if data_match:
+        data_prefix = candidate[: data_match.start(2)]
+        data_suffix = candidate[data_match.end(2) :]
+        data_window = data_match.group(2)
+        data_allowance = max(0, max_prompt_chars - len(data_prefix) - len(data_suffix))
+        if data_allowance <= 0:
+            truncated_data_window = ""
+        elif len(data_window) <= data_allowance:
+            truncated_data_window = data_window
+        else:
+            try:
+                truncated_data_window = _build_balanced_context_excerpt(
+                    data_window,
+                    max_chars=data_allowance,
+                )
+            except Exception:
+                truncated_data_window = data_window[:data_allowance]
+            if not truncated_data_window:
+                truncated_data_window = data_window[:data_allowance]
+        candidate = data_prefix + truncated_data_window + data_suffix
+        if metadata is not None and truncated_data_window != data_window:
+            metadata["data_window_trimmed"] = True
+        if len(candidate) <= max_prompt_chars:
+            return candidate
+
+    # Last-resort compaction: preserve prompt header + instructions tail.
+    instructions_idx = candidate.lower().find("\ninstructions:")
+    if instructions_idx > 0:
+        header_keep = min(1200, max_prompt_chars // 5)
+        header = candidate[:header_keep]
+        instructions_tail = candidate[instructions_idx:]
+        bridge_note = "\n\n[Additional filing material truncated to satisfy strict summary budget.]\n\n"
+        tail_budget = max(0, max_prompt_chars - len(header) - len(bridge_note))
+        if tail_budget > 0:
+            compact = header + bridge_note + instructions_tail[:tail_budget]
+            if metadata is not None and compact != candidate:
+                metadata["last_resort_compaction"] = True
+            if len(compact) <= max_prompt_chars:
+                return compact
+            return compact[:max_prompt_chars]
+
+    if metadata is not None and candidate[:max_prompt_chars] != candidate:
+        metadata["last_resort_compaction"] = True
+    return candidate[:max_prompt_chars]
+
+
+def _truncate_prompt_component_block(
+    block: str,
+    *,
+    max_chars: int,
+) -> str:
+    """Reduce a labeled prompt block body while preserving its heading line."""
+    raw = str(block or "").strip()
+    if not raw or max_chars <= 0:
+        return ""
+    if len(raw) <= max_chars:
+        return raw
+
+    lines = raw.splitlines()
+    if not lines:
+        return raw[:max_chars]
+
+    header = lines[0].strip()
+    body = "\n".join(lines[1:]).strip()
+    if not body:
+        return raw[:max_chars]
+
+    body_allowance = max(0, max_chars - len(header) - 1)
+    if body_allowance <= 0:
+        return header[:max_chars]
+    if len(body) <= body_allowance:
+        return f"{header}\n{body}".strip()
+
+    try:
+        reduced_body = _build_balanced_context_excerpt(body, max_chars=body_allowance)
+    except Exception:
+        reduced_body = body[:body_allowance]
+    if not reduced_body:
+        reduced_body = body[:body_allowance]
+    return f"{header}\n{reduced_body}".strip()
+
+
+def _build_budget_adapted_summary_prompt(
+    *,
+    base_prompt_template: str,
+    company_research_block_placeholder: str,
+    company_research_block: str,
+    target_length: Optional[int],
+    max_output_tokens: int,
+    token_budget: Optional[TokenBudget],
+    cost_budget: Optional[SummaryCostBudget],
+    spotlight_context_block_placeholder: Optional[str] = None,
+    filing_language_block_placeholder: Optional[str] = None,
+    risk_factors_block_placeholder: Optional[str] = None,
+    prompt_component_blocks: Optional[Dict[str, str]] = None,
+    failure_stage: str = "agent_2_summary_generation",
+    prompt_debug_prefix: str = "runtime",
+    reserve_tokens: int = 0,
+    budget_debug: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str, bool, List[str]]:
+    """Build the final Agent-2 prompt with deterministic budget adaptations."""
+    expected_output_tokens = _estimate_summary_output_tokens(
+        target_length=target_length,
+        max_output_tokens=max_output_tokens,
+    )
+    adjustments: List[str] = []
+    prompt_budget_adapted = False
+    debug_prefix = str(prompt_debug_prefix or "runtime").strip().lower() or "runtime"
+    debug_expected_key = f"{debug_prefix}_expected_output_tokens"
+    debug_prompt_tokens_key = f"{debug_prefix}_prompt_tokens_estimated"
+    if isinstance(budget_debug, dict):
+        budget_debug[debug_expected_key] = int(expected_output_tokens)
+
+    raw_research_block = str(company_research_block or "").strip()
+    research_mode: Literal["full", "compressed", "skipped"] = "skipped"
+    effective_research_block = ""
+    if raw_research_block:
+        capped_block = _truncate_text_to_max_words(
+            raw_research_block,
+            max_words=_summary_research_max_words(),
+        )
+        if not capped_block:
+            research_mode = "skipped"
+            effective_research_block = ""
+            adjustments.append("research_skipped")
+            prompt_budget_adapted = True
+        elif capped_block != raw_research_block:
+            research_mode = "compressed"
+            effective_research_block = capped_block
+            adjustments.append("research_compressed")
+            prompt_budget_adapted = True
+        else:
+            research_mode = "full"
+            effective_research_block = raw_research_block
+
+    component_state = dict(prompt_component_blocks or {})
+    spotlight_context_block = str(
+        component_state.get("spotlight_context_block") or ""
+    ).strip()
+    filing_language_block = str(
+        component_state.get("filing_language_block") or ""
+    ).strip()
+    risk_factors_block = str(component_state.get("risk_factors_block") or "").strip()
+    filing_snippets_reduced = False
+    risk_excerpt_reduced = False
+
+    def _render_prompt(research_block: str) -> str:
+        prompt = base_prompt_template.replace(
+            company_research_block_placeholder,
+            research_block or "",
+        )
+        if spotlight_context_block_placeholder:
+            prompt = prompt.replace(
+                str(spotlight_context_block_placeholder),
+                spotlight_context_block or "",
+            )
+        if filing_language_block_placeholder:
+            prompt = prompt.replace(
+                str(filing_language_block_placeholder),
+                filing_language_block or "",
+            )
+        if risk_factors_block_placeholder:
+            prompt = prompt.replace(
+                str(risk_factors_block_placeholder),
+                risk_factors_block or "",
+            )
+        return prompt
+
+    def _token_affordable(prompt: str) -> bool:
+        return (
+            True
+            if token_budget is None
+            else token_budget.can_afford(prompt, expected_output_tokens)
+        )
+
+    def _cost_affordable(prompt: str) -> bool:
+        return (
+            True
+            if cost_budget is None
+            else cost_budget.can_afford(prompt, expected_output_tokens)
+        )
+
+    latest_caps: Dict[str, Optional[int]] = {}
+
+    def _max_prompt_chars_for_budget(prompt: str) -> Optional[int]:
+        del prompt  # Unused: caps depend on budgets + expected output only.
+        caps = _compute_generation_prompt_caps(
+            token_budget=token_budget,
+            cost_budget=cost_budget,
+            expected_output_tokens=expected_output_tokens,
+            reserve_tokens=reserve_tokens,
+        )
+        latest_caps.clear()
+        latest_caps.update(caps)
+        return caps.get("max_prompt_chars_effective")
+
+    def _trim_prompt(
+        prompt: str, *, budget_note: str, adjustment_name: str
+    ) -> Tuple[str, bool]:
+        max_prompt_chars = _max_prompt_chars_for_budget(prompt)
+        if max_prompt_chars is None:
+            return prompt, False
+        if max_prompt_chars <= 0 or len(prompt) <= max_prompt_chars:
+            return prompt, False
+        trim_metadata: Dict[str, Any] = {}
+        trimmed = _truncate_prompt_to_token_budget(
+            prompt,
+            max_prompt_chars=max_prompt_chars,
+            budget_note=budget_note,
+            trim_metadata=trim_metadata,
+        )
+        changed = trimmed != prompt
+        if changed:
+            adjustments.append(adjustment_name)
+            if trim_metadata.get("data_window_trimmed"):
+                adjustments.append("context_trimmed_data_window")
+        return trimmed, changed
+
+    def _build_failure_detail(prompt: str) -> Dict[str, Any]:
+        prompt_tokens_estimated = int(_estimate_summary_tokens(prompt))
+        effective_prompt_token_cap = latest_caps.get("max_prompt_tokens_effective")
+        detail: Dict[str, Any] = {
+            "detail": "Summary budget exceeded before Agent 2 generation.",
+            "budget_cap_usd": (
+                float(cost_budget.budget_cap_usd)
+                if cost_budget is not None
+                else float(_summary_budget_cap_usd(target_length=target_length))
+            ),
+            debug_expected_key: int(expected_output_tokens),
+            debug_prompt_tokens_key: prompt_tokens_estimated,
+            "effective_prompt_token_cap": (
+                int(effective_prompt_token_cap)
+                if effective_prompt_token_cap is not None
+                else None
+            ),
+        }
+        if token_budget is not None and not token_budget.can_afford(
+            prompt, expected_output_tokens
+        ):
+            detail["remaining_token_budget"] = int(token_budget.remaining_tokens)
+        if cost_budget is not None and not cost_budget.can_afford(
+            prompt, expected_output_tokens
+        ):
+            projected_cost = float(cost_budget.spent_usd) + float(
+                cost_budget.estimate_call(prompt, expected_output_tokens)
+            )
+            detail["spent_cost_usd"] = float(cost_budget.spent_usd)
+            detail["projected_cost_usd"] = projected_cost
+            detail["remaining_budget_usd"] = float(cost_budget.remaining_usd)
+        return _decorate_budget_exceeded_detail(
+            detail,
+            stage=failure_stage,
+            target_length=int(target_length) if target_length else None,
+            budget_adjustments_attempted=adjustments,
+        )
+
+    prompt = _render_prompt(effective_research_block)
+    if not (_token_affordable(prompt) and _cost_affordable(prompt)):
+        prompt, trimmed = _trim_prompt(
+            prompt,
+            budget_note="\n\nNote: Filing text truncated to fit per-summary token budget.",
+            adjustment_name="context_trimmed",
+        )
+        prompt_budget_adapted = bool(prompt_budget_adapted or trimmed)
+
+    if not (_token_affordable(prompt) and _cost_affordable(prompt)):
+        if spotlight_context_block:
+            spotlight_context_block = ""
+            adjustments.append("spotlight_context_dropped")
+            prompt_budget_adapted = True
+            prompt = _render_prompt(effective_research_block)
+
+    if not (_token_affordable(prompt) and _cost_affordable(prompt)):
+        if filing_language_block and not filing_snippets_reduced:
+            reduced_block = _truncate_prompt_component_block(
+                filing_language_block,
+                max_chars=_summary_snippets_reduced_max_chars(),
+            )
+            if reduced_block and reduced_block != filing_language_block:
+                filing_language_block = reduced_block
+                filing_snippets_reduced = True
+                adjustments.append("filing_snippets_reduced")
+                prompt_budget_adapted = True
+                prompt = _render_prompt(effective_research_block)
+
+    if not (_token_affordable(prompt) and _cost_affordable(prompt)):
+        if filing_language_block:
+            filing_language_block = ""
+            adjustments.append("filing_snippets_dropped")
+            prompt_budget_adapted = True
+            prompt = _render_prompt(effective_research_block)
+
+    if not (_token_affordable(prompt) and _cost_affordable(prompt)):
+        if risk_factors_block and not risk_excerpt_reduced:
+            reduced_block = _truncate_prompt_component_block(
+                risk_factors_block,
+                max_chars=_summary_risk_excerpt_reduced_max_chars(),
+            )
+            if reduced_block and reduced_block != risk_factors_block:
+                risk_factors_block = reduced_block
+                risk_excerpt_reduced = True
+                adjustments.append("risk_factors_excerpt_reduced")
+                prompt_budget_adapted = True
+                prompt = _render_prompt(effective_research_block)
+
+    if not (_token_affordable(prompt) and _cost_affordable(prompt)):
+        if risk_factors_block:
+            risk_factors_block = ""
+            adjustments.append("risk_factors_excerpt_dropped")
+            prompt_budget_adapted = True
+            prompt = _render_prompt(effective_research_block)
+
+    if not (_token_affordable(prompt) and _cost_affordable(prompt)):
+        if effective_research_block:
+            effective_research_block = ""
+            research_mode = "skipped"
+            adjustments.append("research_skipped")
+            prompt_budget_adapted = True
+            prompt = _render_prompt("")
+
+    if not (_token_affordable(prompt) and _cost_affordable(prompt)):
+        prompt, trimmed = _trim_prompt(
+            prompt,
+            budget_note=(
+                "\n\nNote: Filing context was further truncated after non-core prompt reductions to satisfy the strict per-summary budget cap."
+            ),
+            adjustment_name="context_trimmed_after_non_core_drops",
+        )
+        prompt_budget_adapted = bool(prompt_budget_adapted or trimmed)
+
+    _max_prompt_chars_for_budget(prompt)
+    if isinstance(budget_debug, dict):
+        budget_debug[debug_prompt_tokens_key] = int(_estimate_summary_tokens(prompt))
+        effective_prompt_token_cap = latest_caps.get("max_prompt_tokens_effective")
+        budget_debug["effective_prompt_token_cap"] = (
+            int(effective_prompt_token_cap)
+            if effective_prompt_token_cap is not None
+            else None
+        )
+
+    if prompt_component_blocks is not None:
+        prompt_component_blocks["spotlight_context_block"] = spotlight_context_block
+        prompt_component_blocks["filing_language_block"] = filing_language_block
+        prompt_component_blocks["risk_factors_block"] = risk_factors_block
+
+    if not (_token_affordable(prompt) and _cost_affordable(prompt)):
+        tok_ok = _token_affordable(prompt)
+        cost_ok = _cost_affordable(prompt)
+        prompt_chars = len(prompt)
+        prompt_tokens_est = _estimate_summary_tokens(prompt)
+        logger.warning(
+            "Budget adaptation failed: token_ok=%s cost_ok=%s "
+            "prompt_chars=%d prompt_tokens_est=%d expected_out=%d "
+            "token_remaining=%s cost_spent=%.6f cost_cap=%.6f "
+            "cost_input_rate=%.4f cost_output_rate=%.4f stage=%s",
+            tok_ok,
+            cost_ok,
+            prompt_chars,
+            prompt_tokens_est,
+            expected_output_tokens,
+            (token_budget.remaining_tokens if token_budget else "N/A"),
+            (cost_budget.spent_usd if cost_budget else 0),
+            (cost_budget.budget_cap_usd if cost_budget else 0),
+            (cost_budget.input_rate_per_1m if cost_budget else 0),
+            (cost_budget.output_rate_per_1m if cost_budget else 0),
+            failure_stage,
+        )
+        raise SummaryBudgetExceededError(_build_failure_detail(prompt))
+
+    return (
+        prompt,
+        str(research_mode),
+        bool(prompt_budget_adapted),
+        list(dict.fromkeys(adjustments)),
+    )
 
 
 DETAIL_LEVEL_PROMPTS: Dict[str, str] = {
@@ -406,13 +2351,43 @@ HEALTH_DISPLAY_PROMPTS: Dict[str, str] = {
 
 
 TARGET_LENGTH_MIN_WORDS = 1
-TARGET_LENGTH_MAX_WORDS = 3000
+TARGET_LENGTH_MAX_WORDS = 5000
+
+PERSONA_ID_TO_NAME: Dict[str, str] = {
+    "buffett": "Warren Buffett",
+    "munger": "Charlie Munger",
+    "graham": "Benjamin Graham",
+    "lynch": "Peter Lynch",
+    "dalio": "Ray Dalio",
+    "wood": "Cathie Wood",
+    "greenblatt": "Joel Greenblatt",
+    "bogle": "John Bogle",
+    "marks": "Howard Marks",
+    "ackman": "Bill Ackman",
+}
+PERSONA_NAME_TO_ID: Dict[str, str] = {
+    name.lower(): persona_id for persona_id, name in PERSONA_ID_TO_NAME.items()
+}
 
 
 def _clamp_target_length(value: Optional[int]) -> Optional[int]:
     if value is None:
         return None
     return max(TARGET_LENGTH_MIN_WORDS, min(TARGET_LENGTH_MAX_WORDS, value))
+
+
+def _persona_name_from_id(persona_id: Optional[str]) -> Optional[str]:
+    key = (persona_id or "").strip().lower()
+    if not key:
+        return None
+    return PERSONA_ID_TO_NAME.get(key)
+
+
+def _persona_id_from_name(persona_name: Optional[str]) -> Optional[str]:
+    key = (persona_name or "").strip().lower()
+    if not key:
+        return None
+    return PERSONA_NAME_TO_ID.get(key)
 
 
 def _extract_persona_name(investor_focus: Optional[str]) -> Optional[str]:
@@ -438,25 +2413,39 @@ def _extract_persona_name(investor_focus: Optional[str]) -> Optional[str]:
     if as_match:
         return as_match.group(1).strip()
 
-    # Common persona names to look for
-    persona_names = [
-        "Warren Buffett",
-        "Charlie Munger",
-        "Benjamin Graham",
-        "Peter Lynch",
-        "Ray Dalio",
-        "Cathie Wood",
-        "Joel Greenblatt",
-        "John Bogle",
-        "Howard Marks",
-        "Bill Ackman",
-    ]
-
-    for name in persona_names:
+    for name in PERSONA_ID_TO_NAME.values():
         if name.lower() in investor_focus.lower():
             return name
 
     return None
+
+
+def _closing_takeaway_budget_for_target(
+    target_length: Optional[int], *, include_health_rating: bool
+) -> int:
+    if not target_length or int(target_length) <= 0:
+        return 0
+    budgets = _calculate_section_word_budgets(
+        int(target_length), include_health_rating=include_health_rating
+    )
+    return int(budgets.get("Closing Takeaway", 0) or 0)
+
+
+def _closing_sentence_cap_for_budget(budget_words: Optional[int]) -> int:
+    budget = int(budget_words or 0)
+    if budget <= 0:
+        return 6
+    return int(get_closing_takeaway_shape(budget).max_sentences)
+
+
+def _closing_sentence_cap_for_target(
+    target_length: Optional[int], *, include_health_rating: bool
+) -> int:
+    return _closing_sentence_cap_for_budget(
+        _closing_takeaway_budget_for_target(
+            target_length, include_health_rating=include_health_rating
+        )
+    )
 
 
 def _build_closing_takeaway_description(
@@ -468,123 +2457,60 @@ def _build_closing_takeaway_description(
     budget_words: Optional[int] = None,
     budget_tolerance: int = 10,
 ) -> Tuple[str, str]:
-    """Build a dynamic Closing Takeaway section description based on the selected persona.
-
-    If a persona is selected, the instructions are specifically tailored to that persona's voice.
-    If no persona is selected, generic instructions are provided.
-    """
+    """Build concise closing instructions focused on stance clarity and triggers."""
     title = "Closing Takeaway"
-
-    if budget_words and budget_words > 0:
-        # Budget is for the section body (heading excluded) and must follow the
-        # fixed proportional distribution.
-        length_guidance = f"Target ~{int(budget_words)} words (±{int(budget_tolerance)}) in the Closing Takeaway body."
+    shape = get_closing_takeaway_shape(int(budget_words or 0)) if budget_words else None
+    if shape is not None and budget_words and budget_words > 0:
+        paragraph_desc = describe_paragraph_range(
+            shape.min_paragraphs,
+            shape.max_paragraphs,
+            short=True,
+        )
+        length_guidance = (
+            f"Target ~{int(budget_words)} words (±{int(budget_tolerance)}) for this section body. "
+            f"Use {describe_sentence_range(shape.min_sentences, shape.max_sentences)} across {paragraph_desc}."
+        )
     elif target_length and target_length < 350:
-        length_guidance = "3-4 COMPLETE sentences (~45-70 words)."
+        length_guidance = "Use 3-5 complete sentences in 1 short paragraph."
     elif target_length and target_length < 500:
-        length_guidance = "4-5 COMPLETE sentences (~70-95 words)."
+        length_guidance = "Use 3-5 complete sentences across 1-2 short paragraphs."
     else:
-        length_guidance = "4-6 COMPLETE sentences (~80-110 words)."
+        length_guidance = "Use 3-6 complete sentences across 1-2 short paragraphs."
 
     common_requirements = (
-        "Include a substantive Closing Takeaway. Keep this balanced with other sections.\n"
-        f"{length_guidance} This is your FINAL INVESTMENT VERDICT.\n"
-        "Write as ONE cohesive paragraph (avoid one-sentence throwaways).\n"
-        "Do NOT introduce brand-new facts here; synthesize the narrative built in prior sections so the verdict feels inevitable.\n"
-        "Anchor the verdict with 1-2 concrete metrics or operating drivers.\n"
-        "Explicitly reference the most important change versus the immediately prior comparable period (QoQ for 10-Q, YoY for 10-K) that drove your stance.\n"
-        "FORBIDDEN: single-sentence or one-line closings.\n\n"
-        "=== SUPPORTING ELEMENTS (BRIEF) ===\n"
-        "- Quality assessment: High-quality, average, or poor business (1 sentence)\n"
-        "- Key driver: The #1 factor behind your decision (1 sentence)\n"
-        "- Trigger: What would change the stance (1 sentence)\n\n"
+        "This is the destination the entire memo has been building toward.\n"
+        f"{length_guidance}\n"
+        "Write direct prose that fits the section budget and preserves the memo's finality.\n"
+        "1. State a clear BUY/HOLD/SELL verdict that feels like the inevitable conclusion "
+        "of everything above — not a standalone summary.\n"
+        "2. Name ONE specific measurable 'what must stay true' condition that keeps the view intact.\n"
+        "3. Name ONE specific measurable downside condition that would break the thesis and change the verdict.\n"
+        "4. Include one implication for capital allocation, cash generation, or valuation support when the budget allows it.\n\n"
+        "FORBIDDEN: Listing multiple metrics with 'if X holds near Y' for each. "
+        "Use one must-hold trigger and one breaks-thesis trigger only. "
+        "Do NOT introduce new facts or figures not already discussed. "
+        "Do NOT use phrases like 'remains a key check', 'remains a key checkpoint', "
+        "'the current view is strongest when', 'a sustained deviation in', "
+        "'would weaken the present underwriting case', 'confirmed by stable margin and conversion', "
+        "'my takeaway is that', 'my view would change if', or 'if margins hold through a softer period'. "
+        "No parenthetical asides, no qualifier chains, no watch-list filler."
     )
 
-    persona_verdict_requirement = (
-        "=== REQUIRED VERDICT SENTENCE (CANNOT BE OMITTED) ===\n"
-        "Your FIRST or LAST sentence MUST state a clear action (BUY/HOLD/SELL) in first person and mention the company.\n"
-        "Do NOT use a fixed template; vary phrasing and sentence openings across summaries.\n"
-        "Avoid stock openers like 'Where are we in the cycle?' unless uniquely relevant; if you mention the cycle, phrase it differently.\n"
-        "Examples (choose a style; do NOT copy verbatim):\n"
-        "- 'For my own portfolio, I'd HOLD [Company] at this valuation.'\n"
-        "- 'If I had to act today, I'd BUY [Company] because [reason].'\n"
-        "- 'My stance is SELL on [Company] until [condition].'\n"
-        "VERIFICATION: Does your Closing Takeaway include a first-person BUY/HOLD/SELL sentence? If NO, add one.\n\n"
-    )
-
-    objective_verdict_requirement = (
-        "=== REQUIRED RECOMMENDATION (CANNOT BE OMITTED) ===\n"
-        "Your FIRST or LAST sentence MUST state a clear recommendation (Buy/Hold/Sell) in third person.\n"
-        "Do NOT use a fixed template; vary phrasing and sentence openings across summaries.\n"
-        "Examples (choose a style; do NOT copy verbatim):\n"
-        "- 'A Hold rating appears warranted at current levels.'\n"
-        "- 'The appropriate stance is Buy given [reason].'\n"
-        "- 'A Sell recommendation is justified until [condition].'\n"
-        "VERIFICATION: Does your Closing Takeaway include an explicit Buy/Hold/Sell recommendation? If NO, add one.\n\n"
-    )
-
-    completion_requirements = "\nEnsure sentences are complete and punctuated. Avoid trailing off or ellipses.\n"
-
-    if (
-        persona_requested
-        and persona_name
-        and persona_name in PERSONA_CLOSING_INSTRUCTIONS
-    ):
-        # Persona-specific instructions
-        persona_instructions = PERSONA_CLOSING_INSTRUCTIONS[persona_name]
+    if persona_requested and persona_name:
         description = (
-            common_requirements
-            + persona_verdict_requirement
-            + f"=== YOU ARE {persona_name.upper()} - WRITE EXACTLY AS THEY WOULD ===\n"
-            f"This Closing Takeaway MUST sound like {persona_name} personally wrote it about {company_name}.\n"
-            f"Use FIRST PERSON voice throughout ('I', 'my view', 'I would').\n\n"
-            f"{persona_instructions}\n"
-            f"\nDO NOT write a generic analyst conclusion. Sound EXACTLY like {persona_name}.\n"
-            f"The reader should immediately recognize this as {persona_name}'s voice.\n"
-            + completion_requirements
-            + f"This section MUST provide CLOSURE as {persona_name} giving their final verdict on {company_name}."
+            f"{common_requirements}\n"
+            f"Write in first person with subtle {persona_name}-aligned framing for {company_name}, "
+            "but avoid imitation catchphrases, role-play theatrics, and investor name-dropping."
         )
     elif persona_requested:
-        # Generic persona instructions (user provided a custom persona prompt)
         description = (
-            common_requirements
-            + persona_verdict_requirement
-            + "=== CUSTOM PERSONA MODE (USER-PROVIDED) ===\n"
-            "CRITICAL: The user provided a custom investor persona/viewpoint above. You MUST adopt it fully.\n\n"
-            "REQUIRED:\n"
-            "- Write in FIRST PERSON throughout ('I', 'my view', 'I would').\n"
-            "- Anchor the recommendation in 1-2 specific metrics or operating drivers from this memo.\n"
-            "- End with a clear first-person BUY/HOLD/SELL sentence that mentions the company.\n\n"
-            "FORBIDDEN:\n"
-            "- Do NOT suddenly switch to third-person research tone.\n"
-            "- Do NOT imitate a famous investor unless the user explicitly asked for that voice.\n"
-            + completion_requirements
-            + f"This section MUST provide CLOSURE as the selected persona giving a final verdict on {company_name}."
+            f"{common_requirements}\n"
+            "Write in first person using the selected custom persona lens, but keep the voice institutional and concise."
         )
     else:
-        # Generic instructions (no persona selected) - HIGH QUALITY OBJECTIVE ANALYSIS
         description = (
-            common_requirements
-            + objective_verdict_requirement
-            + "=== OBJECTIVE ANALYST MODE (NO PERSONA) ===\n"
-            "CRITICAL: You are a NEUTRAL PROFESSIONAL ANALYST. You must NOT adopt any persona.\n\n"
-            "FORBIDDEN - DO NOT USE:\n"
-            "- First person language ('I', 'my view', 'I would', 'I believe', 'my conviction')\n"
-            "- Any famous investor's voice or catchphrases (no 'wonderful business', 'moat', 'invert', etc.)\n"
-            "- Persona-specific language patterns from any famous investor\n"
-            "- Folksy analogies or colorful investor expressions\n\n"
-            "REQUIRED - USE THIS APPROACH:\n"
-            "- Third-person objective language ('The analysis suggests...', 'The data indicates...', 'This company...')\n"
-            "- Focus on quantitative metrics: revenue growth %, margins, ROE, debt ratios, valuation multiples\n"
-            "- Professional, neutral tone like a research analyst report\n"
-            "- Evidence-based conclusions tied to specific financial data\n\n"
-            "Provide a balanced, professional conclusion that:\n"
-            "- Summarizes the investment case objectively using third-person language\n"
-            "- States a clear recommendation (Buy/Hold/Sell) with supporting metrics\n"
-            "- Identifies key risks and opportunities based on financial data\n"
-            "- Suggests specific metrics to monitor going forward\n"
-            + completion_requirements
-            + f"This section MUST provide CLOSURE for the analysis of {company_name} using NEUTRAL, OBJECTIVE language."
+            f"{common_requirements}\n"
+            f"Write in neutral third-person analyst voice focused on {company_name}."
         )
 
     return (title, description)
@@ -594,114 +2520,64 @@ def _build_closing_takeaway_description(
 # CRITICAL: All personas MUST end with a first-person buy/hold/sell recommendation (wording should vary).
 PERSONA_CLOSING_INSTRUCTIONS = {
     "Warren Buffett": (
-        "As Warren Buffett, your closing MUST:\n"
-        "- Use phrases like 'wonderful business', 'moat', 'owner earnings', 'circle of competence'\n"
-        "- Reference whether you'd 'hold for decades'\n"
-        "- Assess the moat (wide/narrow/non-existent)\n"
-        "- Use folksy language and analogies\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): Your FINAL sentence MUST be a first-person BUY/HOLD/SELL recommendation that mentions the company (vary wording; do not always use 'I personally would').\n"
+        "As Warren Buffett, write a closing that reflects on the business's durable economics and moat. "
+        "End with a first-person BUY/HOLD/SELL recommendation that mentions the company. "
         "EXAMPLE: 'This is a wonderful business with a wide moat built on [specific advantage]. "
         "The economics are durable, and I would be comfortable holding for decades. "
         "At current prices, Mr. Market is offering a fair deal for patient capital. For my own portfolio, I'd buy and hold for the long term.'"
     ),
     "Charlie Munger": (
-        "As Charlie Munger, your closing MUST:\n"
-        "- Use inversion: 'What would make this a terrible investment?'\n"
-        "- Discuss incentives alignment\n"
-        "- Be blunt and pithy\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a blunt first-person BUY/HOLD/SELL stance (vary wording; do not always use 'I personally would').\n"
+        "As Charlie Munger, write a blunt, pithy closing. Invert the question — what would make this a terrible investment? "
+        "End with a first-person BUY/HOLD/SELL stance. "
         "EXAMPLE: 'Inverting the question: what would make this a disaster? [Answer]. "
         "The incentives are properly aligned. The economics make sense. If I had to act today, I'd buy.'"
     ),
     "Benjamin Graham": (
-        "As Benjamin Graham, your closing MUST:\n"
-        "- Reference 'margin of safety' explicitly\n"
-        "- Discuss intrinsic value vs market price\n"
-        "- Use 'intelligent investor' language\n"
-        "- Be quantitative and methodical\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a clear, first-person BUY/HOLD/SELL stance (wording should vary).\n"
+        "As Benjamin Graham, write a closing anchored in margin of safety and intrinsic value vs. market price. "
+        "End with a clear first-person BUY/HOLD/SELL stance. "
         "EXAMPLE: 'The margin of safety at current prices is [adequate/insufficient]. "
         "For the intelligent investor, this represents [investment/speculation]. "
         "The balance sheet strength [supports/undermines] the thesis. I'd hold until a wider margin of safety appears.'"
     ),
     "Peter Lynch": (
-        "As Peter Lynch, your closing MUST:\n"
-        "- Tell 'the story' in simple terms\n"
-        "- Reference PEG ratio if applicable\n"
-        "- Classify as stalwart/fast grower/turnaround/cyclical\n"
-        "- Be enthusiastic if bullish\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a first-person BUY/HOLD/SELL stance with Lynch-like energy (wording should vary).\n"
+        "As Peter Lynch, close by telling 'the story' in simple terms and classifying the stock (stalwart, fast grower, turnaround, cyclical). "
+        "End with a first-person BUY/HOLD/SELL stance with Lynch-like energy. "
         "EXAMPLE: 'Here's the story: [simple explanation]. The PEG of [X] says this is [cheap/fair/expensive]. "
         "This is a [category] that I would [verdict]. You don't need an MBA to understand this one. I'd buy it and put it away.'"
     ),
     "Ray Dalio": (
-        "As Ray Dalio, your closing MUST:\n"
-        "- Reference 'where we are in the cycle'\n"
-        "- Discuss risk parity considerations\n"
-        "- Mention correlation to macro factors\n"
-        "- Use systems thinking language\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a first-person BUY/HOLD/SELL stance plus sizing rationale (wording should vary).\n"
+        "As Ray Dalio, close by placing the investment in the current cycle and assessing risk-parity considerations. "
+        "End with a first-person BUY/HOLD/SELL stance plus sizing rationale. "
         "EXAMPLE: 'At this point in the cycle, [assessment]. The risk parity consideration suggests [sizing]. "
         "Understanding the machine, I'd hold in moderate size given the current cycle position.'"
     ),
     "Cathie Wood": (
-        "As Cathie Wood, your closing MUST:\n"
-        "- Reference 'disruptive innovation'\n"
-        "- Mention Wright's Law or S-curves if relevant\n"
-        "- Give a 5-year or 2030 vision\n"
-        "- Express high conviction in innovation\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a first-person BUY/HOLD/SELL stance with conviction (wording should vary).\n"
+        "As Cathie Wood, close with your conviction about the company's disruptive innovation potential and a forward-looking vision. "
+        "End with a first-person BUY/HOLD/SELL stance. "
         "EXAMPLE: 'The disruptive innovation potential here is [assessment]. "
         "Wright's Law suggests costs will [trajectory]. By 2030, [vision]. I'd buy with high conviction for the next 5 years.'"
     ),
     "Joel Greenblatt": (
-        "As Joel Greenblatt, your closing MUST:\n"
-        "- Reference return on capital and earnings yield\n"
-        "- Give a clear Magic Formula verdict: Is it GOOD (high ROC), CHEAP (high earnings yield), or BOTH? The Magic Formula works best when a stock is BOTH good AND cheap.\n"
-        "- Be quantitative and direct - cite specific numbers\n"
-        "- Assess if this is a 'clean situation' or if there are complications\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY - FINAL SENTENCE):\n"
-        "  Your VERY LAST sentence MUST be a first-person recommendation that includes BUY/HOLD/SELL/PASS and mentions the company.\n"
-        "  Use one of these styles (do NOT copy verbatim):\n"
-        "  * 'My call: HOLD [Company] (but don't add).'\n"
-        "  * 'On the Magic Formula, I'd BUY [Company] at this price.'\n"
-        "  * 'I'd PASS on [Company] until the screen improves.'\n"
+        "As Joel Greenblatt, close with a Magic Formula verdict: is it GOOD (high ROC), CHEAP (high earnings yield), or BOTH? "
+        "End with a first-person BUY/HOLD/SELL/PASS that mentions the company. "
         "EXAMPLE: 'Return on capital is 25%, earnings yield is 8%. By the Magic Formula, this is a good business at a fair price - but not clearly cheap. "
         "The cash generation is strong, but leverage concerns limit the margin of safety. My call: HOLD UBER, but don't add until it screens cheaper.'"
     ),
     "John Bogle": (
-        "As John Bogle, your closing MUST:\n"
-        "- Reference 'stay the course' and 'costs matter'\n"
-        "- Compare individual stock to index fund approach\n"
-        "- Use 'haystack vs needle' analogy\n"
-        "- Be humble and prudent\n"
-        "- STATE A CLEAR VERDICT: Even as an index advocate, give your assessment\n"
-        "- Include what would change your view (e.g., 'valuation, competitive threats')\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a clear, humble first-person BUY/HOLD/SELL recommendation (wording should vary).\n"
+        "As John Bogle, close with a humble assessment weighing this stock against an index fund approach. "
+        "End with a clear first-person BUY/HOLD/SELL recommendation. "
         "EXAMPLE: 'This is a fine business with exceptional profitability. But why own one needle when you can own the haystack? "
         "Costs matter, and 90% of active managers fail. If valuation became more attractive, I might reconsider. For those who insist on individual stocks, I'd hold this one—but I'd still prefer the index fund.'"
     ),
     "Howard Marks": (
-        "As Howard Marks, your closing MUST:\n"
-        "- Reference 'second-level thinking'\n"
-        "- Discuss 'where we are in the cycle' and 'the pendulum'\n"
-        "- Assess risk-reward asymmetry\n"
-        "- Consider 'what's priced in'\n"
-        "- STATE A CLEAR VERDICT: BUY, HOLD, SELL, or WAIT with your reasoning\n"
-        "- Include what would change your view (cycle shift, valuation change)\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a first-person BUY/HOLD/SELL/WAIT stance (wording should vary).\n"
+        "As Howard Marks, close with second-level thinking about what the market is pricing in and where the cycle stands. "
+        "End with a first-person BUY/HOLD/SELL/WAIT stance. "
         "EXAMPLE: 'Cycle check: optimism is elevated but not extreme. Second-level thinking suggests the market is not fully pricing in competitive risks. "
         "The risk-reward asymmetry favors caution. If it were my money, I'd hold and wait for better asymmetry.'"
     ),
     "Bill Ackman": (
-        "As Bill Ackman, your closing MUST:\n"
-        "- Assess if business is 'simple, predictable, free-cash-flow generative'\n"
-        "- Identify 'the catalyst' for value creation\n"
-        "- State what 'management MUST' do\n"
-        "- Express conviction level\n"
-        "- STATE A CLEAR VERDICT: BUY, HOLD, or SELL with conviction level\n"
-        "- Include what would change your view (catalyst, management action)\n"
-        "- END WITH PERSONAL RECOMMENDATION (MANDATORY): End with a first-person BUY/HOLD/SELL stance with conviction (wording should vary).\n"
+        "As Bill Ackman, close by assessing whether the business is simple, predictable, and free-cash-flow generative, and identify the catalyst. "
+        "End with a first-person BUY/HOLD/SELL stance with conviction level. "
         "EXAMPLE: 'This is simple, predictable, and free-cash-flow generative—exactly what I look for. "
         "The catalyst for value creation is clear. Management MUST maintain discipline. I'd buy with high conviction at these levels.'"
     ),
@@ -897,103 +2773,94 @@ def _micro_trim_filler_words(text: str, max_remove: int) -> Tuple[str, int]:
 
 
 def _micro_pad_tail_words(text: str, min_add_words: int) -> str:
-    """Append a tiny, natural-looking phrase when we need 1–5 extra words.
+    """Disabled: even small template padding damages narrative flow.
 
-    This is only a last resort when sentence-level padding templates are exhausted
-    (e.g., due to dedupe rules) but strict word bands still need to be met.
+    Length targets are achieved via LLM rewrite passes.  Returns input unchanged.
     """
+    return text
+
+    # ── LEGACY CODE BELOW ──
     if not text or min_add_words <= 0:
         return text
 
-    # Minimal phrases with stable word counts (no punctuation-only tokens).
-    #
-    # IMPORTANT:
-    # - Avoid "meta-filler" like "in sum / on balance / as things stand" which can
-    #   accumulate into visible spam if padding runs multiple times.
-    # - Avoid imperative "Watch/Monitor/Track" sentences because upstream filler
-    #   cleanup may strip them, creating padding loops.
-    phrases: List[str] = [
-        "key swing factor",
-        "primary swing factor",
-        "near term factors",
-        "in practical terms",
-        "fundamental catalyst",
-        "structural driver",
-        "operating backdrop",
-        "valuation context",
-        "execution priority",
-        "capital intensity backdrop",
-        "on a forward basis",
-        "relative to the cycle",
-        "across the enterprise",
-        "from a risk standpoint",
-        "on a relative basis",
-        "under current conditions",
-        "given the trajectory",
-        "within this framework",
-    ]
+    section_tail_sentences: Dict[str, List[str]] = {
+        "executive summary": [
+            "The core tension remains durability versus conversion quality.",
+            "What matters next is whether operating signals confirm the thesis.",
+        ],
+        "financial performance": [
+            "The period signal should be judged on margins and cash conversion together.",
+            "That bridge determines whether reported strength is durable.",
+        ],
+        "management discussion and analysis": [
+            "Capital-allocation choices will confirm whether execution quality is improving.",
+            "The next period should show whether reinvestment is earning its keep.",
+        ],
+        "risk factors": [
+            "The downside path depends on whether this pressure is cyclical or structural.",
+            "That risk rises if cash conversion weakens alongside growth.",
+        ],
+        "closing takeaway": [
+            "The view changes only if the measurable trigger is met.",
+            "That condition is the practical hinge for conviction.",
+        ],
+        "default": [
+            "The next period should confirm whether execution is improving.",
+            "Durability still depends on alignment between margins and cash conversion.",
+        ],
+    }
 
     def _wc(s: str) -> int:
         return len([w for w in (s or "").split() if w.strip()])
 
-    eligible = [p for p in phrases if _wc(p) >= min_add_words]
-    if not eligible:
-        eligible = ["key swing factor"]
+    current_text = (text or "").rstrip()
+    lowered_full = current_text.lower()
+    section_name = "default"
+    section_matches = list(
+        re.finditer(r"^\s*##\s*(.+?)\s*$", current_text, re.MULTILINE)
+    )
+    if section_matches:
+        section_name = (
+            _standard_section_name_from_heading(f"## {section_matches[-1].group(1)}")
+            .lower()
+            .replace("&", "and")
+        )
+    pool = section_tail_sentences.get(section_name) or section_tail_sentences["default"]
 
-    lowered = (text or "").lower()
-    # Avoid repeating the *same* micro-phrase, but allow an alternate phrase if the draft
-    # already contains one of them (models sometimes include "key swing factor" naturally).
-    pool = [p for p in eligible if p.lower() not in lowered]
-    if not pool:
-        return text
-
-    # Append as many distinct phrases as needed to reach the target.
-    # We use a loop to avoid one long run-on sentence.
-    current_text = text
     words_added = 0
+    used_norms: set[str] = {
+        " ".join((s or "").lower().split()).rstrip(".!?") for s in pool if s
+    }
+    used_norms = {
+        norm for norm in used_norms if norm and norm in " ".join(lowered_full.split())
+    }
 
-    for _ in range(10):
+    for _ in range(4):
         if words_added >= min_add_words:
             break
 
-        # Avoid repeating the same micro-phrase.
-        lowered = (current_text or "").lower()
-        pool = [p for p in eligible if p.lower() not in lowered]
-        if not pool:
+        available = [
+            sentence
+            for sentence in pool
+            if sentence.lower().rstrip(".!?") not in used_norms
+        ]
+        if not available:
             break
-
-        pool.sort(key=_wc)
-        smallest_wc = _wc(pool[0])
-        same_wc = [p for p in pool if _wc(p) == smallest_wc]
         digest = hashlib.sha256(
             f"{len(current_text)}:{min_add_words}:{current_text[-120:]}".encode("utf-8")
         ).digest()
-        idx = int.from_bytes(digest[:2], "big") % len(same_wc)
-        best = same_wc[idx]
+        chosen = available[int.from_bytes(digest[:2], "big") % len(available)]
+        used_norms.add(chosen.lower().rstrip(".!?"))
 
-        lines = current_text.splitlines()
-        success = False
-        for i in range(len(lines) - 1, -1, -1):
-            line = lines[i].rstrip()
-            if not line.strip() or line.lstrip().startswith("#"):
-                continue
-
-            # Append as a short clause.
-            if line.endswith((".", "!", "?")):
-                line = line[:-1].rstrip()
-            lines[i] = f"{line} ({best})."
-            current_text = "\n".join(lines).strip()
-            words_added += _wc(best)
-            success = True
-            break
-
-        if not success:
-            # Fallback: append as a final sentence.
-            suffix = best
-            if not suffix.endswith((".", "!", "?")):
-                suffix += "."
-            current_text = f"{current_text.rstrip()}\n\n{suffix}".strip()
-            words_added += _wc(best)
+        lines = current_text.splitlines() if current_text else []
+        if lines and re.match(r"^\s*##\s+", lines[-1].strip()):
+            current_text = f"{current_text}\n{chosen}".strip()
+        else:
+            if current_text and not current_text.endswith((".", "!", "?")):
+                current_text = current_text.rstrip() + "."
+            joiner = "\n\n" if "\n## " in current_text[-200:] else " "
+            current_text = f"{current_text}{joiner}{chosen}".strip()
+        words_added += _wc(chosen)
 
     return current_text
 
@@ -1001,7 +2868,7 @@ def _micro_pad_tail_words(text: str, min_add_words: int) -> str:
 def _enforce_whitespace_word_band(
     text: str,
     target_length: int,
-    tolerance: int = 10,
+    tolerance: int = FINAL_STRICT_WORD_BAND_TOLERANCE,
     *,
     allow_padding: bool = False,
     dedupe: bool = True,
@@ -1019,7 +2886,7 @@ def _enforce_whitespace_word_band(
         return text
 
     # Keep the final output inside the global target-length bounds even when the user
-    # selects an extreme. This prevents "within ±10" from exceeding the absolute min/max.
+    # selects an extreme. This prevents strict-band windows from exceeding absolute min/max.
     lower = max(TARGET_LENGTH_MIN_WORDS, target_length - tolerance)
     upper = min(TARGET_LENGTH_MAX_WORDS, target_length + tolerance)
 
@@ -1064,17 +2931,28 @@ def _enforce_whitespace_word_band(
 
     micro_pad_used = False
 
-    for _ in range(5):
+    for _ in range(15):
         split_count = len(text.split())
         stripped_count = _count_words(text)
 
-        if lower <= split_count <= upper and lower <= stripped_count <= upper:
+        # Use canonical (punctuation-stripped) count as the primary gate.
+        # Fall back to requiring both counts only when they meaningfully diverge.
+        canonical_ok = lower <= stripped_count <= upper
+        split_ok = lower <= split_count <= upper
+
+        if canonical_ok and split_ok:
             if dedupe:
                 cleaned = _dedupe_consecutive_sentences(text)
                 cleaned = _deduplicate_sentences(cleaned)
                 if cleaned != text:
-                    text = cleaned
-                    continue
+                    cleaned_split = len(cleaned.split())
+                    cleaned_stripped = _count_words(cleaned)
+                    if (
+                        lower <= cleaned_split <= upper
+                        and lower <= cleaned_stripped <= upper
+                    ):
+                        text = cleaned
+                        continue
             return text
 
         if split_count > upper or stripped_count > upper:
@@ -1124,11 +3002,15 @@ def _enforce_whitespace_word_band(
                     section=None,
                     is_persona=is_persona,
                     max_words=12,
+                    context_text=text,
                 )
                 if padding:
                     block = " ".join(padding).strip()
                     if block:
-                        text = f"{text.rstrip()}\n\n{block}".strip()
+                        base = text.rstrip()
+                        if base and not base.endswith((".", "!", "?")):
+                            base += "."
+                        text = f"{base} {block}".strip()
             continue
         padded = _distribute_padding_across_sections(text, deficit)
         remaining = max(lower - len(padded.split()), lower - _count_words(padded), 0)
@@ -1137,18 +3019,22 @@ def _enforce_whitespace_word_band(
                 padded = _micro_pad_tail_words(padded, remaining)
                 micro_pad_used = True
             else:
-                is_persona = bool(re.search(r"\b(?:I|my|I'm|I’m)\b", padded))
+                is_persona = bool(re.search(r"\b(?:I|my|I’m|I’m)\b", padded))
                 padding = _generate_padding_sentences(
                     remaining,
                     exclude_norms=set(),
                     section=None,
                     is_persona=is_persona,
                     max_words=12,
+                    context_text=padded,
                 )
                 if padding:
                     block = " ".join(padding).strip()
                     if block:
-                        padded = f"{padded.rstrip()}\n\n{block}".strip()
+                        base = padded.rstrip()
+                        if base and not base.endswith((".", "!", "?")):
+                            base += "."
+                        padded = f"{base} {block}".strip()
         text = padded
 
     # Final safety: deterministic clamp if the iterative pass didn't converge.
@@ -1345,23 +3231,30 @@ def _enforce_whitespace_word_band(
         return norms
 
     used_sentences = _seed_exclude_norms_from_memo(hardened)
+    strict_tol = _effective_word_band_tolerance(target_length)
 
     for _ in range(50):
         split_count = len(hardened.split())
         stripped_count = _count_words(hardened)
 
-        # Precision target: land within ±10 words
-        if target_length - 10 <= stripped_count <= target_length + 10:
+        # Precision target: land within the strict final tolerance.
+        if target_length - strict_tol <= stripped_count <= target_length + strict_tol:
             if dedupe:
                 cleaned = _dedupe_consecutive_sentences(hardened)
                 cleaned = _deduplicate_sentences(cleaned)
                 if cleaned != hardened:
-                    hardened = cleaned
-                    used_sentences = _seed_exclude_norms_from_memo(hardened)
-                    continue
+                    cleaned_split = len(cleaned.split())
+                    cleaned_stripped = _count_words(cleaned)
+                    if (
+                        lower <= cleaned_split <= upper
+                        and lower <= cleaned_stripped <= upper
+                    ):
+                        hardened = cleaned
+                        used_sentences = _seed_exclude_norms_from_memo(hardened)
+                        continue
             return hardened
 
-        if stripped_count > target_length + 10:
+        if stripped_count > target_length + strict_tol:
             # Too long: trim
             hardened = _truncate_text_to_word_limit(hardened, target_length)
             continue
@@ -1379,6 +3272,14 @@ def _enforce_whitespace_word_band(
             else:
                 return hardened  # Stop if micro-padding fails
 
+        # For markdown sectioned memos, prefer section-aware padding so we avoid
+        # appending generic one-liner loops to the tail of the final section.
+        if re.search(r"^\s*##\s+", hardened, re.MULTILINE):
+            padded = _distribute_padding_across_sections(hardened, deficit)
+            if padded != hardened:
+                hardened = padded
+                continue
+
         budget = max(1, min(deficit + 8, 120))
         padding_sentences = _generate_padding_sentences(
             deficit,
@@ -1386,12 +3287,16 @@ def _enforce_whitespace_word_band(
             section=None,
             is_persona=is_persona,
             max_words=budget,
+            context_text=hardened,
         )
         if padding_sentences:
             used_sentences.update(padding_sentences)
             padding_block = " ".join(padding_sentences).strip()
             if padding_block:
-                hardened = f"{hardened.rstrip()}\n\n{padding_block}".strip()
+                base = hardened.rstrip()
+                if base and not base.endswith((".", "!", "?")):
+                    base += "."
+                hardened = f"{base} {padding_block}".strip()
                 continue
 
         # Absolute last resort: make minimal progress without creating token spam.
@@ -1409,20 +3314,265 @@ def _ensure_final_strict_word_band(
     target_length: int,
     *,
     include_health_rating: bool,
-    tolerance: int = 10,
+    tolerance: int = FINAL_STRICT_WORD_BAND_TOLERANCE,
+    generation_stats: Optional[Dict[str, Any]] = None,
+    allow_padding: bool = True,
 ) -> str:
     """Final, idempotent guard to ensure the strict total word band after all other processing."""
     if not text or target_length is None:
         return text
 
+    target = int(target_length)
+    lower = max(TARGET_LENGTH_MIN_WORDS, target - int(tolerance))
+    upper = min(TARGET_LENGTH_MAX_WORDS, target + int(tolerance))
+
+    def _in_band(value: str) -> bool:
+        split_wc = len((value or "").split())
+        stripped_wc = _count_words(value or "")
+        return lower <= split_wc <= upper and lower <= stripped_wc <= upper
+
     ordered = _enforce_section_order(text, include_health_rating=include_health_rating)
     enforced = _enforce_whitespace_word_band(
-        ordered, int(target_length), tolerance=int(tolerance), allow_padding=True
+        ordered, target, tolerance=int(tolerance), allow_padding=allow_padding
     )
+    if _in_band(enforced):
+        return _enforce_section_order(
+            enforced, include_health_rating=include_health_rating
+        )
+
+    split_wc = len((enforced or "").split())
+    stripped_wc = _count_words(enforced or "")
+    deficit = max(lower - split_wc, lower - stripped_wc, 0)
+
+    if deficit > 0 and allow_padding:
+        if deficit <= 5:
+            before_micro = enforced
+            enforced = _micro_pad_tail_words(enforced, deficit)
+            _record_padding_telemetry(
+                generation_stats, before_text=before_micro, after_text=enforced
+            )
+        else:
+            before_distribute = enforced
+            enforced = _distribute_padding_across_sections(enforced, deficit)
+            _record_padding_telemetry(
+                generation_stats, before_text=before_distribute, after_text=enforced
+            )
+            remaining = max(
+                lower - len((enforced or "").split()),
+                lower - _count_words(enforced or ""),
+                0,
+            )
+            if 0 < remaining <= 5:
+                before_micro = enforced
+                enforced = _micro_pad_tail_words(enforced, remaining)
+                _record_padding_telemetry(
+                    generation_stats, before_text=before_micro, after_text=enforced
+                )
+
+    if not _in_band(enforced) and allow_padding:
+        before_final = enforced
+        enforced = _enforce_whitespace_word_band(
+            enforced, target, tolerance=int(tolerance), allow_padding=True
+        )
+        _record_padding_telemetry(
+            generation_stats, before_text=before_final, after_text=enforced
+        )
+
     return _enforce_section_order(enforced, include_health_rating=include_health_rating)
 
 
-def _call_gemini_client(
+def _rescue_one_shot_long_form_length_underflow(
+    summary_text: str,
+    *,
+    target_length: Optional[int],
+    include_health_rating: bool,
+    calculated_metrics: Dict[str, Any],
+    company_name: str,
+    generation_stats: Optional[Dict[str, Any]] = None,
+    gemini_client: Optional[Any] = None,
+    quality_validators: Optional[List[Callable[[str], Optional[str]]]] = None,
+    token_budget: Optional[TokenBudget] = None,
+    cost_budget: Optional[SummaryCostBudget] = None,
+    max_output_tokens: int = DEFAULT_OPENAI_MAX_OUTPUT_TOKENS,
+    persona_intensity: str = "strong",
+) -> Tuple[str, Dict[str, Any]]:
+    """Deterministic-only long-form underflow rescue for one-shot target summaries."""
+    text = summary_text or ""
+    info: Dict[str, Any] = {
+        "used": False,
+        "applied": False,
+        "before_wc": int(_count_words(text or "")),
+        "after_wc": int(_count_words(text or "")),
+        "words_added": 0,
+        "underflow_helper_applied": False,
+        "llm_rewrite_applied": False,
+    }
+    if not text or not target_length:
+        return summary_text, info
+    if not _is_long_form_target(target_length):
+        return summary_text, info
+
+    one_shot_policy = bool(
+        generation_stats and generation_stats.get("one_shot_deterministic_policy")
+    )
+    if not one_shot_policy:
+        return summary_text, info
+
+    target = int(target_length)
+    tol = _effective_word_band_tolerance(target)
+    lower = max(TARGET_LENGTH_MIN_WORDS, target - tol)
+    before_wc = int(_count_words(text or ""))
+    if before_wc >= lower:
+        return summary_text, info
+
+    info["used"] = True
+
+    # One-shot policy forbids rewrites. Pass gemini_client=None so the strict-band
+    # helper can only use deterministic addenda/trim paths.
+    text = _enforce_strict_target_band(
+        text,
+        target,
+        calculated_metrics=calculated_metrics,
+        company_name=company_name,
+        include_health_rating=include_health_rating,
+        generation_stats=generation_stats,
+        allow_padding_rescue=False,
+        prefer_narrative_padding=True,
+        gemini_client=None,
+        quality_validators=None,
+    )
+
+    after_strict_wc = int(_count_words(text or ""))
+    catastrophic_underflow = bool(
+        after_strict_wc < max(TARGET_LENGTH_MIN_WORDS, (target + 1) // 2)
+        or (lower - after_strict_wc) >= 700
+    )
+    if after_strict_wc < lower and catastrophic_underflow and gemini_client is not None:
+        rewrite_timeout_seconds: Optional[float] = None
+        runtime_deadline_monotonic = (
+            float(generation_stats.get("summary_runtime_deadline_monotonic") or 0.0)
+            if isinstance(generation_stats, dict)
+            else 0.0
+        )
+        if runtime_deadline_monotonic > 0.0:
+            remaining_wall = float(runtime_deadline_monotonic - time.monotonic())
+            if remaining_wall > 0.0:
+                rewrite_timeout_seconds = min(
+                    float(_summary_rewrite_timeout_seconds()),
+                    float(remaining_wall),
+                )
+        elif _summary_rewrite_timeout_seconds() > 0.0:
+            rewrite_timeout_seconds = float(_summary_rewrite_timeout_seconds())
+
+        if rewrite_timeout_seconds and rewrite_timeout_seconds > 0.0:
+            rewritten_text, _ = _rewrite_summary_to_length(
+                gemini_client,
+                text,
+                target,
+                quality_validators,
+                current_words=after_strict_wc,
+                token_budget=None,
+                cost_budget=None,
+                max_output_tokens=max_output_tokens,
+                generation_stats=generation_stats,
+                persona_intensity=persona_intensity,
+                quality_issue_hint=(
+                    "Catastrophic one-shot long-form underflow: expand every section with "
+                    "filing-grounded analysis and land in the target band."
+                ),
+                allow_over_target_recovery=True,
+                ignore_max_rewrite_attempts=True,
+                allow_one_shot_rewrite=True,
+                timeout_seconds=float(rewrite_timeout_seconds),
+            )
+            rewritten_wc = int(_count_words(rewritten_text or ""))
+            if rewritten_text and rewritten_wc > after_strict_wc:
+                text = rewritten_text
+                after_strict_wc = rewritten_wc
+                info["llm_rewrite_applied"] = True
+
+    if after_strict_wc < lower:
+        max_deficit_words = max(320, min(2400, int(lower - after_strict_wc + 120)))
+        text, underflow_info = _expand_underweight_narrative_sections_for_long_form_underflow(
+            text,
+            target_length=target_length,
+            include_health_rating=include_health_rating,
+            issue_flags={"word_band_issue": True},
+            generation_stats=generation_stats,
+            max_deficit_words=max_deficit_words,
+        )
+        info["underflow_helper_applied"] = bool(underflow_info.get("applied"))
+
+    after_wc = int(_count_words(text or ""))
+    info["after_wc"] = after_wc
+    info["words_added"] = max(0, after_wc - before_wc)
+    info["applied"] = bool(after_wc > before_wc)
+
+    if generation_stats is not None and info["used"]:
+        generation_stats["one_shot_long_form_length_rescue_used"] = True
+        generation_stats["one_shot_long_form_length_rescue_before_wc"] = int(before_wc)
+        generation_stats["one_shot_long_form_length_rescue_after_wc"] = int(after_wc)
+        generation_stats["one_shot_long_form_length_rescue_words_added"] = int(
+            info["words_added"]
+        )
+        generation_stats["one_shot_long_form_underflow_helper_applied"] = bool(
+            info["underflow_helper_applied"]
+        )
+        generation_stats["one_shot_long_form_length_rescue_llm_rewrite_applied"] = bool(
+            info["llm_rewrite_applied"]
+        )
+
+    return text, info
+
+
+def _run_summary_cleanup_pass(
+    text: str,
+    *,
+    include_health_rating: bool,
+    calculated_metrics: Dict[str, Any],
+    company_name: str,
+) -> str:
+    """Deterministic cleanup pass used before final banding."""
+    out = text or ""
+    out = _fix_inline_section_headers(out)
+    out = _normalize_section_headings(out, include_health_rating)
+    out = _merge_duplicate_canonical_sections(
+        out, include_health_rating=include_health_rating
+    )
+    out = _normalize_underwriting_questions_formatting(out)
+    out = _merge_underwriting_question_lines(out)
+    out = _relocate_underwriting_questions_to_mdna(out)
+    out = _strip_directive_lines(out)
+    out = _remove_filler_phrases(out)
+    out = _remove_generic_heuristic_paragraphs(out)
+    out = _rewrite_instruction_leaks_in_place(
+        out,
+        calculated_metrics=calculated_metrics,
+        company_name=company_name,
+    )
+    out = _remove_metric_echo_loops(out)
+    out = _cleanup_sentence_artifacts(out)
+    out = _validate_complete_sentences(out)
+    out = _dedupe_consecutive_sentences(out)
+    out = _dedupe_repeated_paragraphs(out)
+    out = _merge_staccato_paragraphs(out)
+    out = _normalize_casing(out)
+    out = _enforce_section_order(out, include_health_rating=include_health_rating)
+    return out.strip()
+
+
+def _needs_sentence_completion_pass(text: str) -> bool:
+    stripped = (text or "").rstrip()
+    if not stripped:
+        return False
+    if not stripped.endswith((".", "!", "?")):
+        return True
+    return bool(
+        re.search(r"(?:\b(?:and|or|with|because|if)\s*)$", stripped, re.IGNORECASE)
+    )
+
+
+def _call_ai_client(
     gemini_client,
     prompt: str,
     *,
@@ -1435,94 +3585,126 @@ def _call_gemini_client(
     retry: bool = True,
 ) -> str:
     """
-    Generate text using the Gemini client, gracefully falling back when streaming helpers
+    Generate text using the AI client, gracefully falling back when streaming helpers
     are unavailable (e.g., in tests that mock only the underlying model).
     """
-    if allow_stream and hasattr(gemini_client, "stream_generate_content"):
-        try:
-            try:
-                return gemini_client.stream_generate_content(
-                    prompt,
-                    progress_callback=progress_callback,
-                    stage_name=stage_name,
-                    expected_tokens=expected_tokens,
-                    generation_config_override=generation_config_override,
-                    timeout_seconds=timeout_seconds,
-                    retry=retry,
-                )
-            except TypeError:
-                # Back-compat for older clients/tests.
-                return gemini_client.stream_generate_content(
-                    prompt,
-                    progress_callback=progress_callback,
-                    stage_name=stage_name,
-                    expected_tokens=expected_tokens,
-                    generation_config_override=generation_config_override,
-                    timeout_seconds=timeout_seconds,
-                )
-        except ValueError as exc:
-            if "request_options" in str(exc) and hasattr(
-                gemini_client, "force_http_fallback"
-            ):
-                gemini_client.force_http_fallback = True
-                try:
-                    try:
-                        return gemini_client.stream_generate_content(
-                            prompt,
-                            progress_callback=progress_callback,
-                            stage_name=stage_name,
-                            expected_tokens=expected_tokens,
-                            generation_config_override=generation_config_override,
-                            timeout_seconds=timeout_seconds,
-                            retry=retry,
-                        )
-                    except TypeError:
-                        return gemini_client.stream_generate_content(
-                            prompt,
-                            progress_callback=progress_callback,
-                            stage_name=stage_name,
-                            expected_tokens=expected_tokens,
-                            generation_config_override=generation_config_override,
-                            timeout_seconds=timeout_seconds,
-                        )
-                except Exception:
-                    logger.warning(
-                        "Streaming failed after forcing HTTP fallback; using non-stream generation."
-                    )
-            else:
-                logger.warning(
-                    "Streaming generation failed with ValueError (%s); using non-stream generation.",
-                    exc,
-                )
-        except Exception as exc:
-            logger.warning(
-                "Streaming generation unavailable (%s); using non-stream generation.",
-                exc,
-            )
-
-    generator = None
-    if hasattr(gemini_client, "generate_content"):
-        generator = gemini_client.generate_content
-    elif getattr(gemini_client, "model", None) and hasattr(
-        gemini_client.model, "generate_content"
+    stream_saved_retries: Optional[int] = None
+    if (
+        not retry
+        and hasattr(gemini_client, "max_retries")
+        and isinstance(getattr(gemini_client, "max_retries", None), int)
     ):
-        generator = gemini_client.model.generate_content
-
-    if not generator:
-        raise AttributeError("Gemini client does not expose generate_content")
+        stream_saved_retries = int(getattr(gemini_client, "max_retries"))
+        gemini_client.max_retries = 1
 
     try:
-        response = generator(
-            prompt, generation_config_override=generation_config_override
-        )
-    except TypeError:
-        response = generator(prompt)
-    return getattr(response, "text", response)
+        if allow_stream and hasattr(gemini_client, "stream_generate_content"):
+            try:
+                try:
+                    return gemini_client.stream_generate_content(
+                        prompt,
+                        progress_callback=progress_callback,
+                        stage_name=stage_name,
+                        expected_tokens=expected_tokens,
+                        generation_config_override=generation_config_override,
+                        timeout_seconds=timeout_seconds,
+                        retry=retry,
+                    )
+                except TypeError:
+                    # Back-compat for older clients/tests.
+                    return gemini_client.stream_generate_content(
+                        prompt,
+                        progress_callback=progress_callback,
+                        stage_name=stage_name,
+                        expected_tokens=expected_tokens,
+                        generation_config_override=generation_config_override,
+                        timeout_seconds=timeout_seconds,
+                    )
+            except ValueError as exc:
+                if "request_options" in str(exc) and hasattr(
+                    gemini_client, "force_http_fallback"
+                ):
+                    gemini_client.force_http_fallback = True
+                    try:
+                        try:
+                            return gemini_client.stream_generate_content(
+                                prompt,
+                                progress_callback=progress_callback,
+                                stage_name=stage_name,
+                                expected_tokens=expected_tokens,
+                                generation_config_override=generation_config_override,
+                                timeout_seconds=timeout_seconds,
+                                retry=retry,
+                            )
+                        except TypeError:
+                            return gemini_client.stream_generate_content(
+                                prompt,
+                                progress_callback=progress_callback,
+                                stage_name=stage_name,
+                                expected_tokens=expected_tokens,
+                                generation_config_override=generation_config_override,
+                                timeout_seconds=timeout_seconds,
+                            )
+                    except Exception:
+                        logger.warning(
+                            "Streaming failed after forcing HTTP fallback; using non-stream generation."
+                        )
+                else:
+                    logger.warning(
+                        "Streaming generation failed with ValueError (%s); using non-stream generation.",
+                        exc,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Streaming generation unavailable (%s); using non-stream generation.",
+                    exc,
+                )
+
+        generator = None
+        if hasattr(gemini_client, "generate_content"):
+            generator = gemini_client.generate_content
+        elif getattr(gemini_client, "model", None) and hasattr(
+            gemini_client.model, "generate_content"
+        ):
+            generator = gemini_client.model.generate_content
+
+        if not generator:
+            raise AttributeError("AI client does not expose generate_content")
+
+        timeout_with_floor: Optional[float] = None
+        if timeout_seconds is not None:
+            timeout_with_floor = max(1.0, float(timeout_seconds))
+
+        try:
+            response = generator(
+                prompt,
+                generation_config_override=generation_config_override,
+                timeout_seconds=timeout_with_floor,
+            )
+        except TypeError:
+            try:
+                response = generator(
+                    prompt,
+                    generation_config_override=generation_config_override,
+                    timeout=timeout_with_floor,
+                )
+            except TypeError:
+                try:
+                    response = generator(
+                        prompt,
+                        generation_config_override=generation_config_override,
+                    )
+                except TypeError:
+                    response = generator(prompt)
+        return getattr(response, "text", response)
+    finally:
+        if stream_saved_retries is not None:
+            gemini_client.max_retries = stream_saved_retries
 
 
-def _ensure_gemini_client_interface(gemini_client):
+def _ensure_ai_client_interface(gemini_client):
     """
-    Ensure the provided gemini_client exposes a stream-compatible interface.
+    Ensure the provided client exposes a stream-compatible interface.
     Adds a shim when only a bare generate_content/model.generate_content exists (e.g., test doubles).
     """
     if hasattr(gemini_client, "stream_generate_content"):
@@ -1545,7 +3727,12 @@ def _ensure_gemini_client_interface(gemini_client):
         setattr(gemini_client, "stream_generate_content", _shim)
         return gemini_client
 
-    raise AttributeError("Gemini client does not expose a generation method")
+    raise AttributeError("AI client does not expose a generation method")
+
+
+# Backward-compat aliases for legacy tests/mocks.
+_call_gemini_client = _call_ai_client
+_ensure_gemini_client_interface = _ensure_ai_client_interface
 
 
 def _fix_inline_section_headers(text: str) -> str:
@@ -1720,7 +3907,35 @@ def _remove_filler_phrases(text: str) -> str:
         r"\bRisk is asymmetric when\b[^.\n]{0,240}(?:\.|\n|$)",
         r"\bOperating leverage is most\b[^.\n]{0,240}(?:\.|\n|$)",
         r"\bThe decision should be stated once\b[^.\n]{0,240}(?:\.|\n|$)",
+        # Metric-echo stems that read as synthetic reinforcement loops.
+        r"\bThe thesis stays grounded in\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bThe setup remains credible only if\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bNear[- ]term conviction rests on\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\b(?:[^.\n]*?)is the clearest quantitative read on this period\.",
+        r"\bPerformance quality is easier to underwrite with\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bExecution durability should be judged against\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bRisk severity increases(?: quickly)? if\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bThe stance should change only if\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bThis view is easier to defend if\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bThe setup remains investable if\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bCurrent conviction leans on\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bOne primary driver here is\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bThe near[- ]term call depends on\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bThis period'?s read is anchored by\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bThe quarter looks sturdier while\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bThis quarter looks repeatable while\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bQuarter quality improves when\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bExecution quality is visible in\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bExecution confidence depends on\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bManagement credibility improves if\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bCurrent conviction is tied to\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bThe underwriting read is steadier while\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bThe quality signal weakens if\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bCurrent posture remains intact if\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\bThis setup is easier to defend while\b[^.\n]{0,240}(?:\.|\n|$)",
         r"\bIn sum\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"\((?:key swing factor|primary swing factor|near term factors|in practical terms|fundamental catalyst|structural driver|operating backdrop|valuation context|execution priority|capital intensity backdrop|on a forward basis|relative to the cycle|across the enterprise|from a risk standpoint|on a relative basis|under current conditions|given the trajectory|within this framework)\)",
+        r"(?:\s*\((?:[^)\n]{1,40})\)){4,}\s*$",
         # Token/phrase loops (e.g., "in sum in sum in sum ...")
         r"(?:(?:\bin\s+sum\b)[\s,;:]*){2,}",
         # Catch partial sentences
@@ -1776,6 +3991,16 @@ _GENERIC_HEURISTIC_SENTENCES = [
     "Margin resilience hinges on mix and pricing, so product and region shifts can matter more than headline growth when competition heats up.",
     "What matters is whether operating leverage shows up in both margins and cash, not just adjusted metrics or one-time items.",
     "Capital allocation that compounds value usually looks like reinvesting where returns are clear and keeping dilution and acquisition premiums contained.",
+    "The next filing should confirm whether this trend is durable.",
+    "The strongest signal is alignment between margins and cash conversion.",
+    "That is the practical trigger for a higher-conviction stance.",
+    "Execution quality will decide whether the thesis strengthens from here.",
+    "Risk is asymmetric when cost structure is fixed and incremental revenue becomes less profitable.",
+    "Second-order risks matter most when they force permanently higher capital intensity.",
+    "The downside path is usually margin pressure combined with weaker cash conversion.",
+    "A higher-conviction setup appears when operating execution and cash durability improve together.",
+    "Cost flexibility often determines whether growth remains value-creating through a softer cycle.",
+    "Cash generation provides optionality, but capital allocation determines whether value compounds.",
 ]
 
 
@@ -1888,6 +4113,397 @@ def _remove_generic_heuristic_paragraphs(text: str) -> str:
     ).strip()
     rebuilt = re.sub(r"\n{3,}", "\n\n", rebuilt)
     return rebuilt
+
+
+def _remove_metric_echo_loops(text: str) -> str:
+    """Collapse repetitive metric-template loops in narrative sections."""
+    if not text:
+        return text
+
+    section_caps: Dict[str, int] = {
+        "Executive Summary": 2,
+        "Financial Performance": 2,
+        "Management Discussion & Analysis": 2,
+        "Risk Factors": 3,
+        "Closing Takeaway": 0,
+    }
+
+    stem_patterns: Dict[str, re.Pattern[str]] = {
+        "thesis_grounded": re.compile(
+            r"\bthe thesis stays grounded in\b", re.IGNORECASE
+        ),
+        "setup_remains_credible": re.compile(
+            r"\bthe setup remains credible only if\b", re.IGNORECASE
+        ),
+        "near_term_conviction": re.compile(
+            r"\bnear-term conviction rests on\b", re.IGNORECASE
+        ),
+        "clearest_quant_read": re.compile(
+            r"\bthe clearest quantitative read on this period\b", re.IGNORECASE
+        ),
+        "easier_underwrite": re.compile(
+            r"\bis easier to underwrite with\b", re.IGNORECASE
+        ),
+        "execution_judged_against": re.compile(
+            r"\bexecution durability should be judged against\b", re.IGNORECASE
+        ),
+        "risk_severity_increases": re.compile(
+            r"\brisk severity increases(?: quickly)? if\b", re.IGNORECASE
+        ),
+        "stance_change_only_if": re.compile(
+            r"\bthe stance should change only if\b", re.IGNORECASE
+        ),
+        "near_term_call_depends": re.compile(
+            r"\bthe near[- ]term call depends on\b", re.IGNORECASE
+        ),
+        "primary_driver": re.compile(r"\bone primary driver here is\b", re.IGNORECASE),
+        "conviction_leans": re.compile(
+            r"\bcurrent conviction leans on\b", re.IGNORECASE
+        ),
+        "setup_investable": re.compile(
+            r"\bthe setup remains investable if\b", re.IGNORECASE
+        ),
+        "view_defend_if": re.compile(
+            r"\bthis view is easier to defend if\b", re.IGNORECASE
+        ),
+        "narrative_credible_while": re.compile(
+            r"\bthe narrative is more credible while\b", re.IGNORECASE
+        ),
+        "base_case_assumes": re.compile(
+            r"\bthe base case still assumes\b", re.IGNORECASE
+        ),
+        "period_read_anchored": re.compile(
+            r"\bthis period'?s read is anchored by\b", re.IGNORECASE
+        ),
+        "quarter_sturdier": re.compile(
+            r"\bthe quarter looks sturdier while\b", re.IGNORECASE
+        ),
+        "quarter_repeatable": re.compile(
+            r"\bthis quarter looks repeatable while\b", re.IGNORECASE
+        ),
+        "quarter_quality_improves": re.compile(
+            r"\bquarter quality improves when\b", re.IGNORECASE
+        ),
+        "period_signal_weaker": re.compile(
+            r"\bthe period signal is weaker if\b", re.IGNORECASE
+        ),
+        "durability_credible_if": re.compile(
+            r"\bdurability is more credible if\b", re.IGNORECASE
+        ),
+        "operating_read_depends": re.compile(
+            r"\bthe operating read depends on whether\b", re.IGNORECASE
+        ),
+        "execution_quality_visible": re.compile(
+            r"\bexecution quality is visible in\b", re.IGNORECASE
+        ),
+        "plan_underwrite_if": re.compile(
+            r"\bthis plan is easier to underwrite if\b", re.IGNORECASE
+        ),
+        "strategy_read_through": re.compile(
+            r"\bthe strategy read-through is strongest while\b", re.IGNORECASE
+        ),
+        "strategy_follow_through": re.compile(
+            r"\bstrategy follow-through is most testable through\b", re.IGNORECASE
+        ),
+        "execution_confidence_depends": re.compile(
+            r"\bexecution confidence depends on\b", re.IGNORECASE
+        ),
+        "management_credibility_improves": re.compile(
+            r"\bmanagement credibility improves if\b", re.IGNORECASE
+        ),
+        "risk_case_more_likely": re.compile(
+            r"\bthis risk case is more likely if\b", re.IGNORECASE
+        ),
+        "risk_stays_contained": re.compile(
+            r"\bthis risk stays contained while\b", re.IGNORECASE
+        ),
+        "risk_intensity_rises": re.compile(
+            r"\brisk intensity rises if\b", re.IGNORECASE
+        ),
+        "downside_risk_increases": re.compile(
+            r"\bdownside risk increases if\b", re.IGNORECASE
+        ),
+        "downside_path_steepens": re.compile(
+            r"\bthe downside path steepens when\b", re.IGNORECASE
+        ),
+        "base_case_fragile": re.compile(
+            r"\bthe base case becomes fragile if\b", re.IGNORECASE
+        ),
+        "sustained_move_away": re.compile(
+            r"\ba sustained move away from\b", re.IGNORECASE
+        ),
+        "underwriting_read_steadier": re.compile(
+            r"\bthe underwriting read is steadier while\b", re.IGNORECASE
+        ),
+        "current_conviction_tied": re.compile(
+            r"\bcurrent conviction is tied to\b", re.IGNORECASE
+        ),
+        "central_checkpoint": re.compile(
+            r"\bremains a central checkpoint for quality\b", re.IGNORECASE
+        ),
+        "base_case_depends": re.compile(
+            r"\bthe base case still depends on\b", re.IGNORECASE
+        ),
+        "setup_easier_defend": re.compile(
+            r"\bthis setup is easier to defend while\b", re.IGNORECASE
+        ),
+        "quality_signal_weakens": re.compile(
+            r"\bthe quality signal weakens if\b", re.IGNORECASE
+        ),
+        "current_posture_intact": re.compile(
+            r"\bcurrent posture remains intact if\b", re.IGNORECASE
+        ),
+        # ── Padding-template stems (from _generate_padding_sentences) ──
+        "thesis_carries_weight": re.compile(
+            r"\bthe thesis carries more weight if\b", re.IGNORECASE
+        ),
+        "base_case_more_credible": re.compile(
+            r"\bthe base case is more credible when\b", re.IGNORECASE
+        ),
+        "conviction_improves": re.compile(r"\bconviction improves if\b", re.IGNORECASE),
+        "near_term_confidence": re.compile(
+            r"\bnear-term confidence relies on\b", re.IGNORECASE
+        ),
+        "remains_central_thesis": re.compile(
+            r"\bremains central to the thesis\b", re.IGNORECASE
+        ),
+        "period_quality_judged": re.compile(
+            r"\bperiod quality is best judged through\b", re.IGNORECASE
+        ),
+        "supports_period_read": re.compile(
+            r"\bsupports the period read only if\b", re.IGNORECASE
+        ),
+        "durability_looks_stronger": re.compile(
+            r"\bdurability looks stronger when\b", re.IGNORECASE
+        ),
+        "operating_signal_weakens": re.compile(
+            r"\bthe operating signal weakens if\b", re.IGNORECASE
+        ),
+        "remains_key_period_marker": re.compile(
+            r"\bremains a key period marker\b", re.IGNORECASE
+        ),
+        "execution_quality_credible": re.compile(
+            r"\bexecution quality is more credible when\b", re.IGNORECASE
+        ),
+        "management_credibility_improves_pad": re.compile(
+            r"\bmanagement credibility improves if\b", re.IGNORECASE
+        ),
+        "strategy_follow_through_pad": re.compile(
+            r"\bstrategy follow-through is easier to underwrite\b", re.IGNORECASE
+        ),
+        "execution_risk_rises_pad": re.compile(
+            r"\bexecution risk rises if\b", re.IGNORECASE
+        ),
+        "remains_key_execution_marker": re.compile(
+            r"\bremains a key execution marker\b", re.IGNORECASE
+        ),
+        "this_risk_more_manageable": re.compile(
+            r"\bthis risk remains more manageable while\b", re.IGNORECASE
+        ),
+        "base_case_fragile_pad": re.compile(
+            r"\bthe base case becomes more fragile if\b", re.IGNORECASE
+        ),
+        "risk_severity_rises_pad": re.compile(
+            r"\brisk severity rises when\b", re.IGNORECASE
+        ),
+        "risk_rises_quickly": re.compile(r"\brisk rises quickly if\b", re.IGNORECASE),
+        "recommendation_tied_to": re.compile(
+            r"\bthe recommendation remains tied to\b", re.IGNORECASE
+        ),
+        "conviction_holds_while": re.compile(
+            r"\bconviction holds while\b", re.IGNORECASE
+        ),
+        "call_defensible_only": re.compile(
+            r"\bthis call is defensible only if\b", re.IGNORECASE
+        ),
+        "material_deviation_in": re.compile(
+            r"\ba material deviation in\b", re.IGNORECASE
+        ),
+        "remains_main_trigger": re.compile(
+            r"\bremains the main trigger\b", re.IGNORECASE
+        ),
+        "reported_remains_key_check": re.compile(
+            r"\breported .{3,40} remains a key check\b", re.IGNORECASE
+        ),
+        "sustained_deviation_in": re.compile(
+            r"\ba sustained deviation in\b", re.IGNORECASE
+        ),
+        "current_view_strongest": re.compile(
+            r"\bthe current view is strongest when\b", re.IGNORECASE
+        ),
+        "can_hold_around": re.compile(r"\bcan hold around\b", re.IGNORECASE),
+        "remains_key_checkpoint": re.compile(
+            r"\bremains a key checkpoint\b", re.IGNORECASE
+        ),
+        "health_confidence_strengthens": re.compile(
+            r"\bhealth confidence strengthens when\b", re.IGNORECASE
+        ),
+        "rating_more_defensible": re.compile(
+            r"\bthis rating remains more defensible\b", re.IGNORECASE
+        ),
+        "sustained_break_in": re.compile(r"\ba sustained break in\b", re.IGNORECASE),
+        "durability_case_assumes": re.compile(
+            r"\bthe durability case assumes\b", re.IGNORECASE
+        ),
+        "remains_pivotal_rating": re.compile(
+            r"\bremains pivotal to this rating\b", re.IGNORECASE
+        ),
+        # ── Additional echo patterns Gemini produces naturally ──
+        "weaken_underwriting_case": re.compile(
+            r"\bweaken the present underwriting case\b", re.IGNORECASE
+        ),
+        "confirmed_by_stable": re.compile(
+            r"\bconfirmed by stable margin and conversion\b", re.IGNORECASE
+        ),
+        "view_changes_only_if": re.compile(
+            r"\bthe view changes only if\b", re.IGNORECASE
+        ),
+        "practical_hinge_conviction": re.compile(
+            r"\bpractical hinge for conviction\b", re.IGNORECASE
+        ),
+        "underlying_thesis_credible": re.compile(
+            r"\bunderlying thesis remains more credible\b", re.IGNORECASE
+        ),
+        "translating_into_durable": re.compile(
+            r"\btranslating into durable cash outcomes\b", re.IGNORECASE
+        ),
+    }
+
+    metric_phrase_re = re.compile(
+        r"\b("
+        r"free\s+cash\s+flow|fcf\s+margin|operating\s+cash\s+flow|operating\s+income|"
+        r"operating\s+margin|net\s+margin|revenue|cash\s*\+\s*securities|"
+        r"current\s+ratio|liabilities\s*/\s*assets|total\s+debt|net\s+debt|cash"
+        r")\b",
+        re.IGNORECASE,
+    )
+    numeric_token_re = re.compile(r"\$?[\d,.]+(?:\s*[BMKbmkt]|\s*%|\s*x)?")
+
+    def _sentence_skeleton(sentence: str) -> str:
+        lowered = (sentence or "").lower()
+        if not lowered:
+            return ""
+        if not re.search(
+            r"\b(if|while|unless|remain|sustain|deviation|trigger|checkpoint|hold|break|conviction|thesis|risk)\b",
+            lowered,
+        ):
+            return ""
+        if not (re.search(r"\d", lowered) or metric_phrase_re.search(lowered)):
+            return ""
+        lowered = metric_phrase_re.sub(" metric ", lowered)
+        lowered = numeric_token_re.sub(" ", lowered)
+        lowered = re.sub(r"[^a-z ]+", " ", lowered)
+        lowered = re.sub(r"\s+", " ", lowered).strip()
+        words = [
+            w
+            for w in lowered.split()
+            if w
+            and w
+            not in {
+                "the",
+                "a",
+                "an",
+                "this",
+                "that",
+                "these",
+                "those",
+                "and",
+                "or",
+                "of",
+                "to",
+                "in",
+                "on",
+                "for",
+                "with",
+                "as",
+                "at",
+                "by",
+                "from",
+            }
+        ]
+        if len(words) < 4:
+            return ""
+        return " ".join(words[:9])
+
+    for title, sentence_cap in section_caps.items():
+        body = _extract_markdown_section_body(text, title)
+        if not body:
+            continue
+
+        sentences = [
+            s.strip() for s in re.split(r"(?<=[.!?])\s+", body.strip()) if s.strip()
+        ]
+        if not sentences:
+            continue
+
+        kept: List[str] = []
+        seen_stems: Dict[str, int] = {}
+        seen_skeletons: Set[str] = set()
+        for sentence in sentences:
+            matched_stem: Optional[str] = None
+            for stem_name, pattern in stem_patterns.items():
+                if pattern.search(sentence):
+                    matched_stem = stem_name
+                    break
+
+            skeleton = _sentence_skeleton(sentence)
+            if skeleton and skeleton in seen_skeletons:
+                continue
+
+            if matched_stem:
+                prior = int(seen_stems.get(matched_stem, 0))
+                if prior >= 1:
+                    continue
+                seen_stems[matched_stem] = prior + 1
+
+            kept.append(sentence)
+            if skeleton:
+                seen_skeletons.add(skeleton)
+
+        # Only apply hard sentence caps when echo-stem sentences were
+        # actually found.  This prevents capping sections that contain
+        # genuinely long original content with no template padding.
+        echo_found = len(seen_stems) > 0
+        if len(kept) > int(sentence_cap) and (
+            echo_found or title == "Closing Takeaway"
+        ):
+            if title == "Closing Takeaway":
+                if sentence_cap <= 0:
+                    # Cap of 0 means strip ALL padding-stem sentences from closing.
+                    # Keep only sentences that do NOT match any stem pattern.
+                    kept = [
+                        s
+                        for s in kept
+                        if not any(p.search(s) for p in stem_patterns.values())
+                    ]
+                else:
+                    triggers = [
+                        s
+                        for s in kept
+                        if re.search(
+                            r"\b(if|unless|while|above|below|upgrade|downgrade|buy|sell|hold)\b",
+                            s,
+                            re.IGNORECASE,
+                        )
+                    ]
+                    trimmed = kept[: int(sentence_cap)]
+                    if triggers:
+                        last_trigger = triggers[-1]
+                        if last_trigger not in trimmed:
+                            trimmed[-1] = last_trigger
+                    kept = trimmed
+            else:
+                kept = kept[: int(sentence_cap)]
+
+        new_body = " ".join(kept).strip()
+        section_re = re.compile(
+            rf"(^\s*##\s*{re.escape(title)}\s*\n+)(.*?)(?=^\s*##\s|\Z)",
+            re.IGNORECASE | re.MULTILINE | re.DOTALL,
+        )
+        text = section_re.sub(lambda m: f"{m.group(1)}{new_body}\n", text, count=1)
+
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _cleanup_sentence_artifacts(text: str) -> str:
@@ -2100,6 +4716,46 @@ def _cleanup_sentence_artifacts(text: str) -> str:
         cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+
+    # Remove legacy parenthetical buzzword filler chains if they leak from older
+    # padding paths or model over-corrections.
+    legacy_parenthetical_terms = [
+        "key swing factor",
+        "primary swing factor",
+        "near term factors",
+        "in practical terms",
+        "fundamental catalyst",
+        "structural driver",
+        "operating backdrop",
+        "valuation context",
+        "execution priority",
+        "capital intensity backdrop",
+        "on a forward basis",
+        "relative to the cycle",
+        "across the enterprise",
+        "from a risk standpoint",
+        "on a relative basis",
+        "under current conditions",
+        "given the trajectory",
+        "within this framework",
+    ]
+    legacy_parenthetical_re = "|".join(
+        sorted(
+            [re.escape(term) for term in legacy_parenthetical_terms],
+            key=len,
+            reverse=True,
+        )
+    )
+    cleaned = re.sub(
+        rf"(?i)\s*\((?:{legacy_parenthetical_re})\)",
+        "",
+        cleaned,
+    )
+    # Drop long end-of-paragraph runs of short parentheticals even if their exact
+    # text is novel, since this pattern reliably reads as synthetic filler.
+    cleaned = re.sub(r"(?is)(?:\s*\((?:[^()\n]{1,40})\)){4,}\s*$", "", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
 
     # Collapse "overall overall overall" token spam (usually from padding/seams).
     cleaned = re.sub(
@@ -2960,33 +5616,69 @@ def _validate_complete_sentences(text: str) -> str:
         if not is_incomplete:
             validated_lines.append(line)
         else:
-            # If still incomplete, try to add generic completion instead of dropping
+            # If still incomplete, add a deterministic full-sentence completion.
+            # Avoid comma-appended fragments (e.g., "... to, impacting ...").
             line_stripped = original_line.rstrip()
             if line_stripped and not line_stripped[-1] in ".!?":
-                # Add a contextual ending
-                if "risk" in line_stripped.lower():
-                    validated_lines.append(
-                        line_stripped + ", which warrants monitoring."
-                    )
-                elif "compet" in line_stripped.lower():
-                    validated_lines.append(
-                        line_stripped + ", presenting competitive challenges."
-                    )
-                elif (
-                    "growth" in line_stripped.lower()
-                    or "margin" in line_stripped.lower()
-                ):
-                    validated_lines.append(
-                        line_stripped + ", impacting the investment thesis."
-                    )
+                clean_base = re.sub(
+                    r"\b(to|for|with|of|in|on|at|by|and|or|if|when|while|because|as)\s*$",
+                    "",
+                    line_stripped,
+                    flags=re.IGNORECASE,
+                ).rstrip(",;: ")
+                if not clean_base:
+                    clean_base = line_stripped.rstrip(",;: ")
+
+                lower_base = clean_base.lower()
+                if "risk" in lower_base:
+                    completion = "This risk warrants close monitoring."
+                elif "compet" in lower_base:
+                    completion = "This could weaken pricing power or market share."
+                elif "growth" in lower_base or "margin" in lower_base:
+                    completion = "This directly affects the investment thesis."
                 else:
-                    validated_lines.append(
-                        line_stripped + ", which requires attention."
-                    )
+                    completion = "This remains a key underwriting consideration."
+                validated_lines.append(f"{clean_base}. {completion}")
             else:
                 validated_lines.append(original_line)
 
     return "\n".join(validated_lines)
+
+
+def _summary_has_incomplete_tail(text: str) -> bool:
+    """Detect summaries that still end mid-thought after cleanup passes."""
+    if not text:
+        return False
+
+    substantive_lines = [
+        line.strip()
+        for line in str(text or "").splitlines()
+        if line.strip()
+        and not line.strip().startswith("#")
+        and line.strip().upper() not in {"DATA_GRID_START", "DATA_GRID_END"}
+    ]
+    if not substantive_lines:
+        return False
+
+    tail = substantive_lines[-1]
+    if tail.startswith("→"):
+        return False
+    if not tail.endswith((".", "!", "?")):
+        return True
+
+    incomplete_patterns = (
+        r"\$\d+(?:\.\d+)?\.?\s*$",
+        r"[-\u2013\u2014]\s*$",
+        r"\s+(?:of|at|to|for|with)\s*[,]?\s*$",
+        r"[,:]$",
+        r"\s+(?:the|a|an)\s*$",
+        r"\b(?:a|an)\s+\d+\s*$",
+        r"\s+(?:and|but|or|while|although|however|which)\s*$",
+        r"[A-Za-z]+['']s\s*$",
+        r"\s+that\s*$",
+        r"\s+(?:than|as)\s*$",
+    )
+    return any(re.search(pattern, tail, re.IGNORECASE) for pattern in incomplete_patterns)
 
 
 def _truncate_text_to_word_limit(text: str, max_words: int) -> str:
@@ -3077,16 +5769,14 @@ def _build_padding_block(
         return ""
 
     padding_sentences = _generate_padding_sentences(
-        required_words, exclude_norms=exclude_norms
+        required_words, exclude_norms=exclude_norms, context_text=""
     )
     if not padding_sentences:
         return ""
 
-    # Render as a clearly separated continuation block.
-    # IMPORTANT: Do NOT use raw HTML comments as markers here — our markdown renderer
-    # can surface them to end users (confusing). Keep this as plain text.
+    # Render as plain prose continuation (never as a checklist-style header label).
     padding_text = " ".join(padding_sentences).strip()
-    return f"Key underwriting questions: {padding_text}".strip()
+    return padding_text
 
 
 def _strip_length_padding_markers(text: str) -> str:
@@ -3185,39 +5875,25 @@ def _trim_underwriting_payload(payload: str, *, max_words: int) -> str:
 
 
 def _normalize_underwriting_questions_formatting(text: str) -> str:
-    """Ensure 'Key underwriting questions:' is a separate paragraph.
-
-    Without a blank line before it, markdown renders this line *inline* with the
-    previous paragraph, which looks like random low-quality filler inside analysis.
-    """
+    """Normalize legacy underwriting-question labels into plain investor prose."""
 
     if not text:
         return text
 
     result = text
 
-    # If the label appears inline (mid-line), force it to start a new paragraph.
+    # Remove legacy label (both inline and line-start variants) while preserving payload.
     result = re.sub(
-        r"([^\n])\s*(Key\s+underwriting\s+questions\s*:)",
-        r"\1\n\nKey underwriting questions:",
+        r"([^\n])\s*Key\s+underwriting\s+questions\s*:\s*",
+        r"\1 ",
         result,
         flags=re.IGNORECASE,
     )
-
-    # Normalize casing/spacing to a canonical prefix.
     result = re.sub(
         r"^\s*Key\s+underwriting\s+questions\s*:\s*",
-        "Key underwriting questions: ",
+        "",
         result,
         flags=re.IGNORECASE | re.MULTILINE,
-    )
-
-    # Ensure there is a blank line BEFORE the underwriting questions line.
-    result = re.sub(
-        r"([^\n])\n(Key underwriting questions:\s*)",
-        r"\1\n\n\2",
-        result,
-        flags=re.IGNORECASE,
     )
 
     # Collapse excessive newlines.
@@ -3226,7 +5902,7 @@ def _normalize_underwriting_questions_formatting(text: str) -> str:
 
 
 def _relocate_underwriting_questions_to_mdna(text: str) -> str:
-    """Move any 'Key underwriting questions:' line(s) into the MD&A section.
+    """Move legacy underwriting-question payload lines into the MD&A section.
 
     Rationale: underwriting-style prompts read like strategy/earnings-quality commentary.
     The user prefers Risk Factors to stay concise while MD&A carries more narrative weight.
@@ -3265,7 +5941,7 @@ def _relocate_underwriting_questions_to_mdna(text: str) -> str:
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         return cleaned.strip()
 
-    underwriting_line = f"Key underwriting questions: {merged_payload}".strip()
+    underwriting_line = merged_payload.strip()
 
     # Insert into the MD&A section (if present), otherwise place it before Risk Factors,
     # then before Key Metrics, then at end as a last resort.
@@ -3331,7 +6007,7 @@ def _relocate_underwriting_questions_to_mdna(text: str) -> str:
 
 
 def _merge_underwriting_question_lines(text: str) -> str:
-    """Coalesce repeated 'Key underwriting questions:' lines into a single line.
+    """Coalesce repeated legacy underwriting-question lines into one plain-prose line.
 
     Length enforcement can call padding multiple times. If we accidentally insert
     multiple underwriting-question lines, merge them so users see one clean block.
@@ -3367,13 +6043,40 @@ def _merge_underwriting_question_lines(text: str) -> str:
 
     merged_text = " ".join(part for part in merged_parts if part).strip()
     merged_text = _dedupe_underwriting_payload_sentences(merged_text)
-    out_lines[placeholder_idx] = (
-        f"Key underwriting questions: {merged_text}" if merged_text else ""
-    ).strip()
+    out_lines[placeholder_idx] = merged_text.strip() if merged_text else ""
 
     cleaned = "\n".join(out_lines).strip()
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned
+
+
+# ── Global lifetime padding budget ──────────────────────────────────────
+# Tracks cumulative padding words injected across ALL calls within a single
+# summary generation.  Prevents the 133-iteration cascading enforcement
+# loops from accumulating hundreds of repetitive template words.
+import threading as _threading
+
+_LIFETIME_PADDING_CAP = 40  # max total padding words per summary
+
+_padding_budget_local = _threading.local()
+
+
+def _reset_padding_budget() -> None:
+    """Reset the padding budget at the start of summary generation."""
+    _padding_budget_local.remaining = _LIFETIME_PADDING_CAP
+
+
+def _consume_padding_budget(words: int) -> int:
+    """Consume words from the padding budget.  Returns words actually allowed."""
+    remaining = getattr(_padding_budget_local, "remaining", _LIFETIME_PADDING_CAP)
+    allowed = min(words, remaining)
+    _padding_budget_local.remaining = remaining - allowed
+    return allowed
+
+
+def _get_padding_budget_remaining() -> int:
+    """Return how many padding words are still available."""
+    return int(getattr(_padding_budget_local, "remaining", _LIFETIME_PADDING_CAP))
 
 
 def _generate_padding_sentences(
@@ -3384,183 +6087,209 @@ def _generate_padding_sentences(
     is_persona: bool = False,
     exclude_risk_names: Optional[set[str]] = None,
     max_words: Optional[int] = None,
+    context_text: Optional[str] = None,
 ) -> List[str]:
-    """Generate concise, finance-relevant padding sentences to reach required word counts."""
+    """Disabled: template padding destroyed narrative flow and produced repetitive
+    boilerplate.  Length targets are now achieved via LLM rewrite passes that
+    produce contextual prose instead of slotting metrics into sentence templates.
+    """
+    return []
+
+    # ── LEGACY CODE BELOW — kept for reference during transition ──
     if required_words <= 0:
         return []
+
+    # ── Lifetime budget gate ──
+    # If the global padding budget for this summary is exhausted, return nothing.
+    budget_remaining = _get_padding_budget_remaining()
+    if budget_remaining <= 0:
+        return []
+    required_words = min(required_words, budget_remaining)
 
     if max_words is not None:
         max_words = int(max_words)
         if max_words <= 0:
             return []
 
-    # IMPORTANT:
-    # Padding is a LAST-RESORT safety net to satisfy strict word floors.
-    # It must preserve narrative flow and match the document voice (persona vs neutral).
-    #
-    # Design goals:
-    # - Avoid dumping standalone generic one-liners as separate paragraphs.
-    # - Avoid repetitive, boilerplate “template” finance slogans users notice.
-    # - Prefer section-aware connective sentences that can be appended seamlessly.
-
     canon_section = (section or "").strip().lower().replace("&", "and")
     canon_section = re.sub(r"\s+", " ", canon_section).strip()
 
-    # NOTE: Deterministic padding is a last-resort length safety net and should not
-    # inject a first-person "persona" voice. Keep padding neutral even if the draft
-    # already contains "I" statements.
-    def _voice(_persona: str, neutral: str) -> str:
-        return neutral
+    # ── Closing Takeaway is immune to padding injection ──
+    # The closing should only contain what the LLM writes — never template padding.
+    if canon_section == "closing takeaway":
+        return []
+
+    # ── Financial Health Rating is immune to padding injection ──
+    if canon_section == "financial health rating":
+        return []
 
     def _normalize_risk_name(name: str) -> str:
         return re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
 
-    def _risk_name_from_template(sentence: str) -> Optional[str]:
-        match = re.match(r"\*\*(.+?)\*\*\s*:", sentence or "")
-        if match:
-            return _normalize_risk_name(match.group(1))
-        return None
+    def _extract_metric_anchors(blob: str) -> List[Tuple[str, str]]:
+        anchors: List[Tuple[str, str]] = []
+        if not blob:
+            return anchors
+
+        seen: set[str] = set()
+        line_re = re.compile(
+            r"^\s*(?:→\s*)?([A-Za-z][A-Za-z0-9 +/&\-]{2,40})\s*(?:\||:)\s*([^\n|]+)",
+            re.MULTILINE,
+        )
+        for match in line_re.finditer(blob):
+            label = " ".join((match.group(1) or "").split()).strip()
+            value = " ".join((match.group(2) or "").split()).strip()
+            if not label or not value or not re.search(r"\d", value):
+                continue
+            key = f"{label.lower()}::{value.lower()}"
+            if key in seen:
+                continue
+            seen.add(key)
+            anchors.append((label, value))
+            if len(anchors) >= 10:
+                break
+
+        if anchors:
+            return anchors
+
+        # Fallback: recover numeric anchors from any numeric tokens if structured
+        # metric rows are unavailable (e.g., aggressively trimmed drafts).
+        token_re = re.compile(r"\b[\w$€£]*\d[\w%/.\-]*\b")
+        for match in token_re.finditer(blob):
+            value = (match.group(0) or "").strip()
+            if not value:
+                continue
+            key = f"reported figure::{value.lower()}"
+            if key in seen:
+                continue
+            seen.add(key)
+            anchors.append(("reported figure", value))
+            if len(anchors) >= 10:
+                break
+        return anchors
+
+    anchors = _extract_metric_anchors(context_text or "")
+    narrative_sections = {
+        "financial health rating",
+        "executive summary",
+        "financial performance",
+        "management discussion and analysis",
+        "risk factors",
+        "closing takeaway",
+    }
+
+    def _anchor_priority(label: str) -> int:
+        lowered = (label or "").lower()
+        if "free cash flow" in lowered or "fcf" in lowered:
+            return 0
+        if "operating margin" in lowered:
+            return 1
+        if "cash conversion" in lowered:
+            return 2
+        if "operating cash flow" in lowered or lowered == "ocf":
+            return 3
+        if "revenue" in lowered:
+            return 4
+        if "cash" in lowered or "liquidity" in lowered:
+            return 5
+        if "liabilit" in lowered or "debt" in lowered or "leverage" in lowered:
+            return 6
+        if "current ratio" in lowered:
+            return 7
+        if "net margin" in lowered:
+            return 8
+        return 50
+
+    if canon_section in narrative_sections:
+        if not anchors:
+            # Narrative sections should only pad with real numeric anchors.
+            return []
+
+        ranked = sorted(
+            list(enumerate(anchors)),
+            key=lambda pair: (_anchor_priority(pair[1][0]), pair[0]),
+        )
+        unique_ranked: List[Tuple[str, str]] = []
+        seen_labels: set[str] = set()
+        for _idx, (label, value) in ranked:
+            norm_label = re.sub(r"[^a-z0-9]+", " ", (label or "").lower()).strip()
+            if not norm_label:
+                continue
+            if norm_label in seen_labels:
+                continue
+            seen_labels.add(norm_label)
+            unique_ranked.append((label, value))
+
+        max_anchors_by_section: Dict[str, int] = {
+            "executive summary": 2,
+            "financial performance": 2,
+            "management discussion and analysis": 2,
+            "risk factors": 2,
+            "closing takeaway": 2,
+            "financial health rating": 2,
+        }
+        anchor_cap = int(max_anchors_by_section.get(canon_section, 2))
+        anchors = unique_ranked[:anchor_cap]
 
     section_templates: Dict[str, List[str]] = {
         "financial health rating": [
-            "The score is driven by the interaction of margin profile, cash generation, and obligations.",
-            "Profitability only matters if it converts into free cash flow after capex and working-capital swings.",
-            "Balance-sheet strength is defined by liquidity headroom and refinancing flexibility under stress.",
-            "Liquidity matters because it determines whether volatility can be self-funded without dilution or new leverage.",
-            "Downside protection is best read through cash conversion and near-term obligations, not peak-cycle margins.",
-            "A strong cash position provides optionality for reinvestment, buybacks, and de-risking without external financing.",
-            "If cash generation weakens while obligations stay fixed, the downside path accelerates when growth slows.",
-            "Earnings quality is stronger when operating profit and cash flow tell the same story over time.",
-            "High servicing headroom (when present) lowers near-term financial risk, but does not eliminate execution risk.",
-            "The rating is meant to reflect durability and flexibility, not just reported profitability in a single period.",
-            "The health lens emphasizes cash flow durability, liquidity, and leverage sensitivity to a weaker backdrop.",
-            "The key question is whether incremental growth is compounding free cash flow or absorbing it.",
+            "Health confidence strengthens when {label} at {value} aligns with stable margins and cash conversion through the cycle.",
+            "This rating remains more defensible while {label} stays near {value} without relying on balance-sheet stretch.",
+            "A sustained break in {label} from {value} would weaken this score and narrow the margin for error.",
+            "The durability case assumes {label} can hold around {value} as operating conditions normalize.",
+            "{label} near {value} remains pivotal to this rating.",
         ],
         "executive summary": [
-            "The stance is gated by whether earnings translate into repeatable free cash flow after reinvestment.",
-            "Upside requires margin structure to hold while reinvestment intensity stays disciplined.",
-            "The bear path is margin pressure plus elevated reinvestment, compressing free cash flow even if revenue grows.",
-            "Conviction should be tied to measurable triggers (margins, cash flow, reinvestment), not general optimism.",
-            "A neutral stance is justified when the business is strong but the cash trajectory is unstable.",
-            "If cash conversion improves without a growth trade-off, the risk-reward can re-rate quickly.",
-            "If below-the-line items drive net income, operating profit and cash flow are the cleaner signals.",
-            "Liquidity provides cushion, but it does not substitute for durable cash generation.",
-            "The near-term debate is operating leverage versus incremental capital intensity.",
-            "Catalysts matter only if they change the margin and cash trajectory, not just the narrative.",
-            "The thesis weakens when reinvestment rises faster than operating profit and free cash flow.",
-            "The base case improves when cash conversion stabilizes on a run-rate basis.",
-            "The primary constraint should be stated once and then supported with numbers, not repeated as doctrine.",
-            "Capital allocation discipline determines whether growth translates into per-share value creation over time.",
-            "Operational efficiency gains must be weighed against the structural costs of maintaining market leadership.",
-            "The focus remains on organic growth durability rather than acquisition-fueled expansion or accounting tailwinds.",
-            "Long-term value creation is predicated on the ability to maintain pricing power through competitive cycles.",
-            "The gap between reported earnings and cash generation often signals the next stage of the margin cycle.",
-            "Asset intensity and working-capital requirements define the upper bound of sustainable growth without leverage.",
-            "Management's ability to flex the cost base is a critical differentiator in a softening demand environment.",
-        ],
-        "closing takeaway": [
-            "The verdict should be anchored on durability: margins, cash conversion, and balance-sheet flexibility.",
-            "An upgrade case requires repeatable cash conversion without sacrificing margin structure.",
-            "A downgrade case follows sustained margin pressure and continued cash conversion slippage.",
-            "The risk-reward improves when cash generation is visible on a run-rate basis, not a one-quarter spike.",
-            "Triggers should be time-bound and measurable (next two periods), not open-ended monitoring.",
-            "The underwriting check is whether reinvestment is compounding returns or simply absorbing cash.",
-            "A stronger stance requires confirmation that operating leverage shows up in both profit and cash.",
-            "A weaker stance is warranted if the cash bridge deteriorates alongside a softer demand backdrop.",
-            "Balance-sheet flexibility matters most when fundamentals weaken, not when the cycle is strong.",
-            "The cleanest signal is alignment: revenue, margins, and free cash flow improving together.",
-            "The decision should be stated once; the rest of the memo should justify it with evidence.",
-            "What changes the view should be framed as a concrete threshold in margins or cash conversion.",
+            "The thesis carries more weight if {label} can hold near {value}, keeping earnings quality tied to cash-backed execution.",
+            "The base case is more credible when {label} at {value} remains durable beyond a single reporting period.",
+            "Conviction improves if {label} stays around {value} while conversion quality remains consistent.",
+            "Near-term confidence relies on {label} around {value} being repeatable rather than timing-driven.",
+            "{label} near {value} remains central to the thesis.",
         ],
         "financial performance": [
-            "The signal is in how revenue growth translates into operating profit and free cash flow.",
-            "A widening gap between operating and net margins suggests non-operating items are influencing optics.",
-            "Cash conversion can diverge from earnings through working capital, capex, and tax timing.",
-            "Capex intensity matters because it defines how much growth is self-funded versus externally funded.",
-            "If operating cash flow weakens despite profit, working capital is often the swing driver.",
-            "If margins move, the driver should be tied to pricing/mix versus cost intensity, not general statements.",
-            "The OCF-to-FCF bridge is the core underwriting bridge for cash durability in the period.",
-            "Sequential deltas matter because they show whether the trajectory is improving or deteriorating.",
-            "A strong quarter is more credible when both margins and cash conversion improve together.",
-            "If free cash flow falls while revenue rises, reinvestment and working capital are the usual culprits.",
-            "Below-the-line support (tax/FX/other) should not be treated as durable operating improvement.",
-            "The most important changes should be stated clearly, then backed by the delta bridge numbers.",
+            "Period quality is best judged through {label} at {value} and whether that signal converts into durable cash outcomes.",
+            "{label} at {value} supports the period read only if operating execution remains consistent across comparable periods.",
+            "Durability looks stronger when {label} can hold near {value} without requiring temporary working-capital support.",
+            "The operating signal weakens if {label} drifts materially from {value} while reinvestment intensity rises.",
+            "{label} around {value} remains a key period marker.",
         ],
         "management discussion and analysis": [
-            "Management posture shows up in reinvestment cadence, opex discipline, and the monetization path.",
-            "Strategy only matters if it matches the observed margin and cash flow trajectory.",
-            "Cost discipline can be inferred from opex growth relative to revenue and gross profit.",
-            "Capital allocation compounds only when funded by durable free cash flow rather than one-offs.",
-            "Execution risk often appears as rising cost intensity before margins visibly compress.",
-            "A credible posture reconciles KPI commentary with cash flow, not just adjusted metrics.",
-            "If reinvestment is accelerating, the question is payback and operating leverage that follows.",
-            "The underwriting lens is whether growth initiatives improve unit economics or dilute them.",
-            "When management targets efficiency, it should show up in operating margin and cash conversion.",
-            "Guidance posture matters most when it changes reinvestment pacing or pricing strategy.",
-            "If cash conversion is volatile, capital allocation choices become a first-order risk factor.",
-            "The best MD&A reads are concrete: priorities, trade-offs, and the metrics that will prove execution.",
+            "Execution quality is more credible when {label} around {value} is supported by disciplined capital-allocation choices.",
+            "Management credibility improves if {label} holds near {value} while reinvestment continues to earn acceptable payback.",
+            "Strategy follow-through is easier to underwrite when {label} at {value} remains stable through changing demand conditions.",
+            "Execution risk rises if {label} moves away from {value} as fixed-cost intensity increases.",
+            "{label} near {value} remains a key execution marker.",
         ],
-        # Padding must not create NEW risk bullets; if applied, it should read as
-        # incremental weighting/monitoring of the existing risks.
         "risk factors": [
-            "Each risk should map to a mechanism that hits margin, cash, or capital requirements.",
-            "Risk severity rises when a negative driver can coincide with a growth slowdown and higher reinvestment.",
-            "Second-order risks matter when they force structural cost increases or higher capital intensity.",
-            "Mitigation should be framed as a measurable sign the risk is stabilizing or worsening.",
-            "The main transmission channels are pricing, cost intensity, working capital, and capex intensity.",
-            "A credible risk write-up distinguishes temporary noise from structural pressure on margins and cash.",
-            "Balance-sheet risk is secondary when liquidity is ample, but escalates if cash conversion weakens.",
-            "What matters is whether the risk shows up in operating margin, free cash flow, or capital needs.",
-            "Risks should be distinct and non-overlapping, each tied to a specific driver in the filing.",
-            "Probability should be described through leading indicators, not generic macro commentary.",
-            "A good risk framing specifies the sign of the impact and the metric that will confirm it.",
-            "The dominant downside scenario is usually the combination of weaker growth and higher cost intensity.",
+            "Downside risk increases if {label} moves away from {value}, particularly if growth and conversion soften together.",
+            "This risk remains more manageable while {label} stays near {value} and liquidity flexibility is preserved.",
+            "The base case becomes more fragile if {label} cannot sustain around {value} through a weaker demand backdrop.",
+            "Risk severity rises when {label} breaks from {value} and forces capital-allocation tradeoffs.",
+            "Risk rises quickly if {label} drifts from {value}.",
+        ],
+        "closing takeaway": [
+            "The recommendation remains tied to {label} around {value}; a sustained break would require reassessing the current stance.",
+            "Conviction holds while {label} stays near {value}, but a persistent deterioration would weaken the thesis.",
+            "This call is defensible only if {label} around {value} proves durable across upcoming periods.",
+            "A material deviation in {label} from {value} would shift the risk-reward balance against the current view.",
+            "{label} near {value} remains the main trigger.",
+        ],
+        "default": [
+            "Reported {label} at {value} remains a key check on whether operating performance is translating into durable cash outcomes.",
+            "A sustained deviation in {label} from {value} would weaken the present underwriting case and reduce conviction.",
+            "The current view is strongest when {label} near {value} is confirmed by stable margin and conversion behavior.",
+            "If {label} can hold around {value} through the next periods, the underlying thesis remains more credible.",
+            "{label} near {value} remains a key checkpoint.",
         ],
     }
 
-    # Fallback pool used when we can't reliably infer a section (or when section-specific
-    # templates are exhausted). This must be broad enough to avoid repeating the same
-    # "swing factor" sentences when strict word-floor padding runs multiple times.
-    fallback_templates = [
-        "The analysis should prioritize what changed in the latest period and why it matters for durability.",
-        "Operating leverage is most credible when margins and free cash flow strengthen together.",
-        "If net income moves more than operating profit, below-the-line items may be driving the optics.",
-        "Cash durability is best assessed through the operating-cash to free-cash bridge, not reported EPS.",
-        "Working-capital timing can temporarily inflate or depress cash conversion versus earnings.",
-        "Capex intensity matters because it determines how much growth translates into distributable cash.",
-        "Margin pressure is most dangerous when it coincides with higher reinvestment and weaker growth.",
-        "Balance-sheet flexibility is the buffer when the operating trajectory softens.",
-        "Liquidity risk rises when cash conversion weakens and refinancing windows tighten.",
-        "The underwriting lens should separate transient noise from structural drivers of margin and cash.",
-        "A durable thesis is supported by repeatable unit economics, not one-off gains or timing effects.",
-        "Cash generation provides optionality, but capital allocation determines whether value compounds.",
-        "The cleanest signals are time-consistent: trends that repeat across consecutive periods.",
-        "Risk is asymmetric when cost structure is fixed and incremental revenue becomes less profitable.",
-        "A credible bull case explains why incremental margins and cash conversion can improve from here.",
-        "A credible bear case explains how reinvestment and competition can pressure margins and cash.",
-        "The next two quarters should clarify whether recent deltas are noise or a new trajectory.",
-        "When growth is strong, the focus is incremental margin; when growth slows, the focus is cash.",
-        "Cash conversion quality is stronger when working capital normalizes and capex is steady.",
-        "If reinvestment is rising, payback discipline becomes the key determinant of long-term returns.",
-        "The base stance should remain consistent across sections rather than oscillating in tone.",
-        "The memo should avoid restating the same constraint; each section should add a new angle.",
-        "The key question is not whether the business is good, but whether the trajectory is improving.",
-        "Fundamentals matter more than rhetoric: the numbers must corroborate the story.",
-        "Efficiency in capital deployment is the long-term anchor for compounding per-share intrinsic value.",
-        "Margin structure is a function of competitive positioning and the durability of the revenue mix.",
-        "Refining the underwriting bridge requires a close look at the gap between accrual profit and realized cash.",
-        "The probability of outsized returns increases when growth is self-funded through operating leverage.",
-        "Operational risk is often masked by high growth, surfacing only when the market environment tightens.",
-        "A disciplined cost base provides the necessary margin for error during unpredictable demand shifts.",
-        "Transparency in capital allocation choices is a prerequisite for long-term conviction in the thesis.",
-        "The most reliable indicators are those that link operational KPIs directly to financial durability.",
-    ]
-
-    templates: List[str] = []
-    if canon_section in section_templates:
-        templates.extend(section_templates[canon_section])
-    else:
-        templates.extend(fallback_templates)
+    # Only use section-specific templates.  If the section isn't recognized,
+    # return empty — the "default" templates produced the most generic,
+    # repetitive output ("Reported X at Y remains a key check...") and were
+    # the worst offenders in the Closing Takeaway flood.
+    templates = section_templates.get(canon_section)
+    if not templates:
+        return []
 
     def _norm_sentence(s: str) -> str:
         s = (s or "").replace("\u00a0", " ")
@@ -3574,50 +6303,51 @@ def _generate_padding_sentences(
     }
 
     candidates: List[Tuple[int, str]] = []
-    for t in templates:
-        if excluded and _norm_sentence(t) in excluded:
-            continue
-        if canon_section == "risk factors" and risk_name_blacklist:
-            risk_name = _risk_name_from_template(t)
-            if risk_name and risk_name in risk_name_blacklist:
+    max_candidates = 8
+    if not anchors:
+        anchors = [("metrics", "current reported levels")]
+    for template in templates:
+        for label, value in anchors:
+            sentence = template.format(label=label, value=value).strip()
+            if sentence and sentence[-1] not in ".!?":
+                sentence += "."
+            if canon_section in narrative_sections and not re.search(r"\d", sentence):
                 continue
-        wc = _count_words(t)
-        if wc > 0:
-            candidates.append((wc, t))
-
-    # If the section templates are all too long to fit within the per-section slack,
-    # add the fallback pool so we can still make incremental progress.
-    if (
-        max_words is not None
-        and candidates
-        and all(wc > int(max_words) for wc, _t in candidates)
-    ):
-        for t in fallback_templates:
-            if excluded and _norm_sentence(t) in excluded:
+            norm = _norm_sentence(sentence)
+            if not norm or (excluded and norm in excluded):
                 continue
-            wc = _count_words(t)
-            if wc > 0:
-                candidates.append((wc, t))
-
-    if not candidates:
-        # If the section already contains all of its padding templates, broaden to the
-        # generic pool first to avoid inserting duplicate sentences into the same memo.
-        if canon_section in section_templates:
-            for t in fallback_templates:
-                if excluded and _norm_sentence(t) in excluded:
+            if canon_section == "risk factors" and risk_name_blacklist:
+                risk_name = _normalize_risk_name(label)
+                if risk_name and risk_name in risk_name_blacklist:
                     continue
-                wc = _count_words(t)
-                if wc > 0:
-                    candidates.append((wc, t))
+            wc = _count_words(sentence)
+            if wc <= 0:
+                continue
+            candidates.append((wc, sentence))
+            if len(candidates) >= max_candidates:
+                break
+        if len(candidates) >= max_candidates:
+            break
 
     if not candidates:
         return []
-    candidates.sort(key=lambda x: x[0])
+    target_sentence_words = min(30, max(14, int(required_words)))
+    candidates.sort(
+        key=lambda x: (
+            abs(x[0] - target_sentence_words),
+            -x[0],  # Prefer slightly longer prose when distances tie.
+        )
+    )
 
     sentences: List[str] = []
     remaining = int(required_words)
     budget_remaining = int(max_words) if max_words is not None else None
     used: set[str] = set()
+    max_sentences = 1
+    if canon_section in narrative_sections:
+        max_sentences = 1
+        if canon_section == "closing takeaway":
+            max_sentences = 1
 
     def _stable_pick(options: List[Tuple[int, str]], key: str) -> Tuple[int, str]:
         if len(options) == 1:
@@ -3626,10 +6356,7 @@ def _generate_padding_sentences(
         idx = int.from_bytes(digest[:2], "big") % len(options)
         return options[idx]
 
-    # Greedy within bounds:
-    # - Prefer the smallest sentence that covers the remaining deficit.
-    # - If none can cover, take the longest sentence that still fits to make progress.
-    while remaining > 0 and candidates:
+    while remaining > 0 and candidates and len(sentences) < max_sentences:
         if budget_remaining is not None and budget_remaining <= 0:
             break
 
@@ -3661,16 +6388,142 @@ def _generate_padding_sentences(
         if budget_remaining is not None:
             budget_remaining -= wc
 
+    # Debit the global lifetime padding budget so future calls are constrained.
+    if sentences:
+        total_words_used = sum(len(s.split()) for s in sentences)
+        _consume_padding_budget(total_words_used)
+
     return sentences
 
 
 def _distribute_padding_across_sections(summary_text: str, required_words: int) -> str:
-    """Spread deterministic padding across the *shortest* narrative sections.
+    """Add a tiny amount of deterministic padding only for compact sectioned memos.
 
-    Goal: hit strict word bands without dumping all added words into one section.
+    For the real short-form product range (300+ words), filler-free behavior remains
+    mandatory and this helper stays effectively disabled. The active path here exists
+    only to rescue sub-300 sectioned memos that would otherwise fail final length
+    clamps because all legacy padding primitives were retired.
     """
     if required_words <= 0 or not summary_text:
         return summary_text
+
+    current_words = _count_words(summary_text or "")
+    if current_words >= int(SHORT_FORM_SECTIONED_TARGET_MIN_WORDS):
+        return summary_text
+    if int(required_words) > 40:
+        return summary_text
+
+    heading_regex = re.compile(r"^\s*##\s*.+", re.MULTILINE)
+    if not heading_regex.search(summary_text or ""):
+        return summary_text
+
+    compact_bank: Dict[str, Tuple[str, ...]] = {
+        "Executive Summary": (
+            "The focus remains on durability rather than a single period's headline result.",
+            "That keeps the verdict tied to repeatability instead of short-term noise.",
+        ),
+        "Financial Performance": (
+            "Margin behavior and cash conversion matter more than the reported growth alone.",
+            "Those operating details determine whether the quarter was genuinely stronger.",
+        ),
+        "Management Discussion & Analysis": (
+            "Management's capital allocation choices will show whether reinvestment is earning its keep.",
+            "Execution quality is visible in how spending translates into durable operating leverage.",
+        ),
+        "Risk Factors": (
+            "That downside matters most if weaker demand also narrows pricing power and cash flow.",
+            "The risk becomes more material if costs rise before revenue scales to absorb them.",
+        ),
+        "Closing Takeaway": (
+            "Any change in stance still depends on measurable evidence rather than narrative optimism.",
+            "That keeps the recommendation tied to signals investors can monitor.",
+        ),
+    }
+
+    section_pattern = re.compile(r"^\s*##\s*(.+?)\s*$", re.MULTILINE)
+    matches = list(section_pattern.finditer(summary_text or ""))
+    if not matches:
+        return summary_text
+
+    sections: List[Tuple[str, str]] = []
+    for idx, match in enumerate(matches):
+        title = _standard_section_name_from_heading(f"## {match.group(1) or ''}")
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(summary_text)
+        body = (summary_text[start:end] or "").strip()
+        sections.append((title, body))
+
+    section_index = {title: idx for idx, (title, _body) in enumerate(sections)}
+    candidate_titles = [
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Risk Factors",
+        "Executive Summary",
+        "Closing Takeaway",
+    ]
+
+    used_norms: Set[str] = set()
+
+    def _norm_sentence(value: str) -> str:
+        normalized = re.sub(r"\s+", " ", str(value or "").strip().lower())
+        return normalized.rstrip(".!?")
+
+    for _title, body in sections:
+        for sentence in re.split(r"(?<=[.!?])\s+", body):
+            norm = _norm_sentence(sentence)
+            if norm:
+                used_norms.add(norm)
+
+    remaining = int(required_words)
+    changed = False
+
+    def _append_sentence(body: str, sentence: str, *, title: str) -> str:
+        clean_body = (body or "").rstrip()
+        clean_sentence = (sentence or "").strip()
+        if not clean_sentence:
+            return clean_body
+        if not clean_body:
+            return clean_sentence
+        joiner = " " if clean_body.endswith((".", "!", "?")) else ". "
+        if title == "Risk Factors" and "\n\n" in clean_body:
+            joiner = "\n\n"
+        return f"{clean_body}{joiner}{clean_sentence}".strip()
+
+    for title in candidate_titles:
+        if remaining <= 0:
+            break
+        idx = section_index.get(title)
+        if idx is None:
+            continue
+        body = sections[idx][1]
+        if not body:
+            continue
+        for sentence in compact_bank.get(title, ()):
+            norm = _norm_sentence(sentence)
+            if not norm or norm in used_norms:
+                continue
+            new_body = _append_sentence(body, sentence, title=title)
+            sections[idx] = (title, new_body)
+            used_norms.add(norm)
+            remaining -= _count_words(sentence)
+            changed = True
+            body = new_body
+            break
+
+    if not changed:
+        return summary_text
+
+    rebuilt_parts = [f"## {title}\n{body}".strip() for title, body in sections if title]
+    rebuilt = "\n\n".join(rebuilt_parts).strip()
+    return rebuilt or summary_text
+
+    # ── LEGACY CODE BELOW — kept for reference during transition ──
+    if required_words <= 0 or not summary_text:
+        return summary_text
+
+    # ── Global padding budget cap ──
+    _GLOBAL_PADDING_CAP = 40
+    required_words = min(required_words, _GLOBAL_PADDING_CAP)
 
     # Strip legacy markers and normalize any underwriting blocks so we don't amplify
     # formatting issues during padding.
@@ -3707,17 +6560,20 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
         return " ".join(title.split())
 
     if not sections:
-        # Fall back: no headings; append padding as a final paragraph.
+        # Fall back: no headings; append padding inline.
         base = summary_text.rstrip()
         if base and not base.endswith((".", "!", "?")):
             base += "."
-        is_persona = bool(re.search(r"\b(?:I|my|I'm|I’m)\b", summary_text))
+        is_persona = bool(re.search(r"\b(?:I|my|I'm|I'm)\b", summary_text))
         padding_text = " ".join(
             _generate_padding_sentences(
-                required_words, section=None, is_persona=is_persona
+                required_words,
+                section=None,
+                is_persona=is_persona,
+                context_text=summary_text,
             )
         ).strip()
-        return f"{base}\n\n{padding_text}".strip() if padding_text else base
+        return f"{base} {padding_text}".strip() if padding_text else base
 
     # Candidate sections to pad (exclude Health/Key Metrics/Closing).
     #
@@ -3743,13 +6599,16 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
         base = summary_text.rstrip()
         if base and not base.endswith((".", "!", "?")):
             base += "."
-        is_persona = bool(re.search(r"\b(?:I|my|I'm|I’m)\b", summary_text))
+        is_persona = bool(re.search(r"\b(?:I|my|I'm|I'm)\b", summary_text))
         padding_text = " ".join(
             _generate_padding_sentences(
-                required_words, section=None, is_persona=is_persona
+                required_words,
+                section=None,
+                is_persona=is_persona,
+                context_text=summary_text,
             )
         ).strip()
-        return f"{base}\n\n{padding_text}".strip() if padding_text else base
+        return f"{base} {padding_text}".strip() if padding_text else base
 
     candidates.sort()
 
@@ -3822,6 +6681,7 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
             section=canon_title,
             is_persona=is_persona,
             exclude_risk_names=risk_name_exclusions,
+            context_text=summary_text,
         )
         if not pad_sentences:
             continue
@@ -3956,8 +6816,18 @@ def _enforce_section_order(text: str, include_health_rating: bool = True) -> str
 
     rebuilt = []
     for o in order:
-        for title, body in buckets.get(o, []):
+        items = buckets.get(o, [])
+        if not items:
+            continue
+        # ── Deduplicate: if the same canonical section appears more than once,
+        # merge the bodies into a single section (keeps the first title).
+        if len(items) == 1:
+            title, body = items[0]
             rebuilt.append(f"## {title}\n{body}".strip())
+        else:
+            merged_title = items[0][0]
+            merged_body = "\n\n".join(body.strip() for _, body in items if body.strip())
+            rebuilt.append(f"## {merged_title}\n{merged_body}".strip())
     rebuilt.extend([f"## {title}\n{body}".strip() for title, body in leftovers])
 
     return "\n\n".join([block for block in rebuilt if block.strip()])
@@ -4426,7 +7296,7 @@ def _compress_summary_to_length(
     tolerance: int,
     *,
     token_budget: Optional[TokenBudget] = None,
-    max_output_tokens: int = DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+    max_output_tokens: int = DEFAULT_OPENAI_MAX_OUTPUT_TOKENS,
 ) -> Tuple[Optional[str], Optional[int]]:
     """
     Ask the model to compress the memo to fit within the band without truncating sections.
@@ -4473,7 +7343,9 @@ def _compress_summary_to_length(
 
 
 def _finalize_length_band(
-    summary_text: str, target_length: int, tolerance: int = 10
+    summary_text: str,
+    target_length: int,
+    tolerance: int = FINAL_STRICT_WORD_BAND_TOLERANCE,
 ) -> str:
     """
     Hard guardrail to guarantee the final text lands within the requested band,
@@ -4531,7 +7403,7 @@ def _finalize_length_band(
 def _force_final_band(
     summary_text: str,
     target_length: int,
-    tolerance: int = 10,
+    tolerance: int = FINAL_STRICT_WORD_BAND_TOLERANCE,
     *,
     allow_padding: bool = True,
 ) -> str:
@@ -4585,13 +7457,167 @@ def _needs_length_retry(
 
     Enforce a strict word-count band around the user's request.
     """
-    tolerance = 10
+    tolerance = _effective_word_band_tolerance(target_length)
     words = cached_count if cached_count is not None else _count_words(text)
     lower = max(1, int(target_length) - tolerance)
     upper = int(target_length) + tolerance
     if lower <= words <= upper:
         return False, words, tolerance
     return True, words, tolerance
+
+
+def _is_catastrophic_underflow(
+    target_length: int, split_word_count: int, stripped_word_count: int
+) -> bool:
+    """Detect severe long-form collapse where rewrite-only recovery is unreliable."""
+    target = max(1, int(target_length or 0))
+    tol = _effective_word_band_tolerance(target)
+    strict_lower_bound = max(TARGET_LENGTH_MIN_WORDS, int(target) - int(tol))
+    if _is_long_form_target(target):
+        threshold = max(1200, int(target * 0.90))
+    else:
+        # Short-/mid-form targets need a target-relative threshold; using a hard
+        # 1200-word floor incorrectly flags almost every request as catastrophic.
+        threshold = max(80, int(target * 0.70))
+        threshold = min(int(strict_lower_bound), int(threshold))
+    threshold = max(1, int(threshold))
+    observed = max(0, int(max(split_word_count, stripped_word_count)))
+    return observed < threshold
+
+
+def _should_skip_final_underflow_rewrite(
+    *,
+    target_length: int,
+    underflow_gap: int,
+    split_word_count: int,
+    stripped_word_count: int,
+    strict_contract_active: bool,
+) -> bool:
+    """Decide whether to skip the last-chance underflow rewrite.
+
+    The collapse-avoidance guard is useful for long-form memos where a very late
+    rewrite can shrink or destabilize an otherwise substantive draft. It should
+    not block short- and mid-form targets, where users expect the request length
+    to be met tightly and the rewrite burden is materially smaller.
+    """
+    if strict_contract_active:
+        return False
+    if not _is_long_form_target(target_length):
+        return False
+
+    severe_floor = max(TARGET_LENGTH_MIN_WORDS, (int(target_length) + 1) // 2)
+    return (
+        int(underflow_gap or 0) >= 80
+        and int(split_word_count or 0) >= severe_floor
+        and int(stripped_word_count or 0) >= severe_floor
+    )
+
+
+def _allow_fast_explicit_target_length_recovery(
+    *,
+    target_length: Optional[int],
+    explicit_target_requested: bool,
+) -> bool:
+    """Allow one precise late-stage rewrite for explicit short/mid target requests."""
+    if not explicit_target_requested:
+        return False
+    if not _is_short_form_sectioned_target(target_length):
+        return False
+    try:
+        target = int(target_length or 0)
+    except (TypeError, ValueError):
+        return False
+    return target >= 500
+
+
+def _build_contract_recovery_prompt(
+    *,
+    base_prompt: str,
+    target_length: int,
+    retry_target: int,
+    missing_requirements: List[str],
+    section_budgets: Optional[Dict[str, int]] = None,
+    include_health_rating: bool = True,
+) -> str:
+    tol = _effective_word_band_tolerance(target_length)
+    lower = max(TARGET_LENGTH_MIN_WORDS, int(target_length) - tol)
+    upper = min(TARGET_LENGTH_MAX_WORDS, int(target_length) + tol)
+    requirement_lines = "\n".join(
+        f"- {item}" for item in (missing_requirements or [])[:12]
+    )
+
+    # Build category-specific recovery hints based on which requirements failed.
+    recovery_hints: List[str] = []
+    joined_reqs = " ".join(str(r) for r in (missing_requirements or [])).lower()
+    if "word-count band" in joined_reqs or "word count" in joined_reqs:
+        recovery_hints.append(
+            f"WORD COUNT: Write EXACTLY {int(retry_target)} words. "
+            f"The acceptable final band is {lower}-{upper} words. "
+            "Count carefully as you write each section."
+        )
+    if "quote" in joined_reqs or "grounded" in joined_reqs:
+        recovery_hints.append(
+            "QUOTES: Copy 3 short direct quotes CHARACTER-BY-CHARACTER from the "
+            "filing snippets. Place at least 1 in Executive Summary and at least 1 "
+            'in MD&A. Use straight quotes ("), never smart/curly quotes.'
+        )
+    if "key metrics" in joined_reqs or "data_grid" in joined_reqs:
+        recovery_hints.append(
+            "KEY METRICS: Use DATA_GRID_START / DATA_GRID_END markers. "
+            "Every line inside must be: → MetricName: NumericValue. "
+            "No blank lines, no prose, no explanations."
+        )
+    hint_block = ""
+    if recovery_hints:
+        hint_block = (
+            "\nCategory-specific guidance:\n"
+            + "\n".join(f"  • {h}" for h in recovery_hints)
+            + "\n"
+        )
+    section_budget_block = ""
+    if section_budgets:
+        ordered_sections = [
+            "Financial Health Rating",
+            "Executive Summary",
+            "Financial Performance",
+            "Management Discussion & Analysis",
+            "Risk Factors",
+            "Key Metrics",
+            "Closing Takeaway",
+        ]
+        budget_lines: List[str] = []
+        for section_name in ordered_sections:
+            if not include_health_rating and section_name == "Financial Health Rating":
+                continue
+            budget = int(section_budgets.get(section_name, 0) or 0)
+            if budget <= 0:
+                continue
+            budget_tol = _section_budget_tolerance_words(budget, max_tolerance=10)
+            budget_lines.append(
+                f"- {section_name}: {max(1, budget - budget_tol)}-{budget + budget_tol} body words (target {budget})"
+            )
+        if budget_lines:
+            section_budget_block = (
+                "Section body-word ranges to hit exactly:\n"
+                + "\n".join(budget_lines)
+                + "\n"
+                "Count only section body words; headings do not count. Do not repeat any section title inside a section body.\n"
+            )
+
+    return (
+        f"{(base_prompt or '').strip()}\n\n"
+        "STRICT CONTRACT RECOVERY MODE (ONE-SHOT):\n"
+        "The previous output failed strict contract checks. Regenerate the full memo from scratch and satisfy ALL requirements below in one pass.\n"
+        f"- Requested final band: {lower}-{upper} words.\n"
+        f"- Regeneration writing target: {int(retry_target)} words.\n"
+        "- Keep the exact required section headers and preserve deterministic numeric Key Metrics format.\n"
+        "- Keep quote usage strict and filing-grounded.\n"
+        f"{section_budget_block}"
+        f"{hint_block}"
+        "Failed requirements to fix:\n"
+        f"{requirement_lines}\n"
+        "Return only the final output in the exact format requested by the base prompt."
+    ).strip()
 
 
 def _rewrite_summary_to_length(
@@ -4602,177 +7628,282 @@ def _rewrite_summary_to_length(
     current_words: Optional[int] = None,
     *,
     token_budget: Optional[TokenBudget] = None,
-    max_output_tokens: int = DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+    cost_budget: Optional[SummaryCostBudget] = None,
+    max_output_tokens: int = DEFAULT_OPENAI_MAX_OUTPUT_TOKENS,
+    generation_stats: Optional[Dict[str, Any]] = None,
+    persona_intensity: str = "strong",
+    quality_issue_hint: Optional[str] = None,
+    allow_over_target_recovery: bool = False,
+    ignore_max_rewrite_attempts: bool = False,
+    allow_one_shot_rewrite: bool = False,
+    timeout_seconds: Optional[float] = None,
 ) -> Tuple[str, Tuple[int, int]]:
-    """
-    Ask the model to rewrite an existing draft so it fits within the required length band
-    while keeping every section intact. Returns the new draft and its (word_count, tolerance).
-    """
-    tolerance = 10
+    """Run one controlled rewrite to fix length/quality while preserving sections."""
+    tolerance = _effective_word_band_tolerance(target_length)
     lower = target_length - tolerance
     upper = target_length + tolerance
-    corrections: List[str] = []
-    working_draft = summary_text
+    working_draft = summary_text or ""
     latest_words = (
         current_words if current_words is not None else _count_words(working_draft)
     )
-    best_valid_draft = working_draft
-    best_stats: Tuple[int, int] = (latest_words, tolerance)
+    if (
+        generation_stats is not None
+        and generation_stats.get("one_shot_deterministic_policy")
+        and not allow_one_shot_rewrite
+    ):
+        return working_draft, (latest_words, tolerance)
 
-    def _build_prompt() -> str:
-        diff = latest_words - target_length
-        abs_diff = abs(diff)
-        has_health = bool(
-            re.search(r"financial health rating", working_draft, re.IGNORECASE)
-        )
-        health_cut_line = (
-            "   - Financial Health Rating: ~10% of cuts\n" if has_health else ""
-        )
-
-        preserve_titles: List[str] = []
-        for title, _min_words in SUMMARY_SECTION_REQUIREMENTS:
-            if re.search(
-                rf"^\s*##?\s*{re.escape(title)}\b",
-                working_draft,
-                re.IGNORECASE | re.MULTILINE,
-            ):
-                preserve_titles.append(title)
-        if not preserve_titles:
-            preserve_titles = [
-                title
-                for title, _ in SUMMARY_SECTION_REQUIREMENTS
-                if title != "Financial Health Rating" or has_health
-            ]
-        preserve_clause = ", ".join(preserve_titles)
-
-        if latest_words > upper:
-            direction_instruction = (
-                f"You are {abs_diff} words OVER the limit. \n"
-                "ACTION: CONDENSE the text PROPORTIONALLY across ALL sections. \n"
-                f"1. CUT approximately {int(abs_diff * 1.2)} words total.\n"
-                "2. PROPORTIONAL CUTS - reduce EACH section by a similar percentage:\n"
-                f"{health_cut_line}"
-                "   - Executive Summary: ~15% of cuts\n"
-                "   - Financial Performance: ~20% of cuts\n"
-                "   - Management Discussion & Analysis: ~20% of cuts\n"
-                "   - Risk Factors: ~15% of cuts\n"
-                "   - Key Metrics: ~10% of cuts\n"
-                "   - Closing Takeaway: ~10% of cuts (KEEP A COMPLETE VERDICT; do not collapse to a one-liner)\n"
-                "3. DO NOT take all cuts from one section (especially Closing Takeaway).\n"
-                "4. Remove adjectives, adverbs, and filler words. Merge sentences.\n"
-                "5. Keep 'Key Metrics' compact but complete.\n"
-                "6. DO NOT append any new summary. Just condense existing sections."
-            )
-        elif latest_words < lower:
-            words_needed = lower - latest_words
-            direction_instruction = (
-                f"You are {abs_diff} words SHORT of the MINIMUM requirement ({lower} words). \n"
-                f"ACTION: EXPAND the content NOW. You MUST add AT LEAST {int(words_needed * 1.3)} words.\n\n"
-                f"MANDATORY EXPANSION (add exactly these words per section):\n"
-                f"- Financial Health Rating: Add {max(2, int(words_needed * 0.10))} words (link score to 1-2 key drivers)\n"
-                f"- Executive Summary: Add {max(3, int(words_needed * 0.15))} words (thesis + swing factor)\n"
-                f"- Financial Performance: Add {max(5, int(words_needed * 0.20))} words (margin bridge, cash conversion, YoY context)\n"
-                f"- Management Discussion & Analysis: Add {max(5, int(words_needed * 0.20))} words (strategy, capital allocation, execution)\n"
-                f"- Risk Factors: Add {max(4, int(words_needed * 0.15))} words (only the most material, filing-grounded risks)\n"
-                f"- Key Metrics: Add {max(2, int(words_needed * 0.10))} words by adding MORE arrow-line metric rows (NO prose paragraphs)\n"
-                f"- Closing Takeaway: Add {max(3, int(words_needed * 0.10))} words (clear verdict + what changes the view)\n\n"
-                f"DO NOT use generic filler sentences. Add SUBSTANTIVE analysis with specific data points.\n"
-                f"You MUST reach at least {lower} words. Count your words before finishing."
-            )
-        else:
-            direction_instruction = "Ensure you stay within the target range."
-
-        prompt = (
-            f"You previously drafted an equity research memo containing {latest_words} words, which is outside the "
-            f"required range of {lower}–{upper} words (target {target_length}). \n\n"
-            f"{direction_instruction}\n\n"
-            "Rewrite the entire memo so it fits the range while preserving every section and investor-specific instruction."
-            "\n\nMANDATORY REQUIREMENTS (IN PRIORITY ORDER):\n"
-            "1. SENTENCE COMPLETION IS HIGHEST PRIORITY - NEVER cut off mid-sentence, even to meet word count.\n"
-            f"2. Keep all existing section headings ({preserve_clause}) unless they were absent in the draft. Do NOT drop sections to save space.\n"
-            "3. Retain the key figures, personas, and conclusions.\n"
-            "4. EVERY sentence MUST end with proper punctuation. No cutting off with 'and the...', 'which is...', or incomplete numbers like '$1.'.\n"
-            "5. ENSURE THE OUTPUT IS COMPLETE. Do not cut off the last section or the Closing Takeaway.\n"
-            "6. After rewriting, append a final line formatted exactly as `WORD COUNT: ###` (replace ### with the true count)."
-            f"\n\nLENGTH TARGET:\nAim for {lower}–{upper} words. You MUST land inside this range. "
-            f"If finishing a sentence would push you out of range, tighten earlier sentences to compensate. "
-            f"Incomplete sentences are NOT allowed."
-        )
-        if corrections:
-            prompt += "\n\nADDITIONAL CORRECTIONS:\n" + "\n".join(corrections)
-        prompt += "\n\nPREVIOUS DRAFT:\n" + working_draft
-        return prompt
-
-    for attempt in range(1, MAX_REWRITE_ATTEMPTS + 1):
-        # Add delay between rewrite attempts to space out API calls
-        # This helps avoid rapid-fire requests that trigger rate limits
-        if attempt > 1:
-            delay_seconds = 2 ** (attempt - 1)  # Exponential: 2s, 4s, 8s...
-            delay_seconds = min(delay_seconds, 5)  # Cap at 5 seconds
-            logger.info(
-                f"Waiting {delay_seconds}s before rewrite attempt {attempt}/{MAX_REWRITE_ATTEMPTS}"
-            )
-            time.sleep(delay_seconds)
-
-        prompt = _build_prompt()
-        if token_budget and not token_budget.can_afford(prompt, max_output_tokens):
-            logger.warning(
-                "Skipping rewrite attempt due to token budget (remaining=%s tokens)",
-                token_budget.remaining_tokens,
-            )
-            break
-
-        raw_text = _call_gemini_client(gemini_client, prompt)
-        if token_budget:
-            token_budget.charge(prompt, raw_text)
-        new_text, reported_count = _extract_word_count_control(raw_text)
-        if not new_text.strip():
-            corrections.append(
-                "OUTPUT ISSUE: Draft was empty. Provide the full memo with all sections."
-            )
-            continue
-
-        working_draft = new_text
-        latest_words = _count_words(working_draft)
-        within_band = lower <= latest_words <= upper
-
-        if reported_count is None:
-            corrections.append(
-                "QUALITY CORRECTION: Append the control line `WORD COUNT: ###` exactly once at the end after recounting."
-            )
-            continue
-        if latest_words != reported_count:
-            corrections.append(
-                f"QUALITY CORRECTION: Control line reported {reported_count} words but the memo contains {latest_words}. "
-                "Recount accurately and update the memo."
-            )
-            continue
-
-        issue_message = None
-        if quality_validators:
-            for validator in quality_validators:
-                issue_message = validator(working_draft)
-                if issue_message:
-                    break
-
-        if issue_message is None:
-            best_valid_draft = working_draft
-            best_stats = (latest_words, tolerance)
-
-        if within_band and not issue_message:
+    if generation_stats is not None:
+        rewrite_calls = int(generation_stats.get("rewrite_call_count", 0) or 0)
+        if not ignore_max_rewrite_attempts and rewrite_calls >= int(
+            MAX_REWRITE_ATTEMPTS
+        ):
             return working_draft, (latest_words, tolerance)
 
-        if not within_band:
-            corrections.append(
-                f"LENGTH CORRECTION #{attempt}: Draft contains {latest_words} words but must land between {lower} and {upper}. "
-                "Condense prose without deleting mandated sections or metrics."
-            )
-        if issue_message:
-            corrections.append(
-                f"QUALITY CORRECTION #{attempt}: {issue_message} Rewrite the memo while keeping every prior requirement."
-            )
+    preserve_titles: List[str] = []
+    for title, _min_words in SUMMARY_SECTION_REQUIREMENTS:
+        if re.search(
+            rf"^\s*##?\s*{re.escape(title)}\b",
+            working_draft,
+            re.IGNORECASE | re.MULTILINE,
+        ):
+            preserve_titles.append(title)
+    if not preserve_titles:
+        preserve_titles = [title for title, _min_words in SUMMARY_SECTION_REQUIREMENTS]
+    preserve_clause = ", ".join(preserve_titles)
 
-    return best_valid_draft, best_stats
+    delta = latest_words - target_length
+    abs_delta = abs(delta)
+    if latest_words > upper:
+        direction_instruction = (
+            f"You are {abs_delta} words over target. Condense repetitive phrasing and remove low-signal filler "
+            f"while preserving every section and decision-relevant metric. Land between {lower} and {upper} words."
+        )
+    elif latest_words < lower:
+        if abs_delta > 200:
+            # Massive underflow — the model needs to substantially expand, not tweak
+            direction_instruction = (
+                f"CRITICAL: You are {abs_delta} words short. The draft has {latest_words} words but must have "
+                f"between {lower} and {upper} words. You must EXPAND EVERY SECTION significantly.\n"
+                f"For each section, add:\n"
+                f"- Deeper analysis with specific business reasoning\n"
+                f"- Direct quotes from the filing text\n"
+                f"- Multi-paragraph explanations instead of single paragraphs\n"
+                f"- Forward-looking implications and competitive context\n"
+                f"Do NOT just add filler. Add genuine analytical depth to hit exactly {target_length} words."
+            )
+        else:
+            direction_instruction = (
+                f"You are {abs_delta} words short of target. Add substantive analysis with concrete numbers and mechanisms "
+                f"(no generic filler) while preserving every section. Land between {lower} and {upper} words."
+            )
+    else:
+        direction_instruction = f"Keep the draft between {lower} and {upper} words while improving clarity and flow."
+
+    persona_rewrite_instruction = (
+        "Persona handling: keep persona framing subtle and avoid catchphrases."
+        if persona_intensity == "subtle"
+        else "Persona handling: keep persona framing consistent without role-play theatrics."
+    )
+
+    quality_instruction = ""
+    if quality_issue_hint:
+        hint_lower = str(quality_issue_hint).lower()
+        targeted_fix_lines: List[str] = []
+        if "numbers discipline" in hint_lower or "metric priority drift" in hint_lower:
+            targeted_fix_lines.append(
+                "Reduce numeric density in narrative sections and prioritize mechanism over metric inventory."
+            )
+        if "quote" in hint_lower:
+            targeted_fix_lines.append(
+                "Add short verbatim filing-language quotes in Executive Summary and MD&A where missing."
+            )
+        if "word-count band violation" in hint_lower:
+            targeted_fix_lines.append(
+                "Resolve the final total word-count band exactly before any stylistic edits."
+            )
+        if "leading-word repetition" in hint_lower:
+            targeted_fix_lines.append(
+                "Vary sentence openings within each section; do not start more than two sentences with the same word."
+            )
+        if "number repetition across sections" in hint_lower:
+            targeted_fix_lines.append(
+                "Use each specific numeric figure in at most three sections; reference the implication qualitatively elsewhere."
+            )
+        if "theme over-repetition" in hint_lower:
+            targeted_fix_lines.append(
+                "Consolidate repeated themes into one primary section and use brief references elsewhere."
+            )
+        if (
+            (
+                "closing takeaway must include at least one measurable monitoring trigger"
+                in hint_lower
+            )
+            or ("what must stay true" in hint_lower)
+            or ("what breaks the thesis" in hint_lower)
+        ):
+            targeted_fix_lines.append(
+                "Closing Takeaway must include one measurable 'what must stay true' trigger and one measurable downside trigger, each with a distinct time window."
+            )
+        if "section balance issue" in hint_lower:
+            targeted_fix_lines.append(
+                "Reallocate section length to match budgets by tightening overweight sections and expanding underweight sections while preserving flow."
+            )
+        targeted_block = (
+            "\n".join(f"- {line}" for line in targeted_fix_lines)
+            if targeted_fix_lines
+            else ""
+        )
+        quality_instruction = (
+            "\nFix this issue first before making stylistic edits:\n"
+            f"- {quality_issue_hint}\n"
+            + (f"{targeted_block}\n" if targeted_block else "")
+        )
+
+    prompt = (
+        "Rewrite this equity memo for better editorial quality.\n"
+        f"{direction_instruction}\n"
+        f"{persona_rewrite_instruction}\n"
+        "Prioritize narrative quality over metric inventory:\n"
+        "- lead with business mechanism and management actions\n"
+        "- use quotes only when they add strategic context\n"
+        "- keep numeric anchors minimal and decision-relevant\n"
+        f"Keep these section headings (if present): {preserve_clause}.\n"
+        "Do not add meta-instructions, checklists, or process narration.\n"
+        "Keep complete sentences and a coherent closing verdict."
+        f"{quality_instruction}\n"
+        "Append exactly one final line as: WORD COUNT: ###\n\n"
+        "DRAFT TO REWRITE:\n"
+        f"{working_draft}"
+    )
+    budget_adjustments_attempted = (
+        generation_stats.get("budget_adjustments_attempted")
+        if isinstance(generation_stats, dict)
+        and isinstance(generation_stats.get("budget_adjustments_attempted"), list)
+        else None
+    )
+    expected_output_tokens = _estimate_summary_output_tokens(
+        target_length=target_length, max_output_tokens=max_output_tokens
+    )
+
+    if token_budget and not token_budget.can_afford(prompt, expected_output_tokens):
+        logger.info(
+            "Skipping rewrite: token budget exhausted (remaining=%s tokens)",
+            token_budget.remaining_tokens,
+        )
+        if generation_stats is not None:
+            generation_stats["rewrite_skipped_budget_guard"] = True
+        return working_draft, (latest_words, tolerance)
+
+    if cost_budget and not cost_budget.can_afford(prompt, expected_output_tokens):
+        logger.info(
+            "Skipping rewrite: cost budget exhausted (spent=$%.4f cap=$%.4f remaining=$%.4f)",
+            cost_budget.spent_usd,
+            cost_budget.budget_cap_usd,
+            cost_budget.remaining_usd,
+        )
+        if generation_stats is not None:
+            generation_stats["rewrite_skipped_budget_guard"] = True
+        return working_draft, (latest_words, tolerance)
+
+    if generation_stats is not None:
+        next_count = int(generation_stats.get("rewrite_call_count", 0) or 0) + 1
+        generation_stats["rewrite_call_count"] = next_count
+        generation_stats["rewrite_used"] = next_count > 0
+
+    effective_timeout = (
+        float(timeout_seconds)
+        if timeout_seconds is not None
+        else _summary_rewrite_timeout_seconds()
+    )
+    runtime_deadline_monotonic = (
+        float(generation_stats.get("summary_runtime_deadline_monotonic") or 0.0)
+        if isinstance(generation_stats, dict)
+        else 0.0
+    )
+    if runtime_deadline_monotonic > 0.0:
+        remaining_wall = float(runtime_deadline_monotonic - time.monotonic())
+        if remaining_wall <= 0.0:
+            raise TimeoutError("Summary generation runtime cap reached before rewrite.")
+        effective_timeout = min(effective_timeout, remaining_wall)
+    if effective_timeout <= 0.0:
+        raise TimeoutError("Summary generation runtime cap reached before rewrite.")
+
+    raw_text = _call_gemini_client(
+        gemini_client,
+        prompt,
+        timeout_seconds=effective_timeout,
+        generation_config_override={
+            "use_responses_api": True,
+            "api_mode": "responses",
+            "pipeline_mode": "two_agent",
+            "agent_stage": "agent_2_summary",
+            "temperature": 0.30,
+            "maxOutputTokens": int(expected_output_tokens),
+        },
+    )
+    if token_budget:
+        token_budget.charge(prompt, raw_text)
+    if cost_budget:
+        cost_budget.charge(prompt, raw_text)
+        if cost_budget.spent_usd > float(cost_budget.budget_cap_usd):
+            # The rewrite already ran and produced output. Log the overage but
+            # continue — raising here would discard valid work.  Downstream
+            # guards will prevent further LLM calls.
+            logger.warning(
+                "Rewrite overran cost budget (spent=$%.4f cap=$%.4f); "
+                "continuing with rewritten draft.",
+                cost_budget.spent_usd,
+                cost_budget.budget_cap_usd,
+            )
+    rewritten_text, reported_count = _extract_word_count_control(raw_text)
+    if not rewritten_text.strip():
+        return working_draft, (latest_words, tolerance)
+
+    rewritten_words = _count_words(rewritten_text)
+    if reported_count is not None and abs(rewritten_words - reported_count) > 5:
+        logger.debug(
+            "Rewrite control count mismatch (reported=%s actual=%s)",
+            reported_count,
+            rewritten_words,
+        )
+
+    issue_message = None
+    if quality_validators:
+        for validator in quality_validators:
+            issue_message = validator(rewritten_text)
+            if issue_message:
+                validator_name = getattr(validator, "__name__", None) or getattr(
+                    validator, "__qualname__", repr(validator)
+                )
+                logger.info(
+                    "Quality validator still firing after rewrite: validator=%s issue=%s",
+                    validator_name,
+                    issue_message[:200],
+                )
+                break
+
+    if not issue_message:
+        if quality_issue_hint:
+            logger.info(
+                "Rewrite successfully resolved quality issue: %s",
+                quality_issue_hint[:120],
+            )
+        return rewritten_text, (rewritten_words, tolerance)
+
+    original_distance = abs(latest_words - target_length)
+    rewritten_distance = abs(rewritten_words - target_length)
+    if rewritten_distance < original_distance:
+        return rewritten_text, (rewritten_words, tolerance)
+    if (
+        allow_over_target_recovery
+        and latest_words < lower
+        and rewritten_words > latest_words
+    ):
+        # Underflow rescue: accept a longer rewrite even if it overshoots target.
+        # Deterministic strict-band clamping runs after this and will trim safely.
+        return rewritten_text, (rewritten_words, tolerance)
+    return working_draft, (latest_words, tolerance)
 
 
 def _enforce_length_constraints(
@@ -4783,7 +7914,8 @@ def _enforce_length_constraints(
     last_word_stats: Optional[Tuple[int, int]],
     *,
     token_budget: Optional[TokenBudget] = None,
-    max_output_tokens: int = DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+    max_output_tokens: int = DEFAULT_OPENAI_MAX_OUTPUT_TOKENS,
+    generation_stats: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Ensure the final memo does not exceed the requested max length.
@@ -4800,7 +7932,9 @@ def _enforce_length_constraints(
         return summary_text
 
     overage = max(0, actual_words - cap)
-    if overage > 80:
+    if overage > 80 and not (
+        generation_stats and generation_stats.get("one_shot_deterministic_policy")
+    ):
         compressed, compressed_words = _compress_summary_to_length(
             gemini_client,
             summary_text,
@@ -4815,7 +7949,11 @@ def _enforce_length_constraints(
 
     trimmed = _trim_preserving_headings(summary_text, cap)
     return _enforce_whitespace_word_band(
-        trimmed, cap, tolerance=10, allow_padding=True, dedupe=True
+        trimmed,
+        cap,
+        tolerance=_effective_word_band_tolerance(target_length),
+        allow_padding=False,
+        dedupe=True,
     )
 
 
@@ -4826,22 +7964,37 @@ def _enforce_strict_target_band(
     calculated_metrics: Dict[str, Any],
     company_name: str,
     include_health_rating: bool,
+    generation_stats: Optional[Dict[str, Any]] = None,
+    allow_padding_rescue: bool = True,
+    prefer_narrative_padding: bool = False,
+    gemini_client: Optional[Any] = None,
+    quality_validators: Optional[List[Callable[[str], Optional[str]]]] = None,
+    token_budget: Optional[TokenBudget] = None,
+    cost_budget: Optional[SummaryCostBudget] = None,
+    max_output_tokens: int = DEFAULT_OPENAI_MAX_OUTPUT_TOKENS,
+    persona_intensity: str = "strong",
 ) -> str:
-    """Ensure the final memo lands within ±10 words of the requested target.
+    """Ensure the final memo lands within the strict final tolerance of the target.
 
     This prefers:
     - trimming when over the band
-    - adding *numeric, company-specific* addenda when under the band (no generic slogans)
+    - targeted addenda for residual under-runs (no checklist filler)
     """
     if not summary_text or not target_length:
         return summary_text
 
     target = int(target_length)
-    tolerance = 10
+    tolerance = _effective_word_band_tolerance(target_length)
     lower = max(TARGET_LENGTH_MIN_WORDS, target - tolerance)
     upper = min(TARGET_LENGTH_MAX_WORDS, target + tolerance)
+    long_form_contract = _is_long_form_target(target)
+    padding_rescue_enabled = bool(allow_padding_rescue and not long_form_contract)
+    one_shot_deterministic_policy = bool(
+        generation_stats and generation_stats.get("one_shot_deterministic_policy")
+    )
 
     text = summary_text
+    one_shot_section_addenda_used: Dict[str, int] = {}
 
     def _stats(value: str) -> Tuple[int, int]:
         value = value or ""
@@ -4920,110 +8073,85 @@ def _enforce_strict_target_band(
 
         candidates: List[str] = []
 
-        # Prefer concrete, numeric sentences when possible.
-        if rev_str and op_inc_str and operating_margin is not None:
-            candidates.append(
-                f"On a run-rate basis, {company_name} is converting {rev_str} of revenue into {op_inc_str} of operating income (operating margin ~{operating_margin:.1f}%)."
-            )
-        if ocf_str and fcf_str and capex_str:
-            candidates.append(
-                f"The OCF→FCF bridge is the underwriting hinge: operating cash flow {ocf_str} funds capex of {capex_str}, leaving free cash flow {fcf_str}."
-            )
         if capex_pct is not None:
             candidates.append(
                 f"Capex intensity is ~{capex_pct:.1f}% of revenue this period, so small changes in investment cadence can swing free cash flow materially."
             )
-        if fcf_margin_pct is not None:
-            candidates.append(
-                f"Free-cash-flow margin is ~{fcf_margin_pct:.1f}%, which is the cleanest single metric for durability as reinvestment scales."
-            )
-        if operating_margin is not None and net_margin is not None:
+        if (
+            operating_margin is not None
+            and net_margin is not None
+            and abs(net_margin - operating_margin) >= 3
+        ):
             candidates.append(
                 f"The spread between operating margin ({operating_margin:.1f}%) and net margin ({net_margin:.1f}%) is a reminder to underwrite on operating profitability and cash rather than below-the-line volatility."
             )
+        if fcf_margin_pct is not None:
+            if fcf_margin_pct > 100:
+                candidates.append(
+                    f"Free-cash-flow margin is ~{fcf_margin_pct:.1f}%, temporarily exceeding revenue due to working-capital inflows or deferred-revenue timing; this level is not sustainable and should not be extrapolated."
+                )
+            elif fcf_margin_pct > 50:
+                candidates.append(
+                    f"Free-cash-flow margin is ~{fcf_margin_pct:.1f}%, which is unusually high and likely reflects favorable working-capital timing rather than steady-state conversion."
+                )
         if cash_total_str and liabilities_str:
             candidates.append(
                 f"Liquidity is meaningful: {cash_total_str} of cash and securities versus {liabilities_str} of liabilities provides buffer, but it does not replace durable cash conversion."
             )
-        if rev_str and op_inc_str:
+        if ocf_str and fcf_str and ocf and fcf and ocf > 0:
+            try:
+                conversion = (fcf / ocf) * 100
+                candidates.append(
+                    f"Free cash flow conversion from operating cash flow runs at ~{conversion:.0f}%, which frames how much reinvestment the business absorbs before shareholders see cash."
+                )
+            except Exception:
+                pass
+        if rev_str and op_inc_str and operating_margin is not None:
             candidates.append(
-                f"Revenue scale of {rev_str} paired with {op_inc_str} of operating income defines the current earnings power of the enterprise."
+                f"Revenue of {rev_str} translating to operating income of {op_inc_str} ({operating_margin:.1f}% margin) shows how much operating leverage the business carries at current scale."
             )
-        if fcf_str and ocf_str:
+        if (
+            net_margin is not None
+            and operating_margin is not None
+            and abs(net_margin - operating_margin) < 3
+        ):
             candidates.append(
-                f"The conversion from {ocf_str} of operating cash to {fcf_str} of free cash highlights the capital intensity required to maintain the current growth trajectory."
+                f"Net margin of {net_margin:.1f}% tracks operating margin closely, which means below-the-line items are not distorting the profitability picture and the operating read is clean."
             )
-
-        # If the extracted snapshot is missing key line items
-        # add an explicit, non-repetitive
-        # data-gap addendum so strict word-band enforcement can still converge without resorting
-        # to generic slogans or templated “watch list” padding.
+        if fcf_margin_pct is not None and 10 <= fcf_margin_pct <= 50:
+            candidates.append(
+                f"Free-cash-flow margin of ~{fcf_margin_pct:.1f}% gives a sense of how much revenue ultimately converts to cash that can fund buybacks, dividends, or reinvestment."
+            )
+        if ocf and operating_income and operating_income > 0:
+            try:
+                cash_conversion_ratio = ocf / operating_income
+                if cash_conversion_ratio >= 0.8:
+                    candidates.append(
+                        f"Cash conversion of operating income runs above 80%, meaning reported earnings are backed by real cash generation rather than accrual artifacts."
+                    )
+                elif cash_conversion_ratio >= 0.5:
+                    candidates.append(
+                        f"Cash conversion of operating income runs near {cash_conversion_ratio:.0%}, so working-capital swings or non-cash charges are absorbing a meaningful share of reported profits."
+                    )
+            except Exception:
+                pass
 
         if rev_str and (operating_income is None and operating_margin is None):
             candidates.append(
-                f"Scale is visible (revenue {rev_str}), but profitability line items are not present in the extracted snapshot, so operating leverage cannot be underwritten from margin data in this draft."
-            )
-        if rev_str and operating_margin is None:
-            candidates.append(
-                f"Without an operating margin series, the practical question becomes whether incremental revenue is arriving with stable gross profit and controlled opex, or whether cost intensity is rising with growth."
+                f"Scale is visible (revenue {rev_str}), but profitability line items are not present in the reported data, so operating leverage cannot be underwritten from margin data in this filing."
             )
         if ocf is None:
             candidates.append(
-                "Operating cash flow is not present in the extracted snapshot, so cash conversion needs to be validated against working-capital movements, tax timing, and any non-cash add-backs that can inflate earnings optics."
+                "Operating cash flow is not disclosed in the filing, so cash conversion needs to be validated against working-capital movements, tax timing, and any non-cash add-backs that can inflate earnings optics."
             )
         if capex is None:
             candidates.append(
-                "Capital expenditure data is not present here; without it, free cash flow cannot be triangulated, and reinvestment intensity (and its payback) remains the dominant unknown."
+                "Capital expenditure data is not present here; without it, free cash flow cannot be triangulated, and reinvestment intensity remains the dominant unknown."
             )
         if (cash_total_str is None) and (liabilities_str is None):
             candidates.append(
-                "Balance-sheet context is limited in this draft; liquidity and obligations determine how much margin compression the company can absorb before capital allocation shifts from growth to de-risking."
+                "Balance-sheet context is limited in the reported data; liquidity and obligations determine how much margin compression the company can absorb before capital allocation shifts from growth to de-risking."
             )
-        if liabilities_str and cash_total_str is None:
-            candidates.append(
-                f"Liabilities are {liabilities_str}, but cash is not provided in the extracted snapshot; funding optionality is therefore unclear, which matters most if growth slows or risk costs rise."
-            )
-        if cash_total_str and liabilities_str is None:
-            candidates.append(
-                f"Liquidity is {cash_total_str} in the snapshot, but liabilities are not shown; the margin for error depends on near-term obligations and any refinancing cadence not visible in this excerpt."
-            )
-
-        # Add a few structure-preserving underwriting sentences that remain specific to the
-        # metrics available, without repeating the “framework” boilerplate the product strips.
-        if rev_str:
-            candidates.append(
-                f"With revenue at {rev_str}, the next-step underwriting is to reconcile that scale to unit economics: pricing/mix, cost-to-serve, and the extent to which fixed costs are providing (or losing) operating leverage."
-            )
-            candidates.append(
-                "A clean way to pressure-test the story is to reconcile the full bridge—revenue to gross profit to opex to operating income to operating cash flow to capex to free cash flow—because surprises tend to sit in the missing links."
-            )
-            candidates.append(
-                "If stock-based compensation or other non-cash charges are material, reported profitability can look stable while per-share value creation is weaker; that tension becomes visible when buyback capacity is compared to dilution."
-            )
-        candidates.append(
-            "To avoid one-quarter noise, the clearest confirmation is a repeatable pattern across consecutive periods: revenue growth translating into stable (or improving) operating profit and cash generation after reinvestment."
-        )
-        candidates.append(
-            "Working-capital drivers such as receivables, deferred revenue, and payables can swing operating cash flow meaningfully; without that bridge, a single quarter’s cash conversion can be more timing than trajectory."
-        )
-        candidates.append(
-            "Capex can represent either capacity expansion (growth) or maintenance (defense); distinguishing the two changes whether a higher spend rate is value-accretive or simply the cost of staying competitive."
-        )
-        candidates.append(
-            "When balance-sheet detail is limited, the most decision-relevant items are near-term obligations and any refinancing cadence, because those determine whether management can keep investing through a softer demand window."
-        )
-        candidates.append(
-            "A more constructive stance typically follows when margin pressure eases while reinvestment stays purposeful, because that combination raises the probability that future growth compounds free cash flow rather than consuming it."
-        )
-        candidates.append(
-            "If revenue slows while cost intensity stays high, fixed costs can turn small demand changes into outsized earnings volatility; the practical mitigation is visible operating leverage and a cost base that flexes with demand."
-        )
-        candidates.append(
-            "The downside scenario is a simultaneous squeeze—higher cost intensity alongside elevated investment spend—which can compress free cash flow even if headline revenue remains resilient."
-        )
-        candidates.append(
-            "Where the draft lacks numeric detail, the decision should be treated as provisional: the missing lines (margins, cash flow, capex, and obligations) are the variables that most directly change downside protection and capital-allocation flexibility."
-        )
 
         # Keep only sentences that aren't already present verbatim-ish.
         existing_norm = " ".join((text or "").lower().split())
@@ -5034,9 +8162,47 @@ def _enforce_strict_target_band(
                 kept.append(sentence)
                 existing_norm += " " + norm
 
+        def _numeric_token_count(sentence: str) -> int:
+            return len(re.findall(r"\b[\w$€£]*\d[\w%/.\-]*\b", sentence or ""))
+
+        # Keep the addendum narrative-first: avoid long runs of conditional one-liners
+        # and cap sentence count to prevent synthetic-looking over-padding.
+        prioritized: List[str] = []
+        for sentence in kept:
+            if re.match(r"(?i)^\s*if\s+", sentence or ""):
+                continue
+            prioritized.append(sentence)
+        if not prioritized:
+            prioritized = kept[:]
+
+        mechanism_re = re.compile(
+            r"\b(because|which means|as a result|therefore|depends on|durability|underwriting|reinvestment|conversion|leverage|liquidity|margin)\b",
+            re.IGNORECASE,
+        )
+        if prefer_narrative_padding:
+            prioritized.sort(
+                key=lambda s: (
+                    _numeric_token_count(s),
+                    not bool(mechanism_re.search(s or "")),
+                    bool(re.match(r"(?i)^\s*if\s+", s or "")),
+                    abs(_count_words(s) - 21),
+                )
+            )
+        else:
+            prioritized.sort(
+                key=lambda s: (
+                    _numeric_token_count(s) > 4,
+                    bool(re.match(r"(?i)^\s*if\s+", s or "")),
+                    abs(_count_words(s) - 22),
+                )
+            )
+
+        max_sentences = 2 if int(max_words or 0) <= 110 else 3
         out: List[str] = []
         budget = int(max_words)
-        for sentence in kept:
+        for sentence in prioritized:
+            if len(out) >= max_sentences:
+                break
             if not sentence:
                 continue
             next_block = (" ".join(out + [sentence])).strip()
@@ -5055,9 +8221,9 @@ def _enforce_strict_target_band(
         if text and not text.rstrip().endswith((".", "!", "?")):
             text = text.rstrip() + "."
 
-    # 2) If underweight, add addenda into narrative sections (not Key Metrics).
-    # Use a bounded loop so we can add multiple distinct sentences without duplicating.
-    for _ in range(12):
+    # 2) If underweight, prefer constrained LLM rewrites for large deficits to
+    # preserve prose quality. Deterministic addenda are a fallback for small gaps.
+    for _ in range(6):
         if _in_band(text):
             break
 
@@ -5066,39 +8232,164 @@ def _enforce_strict_target_band(
         if split_wc > upper or stripped_wc > upper:
             text = _trim_preserving_headings(text, upper)
             break
-        if current >= lower:
+        # Continue expanding until BOTH counting methods clear the lower bound.
+        if split_wc >= lower and stripped_wc >= lower:
             break
 
         deficit = max(lower - split_wc, lower - stripped_wc)
-        # Prefer adding to Financial Performance first; then MD&A; then Closing Takeaway.
+        if deficit >= 40 and gemini_client is not None:
+            rewrite_attempts = 2 if deficit >= 80 else 1
+            rewrite_applied = False
+            for _attempt in range(rewrite_attempts):
+                prev_calls = (
+                    int(generation_stats.get("rewrite_call_count", 0) or 0)
+                    if generation_stats
+                    else 0
+                )
+                rewritten, _ = _rewrite_summary_to_length(
+                    gemini_client,
+                    text,
+                    target,
+                    quality_validators,
+                    current_words=current,
+                    token_budget=token_budget,
+                    cost_budget=cost_budget,
+                    max_output_tokens=max_output_tokens,
+                    generation_stats=generation_stats,
+                    persona_intensity=persona_intensity,
+                    quality_issue_hint=(
+                        f"Large underflow detected ({deficit} words short). "
+                        "Expand with filing-grounded analysis and connected prose; "
+                        "do not use checklist padding or metric-template addenda."
+                    ),
+                    allow_over_target_recovery=True,
+                )
+                new_calls = (
+                    int(generation_stats.get("rewrite_call_count", 0) or 0)
+                    if generation_stats
+                    else prev_calls
+                )
+                if (
+                    rewritten
+                    and rewritten.strip()
+                    and (rewritten != text or new_calls > prev_calls)
+                ):
+                    text = _post_rewrite_regex_cleanup(rewritten)
+                    rewrite_applied = True
+                    break
+            if rewrite_applied:
+                continue
+            if deficit >= 80 and not long_form_contract:
+                # For large deficits we avoid deterministic numeric top-up templates.
+                # Exception: if cleanup pushed the draft below a severe floor (50% of
+                # target), add a small floor-rescue addendum so output does not collapse.
+                severe_floor = max(TARGET_LENGTH_MIN_WORDS, (target + 1) // 2)
+                if split_wc < severe_floor or stripped_wc < severe_floor:
+                    floor_deficit = max(
+                        severe_floor - split_wc, severe_floor - stripped_wc
+                    )
+                    floor_addendum = _build_numeric_addendum(
+                        max_words=min(70, floor_deficit + 20)
+                    )
+                    if floor_addendum:
+                        before = text
+                        insert_candidates = [
+                            "Management Discussion & Analysis",
+                            "Financial Performance",
+                            "Executive Summary",
+                        ]
+                        section_sizes: List[Tuple[int, str]] = []
+                        for section_title in insert_candidates:
+                            section_body = (
+                                _extract_markdown_section_body(text, section_title)
+                                or ""
+                            )
+                            section_sizes.append(
+                                (_count_words(section_body), section_title)
+                            )
+                        for _wc, section_title in sorted(
+                            section_sizes, key=lambda item: item[0]
+                        ):
+                            text = _safe_insert_into_section(
+                                section_title, floor_addendum
+                            )
+                            if text != before:
+                                break
+                        if text != before:
+                            continue
+                break
+
+        # Prefer adding to the shortest narrative section first so section balance
+        # doesn't drift while we repair the strict band.
         # Allow a larger addendum when we're far below target (e.g., after aggressive
         # post-processing) so we can converge without resorting to repetitive filler.
-        addendum = _build_numeric_addendum(max_words=min(420, deficit + 40))
+        addendum = ""
+        if (
+            not addendum
+            and long_form_contract
+            and one_shot_deterministic_policy
+            and deficit > 0
+        ):
+            # One-shot policy forbids LLM rewrites. Use a bounded, evidence-grounded
+            # numeric addendum built from already-computed metrics to rescue underflow.
+            addendum_budget = min(95, max(18, int(deficit) + 14))
+            addendum = _build_numeric_addendum(max_words=addendum_budget)
         if addendum:
             before = text
-            text = _safe_insert_into_section("Financial Performance", addendum)
-            if text == before:
-                text = _safe_insert_into_section(
-                    "Management Discussion & Analysis", addendum
-                )
-            if text == before:
-                text = _safe_insert_into_section("Closing Takeaway", addendum)
+            insert_candidates = [
+                "Financial Performance",
+                "Management Discussion & Analysis",
+                "Executive Summary",
+            ]
+            section_sizes: List[Tuple[int, str]] = []
+            for section_title in insert_candidates:
+                section_body = _extract_markdown_section_body(text, section_title) or ""
+                section_sizes.append((_count_words(section_body), section_title))
+            for _wc, section_title in sorted(section_sizes, key=lambda item: item[0]):
+                if one_shot_deterministic_policy and long_form_contract:
+                    if int(one_shot_section_addenda_used.get(section_title, 0)) >= 1:
+                        continue
+                text = _safe_insert_into_section(section_title, addendum)
+                if text != before:
+                    if one_shot_deterministic_policy and long_form_contract:
+                        one_shot_section_addenda_used[section_title] = int(
+                            one_shot_section_addenda_used.get(section_title, 0)
+                        ) + 1
+                    break
+            # NOTE: Closing Takeaway is deliberately NOT a fallback target.
+            # The closing should only contain what the LLM generates.
         else:
             break
 
-    # 3) Final precision adjustment (1–10 words) if still slightly short.
-    # We allow a larger micro-padding window here to ensure we hit the ±10 band.
-    if not _in_band(text):
+    # 3) Final precision adjustment if still slightly short.
+    # We allow a larger micro-padding window here to ensure we hit the strict band.
+    if not _in_band(text) and padding_rescue_enabled:
         split_wc, stripped_wc = _stats(text)
         remaining = max(lower - split_wc, lower - stripped_wc)
         if remaining > 0:
+            before_micro = text
             text = _micro_pad_tail_words(text, remaining)
+            _record_padding_telemetry(
+                generation_stats, before_text=before_micro, after_text=text
+            )
 
-    # Final reconciliation: guarantee BOTH backend and UI-visible word counts land
-    # inside the ±10 band.
+    # Final reconciliation: preserve narrative-first ordering and only use
+    # deterministic section padding as a final rescue path.
     text = _enforce_whitespace_word_band(
-        text, target, tolerance=tolerance, allow_padding=True, dedupe=True
+        text,
+        target,
+        tolerance=tolerance,
+        allow_padding=False,
+        dedupe=True,
     )
+    if not _in_band(text) and padding_rescue_enabled:
+        before_padding = text
+        text = _enforce_whitespace_word_band(
+            text, target, tolerance=tolerance, allow_padding=True, dedupe=True
+        )
+        _record_padding_telemetry(
+            generation_stats, before_text=before_padding, after_text=text
+        )
     if _count_words(text) > upper or len(text.split()) > upper:
         text = _trim_preserving_headings(text, upper)
     return text.strip()
@@ -5114,6 +8405,83 @@ def _generate_summary_with_length_control(
     )
 
 
+def _post_rewrite_regex_cleanup(text: str) -> str:
+    """Last-resort regex cleanup for common LLM failure patterns that survived rewrite.
+
+    This runs WITHOUT an LLM call so it must be conservative — only strip
+    patterns that are unambiguously garbage output.
+    """
+    if not text:
+        return text
+
+    # 1. Strip chains of parenthetical buzzword filler in the closing
+    #    e.g. "(key swing factor) (execution priority) (structural driver) ..."
+    _parenthetical_chain_re = re.compile(
+        r"\s*\((?:key swing factor|primary swing factor|near term factors|in practical terms|"
+        r"fundamental catalyst|structural driver|operating backdrop|valuation context|"
+        r"execution priority|capital intensity backdrop|on a forward basis|relative to the cycle|"
+        r"across the enterprise|from a risk standpoint|on a relative basis|under current conditions|"
+        r"given the trajectory|within this framework|from a portfolio perspective|"
+        r"as things stand|in this environment|at this stage)\)",
+        re.IGNORECASE,
+    )
+    text = _parenthetical_chain_re.sub("", text)
+
+    # 2. Remove consecutive parenthetical asides at end of sentences (catch novel ones too)
+    #    Matches: "sentence text (foo) (bar) (baz)." → "sentence text."
+    def _strip_trailing_paren_chains(match: re.Match) -> str:
+        core = match.group(1).rstrip()
+        ending = match.group(2)
+        return f"{core}{ending}"
+
+    text = re.sub(
+        r"((?:^|\.\s+)[^.]*\S)\s*(?:\([^)]{3,50}\)\s*){3,}([.!?])",
+        _strip_trailing_paren_chains,
+        text,
+    )
+
+    # 3. Cap "If [X], [generic consequence]" sentences: keep at most 2 per section
+    def _cap_if_sentences_per_section(full_text: str) -> str:
+        sections = re.split(r"(^##\s+.+$)", full_text, flags=re.MULTILINE)
+        result_parts: List[str] = []
+        for part in sections:
+            if part.startswith("## "):
+                result_parts.append(part)
+                continue
+            # Split into sentences
+            sentences = re.split(r"(?<=[.!?])\s+", part)
+            if_count = 0
+            kept: List[str] = []
+            for sentence in sentences:
+                stripped = sentence.strip()
+                if not stripped:
+                    kept.append(sentence)
+                    continue
+                # Check for generic "If [financial concept]..." pattern
+                is_generic_if = bool(
+                    re.match(
+                        r"^If\s+(?:cash|margin|free|operating|revenue|growth|net|working|below|reinvestment|capex)",
+                        stripped,
+                        re.IGNORECASE,
+                    )
+                )
+                if is_generic_if:
+                    if_count += 1
+                    if if_count > 2:
+                        continue  # Drop it
+                kept.append(sentence)
+            result_parts.append(" ".join(kept))
+        return "".join(result_parts)
+
+    text = _cap_if_sentences_per_section(text)
+
+    # 4. Collapse multiple whitespace left by removals
+    text = re.sub(r" {2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
 def _generate_summary_with_quality_control(
     gemini_client,
     base_prompt: str,
@@ -5121,187 +8489,558 @@ def _generate_summary_with_quality_control(
     quality_validators: Optional[List[Callable[[str], Optional[str]]]],
     filing_id: Optional[str] = None,
     timeout_seconds: Optional[int] = None,
+    rewrite_client=None,
     *,
     token_budget: Optional[TokenBudget] = None,
-    max_output_tokens: int = DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+    cost_budget: Optional[SummaryCostBudget] = None,
+    max_output_tokens: int = DEFAULT_OPENAI_MAX_OUTPUT_TOKENS,
+    generation_stats: Optional[Dict[str, Any]] = None,
+    persona_requested: bool = False,
+    section_budgets: Optional[Dict[str, int]] = None,
+    include_health_rating: bool = True,
+    budget_adjustments_attempted: Optional[List[str]] = None,
+    allow_llm_rewrites: bool = True,
 ) -> str:
-    """
-    Call Gemini up to MAX_SUMMARY_ATTEMPTS times, tightening instructions if word count or quality drifts.
-    Uses streaming for real-time progress updates when filing_id is provided.
-    """
-    gemini_client = _ensure_gemini_client_interface(gemini_client)
+    """Single-shot generation with bounded rewrite passes for quality/length recovery."""
+    gemini_client = _ensure_ai_client_interface(gemini_client)
 
-    corrections: List[str] = []
-    prompt = base_prompt
-    previous_draft: Optional[str] = None
     summary_text: str = ""
-    last_word_stats: Optional[Tuple[int, int]] = None  # (actual_words, tolerance)
-    tolerance = 10
-    tolerance = 10
     start_time = time.time()
+    fast_summary_mode = bool(
+        isinstance(generation_stats, dict) and generation_stats.get("fast_summary_mode")
+    )
+    fast_max_rewrites = (
+        int(generation_stats.get("fast_max_rewrites", 0) or 0)
+        if isinstance(generation_stats, dict)
+        else 0
+    )
+    fast_deadline_ts = (
+        float(generation_stats.get("fast_runtime_deadline_ts") or 0.0)
+        if isinstance(generation_stats, dict)
+        else 0.0
+    )
+
+    def _remaining_fast_runtime_seconds() -> Optional[float]:
+        if not fast_summary_mode or fast_deadline_ts <= 0:
+            return None
+        return max(0.0, float(fast_deadline_ts - time.time()))
 
     def _progress_callback(percentage: int, status: str):
         if filing_id:
-            # Keep progress in the 85-95% range during AI generation phase
-            stage_pct = 85 + int(percentage * 0.1)  # Maps 0-100% -> 85-95%
+            stage_pct = 85 + int(percentage * 0.1)
             set_summary_progress(filing_id, status=status, stage_percent=stage_pct)
 
-    def _rebuild_prompt() -> str:
-        correction_block = ("\n\n".join(corrections)) if corrections else ""
-        previous_block = (
-            f"\n\nPrevious draft (for reference, do not copy verbatim):\n{previous_draft}\n"
-            if previous_draft
-            else ""
-        )
-        combined = base_prompt
-        # For rewrite attempts, do NOT resend the entire filing context. This keeps
-        # token usage bounded and helps stay within per-summary cost budgets.
-        if previous_draft:
-            combined = _strip_large_context_block(combined)
-        if correction_block:
-            combined += "\n\n" + correction_block
-        combined += previous_block
-        combined += "\n\nRewrite the entire memo applying every instruction above."
-        return combined
+    elapsed = time.time() - start_time
+    if timeout_seconds and elapsed > timeout_seconds:
+        raise TimeoutError(f"Summary generation exceeded {timeout_seconds} seconds")
 
-    for attempt in range(1, MAX_SUMMARY_ATTEMPTS + 1):
-        elapsed = time.time() - start_time
-        if timeout_seconds and elapsed > timeout_seconds:
+    stage_label = "Generating Summary"
+    if filing_id:
+        set_summary_progress(filing_id, status=f"{stage_label}...", stage_percent=88)
+
+    expected_out_tokens = _estimate_summary_output_tokens(
+        target_length=target_length, max_output_tokens=max_output_tokens
+    )
+    effective_adjustments = (
+        budget_adjustments_attempted
+        if budget_adjustments_attempted is not None
+        else (
+            generation_stats.get("budget_adjustments_attempted")
+            if isinstance(generation_stats, dict)
+            and isinstance(generation_stats.get("budget_adjustments_attempted"), list)
+            else None
+        )
+    )
+    if token_budget and not token_budget.can_afford(base_prompt, expected_out_tokens):
+        logger.warning(
+            "Generation token budget guard: remaining=%d prompt_tokens=%d expected_out=%d",
+            token_budget.remaining_tokens,
+            _estimate_summary_tokens(base_prompt),
+            expected_out_tokens,
+        )
+        detail = {
+            "detail": "Summary budget exhausted before Agent 2 generation.",
+            "remaining_token_budget": int(token_budget.remaining_tokens),
+            "budget_cap_usd": float(
+                _summary_budget_cap_usd(target_length=target_length)
+            ),
+        }
+        raise SummaryBudgetExceededError(
+            _decorate_budget_exceeded_detail(
+                detail,
+                stage="agent_2_summary_generation",
+                target_length=int(target_length) if target_length else None,
+                budget_adjustments_attempted=effective_adjustments,
+            )
+        )
+    if cost_budget and not cost_budget.can_afford(base_prompt, expected_out_tokens):
+        projected_cost = cost_budget.spent_usd + cost_budget.estimate_call(
+            base_prompt, expected_out_tokens
+        )
+        logger.warning(
+            "Generation cost budget guard: spent=%.6f cap=%.6f projected=%.6f "
+            "input_rate=%.4f output_rate=%.4f prompt_tokens=%d expected_out=%d",
+            cost_budget.spent_usd,
+            cost_budget.budget_cap_usd,
+            projected_cost,
+            cost_budget.input_rate_per_1m,
+            cost_budget.output_rate_per_1m,
+            _estimate_summary_tokens(base_prompt),
+            expected_out_tokens,
+        )
+        detail = {
+            "detail": "Summary budget exceeded before Agent 2 generation.",
+            "budget_cap_usd": float(cost_budget.budget_cap_usd),
+            "spent_cost_usd": float(cost_budget.spent_usd),
+            "projected_cost_usd": float(projected_cost),
+            "remaining_budget_usd": float(cost_budget.remaining_usd),
+        }
+        raise SummaryBudgetExceededError(
+            _decorate_budget_exceeded_detail(
+                detail,
+                stage="agent_2_summary_generation",
+                target_length=int(target_length) if target_length else None,
+                budget_adjustments_attempted=effective_adjustments,
+            )
+        )
+
+    if timeout_seconds:
+        remaining = max(0.0, float(timeout_seconds - elapsed))
+        if remaining <= 0.0:
             raise TimeoutError(f"Summary generation exceeded {timeout_seconds} seconds")
-        stage_label = "Generating Summary"
-        if filing_id:
-            # Keep the status user-facing and stable across retries; internal attempt counts are noise.
-            set_summary_progress(
-                filing_id, status=f"{stage_label}...", stage_percent=88
-            )
-
-        expected_out_tokens = (
-            min(max_output_tokens, max(500, int(target_length * 2)))
-            if target_length
-            else min(max_output_tokens, 4000)
+        request_timeout_s = max(1.0, remaining)
+    else:
+        request_timeout_s = 60.0
+    fast_remaining = _remaining_fast_runtime_seconds()
+    if fast_remaining is not None:
+        if fast_remaining <= 0.0:
+            raise TimeoutError("Fast summary runtime cap reached before Agent 2 generation.")
+        request_timeout_s = max(1.0, min(request_timeout_s, float(fast_remaining)))
+    if generation_stats is not None:
+        generation_stats["generation_call_count"] = (
+            int(generation_stats.get("generation_call_count", 0)) + 1
         )
-        if token_budget and not token_budget.can_afford(prompt, expected_out_tokens):
+
+    raw_text = _call_gemini_client(
+        gemini_client,
+        base_prompt,
+        allow_stream=bool(filing_id),
+        progress_callback=_progress_callback if filing_id else None,
+        stage_name=stage_label if filing_id else "Generating",
+        expected_tokens=expected_out_tokens,
+        timeout_seconds=request_timeout_s,
+        generation_config_override={
+            "maxOutputTokens": int(
+                max_output_tokens if (target_length and _is_long_form_target(target_length))
+                else min(max_output_tokens, expected_out_tokens)
+            ),
+            "temperature": 0.35,
+            "use_responses_api": True,
+            "api_mode": "responses",
+            "pipeline_mode": "two_agent",
+            "agent_stage": "agent_2_summary",
+        },
+        retry=False,
+    )
+    if token_budget:
+        token_budget.charge(base_prompt, raw_text)
+    if cost_budget:
+        cost_budget.charge(base_prompt, raw_text)
+        # Allow a 20% post-generation tolerance so that slight budget overruns
+        # (e.g. actual output tokens exceeding the pre-generation estimate) do
+        # not discard an already-generated summary.  The pre-generation
+        # `can_afford` guard already enforces the hard cap; this post-hoc check
+        # only catches estimation drift and should never waste a completed call.
+        _post_gen_tolerance = 1.20
+        if cost_budget.spent_usd > float(cost_budget.budget_cap_usd) * _post_gen_tolerance:
+            detail = {
+                "detail": "Summary budget exceeded during Agent 2 generation.",
+                "budget_cap_usd": float(cost_budget.budget_cap_usd),
+                "actual_cost_usd": float(cost_budget.spent_usd),
+            }
+            raise SummaryBudgetExceededError(
+                _decorate_budget_exceeded_detail(
+                    detail,
+                    stage="agent_2_summary_generation",
+                    target_length=int(target_length) if target_length else None,
+                    budget_adjustments_attempted=effective_adjustments,
+                )
+            )
+        elif cost_budget.spent_usd > float(cost_budget.budget_cap_usd):
             logger.warning(
-                "Stopping summary attempts due to token budget (remaining=%s tokens)",
-                token_budget.remaining_tokens,
+                "Post-generation budget overrun within tolerance: spent=%.4f cap=%.4f (%.1f%% over)",
+                cost_budget.spent_usd,
+                cost_budget.budget_cap_usd,
+                ((cost_budget.spent_usd / cost_budget.budget_cap_usd) - 1) * 100,
             )
-            break
-
-        # Hard-cap the *single request* time so we don't spend minutes in retry/backoff.
-        request_timeout_s = (
-            max(8.0, float(timeout_seconds - elapsed)) if timeout_seconds else 60.0
+    summary_text, _reported_count = _extract_word_count_control(raw_text)
+    structured_payload = extract_structured_section_payload(summary_text)
+    if structured_payload:
+        assembled_summary = assemble_structured_summary(
+            structured_payload,
+            include_health_rating=include_health_rating,
         )
-        raw_text = _call_gemini_client(
-            gemini_client,
-            prompt,
-            allow_stream=bool(filing_id),
-            progress_callback=_progress_callback if filing_id else None,
-            stage_name=stage_label if filing_id else "Generating",
-            expected_tokens=expected_out_tokens,
-            timeout_seconds=request_timeout_s,
-            generation_config_override={
-                "maxOutputTokens": int(min(max_output_tokens, expected_out_tokens)),
-                "temperature": 0.35,
-            },
-            retry=False,
-        )
-        if token_budget:
-            token_budget.charge(prompt, raw_text)
-        summary_text, reported_count = _extract_word_count_control(raw_text)
-        previous_draft = summary_text
+        if assembled_summary:
+            summary_text = assembled_summary
+            if generation_stats is not None:
+                generation_stats["structured_section_generation_used"] = True
+                generation_stats["structured_reported_total_word_count"] = int(
+                    structured_payload.get("reported_total_word_count") or 0
+                )
+        elif generation_stats is not None:
+            generation_stats["structured_section_generation_used"] = False
+    if not summary_text.strip():
+        return summary_text
 
-        needs_length_retry = False
-        actual_words = None
-        if target_length:
-            actual_words = _count_words(summary_text)
-            needs_length_retry, actual_words, tolerance = _needs_length_retry(
-                summary_text, target_length, cached_count=actual_words
-            )
-            last_word_stats = (actual_words, tolerance)
-
-        if target_length:
-            # Word-count control lines are optional; the backend enforces max length post-hoc.
-            pass
-
-        if not needs_length_retry:
-            issue_message = None
-            if quality_validators:
-                for validator in quality_validators:
-                    issue_message = validator(summary_text)
-                    if issue_message:
-                        break
-            if not issue_message:
-                return summary_text
-
-            corrections.append(
-                f"QUALITY CORRECTION #{attempt}: {issue_message} Rewrite the entire memo while keeping all previous requirements intact."
-            )
-            prompt = _rebuild_prompt()
-            continue
-
-        prior_count = (
-            int(actual_words)
-            if actual_words is not None
-            else _count_words(summary_text)
-        )
-
-        target_val = (
-            int(target_length) if target_length is not None else TARGET_LENGTH_MAX_WORDS
-        )
-        tolerance_val = int(tolerance)
-        lower = max(1, target_val - tolerance_val)
-        upper = target_val + tolerance_val
-
-        if prior_count > upper:
-            abs_diff = prior_count - target_val
-            sentences_to_cut = max(1, int(abs_diff / 10)) if abs_diff else 1
-            action = (
-                f"CONDENSE the memo to land between {lower}–{upper} words. You are {abs_diff} words OVER target {target_val}. "
-                f"Remove approximately {sentences_to_cut} sentences of redundancy and low-signal filler, "
-                "merge overlapping points, and keep the most decision-relevant numbers and mechanisms. "
-                "Do NOT add new sections or any end-of-memo recap."
-            )
-            corrections.append(
-                f"LENGTH CORRECTION #{attempt}: Draft contains {prior_count} words; required range is {lower}–{upper} (target {target_val}). "
-                f"ACTION: {action}"
-            )
-        else:
-            shortfall = target_val - prior_count
-            # Expand with substance (numbers/mechanisms) rather than generic framework filler.
-            action = (
-                f"EXPAND the memo to land between {lower}–{upper} words. You are {shortfall} words UNDER target {target_val}. "
-                "Add NEW, non-repetitive content by deepening mechanisms and quantifying trade-offs using ONLY the numbers already present in the memo/metrics. "
-                "Concrete expansion options (pick 2–3): "
-                "(1) add one paragraph in Financial Performance explaining the OCF→FCF bridge and the biggest sequential deltas; "
-                "(2) add one paragraph in MD&A linking reinvestment cadence to margin trajectory and cash conversion; "
-                "(3) add one additional risk item with a numeric anchor and a clear transmission channel; "
-                "(4) add 2–3 measurable triggers in Closing Takeaway (thresholds, next 1–2 periods). "
-                "Do NOT add process narration, definitions, or repeated 'framework' slogans."
-            )
-            corrections.append(
-                f"LENGTH CORRECTION #{attempt}: Draft contains {prior_count} words; required range is {lower}–{upper} (target {target_val}). "
-                f"ACTION: {action}"
-            )
-        prompt = _rebuild_prompt()
-
-    if (
+    # --- Underflow Re-generation ---
+    # When the first pass undershoots the target (< 90% of requested),
+    # rewriting a short draft doesn't work — the model can't reliably expand
+    # output sufficiently. Instead, regenerate from scratch with an aggressive
+    # length instruction.  The 90% threshold catches more underflow cases than
+    # the previous 80% threshold and triggers the more reliable full-regeneration
+    # path instead of relying on incremental rewrites.
+    first_pass_words = _count_words(summary_text) if target_length else 0
+    severe_underflow = (
         target_length
-        and summary_text
-        and _count_words(summary_text) > int(target_length)
-    ):
-        summary_text = _enforce_length_constraints(
-            summary_text,
-            int(target_length),
+        and _is_long_form_target(target_length)
+        and first_pass_words < int(target_length * 0.85)
+    )
+    one_shot_longform_contract_mode = bool(
+        target_length
+        and _is_long_form_target(target_length)
+        and isinstance(generation_stats, dict)
+        and generation_stats.get("one_shot_deterministic_policy")
+    )
+    if target_length and not fast_summary_mode and (allow_llm_rewrites or severe_underflow):
+        underflow_threshold = (
+            int(target_length * 0.95)
+            if int(target_length) >= 1500
+            else int(target_length * 0.90)
+        )
+        if first_pass_words < underflow_threshold:
+            logger.info(
+                "Severe underflow detected: %d words vs %d target (%.0f%%). "
+                "Regenerating with explicit length emphasis.",
+                first_pass_words,
+                target_length,
+                (first_pass_words / target_length) * 100,
+            )
+            if generation_stats is not None:
+                generation_stats["underflow_regeneration_triggered"] = True
+
+            # Build a stronger length-focused prompt addition
+            # Use 25% overshoot to compensate for post-generation cleanup —
+            # the cleanup pipeline strips 200-400 words so we need extra buffer.
+            # For long-form targets, use 45% overshoot since the LLM consistently
+            # undershoots and the cleanup pipeline aggressively removes filler.
+            overshoot_pct = 1.45 if _is_long_form_target(target_length) else 1.25
+            regen_overshoot_target = int(target_length * overshoot_pct)
+            length_emphasis = (
+                f"\n\n*** CRITICAL LENGTH REQUIREMENT ***\n"
+                f"Your previous attempt was only {first_pass_words} words. "
+                f"The target is {regen_overshoot_target} words (±10). "
+                f"You MUST write EXACTLY {regen_overshoot_target} words total across all 7 sections.\n"
+                f"This is NOT optional. Each section must use its full word budget:\n"
+            )
+            if section_budgets:
+                for sec_name, sec_budget in section_budgets.items():
+                    if sec_budget > 0:
+                        length_emphasis += (
+                            f"  - {sec_name}: write ~{int(sec_budget * 1.25)} words\n"
+                        )
+            length_emphasis += (
+                f"\nWrite multi-paragraph sections. Use detailed analysis, filing quotes, "
+                f"and business context to fill each section completely. "
+                f"Do NOT stop early. Count your words as you write.\n"
+            )
+
+            regeneration_prompt = base_prompt + length_emphasis
+
+            elapsed = time.time() - start_time
+            if timeout_seconds:
+                remaining = max(0.0, float(timeout_seconds - elapsed))
+                if remaining <= 0.0:
+                    raise TimeoutError(
+                        f"Summary generation exceeded {timeout_seconds} seconds"
+                    )
+                regen_timeout = max(1.0, remaining)
+            else:
+                regen_timeout = 60.0
+            skip_regeneration = False
+            regen_budget_bypass = False
+            if token_budget and not token_budget.can_afford(
+                regeneration_prompt, max_output_tokens
+            ):
+                logger.info(
+                    "Skipping underflow regeneration due to token budget guard (remaining=%s expected_out=%s)",
+                    token_budget.remaining_tokens,
+                    max_output_tokens,
+                )
+                skip_regeneration = True
+            elif cost_budget and not cost_budget.can_afford(
+                regeneration_prompt, max_output_tokens
+            ):
+                projected_cost = cost_budget.spent_usd + cost_budget.estimate_call(
+                    regeneration_prompt, max_output_tokens
+                )
+                logger.info(
+                    "Skipping underflow regeneration due to cost budget guard (spent=$%.4f cap=$%.4f projected=$%.4f)",
+                    cost_budget.spent_usd,
+                    cost_budget.budget_cap_usd,
+                    projected_cost,
+                )
+                skip_regeneration = True
+            if skip_regeneration and one_shot_longform_contract_mode:
+                regen_budget_bypass = True
+                skip_regeneration = False
+                logger.warning(
+                    "Bypassing underflow regeneration budget guard for one-shot long-form summary recovery."
+                )
+                if generation_stats is not None:
+                    generation_stats["underflow_regeneration_budget_bypass"] = True
+
+            if skip_regeneration:
+                if generation_stats is not None:
+                    generation_stats["underflow_regeneration_skipped_budget_guard"] = (
+                        True
+                    )
+                    generation_stats["underflow_regeneration_words"] = first_pass_words
+            else:
+                # Use slightly higher temperature for longer generation.
+                # Keep max_output_tokens for this pass so the model has room to recover severe underflow.
+                regen_text = _call_gemini_client(
+                    gemini_client,
+                    regeneration_prompt,
+                    allow_stream=bool(filing_id),
+                    progress_callback=_progress_callback if filing_id else None,
+                    stage_name="Regenerating (length)" if filing_id else "Generating",
+                    expected_tokens=max_output_tokens,
+                    timeout_seconds=regen_timeout,
+                    generation_config_override={
+                        "maxOutputTokens": int(max_output_tokens),
+                        "temperature": 0.45,
+                        "use_responses_api": True,
+                        "api_mode": "responses",
+                        "pipeline_mode": "two_agent",
+                        "agent_stage": "agent_2_summary",
+                    },
+                    retry=False,
+                )
+                if token_budget:
+                    token_budget.charge(regeneration_prompt, regen_text)
+                if cost_budget:
+                    cost_budget.charge(regeneration_prompt, regen_text)
+                    if cost_budget.spent_usd > float(cost_budget.budget_cap_usd):
+                        if regen_budget_bypass:
+                            logger.warning(
+                                "Underflow regeneration overran budget during one-shot long-form recovery "
+                                "(spent=$%.4f cap=$%.4f); continuing with recovered draft.",
+                                cost_budget.spent_usd,
+                                cost_budget.budget_cap_usd,
+                            )
+                        else:
+                            detail = {
+                                "detail": "Summary budget exceeded during Agent 2 regeneration.",
+                                "budget_cap_usd": float(cost_budget.budget_cap_usd),
+                                "actual_cost_usd": float(cost_budget.spent_usd),
+                            }
+                            raise SummaryBudgetExceededError(
+                                _decorate_budget_exceeded_detail(
+                                    detail,
+                                    stage="agent_2_summary_generation_retry",
+                                    target_length=int(target_length)
+                                    if target_length
+                                    else None,
+                                    budget_adjustments_attempted=effective_adjustments,
+                                )
+                            )
+                regen_summary, _ = _extract_word_count_control(regen_text)
+                regen_words = _count_words(regen_summary) if regen_summary else 0
+                if generation_stats is not None:
+                    generation_stats["underflow_regeneration_words"] = regen_words
+                    generation_stats["generation_call_count"] = (
+                        int(generation_stats.get("generation_call_count", 0)) + 1
+                    )
+                # Accept the regeneration if it's meaningfully closer to target
+                if regen_words > first_pass_words:
+                    summary_text = regen_summary
+                    logger.info(
+                        "Underflow regeneration improved from %d to %d words (target=%d)",
+                        first_pass_words,
+                        regen_words,
+                        target_length,
+                    )
+
+    # Apply deterministic cleanup before validators so known failure patterns
+    # (parenthetical chains, generic "If..." filler) don't trigger a rewrite.
+    summary_text = _post_rewrite_regex_cleanup(summary_text)
+
+    issue_message: Optional[str] = None
+    if quality_validators:
+        for validator in quality_validators:
+            issue_message = validator(summary_text)
+            if issue_message:
+                validator_name = getattr(validator, "__name__", None) or getattr(
+                    validator, "__qualname__", repr(validator)
+                )
+                logger.info(
+                    "Quality validator fired on initial generation: validator=%s issue=%s",
+                    validator_name,
+                    issue_message[:200],
+                )
+                if generation_stats is not None:
+                    generation_stats.setdefault("validators_fired", []).append(
+                        validator_name
+                    )
+                break
+
+    needs_length_retry = False
+    current_words = _count_words(summary_text)
+    if target_length:
+        needs_length_retry, current_words, _tol = _needs_length_retry(
+            summary_text, target_length, cached_count=current_words
+        )
+
+    if fast_summary_mode:
+        # Fast mode is best-effort by design: avoid rewrite loops and return the
+        # first-pass draft after lightweight cleanup/validator evaluation.
+        if generation_stats is not None:
+            generation_stats["fast_quality_bypass_issue"] = issue_message
+            generation_stats["fast_length_retry_bypassed"] = bool(needs_length_retry)
+        return summary_text
+
+    if issue_message is None and not needs_length_retry:
+        return summary_text
+
+    # Back-compat behavior for unconstrained summaries: single-shot unless
+    # a required-section/completeness validator explicitly asks for a rewrite.
+    if target_length is None:
+        if issue_message and _should_rewrite_without_target(issue_message):
+            target_length = max(TARGET_LENGTH_MIN_WORDS + 20, current_words + 20)
+        else:
+            return summary_text
+
+    persona_intensity = "strong"
+    if persona_requested and _should_soften_persona_for_rewrite(issue_message):
+        persona_intensity = "subtle"
+        if generation_stats is not None:
+            generation_stats["persona_intensity_downgraded"] = True
+
+    rewrite_hint = issue_message
+    if not rewrite_hint and needs_length_retry and target_length:
+        rewrite_hint = (
+            f"Length drift detected: current draft has {current_words} words while target is "
+            f"{target_length} ±{_effective_word_band_tolerance(target_length)}."
+        )
+
+    rewrite_target = (
+        int(target_length)
+        if target_length is not None
+        else max(TARGET_LENGTH_MIN_WORDS + 20, current_words)
+    )
+    if allow_llm_rewrites:
+        rewrite_timeout_seconds: Optional[float] = None
+        if timeout_seconds:
+            elapsed = time.time() - start_time
+            remaining = max(0.0, float(timeout_seconds - elapsed))
+            if remaining <= 0.0:
+                raise TimeoutError(f"Summary generation exceeded {timeout_seconds} seconds")
+            rewrite_timeout_seconds = max(1.0, remaining)
+        rewritten, _stats = _rewrite_summary_to_length(
             gemini_client,
+            summary_text,
+            rewrite_target,
             quality_validators,
-            last_word_stats,
+            current_words=current_words,
             token_budget=token_budget,
+            cost_budget=cost_budget,
             max_output_tokens=max_output_tokens,
+            generation_stats=generation_stats,
+            persona_intensity=persona_intensity,
+            quality_issue_hint=rewrite_hint,
+            timeout_seconds=rewrite_timeout_seconds,
         )
-        # Final deterministic guardrail: enforce strict band by trimming only.
-        summary_text = _enforce_whitespace_word_band(
-            summary_text, int(target_length), tolerance=10, allow_padding=False
-        )
+        if rewritten:
+            summary_text = rewritten
+
+    # Apply deterministic regex cleanup for common LLM failure patterns
+    # (parenthetical chains, generic "If..." filler) without an LLM call.
+    summary_text = _post_rewrite_regex_cleanup(summary_text)
+
+    # --- Second quality-only rewrite pass ---
+    # If the first rewrite fixed length but quality validators still flag issues,
+    # allow one more targeted LLM rewrite focused purely on the quality problem.
+    if allow_llm_rewrites and quality_validators:
+        second_pass_issue: Optional[str] = None
+        second_pass_validator_name = ""
+        for validator in quality_validators:
+            second_pass_issue = validator(summary_text)
+            if second_pass_issue:
+                second_pass_validator_name = getattr(
+                    validator, "__name__", None
+                ) or getattr(validator, "__qualname__", repr(validator))
+                break
+        if second_pass_issue and generation_stats is not None and not fast_summary_mode:
+            prev_rewrite_count = int(generation_stats.get("rewrite_call_count", 0))
+            if prev_rewrite_count < int(
+                min(MAX_REWRITE_ATTEMPTS, max(fast_max_rewrites, MAX_REWRITE_ATTEMPTS))
+            ):
+                logger.info(
+                    "Triggering second quality-only rewrite: validator=%s issue=%s",
+                    second_pass_validator_name,
+                    second_pass_issue[:200],
+                )
+                current_wc = _count_words(summary_text)
+                rewrite_target_2 = int(target_length) if target_length else current_wc
+                rewrite_timeout_seconds_2: Optional[float] = None
+                if timeout_seconds:
+                    elapsed = time.time() - start_time
+                    remaining = max(0.0, float(timeout_seconds - elapsed))
+                    if remaining <= 0.0:
+                        raise TimeoutError(
+                            f"Summary generation exceeded {timeout_seconds} seconds"
+                        )
+                    rewrite_timeout_seconds_2 = max(1.0, remaining)
+                rewritten_2, _ = _rewrite_summary_to_length(
+                    gemini_client,
+                    summary_text,
+                    rewrite_target_2,
+                    quality_validators,
+                    current_words=current_wc,
+                    token_budget=token_budget,
+                    cost_budget=cost_budget,
+                    max_output_tokens=max_output_tokens,
+                    generation_stats=generation_stats,
+                    persona_intensity=persona_intensity,
+                    quality_issue_hint=second_pass_issue,
+                    timeout_seconds=rewrite_timeout_seconds_2,
+                )
+                if rewritten_2:
+                    summary_text = rewritten_2
+                summary_text = _post_rewrite_regex_cleanup(summary_text)
+                if generation_stats is not None:
+                    generation_stats["second_quality_rewrite_used"] = True
+
+    if target_length and not fast_summary_mode:
+        target_val = int(target_length)
+        upper = target_val + _effective_word_band_tolerance(target_length)
+        if _count_words(summary_text) > upper:
+            summary_text = _enforce_length_constraints(
+                summary_text,
+                target_val,
+                gemini_client,
+                quality_validators,
+                None,
+                token_budget=token_budget,
+                max_output_tokens=max_output_tokens,
+                generation_stats=generation_stats,
+            )
+            summary_text = _enforce_whitespace_word_band(
+                summary_text,
+                target_val,
+                tolerance=_effective_word_band_tolerance(target_length),
+                allow_padding=False,
+            )
 
     return summary_text
 
@@ -5369,165 +9108,63 @@ SUMMARY_SECTION_MIN_WORDS = {
 # These represent relative importance/length of each section
 # Sum = 100 (percentages)
 # Executive Summary is the HERO section - the premium insight users pay for
-SECTION_PROPORTIONAL_WEIGHTS: Dict[str, int] = {
-    # CRITICAL PRODUCT REQUIREMENT:
-    # The section-length distribution must stay FIXED regardless of the user's
-    # requested total length.
-    #
-    # Target distribution (sum = 100):
-    #   - Financial Health Rating: 14%
-    #   - Executive Summary: 14%
-    #   - Financial Performance: 15% (Hero Section)
-    #   - Management Discussion & Analysis: 15% (Hero Section)
-    #   - Risk Factors: 14%
-    #   - Key Metrics: 14%
-    #   - Closing Takeaway: 14%
-    "Financial Health Rating": 14,
-    "Executive Summary": 14,
-    "Financial Performance": 15,
-    "Management Discussion & Analysis": 15,
-    "Risk Factors": 14,
-    "Key Metrics": 14,
-    "Closing Takeaway": 14,
-}
+SECTION_PROPORTIONAL_WEIGHTS: Dict[str, int] = dict(
+    DEFAULT_SECTION_WEIGHTS_WITH_HEALTH
+)
 
 # Key Metrics is a fixed-format, scannable data block. Past a certain length,
 # scaling it with the full memo causes low-quality output (repeated "watch" lines).
 # For long targets, cap Key Metrics and redistribute the remaining budget across
 # narrative sections using their existing weights.
-KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS = 1000
-KEY_METRICS_FIXED_BUDGET_WORDS = 350
-KEY_METRICS_MAX_WORDS = 500
+KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS = (
+    CANONICAL_KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS
+)
+KEY_METRICS_FIXED_BUDGET_WORDS = CANONICAL_KEY_METRICS_FIXED_BUDGET_WORDS
+KEY_METRICS_MAX_WORDS = CANONICAL_KEY_METRICS_MAX_WORDS
+SHORT_FORM_SECTIONED_TARGET_MIN_WORDS = (
+    CANONICAL_SHORT_FORM_SECTIONED_TARGET_MIN_WORDS
+)
+SHORT_FORM_SECTIONED_TARGET_MAX_WORDS = (
+    CANONICAL_SHORT_FORM_SECTIONED_TARGET_MAX_WORDS
+)
 KEY_METRICS_MAX_WATCH_ITEMS = 12
 
 
 def _section_budget_tolerance_words(
     budget_words: int, *, max_tolerance: int = 10
 ) -> int:
-    """Compute a per-section word tolerance for enforcing the fixed distribution.
-
-    A flat ±10 words is far too loose for short targets (e.g., a 20-word budget would
-    allow a 0–40 word section). We scale tolerance to the section budget so the
-    proportions stay stable across all target lengths.
-    """
-
-    max_tolerance = max(0, int(max_tolerance))
-    budget_words = int(budget_words or 0)
-    if budget_words <= 0:
-        return max(4, max_tolerance) if max_tolerance else 4
-
-    # ~6% of the section budget, bounded to avoid over-tightening and impossible
-    # padding when the budget is small.
-    scaled = max(4, int(round(budget_words * 0.06)))
-    return min(max_tolerance, scaled) if max_tolerance else scaled
+    """Delegate section tolerance computation to the canonical budget controller."""
+    tol = canonical_section_budget_tolerance_words("", int(budget_words or 0))
+    if max_tolerance:
+        return min(int(max_tolerance), int(tol))
+    return int(tol)
 
 
 def _calculate_section_word_budgets(
     target_length: int,
     include_health_rating: bool = True,
+    weight_overrides: Optional[Dict[str, int]] = None,
 ) -> Dict[str, int]:
     """
-    Calculate per-section *body* word budgets using a fixed percentage distribution.
+    Calculate per-section *body* word budgets using a percentage distribution.
 
     IMPORTANT: These budgets are for SECTION BODY WORDS (excluding the heading titles).
     This aligns with:
       - our validators (which count section bodies), and
       - trimming logic that subtracts heading-title words.
 
-    The distribution MUST remain constant regardless of target_length.
+    When *weight_overrides* is provided (a dict mapping section name → int
+    percentage, summing to ~100), it replaces the default
+    ``SECTION_PROPORTIONAL_WEIGHTS`` so the frontend can shift emphasis based
+    on user-selected focus areas.  Unknown section keys are silently ignored.
+
+    Without overrides the fixed default distribution is used.
     """
-    if not target_length or target_length <= 0:
-        return {}
-
-    # Determine which sections to include.
-    sections_to_use = list(SECTION_PROPORTIONAL_WEIGHTS.keys())
-    if not include_health_rating:
-        sections_to_use = [s for s in sections_to_use if s != "Financial Health Rating"]
-    if not sections_to_use:
-        return {}
-
-    # Budgets are for SECTION BODY words (headings are counted separately in our
-    # validators / trimming), so subtract heading-title words from the total.
-    heading_words = sum(
-        len(re.findall(r"\b\w+\b", section)) for section in sections_to_use
+    return canonical_calculate_section_word_budgets(
+        int(target_length),
+        include_health_rating=bool(include_health_rating),
+        weight_overrides=weight_overrides,
     )
-    body_target = max(0, int(target_length) - int(heading_words))
-    if body_target <= 0:
-        # Degenerate case: user requested a length so small the headings alone don't fit.
-        # Fall back to treating target_length as body budget so downstream logic doesn't
-        # divide-by-zero.
-        body_target = int(target_length)
-
-    use_key_metrics_cap = (
-        int(target_length) >= int(KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS)
-        and "Key Metrics" in sections_to_use
-    )
-    fixed_key_metrics_budget = 0
-    distribution_sections = sections_to_use[:]
-    if use_key_metrics_cap:
-        distribution_sections = [s for s in sections_to_use if s != "Key Metrics"]
-        fixed_key_metrics_budget = min(
-            int(KEY_METRICS_FIXED_BUDGET_WORDS), int(body_target)
-        )
-
-    remaining_body_target = max(0, int(body_target) - int(fixed_key_metrics_budget))
-
-    total_weight = sum(
-        SECTION_PROPORTIONAL_WEIGHTS.get(s, 0) for s in distribution_sections
-    )
-    if total_weight <= 0:
-        total_weight = len(distribution_sections) if distribution_sections else 1
-
-    exacts = {
-        s: (
-            SECTION_PROPORTIONAL_WEIGHTS.get(s, 0)
-            * remaining_body_target
-            / total_weight
-        )
-        for s in distribution_sections
-    }
-    budgets: Dict[str, int] = {s: int(exacts[s]) for s in distribution_sections}
-    remainders = {s: exacts[s] - budgets[s] for s in distribution_sections}
-
-    drift = remaining_body_target - sum(budgets.values())
-    if drift != 0:
-        order = sorted(
-            distribution_sections, key=lambda s: remainders.get(s, 0), reverse=True
-        )
-        step = 1 if drift > 0 else -1
-        remaining = abs(drift)
-        idx = 0
-        while remaining > 0 and order and idx < 10_000:
-            section = order[idx % len(order)]
-            next_val = budgets.get(section, 0) + step
-            if next_val >= 0:
-                budgets[section] = next_val
-                remaining -= 1
-            idx += 1
-
-    if use_key_metrics_cap:
-        budgets["Key Metrics"] = int(fixed_key_metrics_budget)
-
-    # Avoid 0-word sections when the target is extremely small.
-    zeros = [s for s in sections_to_use if budgets.get(s, 0) <= 0]
-    if zeros:
-        for s in zeros:
-            budgets[s] = 1
-        # Re-balance to preserve exact sum.
-        diff = sum(budgets.values()) - body_target
-        if diff > 0:
-            order = sorted(
-                sections_to_use, key=lambda s: budgets.get(s, 0), reverse=True
-            )
-            idx = 0
-            while diff > 0 and order and idx < 10_000:
-                section = order[idx % len(order)]
-                if budgets.get(section, 0) > 1:
-                    budgets[section] -= 1
-                    diff -= 1
-                idx += 1
-
-    return budgets
 
 
 def _calculate_section_min_words_for_target(
@@ -5664,6 +9301,15 @@ def _enforce_section_budget_distribution(
     if not summary_text or not target_length:
         return summary_text
 
+    # Section budget enforcement is a controlled, structured process that targets
+    # specific word counts per section.  It should NOT be constrained by the global
+    # lifetime padding cap (which exists to prevent cascading padding from the
+    # 133-iteration whitespace-enforcement loops).  Save the budget, give this
+    # function an unlimited budget, and restore afterwards.
+    short_quality_mode = _is_short_quality_sensitive_target(target_length)
+    _saved_budget = _get_padding_budget_remaining()
+    _padding_budget_local.remaining = 999_999
+
     # When we have deterministic Key Metrics (from extracted financials), do not pad it into
     # low-signal filler; keep it compact and shift length to narrative sections instead.
     key_metrics_capped = bool(metrics_lines) or (
@@ -5674,6 +9320,7 @@ def _enforce_section_budget_distribution(
         int(target_length), include_health_rating=include_health_rating
     )
     if not budgets:
+        _padding_budget_local.remaining = _saved_budget
         return summary_text
 
     heading_regex = re.compile(r"^\s*##\s+.+")
@@ -5702,6 +9349,7 @@ def _enforce_section_budget_distribution(
         sections.append((current_heading, "\n".join(buffer).strip()))
 
     if not sections:
+        _padding_budget_local.remaining = _saved_budget
         return summary_text
 
     # Merge duplicate canonical sections.
@@ -6116,6 +9764,15 @@ def _enforce_section_budget_distribution(
     global_exclude_norms: set[str] = set()
     for existing_body in merged.values():
         global_exclude_norms.update(_seed_exclude_norms(existing_body or ""))
+    memo_padding_context = "\n\n".join(
+        [
+            f"## {name}\n{(body or '').strip()}"
+            for name, body in merged.items()
+            if (body or "").strip()
+        ]
+    ).strip()
+    if not memo_padding_context:
+        memo_padding_context = (summary_text or "").strip()
 
     # Adjust each canonical section into its budget band.
     for section_name, budget in budgets.items():
@@ -6134,6 +9791,11 @@ def _enforce_section_budget_distribution(
         upper = budget + tol
 
         body = (merged.get(section_name) or "").strip()
+        section_padding_context = (
+            f"{memo_padding_context}\n\n## {section_name}\n{body}".strip()
+            if memo_padding_context
+            else body
+        )
 
         # Trim if overweight.
         wc = _count_words(body)
@@ -6147,12 +9809,14 @@ def _enforce_section_budget_distribution(
 
         # Pad if underweight.
         if wc < lower:
+            if short_quality_mode:
+                merged[section_name] = (body or "").strip()
+                continue
             if section_name == "Key Metrics":
-                # Only pad Key Metrics for shorter targets where the budget is small.
-                # For long targets, padding becomes a repetitive "watch list" dump.
-                if not key_metrics_capped:
-                    body = _pad_key_metrics(body, lower - wc, upper_words=upper)
-                    wc = _count_words(body)
+                # Keep Key Metrics factual-only: trim or canonicalize rows, but never
+                # synthesize non-numeric filler to force it into a section budget.
+                merged[section_name] = (body or "").strip()
+                continue
             else:
                 # IMPORTANT: Padding must be incremental so we don't overshoot the
                 # section upper bound and then get truncated back to the original
@@ -6170,9 +9834,10 @@ def _enforce_section_budget_distribution(
                     needed = max(1, lower - wc)
 
                     request_candidates = [
+                        min(needed, slack, 24),
+                        min(needed, slack, 18),
                         min(needed, slack, 12),
                         min(needed, slack, 8),
-                        min(needed, slack, 5),
                         1,
                     ]
                     request_candidates = [r for r in request_candidates if r > 0]
@@ -6187,6 +9852,7 @@ def _enforce_section_budget_distribution(
                             is_persona=is_persona,
                             exclude_risk_names=risk_name_exclusions,
                             max_words=slack,
+                            context_text=section_padding_context,
                         )
                         if section_name == "Risk Factors":
                             pad_text = "\n".join(
@@ -6207,9 +9873,26 @@ def _enforce_section_budget_distribution(
                             break
 
                     if not progressed:
-                        # Fallback: templates may not fit. Stop here rather than forcing
-                        # low-quality micro-padding loops. Section will remain slightly
-                        # short, which is preferred over repetitive filler.
+                        # Fallback: if templates are exhausted, use short narrative
+                        # micro-padding sentences so section budgets still converge.
+                        remaining = max(0, min(upper - wc, lower - wc))
+                        if remaining > 0:
+                            candidate = body
+                            while remaining > 0:
+                                before_wc = _count_words(candidate)
+                                candidate2 = _micro_pad_tail_words(
+                                    candidate, min(remaining, 6)
+                                )
+                                after_wc = _count_words(candidate2)
+                                if after_wc <= before_wc:
+                                    break
+                                candidate = candidate2
+                                remaining = max(0, remaining - (after_wc - before_wc))
+                            candidate_wc = _count_words(candidate)
+                            if candidate_wc > wc and candidate_wc <= upper:
+                                body = candidate
+                                wc = candidate_wc
+                                continue
                         break
 
         if section_name == "Risk Factors":
@@ -6228,8 +9911,9 @@ def _enforce_section_budget_distribution(
     ]
     order = [o for o in order if o]
 
-    overall_lower = int(target_length) - 10
-    overall_upper = int(target_length) + 10
+    strict_tolerance = _effective_word_band_tolerance(target_length)
+    overall_lower = int(target_length) - strict_tolerance
+    overall_upper = int(target_length) + strict_tolerance
 
     def _section_bounds(name: str) -> Tuple[int, int]:
         budget = int(budgets.get(name, 0) or 0)
@@ -6304,6 +9988,8 @@ def _enforce_section_budget_distribution(
             continue
 
         # Under target: pad into sections that still have room up to their upper bound.
+        if short_quality_mode:
+            break
         deficit = max(overall_lower - split_count, overall_lower - stripped_count)
         pad_candidates: List[Tuple[int, str]] = []  # (slack, name)
         for name in order:
@@ -6327,9 +10013,7 @@ def _enforce_section_budget_distribution(
                 continue
 
             if name == "Key Metrics":
-                if key_metrics_capped:
-                    continue
-                new_body = _pad_key_metrics(body, deficit, upper_words=sec_upper)
+                continue
             else:
                 # IMPORTANT:
                 # `_generate_padding_sentences(required_words)` chooses the *shortest* template
@@ -6338,15 +10022,21 @@ def _enforce_section_budget_distribution(
                 # truncated away entirely (no net progress). To guarantee progress, request
                 # smaller chunks that fit inside the slack.
                 request_candidates = [
+                    min(deficit, slack, 24),
+                    min(deficit, slack, 18),
                     min(deficit, slack, 12),
                     min(deficit, slack, 8),
-                    min(deficit, slack, 5),
                     1,
                 ]
                 request_candidates = [r for r in request_candidates if r > 0]
                 request_candidates = list(dict.fromkeys(request_candidates))
 
                 new_body = body
+                section_padding_context = (
+                    f"{memo_padding_context}\n\n## {name}\n{body}".strip()
+                    if memo_padding_context
+                    else body
+                )
                 risk_name_exclusions = (
                     _extract_risk_names(body) if name == "Risk Factors" else None
                 )
@@ -6360,6 +10050,7 @@ def _enforce_section_budget_distribution(
                         is_persona=is_persona,
                         exclude_risk_names=risk_name_exclusions,
                         max_words=slack,
+                        context_text=section_padding_context,
                     )
                     if not pad_sentences and global_exclude_norms:
                         pad_sentences = _generate_padding_sentences(
@@ -6369,6 +10060,7 @@ def _enforce_section_budget_distribution(
                             is_persona=is_persona,
                             exclude_risk_names=risk_name_exclusions,
                             max_words=slack,
+                            context_text=section_padding_context,
                         )
                     pad_text = " ".join(pad_sentences).strip()
                     candidate = _append_padding(body, pad_text, name)
@@ -6511,6 +10203,10 @@ def _enforce_section_budget_distribution(
             rebuilt = _rebuild_from_merged().strip()
             if not trimmed_any:
                 break
+
+    # Restore the original padding budget so downstream ad-hoc padding is still
+    # constrained by the lifetime cap.
+    _padding_budget_local.remaining = _saved_budget
     return rebuilt.strip()
 
 
@@ -6603,9 +10299,16 @@ def _make_no_extra_sections_validator(
     def _validator(text: str) -> Optional[str]:
         if not text:
             return None
+        seen: Set[str] = set()
         for match in heading_re.finditer(text):
             raw_title = (match.group(1) or "").strip()
             canon = _standard_section_name_from_heading(f"## {raw_title}")
+            if canon in seen:
+                return (
+                    f"Duplicate section heading detected: '## {raw_title}'. "
+                    "Each required section may appear only once. Merge duplicate content into a single canonical section."
+                )
+            seen.add(canon)
             if canon not in allowed:
                 return (
                     f"Extra section heading detected: '## {raw_title}'. "
@@ -6629,12 +10332,8 @@ def _make_section_balance_validator(include_health_rating: bool, target_length: 
     budgets = _calculate_section_word_budgets(
         target_length, include_health_rating=include_health_rating
     )
-    lower = target_length - 10
-    upper = target_length + 10
-
-    # User requirement: enforce the proportional distribution tightly.
-    # Budgets are for *section body* words (heading titles excluded).
-    section_tolerance = 10
+    lower = target_length - _effective_word_band_tolerance(target_length)
+    upper = target_length + _effective_word_band_tolerance(target_length)
 
     required_titles: List[Tuple[str, int]] = [
         (title, minimum)
@@ -6676,6 +10375,11 @@ def _make_section_balance_validator(include_health_rating: bool, target_length: 
                 search_start = section_start
                 continue
 
+            # Use target-scaled per-section tolerance so short targets do not
+            # inherit a flat fixed-word allowance that is too wide/narrow.
+            section_tolerance = _section_budget_tolerance_words(
+                expected, max_tolerance=10
+            )
             min_allowed = max(1, expected - section_tolerance)
             max_allowed = expected + section_tolerance
 
@@ -6709,6 +10413,518 @@ def _extract_markdown_section_body(text: str, title: str) -> Optional[str]:
     return match.group(1).strip() if match else None
 
 
+def _replace_markdown_section_body(text: str, title: str, body: str) -> str:
+    if not text or not title:
+        return text
+    pattern = re.compile(
+        rf"(^\s*##\s*{re.escape(title)}\s*\n+)(.*?)(?=^\s*##\s|\Z)",
+        re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    if not pattern.search(text):
+        return text
+    replacement_body = (body or "").strip()
+    return pattern.sub(
+        lambda m: f"{m.group(1)}{replacement_body}\n",
+        text,
+        count=1,
+    )
+
+
+def _canonicalize_key_metrics_section(summary_text: str, metrics_lines: str) -> str:
+    text = (summary_text or "").strip()
+    block = (metrics_lines or "").strip()
+    if not text or not block:
+        return summary_text
+
+    section_pattern = re.compile(
+        r"(^\s*##\s*(?:Key\s+(?:Financial\s+)?Metrics|Key Data Appendix|Metrics)\s*\n+)(.*?)(?=^\s*##\s|\Z)",
+        re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+    if not section_pattern.search(text):
+        return summary_text
+    return section_pattern.sub(
+        lambda _m: f"## Key Metrics\n{block}\n",
+        text,
+        count=1,
+    )
+
+
+def _ensure_health_to_exec_bridge(
+    summary_text: str, *, target_length: Optional[int] = None
+) -> str:
+    text = (summary_text or "").strip()
+    if not text:
+        return summary_text
+    health_body = _extract_markdown_section_body(text, "Financial Health Rating")
+    exec_body = _extract_markdown_section_body(text, "Executive Summary")
+    if not health_body or exec_body is None:
+        return summary_text
+
+    transition_hints = (
+        r"executive summary",
+        r"thesis",
+        r"sets? up",
+        r"frames the thesis",
+    )
+    if any(re.search(hint, health_body, re.IGNORECASE) for hint in transition_hints):
+        return summary_text
+
+    bridge = "This frames the thesis in the Executive Summary that follows."
+    if target_length:
+        try:
+            target = int(target_length)
+            tol = _effective_word_band_tolerance(target_length)
+            upper = min(TARGET_LENGTH_MAX_WORDS, target + tol)
+            bridge_wc = _count_words(bridge)
+            current_wc = _count_words(text)
+            current_split = len((text or "").split())
+            if max(current_wc, current_split) + bridge_wc > upper:
+                health_sentences = [
+                    s.strip()
+                    for s in re.split(r"(?<=[.!?])\s+", health_body.strip())
+                    if s.strip()
+                ]
+                if health_sentences:
+                    non_health_wc = max(0, int(current_wc) - int(_count_words(health_body)))
+                    allowed_health_wc = max(0, int(upper) - int(non_health_wc) - int(bridge_wc))
+                    kept_sentences = list(health_sentences)
+                    while len(kept_sentences) > 1 and _count_words(" ".join(kept_sentences)) > allowed_health_wc:
+                        kept_sentences.pop()
+                    trimmed_health = " ".join(kept_sentences).strip()
+                    if trimmed_health and not trimmed_health.endswith((".", "!", "?")):
+                        trimmed_health += "."
+                    merged = f"{trimmed_health} {bridge}".strip() if trimmed_health else bridge
+                    return _replace_markdown_section_body(text, "Financial Health Rating", merged)
+                # If only one sentence, still add bridge (let downstream handle word count)
+        except Exception:
+            pass
+    merged = (health_body or "").strip()
+    if merged:
+        if not merged.endswith((".", "!", "?")):
+            merged += "."
+        merged = f"{merged} {bridge}".strip()
+    else:
+        merged = bridge
+    return _replace_markdown_section_body(text, "Financial Health Rating", merged)
+
+
+def _apply_contract_structural_repairs(
+    summary_text: str,
+    *,
+    include_health_rating: bool,
+    target_length: Optional[int],
+    calculated_metrics: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Deterministic structural repairs for strict summary contract compliance."""
+    text = (summary_text or "").strip()
+    if not text:
+        return summary_text
+
+    metrics = calculated_metrics or {}
+    min_words_by_section: Dict[str, int] = {
+        "Financial Health Rating": 12,
+        "Executive Summary": 20,
+        "Financial Performance": 20,
+        "Management Discussion & Analysis": 25,
+        "Risk Factors": 20,
+        "Key Metrics": 5,
+        "Closing Takeaway": 15,
+    }
+    if not include_health_rating:
+        min_words_by_section.pop("Financial Health Rating", None)
+
+    perf_to_mdna_hints = (
+        r"md&a",
+        r"management discussion",
+        r"capital allocation",
+        r"management",
+    )
+    mdna_to_risk_hints = (
+        r"risk factors",
+        r"downside",
+        r"risk",
+        r"stress[- ]?test",
+    )
+    risk_to_metrics_hints = (
+        r"key metrics",
+        r"metrics below",
+        r"scoreboard",
+    )
+    trigger_re = re.compile(r"\b(if|unless|would|trigger|flip|change)\b", re.IGNORECASE)
+    measurable_re = re.compile(
+        r"(\$?\d+(?:\.\d+)?\s*(?:%|x|pp|b|m|bn|mm)?|\babove\b|\bbelow\b|\bat least\b|\bless than\b|\bmore than\b)",
+        re.IGNORECASE,
+    )
+    timeframe_re = re.compile(
+        r"\b(next|quarter|quarters|month|months|year|years|period|periods|q[1-4]|fy\d{2})\b",
+        re.IGNORECASE,
+    )
+    must_hold_re = re.compile(
+        r"\b(while|so long as|as long as|holds?|remains?|stays?|upgrade|upside|buy)\b",
+        re.IGNORECASE,
+    )
+    break_re = re.compile(
+        r"\b(breaks?|falls?|below|compress(?:es|ion)?|deteriorat(?:e|es|ion)|weakens?|downgrade|sell|downside)\b",
+        re.IGNORECASE,
+    )
+
+    def _ensure_terminal_sentence(body: str) -> str:
+        cleaned = (body or "").strip()
+        if cleaned and not cleaned.endswith((".", "!", "?")):
+            cleaned += "."
+        return cleaned
+
+    def _append_sentence(body: str, sentence: str) -> str:
+        base = _ensure_terminal_sentence(body)
+        addition = (sentence or "").strip()
+        if not addition:
+            return base
+        if base:
+            return f"{base} {addition}".strip()
+        return addition
+
+    def _top_up_sentence(section_title: str, attempt: int = 0) -> str:
+        sentence_map: Dict[str, List[str]] = {
+            "Financial Health Rating": [
+                "Profitability, cash conversion, and balance-sheet flexibility still define how much operating pressure this business can absorb.",
+                "That financial baseline matters because it sets the room management has to keep investing without stressing liquidity.",
+            ],
+            "Executive Summary": [
+                "The core decision is whether current execution quality can sustain returns as competitive and reinvestment pressures evolve.",
+                "That tension matters because the stock's durability depends more on operating discipline than on a single headline quarter.",
+            ],
+            "Financial Performance": [
+                "The period-over-period moves point to the operating levers that actually drove the quarter, especially mix, margin, and cash conversion.",
+                "Those changes matter because they show whether the reported quarter improved through stronger economics or only through timing effects.",
+            ],
+            "Management Discussion & Analysis": [
+                "Management's spending cadence and capital allocation will determine whether today's operating profile compounds or erodes.",
+                "That strategic posture matters because disciplined reinvestment can build share, while loose spending simply locks in lower margins.",
+            ],
+            "Risk Factors": [
+                "The downside case becomes real only if pressure reaches margins, cash generation, or balance-sheet flexibility before management can respond.",
+                "The practical question is not whether risks exist, but whether they can travel quickly enough to break the current operating thesis.",
+            ],
+            "Key Metrics": [
+                "The quarter's operating scoreboard is best read through the reported revenue, margin, cash-flow, and leverage figures.",
+            ],
+            "Closing Takeaway": [
+                "The verdict ultimately rests on a short list of measurable signals rather than on the headline numbers alone.",
+                "That keeps the recommendation tied to evidence instead of to a broad macro narrative or a single management sound bite.",
+            ],
+        }
+        options = sentence_map.get(
+            section_title,
+            [
+                "Additional company-specific context is needed to clarify the investment implication in this section.",
+            ],
+        )
+        return options[int(attempt) % len(options)]
+
+    def _closing_trigger_sentences(body: str) -> List[str]:
+        sentences = [
+            s.strip()
+            for s in re.split(r"(?<=[.!?])\s+", (body or "").strip())
+            if s.strip()
+        ]
+        return [
+            sentence
+            for sentence in sentences
+            if trigger_re.search(sentence)
+            and measurable_re.search(sentence)
+            and timeframe_re.search(sentence)
+        ]
+
+    def _must_hold_sentence() -> str:
+        operating_margin = metrics.get("operating_margin")
+        if isinstance(operating_margin, (int, float)):
+            hold_threshold = max(0.0, float(operating_margin) - 1.0)
+            return f"This view remains intact over the next two quarters if operating margin stays above {hold_threshold:.1f}%."
+
+        free_cash_flow = metrics.get("free_cash_flow")
+        if isinstance(free_cash_flow, (int, float)) and float(free_cash_flow) > 0:
+            hold_value = float(free_cash_flow) * 0.80
+            hold_value_str = _format_metric_value_for_text("free_cash_flow", hold_value)
+            return f"This view remains intact over the next four quarters if free cash flow remains above {hold_value_str}."
+
+        return "This view remains intact over the next two quarters if operating margin remains above 10.0%."
+
+    def _break_sentence() -> str:
+        operating_margin = metrics.get("operating_margin")
+        if isinstance(operating_margin, (int, float)):
+            break_threshold = max(0.0, float(operating_margin) - 3.0)
+            return f"The view would warrant a downgrade over the next four quarters if operating margin falls below {break_threshold:.1f}%."
+
+        free_cash_flow = metrics.get("free_cash_flow")
+        if isinstance(free_cash_flow, (int, float)) and float(free_cash_flow) > 0:
+            break_value = float(free_cash_flow) * 0.50
+            break_value_str = _format_metric_value_for_text(
+                "free_cash_flow", break_value
+            )
+            return f"The view would warrant a downgrade over the next four quarters if free cash flow falls below {break_value_str}."
+
+        return "The view would warrant a downgrade over the next four quarters if operating margin falls below 8.0%."
+
+    ordered_sections: List[str] = [
+        "Financial Health Rating",
+        "Executive Summary",
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Risk Factors",
+        "Key Metrics",
+        "Closing Takeaway",
+    ]
+    if not include_health_rating:
+        ordered_sections = [
+            s for s in ordered_sections if s != "Financial Health Rating"
+        ]
+
+    # ── Inject any required sections that are entirely missing ──────────
+    for section_title in ordered_sections:
+        body = _extract_markdown_section_body(text, section_title)
+        if body is not None:
+            continue
+        # Section heading is missing — inject deterministically
+        stub = _top_up_sentence(section_title, attempt=0)
+        stub = _ensure_terminal_sentence(stub)
+        min_words = int(min_words_by_section.get(section_title, 15) or 15)
+        guard = 0
+        while _count_words(stub) < min_words and guard < 6:
+            stub = _append_sentence(stub, _top_up_sentence(section_title, attempt=guard + 1))
+            guard += 1
+        inject_block = f"\n\n## {section_title}\n{stub}\n"
+        # Insert before the next section that exists, or at the end
+        inserted = False
+        idx = ordered_sections.index(section_title)
+        for later_title in ordered_sections[idx + 1 :]:
+            later_match = re.search(
+                r"(^\s*##\s+" + re.escape(later_title) + r")",
+                text,
+                re.IGNORECASE | re.MULTILINE,
+            )
+            if later_match:
+                text = (
+                    text[: later_match.start()]
+                    + inject_block
+                    + text[later_match.start() :]
+                )
+                inserted = True
+                break
+        if not inserted:
+            text = text.rstrip() + inject_block
+
+    for section_title in ordered_sections:
+        body = _extract_markdown_section_body(text, section_title)
+        if body is None:
+            continue
+        body = _ensure_terminal_sentence(body)
+
+        if section_title == "Financial Performance":
+            if not any(
+                re.search(hint, body, re.IGNORECASE) for hint in perf_to_mdna_hints
+            ):
+                body = _append_sentence(
+                    body,
+                    "This leads directly into Management Discussion & Analysis, where management's capital-allocation and execution choices determine whether these trends can persist.",
+                )
+
+        if section_title == "Management Discussion & Analysis":
+            if not any(
+                re.search(hint, body, re.IGNORECASE) for hint in mdna_to_risk_hints
+            ):
+                body = _append_sentence(
+                    body,
+                    "This sets up the Risk Factors section that follows, where the thesis is stress-tested against the main downside paths.",
+                )
+
+        if section_title == "Closing Takeaway":
+            triggers = _closing_trigger_sentences(body)
+            has_must_hold = any(must_hold_re.search(sentence) for sentence in triggers)
+            has_break = any(break_re.search(sentence) for sentence in triggers)
+            if not has_must_hold:
+                body = _append_sentence(body, _must_hold_sentence())
+            if not has_break:
+                body = _append_sentence(body, _break_sentence())
+
+        if section_title == "Risk Factors":
+            if not any(
+                re.search(hint, body, re.IGNORECASE) for hint in risk_to_metrics_hints
+            ):
+                body = _append_sentence(
+                    body,
+                    "These transmission paths are tracked in the Key Metrics section below, where the earliest confirmation signals are monitored.",
+                )
+
+        min_words = int(min_words_by_section.get(section_title, 0) or 0)
+        if section_title != "Key Metrics" and min_words > 0:
+            guard = 0
+            while _count_words(body) < min_words and guard < 6:
+                body = _append_sentence(body, _top_up_sentence(section_title, attempt=guard))
+                guard += 1
+            remaining = max(0, min_words - _count_words(body))
+            if 0 < remaining <= 6:
+                body = _micro_pad_tail_words(body, remaining)
+
+        if section_title == "Closing Takeaway":
+            body, _ = _cap_closing_takeaway_sentences_preserve_triggers(
+                body,
+                budget_words=_closing_takeaway_budget_for_target(
+                    target_length, include_health_rating=include_health_rating
+                ),
+            )
+
+        text = _replace_markdown_section_body(text, section_title, body)
+
+    if target_length:
+        text = _enforce_section_order(text, include_health_rating=include_health_rating)
+    return text
+
+
+def _extract_quotes_from_filing_snippets(snippets: str) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for match in re.finditer(r"[“\"]([^“”\"\n]{8,260})[”\"]", snippets or ""):
+        candidate = " ".join((match.group(1) or "").split()).strip()
+        if not candidate:
+            continue
+        norm = re.sub(r"\s+", " ", candidate.lower()).strip()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        out.append(candidate)
+        if len(out) >= 12:
+            break
+    return out
+
+
+def _rebalance_contract_quotes(
+    summary_text: str,
+    *,
+    filing_language_snippets: str,
+    min_required_quotes: int,
+    max_allowed_quotes: int,
+) -> str:
+    text = (summary_text or "").strip()
+    if not text:
+        return summary_text
+
+    exec_body = _extract_markdown_section_body(text, "Executive Summary")
+    mdna_body = _extract_markdown_section_body(text, "Management Discussion & Analysis")
+    if exec_body is None or mdna_body is None:
+        return summary_text
+
+    quote_re = re.compile(r"[“\"]([^“”\"\n]{8,260})[”\"]")
+
+    def _extract_quotes(body: str) -> List[str]:
+        return [
+            " ".join((m.group(1) or "").split()).strip()
+            for m in quote_re.finditer(body or "")
+            if (m.group(1) or "").strip()
+        ]
+
+    def _dedupe(values: List[str]) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        for item in values:
+            normalized = re.sub(r"\s+", " ", (item or "").strip().lower())
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            out.append(" ".join((item or "").split()).strip())
+        return out
+
+    exec_quotes_existing = _extract_quotes(exec_body)
+    mdna_quotes_existing = _extract_quotes(mdna_body)
+    snippet_quotes = _extract_quotes_from_filing_snippets(filing_language_snippets)
+
+    # Prefer filing-snippet quotes first so any rebalance repairs ungrounded model
+    # quotes instead of accidentally preserving them.
+    quote_pool = _dedupe(snippet_quotes + exec_quotes_existing + mdna_quotes_existing)
+    max_quotes = max(1, int(max_allowed_quotes or 0))
+    target_quotes = max(0, min(max_quotes, int(min_required_quotes or 0)))
+    if target_quotes <= 0:
+        return summary_text
+    if len(quote_pool) < target_quotes:
+        # Fallback: extract short sentence fragments from filing snippets
+        # that contain management language patterns
+        management_patterns = [
+            r"(?:we|the company|management)\s+(?:believe|expect|anticipate|continue|remain|plan|intend)[^.]{10,120}\.",
+            r"(?:our|the)\s+(?:strategy|focus|priority|goal|objective)[^.]{10,120}\.",
+        ]
+        fallback_quotes = []
+        for pattern in management_patterns:
+            for match in re.finditer(
+                pattern, filing_language_snippets or "", re.IGNORECASE
+            ):
+                candidate = match.group(0).strip().rstrip(".")
+                if 10 <= len(candidate.split()) <= 30:
+                    fallback_quotes.append(candidate)
+            if len(quote_pool) + len(fallback_quotes) >= target_quotes:
+                break
+        quote_pool = _dedupe(quote_pool + fallback_quotes)
+        if len(quote_pool) < target_quotes:
+            return summary_text  # Still insufficient — genuine data gap
+
+    selected = quote_pool[:target_quotes]
+    exec_assigned: List[str] = []
+    mdna_assigned: List[str] = []
+
+    preferred_exec = next((q for q in selected if q in exec_quotes_existing), None)
+    exec_assigned.append(preferred_exec or selected[0])
+
+    preferred_mdna = next(
+        (q for q in selected if q in mdna_quotes_existing and q not in exec_assigned),
+        None,
+    )
+    if preferred_mdna:
+        mdna_assigned.append(preferred_mdna)
+    else:
+        fallback_mdna = next((q for q in selected if q not in exec_assigned), None)
+        if fallback_mdna:
+            mdna_assigned.append(fallback_mdna)
+
+    for quote in selected:
+        if quote in exec_assigned or quote in mdna_assigned:
+            continue
+        mdna_assigned.append(quote)
+
+    if not mdna_assigned and len(selected) >= 2:
+        mdna_assigned.append(selected[1])
+
+    def _strip_direct_quotes(body: str) -> str:
+        cleaned = quote_re.sub("", body or "")
+        cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        return cleaned.strip()
+
+    def _append_quote_lines(base: str, lines: List[str], *, lead: str) -> str:
+        out = (base or "").strip()
+        for quote in lines:
+            sentence = f'{lead} "{quote}".'
+            if out and not out.endswith((".", "!", "?")):
+                out += "."
+            out = f"{out} {sentence}".strip() if out else sentence
+        return out.strip()
+
+    exec_rebuilt = _append_quote_lines(
+        _strip_direct_quotes(exec_body),
+        exec_assigned[:1],
+        lead="Management noted",
+    )
+    mdna_rebuilt = _append_quote_lines(
+        _strip_direct_quotes(mdna_body),
+        mdna_assigned,
+        lead="Management added",
+    )
+
+    out_text = _replace_markdown_section_body(text, "Executive Summary", exec_rebuilt)
+    out_text = _replace_markdown_section_body(
+        out_text, "Management Discussion & Analysis", mdna_rebuilt
+    )
+    return out_text
+
+
 def _count_numeric_tokens(text: str) -> int:
     if not text:
         return 0
@@ -6716,11 +10932,144 @@ def _count_numeric_tokens(text: str) -> int:
     return len(re.findall(r"\b[\w$€£]*\d[\w%/.\-]*\b", text))
 
 
+@dataclass(frozen=True)
+class SummaryFlowQualityProfile:
+    max_same_opening: int = 3
+    max_sections_per_repeated_number: int = 3
+    max_sections_per_theme: int = 4
+    closing_numeric_anchor_cap: Optional[int] = None
+
+
+_SUMMARY_NARRATIVE_REPETITION_SECTIONS: Tuple[str, ...] = (
+    "Financial Health Rating",
+    "Executive Summary",
+    "Financial Performance",
+    "Management Discussion & Analysis",
+    "Risk Factors",
+    "Closing Takeaway",
+)
+
+_SUMMARY_REPEATED_FIGURE_RE = re.compile(
+    r"\$[\d,.]+\s*[BMKTbmkt]?\b|\d+\.?\d*\s*%"
+)
+
+_SUMMARY_THEME_PATTERNS: Dict[str, re.Pattern[str]] = {
+    "cash conversion": re.compile(
+        r"cash\s+(?:conversion|converts?|converting)", re.IGNORECASE
+    ),
+    "free cash flow": re.compile(r"free\s+cash\s+flow|FCF", re.IGNORECASE),
+    "margin pressure": re.compile(
+        r"margin\s+(?:pressure|compression|compresses?|erodes?)", re.IGNORECASE
+    ),
+    "reinvestment": re.compile(
+        r"reinvestment|capex\s+(?:intensity|cycle|rising)", re.IGNORECASE
+    ),
+    "balance sheet flexibility": re.compile(
+        r"balance[- ]sheet\s+(?:flexibility|risk|strength|buffer)", re.IGNORECASE
+    ),
+    "working capital": re.compile(
+        r"working[- ]capital\s+(?:timing|normaliz|inflat|depress)", re.IGNORECASE
+    ),
+    "below the line": re.compile(
+        r"below[- ]the[- ]line|non[- ]operating\s+(?:items?|support|income)",
+        re.IGNORECASE,
+    ),
+    "earnings quality": re.compile(
+        r"earnings?\s+quality|operating\s+vs\.?\s+net", re.IGNORECASE
+    ),
+}
+
+_SUMMARY_QUESTION_FRAMING_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:that\s+sets\s+up\s+)?(?:the\s+)?(?:core|key|central|main|operating|execution)\s+question\s+(?:is|remains|becomes)?\s*whether\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bthe\s+central\s+tension\s+(?:is|remains)\s+whether\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bthe\s+key\s+issue\s+(?:is|remains)\s+whether\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _normalize_repeated_figure_token(fig: str) -> str:
+    return re.sub(r"\s+", "", str(fig or "").strip().lower())
+
+
+def _numbers_discipline_caps(
+    target_length: Optional[int],
+    *,
+    closing_numeric_cap_override: Optional[int] = None,
+) -> Dict[str, int]:
+    """Shared caps for narrative numeric density (used by validators + repairs)."""
+    long_form = _is_long_form_target(target_length)
+    higher_detail = bool((target_length or 0) >= 600)
+    if long_form:
+        caps = {
+            "Executive Summary": 3,
+            "Financial Performance": 7,
+            "Management Discussion & Analysis": 3,
+            "Risk Factors": 2,
+            "Closing Takeaway": 2,
+        }
+    else:
+        caps = {
+            "Executive Summary": 4 if higher_detail else 3,
+            "Financial Performance": 7 if higher_detail else 5,
+            "Management Discussion & Analysis": 4 if higher_detail else 3,
+            "Risk Factors": 3 if higher_detail else 2,
+            "Closing Takeaway": 2 if higher_detail else 1,
+        }
+    if closing_numeric_cap_override is not None:
+        caps["Closing Takeaway"] = max(1, int(closing_numeric_cap_override))
+    return caps
+
+
+def _build_summary_quality_profile(
+    *,
+    target_length: Optional[int],
+    is_flash_model: bool,
+    flash_first_enabled: bool,
+) -> SummaryFlowQualityProfile:
+    if _is_short_quality_sensitive_target(target_length):
+        return SummaryFlowQualityProfile(
+            max_same_opening=2,
+            max_sections_per_repeated_number=2,
+            max_sections_per_theme=2,
+            closing_numeric_anchor_cap=1 if (target_length or 0) < 600 else 2,
+        )
+    if not (flash_first_enabled and is_flash_model):
+        return SummaryFlowQualityProfile()
+
+    is_long_form = (target_length or 0) >= 1500
+    base_closing_cap = 4 if (target_length or 0) >= 600 else 3
+    return SummaryFlowQualityProfile(
+        max_same_opening=2,
+        max_sections_per_repeated_number=3 if is_long_form else 2,
+        max_sections_per_theme=4 if is_long_form else 3,
+        closing_numeric_anchor_cap=max(1, base_closing_cap - 1),
+    )
+
+
 def _make_numbers_discipline_validator(
     target_length: Optional[int],
+    *,
+    closing_numeric_cap_override: Optional[int] = None,
 ) -> Callable[[str], Optional[str]]:
-    max_exec = 8 if (target_length or 0) >= 600 else 6
-    max_closing = 4 if (target_length or 0) >= 600 else 3
+    # Keep narrative sections argument-first, not inventory-first.
+    # Tightened caps to force qualitative writing — numbers support, not structure.
+    caps = _numbers_discipline_caps(
+        target_length,
+        closing_numeric_cap_override=closing_numeric_cap_override,
+    )
+    max_exec = int(caps.get("Executive Summary", 4))
+    max_perf = int(caps.get("Financial Performance", 7))
+    max_mdna = int(caps.get("Management Discussion & Analysis", 4))
+    max_risk = int(caps.get("Risk Factors", 3))
+    max_closing = int(caps.get("Closing Takeaway", 2))
 
     def _validator(text: str) -> Optional[str]:
         exec_body = _extract_markdown_section_body(text, "Executive Summary")
@@ -6732,6 +11081,35 @@ def _make_numbers_discipline_validator(
                     "Keep it mostly qualitative with only 1-2 anchor figures; move dense metrics to Financial Performance / Key Metrics."
                 )
 
+        perf_body = _extract_markdown_section_body(text, "Financial Performance")
+        if perf_body:
+            perf_nums = _count_numeric_tokens(perf_body)
+            if perf_nums > max_perf:
+                return (
+                    f"Numbers discipline: Financial Performance is too numeric ({perf_nums} numeric tokens). "
+                    "Keep only the 3-5 most decision-relevant figures in prose and move the rest to Key Metrics."
+                )
+
+        mdna_body = _extract_markdown_section_body(
+            text, "Management Discussion & Analysis"
+        )
+        if mdna_body:
+            mdna_nums = _count_numeric_tokens(mdna_body)
+            if mdna_nums > max_mdna:
+                return (
+                    f"Numbers discipline: Management Discussion & Analysis is too numeric ({mdna_nums} numeric tokens). "
+                    "Keep this section strategic and mechanism-first, with only a few anchor numbers."
+                )
+
+        risk_body = _extract_markdown_section_body(text, "Risk Factors")
+        if risk_body:
+            risk_nums = _count_numeric_tokens(risk_body)
+            if risk_nums > max_risk:
+                return (
+                    f"Numbers discipline: Risk Factors is too numeric ({risk_nums} numeric tokens). "
+                    "Keep risk discussion mechanism-first (business exposure and transmission path), with numbers as optional support."
+                )
+
         closing_body = _extract_markdown_section_body(text, "Closing Takeaway")
         if closing_body:
             closing_nums = _count_numeric_tokens(closing_body)
@@ -6740,6 +11118,109 @@ def _make_numbers_discipline_validator(
                     f"Numbers discipline: Closing Takeaway is too numeric ({closing_nums} numeric tokens). "
                     "Synthesize the narrative and keep numbers minimal; focus on verdict + what would change the view."
                 )
+
+        return None
+
+    return _validator
+
+
+def _make_metric_priority_validator(
+    target_length: Optional[int],
+) -> Callable[[str], Optional[str]]:
+    """Keep narrative sections focused on a small set of primary drivers."""
+
+    higher_detail = bool((target_length or 0) >= 600)
+    max_unique_numbers: Dict[str, int] = {
+        "Executive Summary": 3 if higher_detail else 2,
+        "Financial Performance": 6 if higher_detail else 5,
+        "Management Discussion & Analysis": 4 if higher_detail else 3,
+        "Risk Factors": 3 if higher_detail else 2,
+        "Closing Takeaway": 2 if higher_detail else 1,
+    }
+
+    metric_terms: Dict[str, re.Pattern[str]] = {
+        "free_cash_flow": re.compile(r"\bfree\s+cash\s+flow|fcf\b", re.IGNORECASE),
+        "operating_margin": re.compile(r"\boperating\s+margin\b", re.IGNORECASE),
+        "cash_conversion": re.compile(
+            r"\bcash\s+conversion\b|\bocf\s*(?:to|→|-)\s*fcf\b", re.IGNORECASE
+        ),
+        "revenue": re.compile(r"\brevenue\b", re.IGNORECASE),
+        "operating_cash_flow": re.compile(
+            r"\boperating\s+cash\s+flow\b|\bocf\b", re.IGNORECASE
+        ),
+        "net_margin": re.compile(r"\bnet\s+margin\b", re.IGNORECASE),
+        "liquidity": re.compile(
+            r"\bcurrent\s+ratio\b|\bcash\b|\bliquidity\b", re.IGNORECASE
+        ),
+        "leverage": re.compile(
+            r"\bdebt\b|\bliabilit(?:y|ies)\b|\bleverage\b", re.IGNORECASE
+        ),
+    }
+
+    echo_patterns: Dict[str, re.Pattern[str]] = {
+        "thesis_stays_grounded": re.compile(
+            r"\bthe thesis stays grounded in\b", re.IGNORECASE
+        ),
+        "clearest_quantitative_read": re.compile(
+            r"\bthe clearest quantitative read on this period\b", re.IGNORECASE
+        ),
+        "easier_to_underwrite": re.compile(
+            r"\b(?:performance quality|capital-allocation credibility)\s+is easier to underwrite\b",
+            re.IGNORECASE,
+        ),
+        "execution_judged_against": re.compile(
+            r"\bexecution durability should be judged against\b", re.IGNORECASE
+        ),
+        "risk_severity_increases": re.compile(
+            r"\brisk severity increases(?: quickly)? if\b", re.IGNORECASE
+        ),
+        "stance_changes_only_if": re.compile(
+            r"\bthe stance should change only if\b", re.IGNORECASE
+        ),
+    }
+
+    figure_re = re.compile(r"\$[\d,.]+\s*[BMKTbmkt]?\b|\d+\.?\d*\s*(?:%|x|pp)\b")
+
+    def _validator(text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        for section, limit in max_unique_numbers.items():
+            body = _extract_markdown_section_body(text, section)
+            if not body:
+                continue
+
+            # Prioritize a small set of numbers in narrative prose.
+            unique_numbers = {
+                re.sub(r"\s+", "", m.group(0).lower())
+                for m in figure_re.finditer(body)
+                if (m.group(0) or "").strip()
+            }
+            if len(unique_numbers) > int(limit):
+                return (
+                    f"Metric priority drift: {section} references {len(unique_numbers)} distinct numeric figures. "
+                    f"Keep this section to at most {limit} anchor figures and move the rest to Key Metrics."
+                )
+
+            # Executive + Closing should communicate hierarchy, not inventory.
+            if section in {"Executive Summary", "Closing Takeaway"}:
+                mentioned = {
+                    name for name, pat in metric_terms.items() if pat.search(body or "")
+                }
+                if len(mentioned) > 3:
+                    return (
+                        f"Metric hierarchy drift in {section}: {len(mentioned)} driver classes are treated as primary. "
+                        "Prioritize at most 3 core drivers and treat all others as supporting evidence."
+                    )
+
+            for label, pattern in echo_patterns.items():
+                count = len(pattern.findall(body))
+                if count > 1:
+                    pretty = label.replace("_", " ")
+                    return (
+                        f"Metric echo detected in {section}: pattern '{pretty}' repeats {count} times. "
+                        "State each driver once, then advance the analysis."
+                    )
 
         return None
 
@@ -6803,6 +11284,28 @@ def _make_verbatim_repetition_validator() -> Callable[[str], Optional[str]]:
                 f"Remove repeats and keep each idea once per section. Example repeated sentence: '{sample[:140]}...'"
             )
 
+        normalized_tail = _normalize(joined)
+        tokens = [token for token in normalized_tail.split() if token]
+        for span in range(8, 3, -1):
+            max_start = len(tokens) - (span * 3) + 1
+            if max_start <= 0:
+                continue
+            for start in range(max_start):
+                clause = tokens[start : start + span]
+                if len(set(clause)) < 3:
+                    continue
+                repeats = 1
+                cursor = start + span
+                while cursor + span <= len(tokens) and tokens[cursor : cursor + span] == clause:
+                    repeats += 1
+                    cursor += span
+                if repeats >= 3:
+                    sample = " ".join(clause).strip()
+                    return (
+                        "Verbatim repetition detected (repeated clause loop in narrative prose). "
+                        f"Remove repeated tail padding. Example clause: '{sample[:120]}...'"
+                    )
+
         return None
 
     return _validator
@@ -6823,6 +11326,9 @@ def _make_phrase_limits_validator() -> Callable[[str], Optional[str]]:
 
     # pattern -> max allowed count
     limits: Dict[str, int] = {
+        "management execution drivers remain the key watchpoint": 0,
+        "reported financials lack sufficient detail on revenue margin and cash flow": 0,
+        "future filings clarify the earnings to cash bridge": 0,
         # Definitions / meta-commentary (forbidden)
         "free cash flow is the difference": 0,
         "thesis reads best": 0,
@@ -6835,10 +11341,45 @@ def _make_phrase_limits_validator() -> Callable[[str], Optional[str]]:
         "falsify the thesis": 0,
         "falsifies the thesis": 0,
         "what would falsify": 0,
+        # Monitoring-checklist patterns (cap or forbid)
+        "track whether": 1,
+        "watch whether": 1,
+        "verify whether": 0,
+        "monitor whether": 1,
+        "additionally monitor": 0,
+        "additionally track": 0,
+        "additionally watch": 0,
+        "additionally verify": 0,
+        "also monitor": 1,
+        "also track": 1,
+        "also watch": 1,
         # Catchphrase spam (cap tightly)
         "margin for error": 1,
         "watch cash conversion": 1,
         "base case hold": 1,
+        # Instruction-echo patterns (forbidden — these are internal directives, not analysis)
+        "as instructed": 0,
+        "per the guidelines": 0,
+        "commentary not provided": 0,
+        "not provided in the draft": 0,
+        "the memo should": 0,
+        "the analysis should": 0,
+        "keep this section": 0,
+        "each risk should map to": 0,
+        "connect revenue trends to": 0,
+        # Generic financial axioms that pad word count (cap tightly)
+        "cash conversion can diverge": 0,
+        "below the line support should not be treated": 0,
+        "a strong quarter is more credible when": 0,
+        "risk is asymmetric when": 1,
+        "the dominant downside scenario": 1,
+        "a credible risk write up": 0,
+        "second order risks matter": 0,
+        "the probability of outsized returns": 0,
+        "provides the balance sheet backdrop": 0,
+        "frames the margin for error": 1,
+        "defines the upper bound of sustainable growth": 0,
+        "the usual culprits": 0,
     }
 
     def _validator(text: str) -> Optional[str]:
@@ -6857,10 +11398,61 @@ def _make_phrase_limits_validator() -> Callable[[str], Optional[str]]:
     return _validator
 
 
-def _make_sentence_stem_repetition_validator() -> Callable[[str], Optional[str]]:
+def _make_instruction_leak_validator() -> Callable[[str], Optional[str]]:
+    """Catch instruction-leak patterns that escaped prompt boundaries.
+
+    These are phrases that belong to our system prompt or synthesizer
+    coaching, not to the user-visible memo.  If any are detected, force
+    a retry so the LLM rewrites without echoing its instructions.
+    """
+
+    _leak_patterns: List[re.Pattern[str]] = [
+        re.compile(r"financial performance commentary not provided", re.IGNORECASE),
+        re.compile(r"not provided in the draft", re.IGNORECASE),
+        re.compile(r"commentary not provided", re.IGNORECASE),
+        re.compile(r"keep this section concrete", re.IGNORECASE),
+        re.compile(r"keep this section", re.IGNORECASE),
+        re.compile(r"this section should\b", re.IGNORECASE),
+        re.compile(r"each risk should map to", re.IGNORECASE),
+        re.compile(r"as instructed", re.IGNORECASE),
+        re.compile(r"per the guidelines", re.IGNORECASE),
+        re.compile(r"the analysis should\b", re.IGNORECASE),
+        re.compile(r"the memo should\b", re.IGNORECASE),
+        re.compile(r"connect revenue trends to", re.IGNORECASE),
+        re.compile(r"unit economics need to improve via", re.IGNORECASE),
+        re.compile(r"reconciles KPI commentary", re.IGNORECASE),
+        re.compile(
+            r"add\s+revenue(?:/margin/cash\s*flow|,\s*margin,?\s*(?:and\s*)?cash\s*flow)",
+            re.IGNORECASE,
+        ),
+        re.compile(r"(?:structure|flow) is mandatory", re.IGNORECASE),
+        re.compile(r"suggested length:", re.IGNORECASE),
+        re.compile(r"voice discipline:", re.IGNORECASE),
+        re.compile(r"numbers discipline:", re.IGNORECASE),
+    ]
+
+    def _validator(text: str) -> Optional[str]:
+        for pat in _leak_patterns:
+            m = pat.search(text or "")
+            if m:
+                return (
+                    f"Instruction leak detected ('{m.group()}'). "
+                    "Rewrite the output without echoing any part of the instructions, "
+                    "coaching language, or meta-commentary about your process."
+                )
+        return None
+
+    return _validator
+
+
+def _make_sentence_stem_repetition_validator(
+    *,
+    max_same_opening: int = 3,
+) -> Callable[[str], Optional[str]]:
     """
     Detect "same sentence shape" repetition even when not verbatim.
-    Heuristic: repeated leading word-stems across long sentences.
+    Heuristic: repeated leading word-stems across long sentences, plus
+    per-section leading-word frequency checks to catch "If... If... If..." loops.
     """
 
     stopwords = {
@@ -6887,9 +11479,20 @@ def _make_sentence_stem_repetition_validator() -> Callable[[str], Optional[str]]
         "those",
     }
 
+    _SECTION_TITLES = (
+        "Financial Health Rating",
+        "Executive Summary",
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Risk Factors",
+        "Closing Takeaway",
+    )
+
     def _normalize(sentence: str) -> List[str]:
         cleaned = (sentence or "").lower()
-        cleaned = cleaned.replace("’", "'").replace("“", '"').replace("”", '"')
+        cleaned = (
+            cleaned.replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
+        )
         cleaned = re.sub(r"[^a-z0-9 ]+", " ", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         words = [w for w in cleaned.split() if w and w not in stopwords]
@@ -6898,21 +11501,49 @@ def _make_sentence_stem_repetition_validator() -> Callable[[str], Optional[str]]
     def _validator(text: str) -> Optional[str]:
         if not text:
             return None
+
+        # --- Check 1: per-section leading-word frequency ---
+        for title in _SECTION_TITLES:
+            body = _extract_markdown_section_body(text, title)
+            if not body:
+                continue
+            # Strip markdown header lines before splitting into sentences
+            # so that `##` is not counted as a leading word.
+            body_lines = body.strip().splitlines()
+            prose_lines = [ln for ln in body_lines if not re.match(r"^\s*#{1,6}", ln)]
+            prose_body = "\n".join(prose_lines)
+            section_sentences = [
+                s.strip()
+                for s in re.split(r"(?<=[.!?])\s+", prose_body)
+                if s.strip() and len(s.split()) >= 6
+            ]
+            if len(section_sentences) < 5:
+                continue
+            leading_word_counts: Dict[str, int] = {}
+            for s in section_sentences:
+                first_word = s.split()[0].lower().rstrip(".,;:")
+                if first_word.startswith("#") or first_word in stopwords:
+                    continue
+                leading_word_counts[first_word] = (
+                    leading_word_counts.get(first_word, 0) + 1
+                )
+            for word, count in leading_word_counts.items():
+                if count > int(max_same_opening):
+                    return (
+                        f"Leading-word repetition in {title}: {count} sentences start with '{word.capitalize()}'. "
+                        "Vary sentence openings — do not begin more than 2 sentences per section with the same word."
+                    )
+
+        # --- Check 2: cross-section stem repetition (lowered from 3 → 2) ---
         bodies: List[str] = []
-        for title in (
-            "Financial Health Rating",
-            "Executive Summary",
-            "Financial Performance",
-            "Management Discussion & Analysis",
-            "Risk Factors",
-            "Closing Takeaway",
-        ):
+        for title in _SECTION_TITLES:
             body = _extract_markdown_section_body(text, title)
             if body:
                 bodies.append(body)
 
         joined = "\n".join(bodies)
         joined = re.sub(r"^\s*WORD COUNT:\s*\d+\s*$", "", joined, flags=re.MULTILINE)
+        joined = re.sub(r"^\s*#{1,6}\s+.*$", "", joined, flags=re.MULTILINE)
 
         sentences = re.split(r"(?<=[.!?])\s+", joined)
         counts: Dict[str, int] = {}
@@ -6927,12 +11558,199 @@ def _make_sentence_stem_repetition_validator() -> Callable[[str], Optional[str]]
             counts[stem] = counts.get(stem, 0) + 1
             samples.setdefault(stem, sentence.strip())
 
-        repeated = [k for k, v in counts.items() if v >= 3]
+        repeated = [k for k, v in counts.items() if v >= 2]
         if repeated:
             sample = re.sub(r"\s+", " ", samples[repeated[0]]).strip()
             return (
                 "Repetition-by-structure detected (multiple long sentences start the same way). "
                 f"Rewrite to avoid looping phrasing. Example: '{sample[:140]}...'"
+            )
+        return None
+
+    return _validator
+
+
+def _make_cross_section_number_repetition_validator(
+    *,
+    max_sections_per_figure: int = 3,
+) -> Callable[[str], Optional[str]]:
+    """Reject memos where the same specific dollar figure or percentage appears in too many sections."""
+
+    def _validator(text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        figure_section_map: Dict[str, set] = {}
+        for section_title in _SUMMARY_NARRATIVE_REPETITION_SECTIONS:
+            body = _extract_markdown_section_body(text, section_title)
+            if not body:
+                continue
+            figures = _SUMMARY_REPEATED_FIGURE_RE.findall(body)
+            for fig in figures:
+                norm = _normalize_repeated_figure_token(fig)
+                if not norm:
+                    continue
+                figure_section_map.setdefault(norm, set()).add(section_title)
+
+        overused = [
+            (fig, sections)
+            for fig, sections in figure_section_map.items()
+            if len(sections) > int(max_sections_per_figure)
+        ]
+        if overused:
+            worst_fig, worst_sections = max(overused, key=lambda x: len(x[1]))
+            return (
+                f"Number repetition across sections: '{worst_fig}' appears in {len(worst_sections)} sections. "
+                "Use each specific figure in at most 2-3 sections; reference it by context elsewhere."
+            )
+        return None
+
+    return _validator
+
+
+def _make_generic_filler_validator() -> Callable[[str], Optional[str]]:
+    """Reject sections dominated by generic financial axioms that apply to any company."""
+
+    # Patterns that signal generic textbook filler rather than company-specific analysis
+    _GENERIC_PATTERNS = [
+        re.compile(
+            r"^if\s+(cash\s+conversion|margins?\s+move|free\s+cash\s+flow|operating\s+cash\s+flow|revenue\s+rises?|growth\s+slow)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^(a|the)\s+(strong|weak|durable|credible)\s+(quarter|thesis|risk|position)\s+is\s+(more|most|best|only)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^(margin|cash|balance.sheet|working.capital|risk)\s+(compression|pressure|risk|flexibility|structure)\s+is\s+(most|often|usually|secondary|best)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^(when|if)\s+growth\s+(is\s+strong|slows?|weakens?),?\s+the\s+focus\s+is\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^(cash\s+conversion\s+can|below.the.line|second.order\s+risks?|a\s+widening\s+gap)\b",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"^(transparency|execution\s+risk|operational\s+risk|liquidity\s+risk|margin\s+structure)\s+(in|is|often|matters)\b",
+            re.IGNORECASE,
+        ),
+    ]
+
+    _NARRATIVE_SECTIONS = (
+        "Executive Summary",
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Closing Takeaway",
+    )
+
+    def _is_generic(sentence: str) -> bool:
+        stripped = sentence.strip()
+        for pat in _GENERIC_PATTERNS:
+            if pat.search(stripped):
+                return True
+        return False
+
+    def _validator(text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        for section_title in _NARRATIVE_SECTIONS:
+            body = _extract_markdown_section_body(text, section_title)
+            if not body:
+                continue
+            sentences = [
+                s.strip()
+                for s in re.split(r"(?<=[.!?])\s+", body.strip())
+                if s.strip() and len(s.strip().split()) >= 8
+            ]
+            if not sentences:
+                continue
+            generic_count = sum(1 for s in sentences if _is_generic(s))
+            if len(sentences) >= 4 and generic_count / len(sentences) > 0.30:
+                return (
+                    f"Generic filler detected in {section_title}: {generic_count} of {len(sentences)} sentences "
+                    "are financial axioms that apply to any company. Replace with company-specific analysis."
+                )
+            if generic_count >= 5:
+                return (
+                    f"Excessive generic filler in {section_title}: {generic_count} textbook statements. "
+                    "Every sentence should reference this company's specific data or situation."
+                )
+
+        return None
+
+    return _validator
+
+
+def _make_cross_section_question_framing_validator() -> Callable[[str], Optional[str]]:
+    """Reject memo drafts that keep re-stating the thesis as a question."""
+
+    def _validator(text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        matched_sentences: List[Tuple[str, str]] = []
+        for section_title in _SUMMARY_NARRATIVE_REPETITION_SECTIONS:
+            body = _extract_markdown_section_body(text, section_title)
+            if not body:
+                continue
+            sentences = [
+                s.strip()
+                for s in re.split(r"(?<=[.!?])\s+", body.strip())
+                if s.strip() and len(s.strip().split()) >= 8
+            ]
+            for sentence in sentences:
+                if any(
+                    pattern.search(sentence)
+                    for pattern in _SUMMARY_QUESTION_FRAMING_PATTERNS
+                ):
+                    matched_sentences.append((section_title, sentence))
+
+        if len(matched_sentences) <= 1:
+            return None
+
+        sample_section, sample_sentence = matched_sentences[1]
+        sample_sentence = re.sub(r"\s+", " ", sample_sentence).strip()
+        return (
+            "Question-framing repetition: multiple sections restate the thesis as a question. "
+            f"Keep that framing in Executive Summary only and answer it directly elsewhere. Example from {sample_section}: '{sample_sentence[:140]}...'"
+        )
+
+    return _validator
+
+
+def _make_cross_section_theme_repetition_validator(
+    *,
+    max_sections_per_theme: int = 4,
+) -> Callable[[str], Optional[str]]:
+    """Detect when the same conceptual theme is belabored across too many sections."""
+
+    def _validator(text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        theme_section_map: Dict[str, set] = {}
+        for section_title in _SUMMARY_NARRATIVE_REPETITION_SECTIONS:
+            body = _extract_markdown_section_body(text, section_title)
+            if not body:
+                continue
+            for theme_name, pattern in _SUMMARY_THEME_PATTERNS.items():
+                if pattern.search(body):
+                    theme_section_map.setdefault(theme_name, set()).add(section_title)
+
+        overused = [
+            (theme, sections)
+            for theme, sections in theme_section_map.items()
+            if len(sections) > int(max_sections_per_theme)
+        ]
+        if overused:
+            worst_theme, worst_sections = max(overused, key=lambda x: len(x[1]))
+            return (
+                f"Theme over-repetition: '{worst_theme}' discussed in {len(worst_sections)} sections. "
+                "Consolidate to the most relevant section and reference briefly elsewhere."
             )
         return None
 
@@ -6950,112 +11768,46 @@ def _make_period_delta_bridge_validator(
             return None
 
         lines = [ln.strip() for ln in perf_body.splitlines() if ln.strip()]
-        bridge_window = lines[:16]
+        opening_window = lines[:10]
 
-        bridge_lines = [
+        # We no longer require a six-line delta bridge. If the section starts with one,
+        # force conversion into flowing prose so the memo reads naturally.
+        delta_bullets = [
             ln
-            for ln in bridge_window
-            if ("→" in ln and "(Δ" in ln and ln.lstrip().startswith(("-", "•", "·")))
+            for ln in opening_window
+            if ln.lstrip().startswith(("-", "•", "·")) and ("Δ" in ln or "→" in ln)
         ]
-
-        if not (6 <= len(bridge_lines) <= 8):
+        if len(delta_bullets) >= 5:
             return (
-                "Missing the required Q/Q (or Y/Y) delta bridge at the top of Financial Performance. "
-                "Add exactly 6 short lines (no more than 8) using the pattern: "
-                "Metric: prior → current (Δ ... ) — why changed — why it matters. "
-                "Use the 'Q/Q DELTA BRIDGE NUMBERS' reference block if present; do not invent prior-period values."
+                "Financial Performance should open with flowing prose (revenue, margins, cash conversion), "
+                "not a mandatory delta-bridge checklist. Convert deltas into narrative comparisons."
             )
 
-        lowered_bridge = " ".join(bridge_lines).lower()
-        required_terms = (
-            "revenue",
-            "operating margin",
-            "operating cash",
-            "capex",
-            "free cash",
+        normalized = " ".join(perf_body.lower().split())
+        has_period_compare = bool(
+            re.search(
+                r"\b(compared with|compared to|versus|vs\.?|prior quarter|prior year|qoq|yo y|yoy|sequentially|from .* to)\b",
+                normalized,
+                re.IGNORECASE,
+            )
         )
-        if not all(term in lowered_bridge for term in required_terms):
+        if not has_period_compare:
             return (
-                "Delta bridge is missing required lines. Include: Revenue, Operating margin, Operating cash flow, Capex, Free cash flow, "
-                "and one balance-sheet liquidity line (Cash+securities or Cash)."
+                "Financial Performance is missing an explicit period-over-period comparison. "
+                "State what changed versus the prior comparable period and why."
             )
 
-        # Validate math + consistency for the bridge lines.
-        money_pattern = re.compile(
-            r"\$(?P<sign>[+\-])?(?P<num>\d+(?:\.\d+)?)(?P<unit>[BM])"
+        has_revenue = "revenue" in normalized
+        has_margin = "operating margin" in normalized or "net margin" in normalized
+        has_cash = (
+            "operating cash flow" in normalized
+            or "free cash flow" in normalized
+            or "cash conversion" in normalized
+            or "ocf" in normalized
+            or "fcf" in normalized
         )
-        percent_pattern = re.compile(r"(?P<num>[+\-]?\d+(?:\.\d+)?)%")
-        pp_pattern = re.compile(r"(?P<num>[+\-]?\d+(?:\.\d+)?)pp")
-
-        def _money_to_billions(token: str) -> Optional[float]:
-            match = money_pattern.search(token)
-            if not match:
-                return None
-            sign = -1.0 if match.group("sign") == "-" else 1.0
-            try:
-                value = float(match.group("num")) * sign
-            except Exception:
-                return None
-            unit = match.group("unit")
-            if unit == "B":
-                return value
-            if unit == "M":
-                return value / 1000.0
-            return None
-
-        for line in bridge_lines:
-            head = line.split("—", 1)[0].strip()
-
-            if "operating margin" in head.lower():
-                percents = percent_pattern.findall(head)
-                pp_match = pp_pattern.search(head)
-                if len(percents) < 2 or not pp_match:
-                    return (
-                        "Delta bridge formatting error for Operating margin. Use: "
-                        "Operating margin: prior% → current% (Δ +X.Xpp) — why changed — why it matters."
-                    )
-                prev = float(percents[0])
-                cur = float(percents[1])
-                delta_pp = float(pp_match.group("num"))
-                if abs((cur - prev) - delta_pp) > 0.2:
-                    return "Delta bridge math error for Operating margin. Ensure the pp delta matches prior → current."
-                continue
-
-            monies = money_pattern.findall(head)
-            if len(monies) < 3:
-                return (
-                    "Delta bridge formatting error for money metrics. Use: "
-                    "Metric: $prior → $current (Δ $delta, +X.X%) — why changed — why it matters."
-                )
-            tokens = money_pattern.finditer(head)
-            amounts = [_money_to_billions(m.group(0)) for m in tokens]
-            if len(amounts) < 3 or any(v is None for v in amounts[:3]):
-                return "Delta bridge parsing error. Use $X.XXB or $X.XXM consistently for prior, current, and delta."
-            prev_b, cur_b, delta_b = amounts[0], amounts[1], amounts[2]
-            if abs((cur_b - prev_b) - delta_b) > 0.03:
-                return "Delta bridge math error. Ensure delta equals current minus prior (prior → current) for each line."
-            pct_match = percent_pattern.search(head)
-            if pct_match:
-                pct = float(pct_match.group("num"))
-                if prev_b != 0:
-                    expected = (delta_b / abs(prev_b)) * 100
-                    if abs(expected - pct) > 0.6:
-                        return "Delta bridge percent error. Ensure the percent change matches delta divided by prior."
-
-            # Catch obvious language contradictions (e.g., negative delta described as growth to X).
-            contradiction_phrases = (
-                "growth to",
-                "grew to",
-                "increased to",
-                "up to",
-                "rose to",
-                "expanded to",
-            )
-            if delta_b < 0 and any(p in line.lower() for p in contradiction_phrases):
-                return (
-                    "Delta bridge language contradiction: negative delta described as growth/increase. "
-                    "Rewrite the driver sentence to match the direction (down/decline) without changing numbers."
-                )
+        if not (has_revenue and has_margin and has_cash):
+            return "Financial Performance must cover revenue, margin interpretation, and cash conversion (OCF→FCF) in prose."
 
         return None
 
@@ -7080,8 +11832,275 @@ def _make_closing_recommendation_validator(
     return _validator
 
 
+def _make_section_transition_validator(
+    *, include_health_rating: bool, target_length: Optional[int] = None
+) -> Callable[[str], Optional[str]]:
+    """Require explicit handoffs between major sections for narrative flow."""
+
+    transition_rules: List[Tuple[str, str, Tuple[str, ...]]] = [
+        (
+            "Executive Summary",
+            "Financial Performance",
+            (
+                r"financial performance",
+                r"numbers",
+                r"cash bridge",
+                r"margin",
+            ),
+        ),
+        (
+            "Financial Performance",
+            "Management Discussion & Analysis",
+            (
+                r"md&a",
+                r"management discussion",
+                r"capital allocation",
+                r"management",
+            ),
+        ),
+        (
+            "Management Discussion & Analysis",
+            "Risk Factors",
+            (
+                r"risk factors",
+                r"downside",
+                r"risk",
+                r"stress[- ]?test",
+            ),
+        ),
+        (
+            "Risk Factors",
+            "Key Metrics",
+            (
+                r"key metrics",
+                r"scoreboard",
+                r"metrics below",
+            ),
+        ),
+    ]
+    if include_health_rating:
+        transition_rules.insert(
+            0,
+            (
+                "Financial Health Rating",
+                "Executive Summary",
+                (
+                    r"executive summary",
+                    r"thesis",
+                    r"sets? up",
+                    r"frames the thesis",
+                ),
+            ),
+        )
+
+    def _validator(text: str) -> Optional[str]:
+        for source, target, hints in transition_rules:
+            body = _extract_markdown_section_body(text, source)
+            if not body:
+                continue
+
+            if target_length and target_length <= 350 and _count_words(body) < 35:
+                # Very short memos have limited space; keep this validator flexible.
+                continue
+
+            if any(re.search(hint, body, re.IGNORECASE) for hint in hints):
+                continue
+
+            return (
+                f"{source} should include an explicit bridge into {target} "
+                "so the memo reads as one coherent narrative."
+            )
+        return None
+
+    return _validator
+
+
+def _make_closing_structure_validator() -> Callable[[str], Optional[str]]:
+    """Enforce a decisive closing with one stance and measurable trigger(s)."""
+
+    stance_re = re.compile(r"\b(buy|hold|sell|neutral)\b", re.IGNORECASE)
+    time_window_re = re.compile(
+        r"\b(?:over|for|in)\s+the\s+next\s+[a-z0-9\-\s]+?\b(?=[,.;]|$)",
+        re.IGNORECASE,
+    )
+    measurable_re = re.compile(
+        r"(\$?\d+(?:\.\d+)?\s*(?:%|x|pp|b|m|bn|mm)?|\babove\b|\bbelow\b|\bat least\b|\bless than\b|\bmore than\b)",
+        re.IGNORECASE,
+    )
+    timeframe_re = re.compile(
+        r"\b(next|quarter|quarters|month|months|year|years|period|periods|q[1-4]|fy\d{2})\b",
+        re.IGNORECASE,
+    )
+    upgrade_re = re.compile(
+        r"\b(upgrade|upside|more constructive|buy)\b", re.IGNORECASE
+    )
+    downgrade_re = re.compile(
+        r"\b(downgrade|downside|more defensive|sell)\b", re.IGNORECASE
+    )
+    must_hold_re = re.compile(
+        r"\b(while|so long as|as long as|holds?|remains?|stays?|upgrade|upside|buy)\b",
+        re.IGNORECASE,
+    )
+    break_re = re.compile(
+        r"\b(breaks?|falls?|below|compress(?:es|ion)?|deteriorat(?:e|es|ion)|weakens?|downgrade|sell|downside)\b",
+        re.IGNORECASE,
+    )
+    parenthetical_filler_re = re.compile(
+        r"\((?:on a forward basis|from a portfolio perspective|as things stand|in this environment|at this stage)\)",
+        re.IGNORECASE,
+    )
+    legacy_parenthetical_filler_re = re.compile(
+        r"\((?:key swing factor|primary swing factor|near term factors|in practical terms|fundamental catalyst|structural driver|"
+        r"operating backdrop|valuation context|execution priority|capital intensity backdrop|on a forward basis|relative to the cycle|"
+        r"across the enterprise|from a risk standpoint|on a relative basis|under current conditions|given the trajectory|within this framework)\)",
+        re.IGNORECASE,
+    )
+
+    def _validator(text: str) -> Optional[str]:
+        closing_body = _extract_markdown_section_body(text, "Closing Takeaway")
+        if not closing_body:
+            return None
+
+        if parenthetical_filler_re.search(
+            closing_body
+        ) or legacy_parenthetical_filler_re.search(closing_body):
+            return (
+                "Closing Takeaway contains parenthetical buzzword filler. "
+                "Remove parenthetical buzzwords and keep direct investor prose."
+            )
+        parenthetical_chunks = re.findall(r"\(([^)\n]{1,60})\)", closing_body)
+        # Hard cap: more than 3 parenthetical fragments total is always a smell
+        if len(parenthetical_chunks) > 3:
+            return (
+                "Closing Takeaway has too many parenthetical asides "
+                f"({len(parenthetical_chunks)} found). Remove them and write clean prose."
+            )
+        low_signal_parentheticals = 0
+        for chunk in parenthetical_chunks:
+            chunk_norm = " ".join((chunk or "").lower().split())
+            if not chunk_norm:
+                continue
+            if re.search(
+                r"\d|%|\$|buy|hold|sell|if|unless|q[1-4]|fy\d{2}",
+                chunk_norm,
+                re.IGNORECASE,
+            ):
+                continue
+            if len(chunk_norm.split()) <= 5:
+                low_signal_parentheticals += 1
+        if low_signal_parentheticals >= 2:
+            return (
+                "Closing Takeaway contains low-signal parenthetical fragments. "
+                "Rewrite as clean prose without parenthetical filler."
+            )
+
+        sentences = [
+            s.strip()
+            for s in re.split(r"(?<=[.!?])\s+", closing_body.strip())
+            if s.strip()
+        ]
+        closing_shape = get_closing_takeaway_shape(_count_words(closing_body))
+        max_allowed_sentences = max(6, int(closing_shape.max_sentences))
+        if len(sentences) > max_allowed_sentences:
+            return (
+                f"Closing Takeaway has {len(sentences)} sentences. "
+                f"Use at most {max_allowed_sentences} sentences and preserve the verdict / must-stay-true / breaks-thesis structure."
+            )
+
+        trigger_sentences: List[Tuple[int, str]] = []
+        for idx, sentence in enumerate(sentences):
+            lowered = sentence.lower()
+            if not re.search(r"\b(if|unless|would|trigger|flip|change)\b", lowered):
+                continue
+            if not measurable_re.search(sentence):
+                continue
+            if not timeframe_re.search(sentence):
+                continue
+            trigger_sentences.append((idx, sentence))
+
+        trigger_indexes = {idx for idx, _ in trigger_sentences}
+        stance_tokens: List[str] = []
+        for idx, sentence in enumerate(sentences):
+            if idx in trigger_indexes:
+                continue
+            for match in stance_re.finditer(sentence):
+                token = (match.group(1) or "").lower()
+                if token:
+                    stance_tokens.append(token)
+
+        normalized_stances = {
+            "hold" if token == "neutral" else token for token in stance_tokens
+        }
+        if len(normalized_stances) == 0:
+            return (
+                "Closing Takeaway must state exactly one explicit stance (BUY, HOLD, or SELL). "
+                "Add one clear recommendation sentence."
+            )
+        if len(normalized_stances) > 1:
+            labels = ", ".join(sorted(token.upper() for token in normalized_stances))
+            return (
+                f"Closing Takeaway contains conflicting stances ({labels}). "
+                "Use exactly one explicit recommendation."
+            )
+
+        trigger_sentence_text = [sentence for _idx, sentence in trigger_sentences]
+        if len(trigger_sentence_text) < 1:
+            return (
+                "Closing Takeaway must include at least one measurable monitoring trigger "
+                "that clearly states what would change the view."
+            )
+
+        has_must_hold = any(must_hold_re.search(s) for s in trigger_sentence_text)
+        if not has_must_hold:
+            return (
+                "Closing Takeaway is missing the 'what must stay true' condition. "
+                "Add one measurable trigger describing what needs to hold to keep the thesis intact."
+            )
+
+        has_break = any(break_re.search(s) for s in trigger_sentence_text)
+        if not has_break:
+            return (
+                "Closing Takeaway is missing the 'what breaks the thesis' condition. "
+                "Add one measurable downside trigger with a clear threshold and timeframe."
+            )
+
+        has_directional_trigger = any(
+            upgrade_re.search(s) or downgrade_re.search(s)
+            for s in trigger_sentence_text
+        )
+        if not has_directional_trigger:
+            return (
+                "Closing Takeaway trigger(s) must be directional (upgrade or downgrade) "
+                "and measurable over a timeframe."
+            )
+
+        window_phrases = []
+        for sentence in trigger_sentence_text:
+            match = time_window_re.search(sentence)
+            if match:
+                window_phrases.append(" ".join(match.group(0).lower().split()))
+        if len(window_phrases) >= 2 and len(set(window_phrases)) == 1:
+            return (
+                "Closing Takeaway repeats the same monitoring-window phrase across triggers. "
+                "Use distinct windows to improve decisiveness."
+            )
+
+        return None
+
+    return _validator
+
+
 def _make_stance_consistency_validator() -> Callable[[str], Optional[str]]:
-    """Ensure the memo uses a single Buy/Hold/Sell stance consistently."""
+    """Ensure the memo uses a single Buy/Hold/Sell stance consistently.
+
+    Catches two problems:
+    1. Intra-section oscillation — the Closing Takeaway itself contains
+       multiple conflicting stance words (e.g. "neutral" + "buy" + "hold").
+    2. Cross-section inconsistency — other sections contradict the Closing
+       Takeaway's stance.
+    """
+
+    _stance_re = re.compile(r"\b(buy|hold|sell|neutral)\b", re.IGNORECASE)
 
     def _last_stance(text: str) -> Optional[str]:
         matches = list(re.finditer(r"\b(buy|hold|sell)\b", text or "", re.IGNORECASE))
@@ -7094,10 +12113,27 @@ def _make_stance_consistency_validator() -> Callable[[str], Optional[str]]:
         if not closing_body:
             return None
 
+        # --- Check 1: intra-Closing-Takeaway stance oscillation ---
+        stance_matches = list(_stance_re.finditer(closing_body))
+        if stance_matches:
+            distinct_stances = {m.group(1).lower() for m in stance_matches}
+            # "neutral" and "hold" are close enough — treat as equivalent
+            normalized = set()
+            for s in distinct_stances:
+                normalized.add("hold" if s == "neutral" else s)
+            if len(normalized) > 1:
+                labels = ", ".join(sorted(s.upper() for s in distinct_stances))
+                return (
+                    f"Closing Takeaway contains conflicting stances ({labels}). "
+                    "The section must commit to ONE clear recommendation — pick a single stance "
+                    "and remove all contradictory stance words."
+                )
+
         closing_stance = _last_stance(closing_body)
         if not closing_stance:
             return None
 
+        # --- Check 2: cross-section consistency ---
         # Scan all non-closing sections for stance words; they must either be absent
         # or match the Closing Takeaway stance.
         pattern = re.compile(r"^\s*##\s*(.+)\s*$", re.MULTILINE)
@@ -7122,6 +12158,2601 @@ def _make_stance_consistency_validator() -> Callable[[str], Optional[str]]:
         return None
 
     return _validator
+
+
+def _first_quality_validator_issue(
+    text: str, validators: Optional[List[Callable[[str], Optional[str]]]]
+) -> Tuple[Optional[str], Optional[str]]:
+    if not validators:
+        return None, None
+    for validator in validators:
+        issue = validator(text)
+        if not issue:
+            continue
+        validator_name = getattr(validator, "__name__", None) or getattr(
+            validator, "__qualname__", repr(validator)
+        )
+        return issue, str(validator_name)
+    return None, None
+
+
+def _build_post_final_quality_validators(
+    *,
+    include_health_rating: bool,
+    target_length: Optional[int],
+    profile: SummaryFlowQualityProfile,
+    v2_enabled: bool,
+    persona_requested: bool,
+    company_name: str,
+    source_text: Optional[str] = None,
+    require_quotes: bool = False,
+) -> List[Callable[[str], Optional[str]]]:
+    validators: List[Callable[[str], Optional[str]]] = [
+        _make_section_transition_validator(
+            include_health_rating=include_health_rating, target_length=target_length
+        ),
+        _make_sentence_stem_repetition_validator(
+            max_same_opening=profile.max_same_opening
+        ),
+        _make_cross_section_question_framing_validator(),
+        _make_cross_section_number_repetition_validator(
+            max_sections_per_figure=profile.max_sections_per_repeated_number
+        ),
+        _make_cross_section_theme_repetition_validator(
+            max_sections_per_theme=profile.max_sections_per_theme
+        ),
+        _make_numbers_discipline_validator(
+            target_length,
+            closing_numeric_cap_override=profile.closing_numeric_anchor_cap,
+        ),
+        _make_closing_recommendation_validator(
+            persona_requested=persona_requested,
+            company_name=company_name,
+        ),
+        _make_closing_structure_validator(),
+    ]
+    if _is_short_quality_sensitive_target(target_length):
+        validators.insert(1, _make_verbatim_repetition_validator())
+        validators.insert(2, _make_phrase_limits_validator())
+        validators.insert(3, _make_instruction_leak_validator())
+        validators.insert(7, _make_generic_filler_validator())
+    if source_text:
+        validators.append(
+            _make_quote_grounding_validator(
+                source_text=source_text,
+                require_quotes=require_quotes,
+                min_required_quotes=_summary_min_verified_quotes(),
+                max_allowed_quotes=_summary_max_verified_quotes(),
+            )
+        )
+    if v2_enabled and target_length:
+        validators.append(
+            _make_section_balance_validator(
+                include_health_rating=include_health_rating,
+                target_length=int(target_length),
+            )
+        )
+    return validators
+
+
+def _count_direct_quotes_in_section(summary_text: str, section_title: str) -> int:
+    body = _extract_markdown_section_body(summary_text, section_title) or ""
+    if not body:
+        return 0
+    return len(re.findall(r"[“\"]([^“”\"\n]{8,260})[”\"]", body))
+
+
+def _apply_short_form_structural_seal(
+    summary_text: str,
+    *,
+    include_health_rating: bool,
+    metrics_lines: str,
+    calculated_metrics: Dict[str, Any],
+    company_name: str,
+    risk_factors_excerpt: Optional[str] = None,
+    health_score_data: Optional[Dict[str, Any]] = None,
+    health_rating_config: Optional[Dict[str, Any]] = None,
+    persona_name: Optional[str] = None,
+    persona_requested: bool = False,
+    target_length: Optional[int] = None,
+) -> str:
+    text = (summary_text or "").strip()
+    if not text:
+        return summary_text
+
+    text = _merge_duplicate_canonical_sections(
+        text, include_health_rating=include_health_rating
+    )
+    text = _ensure_required_sections(
+        text,
+        include_health_rating=include_health_rating,
+        metrics_lines=metrics_lines,
+        calculated_metrics=calculated_metrics,
+        health_score_data=health_score_data,
+        company_name=company_name,
+        risk_factors_excerpt=risk_factors_excerpt,
+        health_rating_config=health_rating_config,
+        persona_name=persona_name,
+        persona_requested=persona_requested,
+        target_length=target_length,
+    )
+    if (metrics_lines or "").strip():
+        text = _canonicalize_key_metrics_section(text, metrics_lines)
+    text = _cleanup_sentence_artifacts(text)
+    text = _validate_complete_sentences(text)
+    text = _dedupe_consecutive_sentences(text)
+    text = _dedupe_repeated_paragraphs(text)
+    text = _repair_closing_recommendation_in_summary(
+        text,
+        company_name=company_name,
+        calculated_metrics=calculated_metrics,
+        persona_requested=bool(persona_requested or persona_name),
+    )
+    text = _merge_duplicate_canonical_sections(
+        text, include_health_rating=include_health_rating
+    )
+    return text
+
+
+def _evaluate_summary_contract_requirements(
+    *,
+    summary_text: str,
+    target_length: Optional[int],
+    include_health_rating: bool,
+    quality_validators: Optional[List[Callable[[str], Optional[str]]]],
+    source_text: Optional[str],
+    filing_language_snippets: str,
+    enforce_quote_contract: bool,
+) -> Tuple[List[str], Dict[str, Any]]:
+    text = (summary_text or "").strip()
+    missing_requirements: List[str] = []
+    quality_checks_passed: List[str] = []
+    quality_issues: List[str] = []
+    micro_plaintext_mode = _is_micro_plaintext_target(target_length)
+
+    final_word_count = _count_words(text)
+    final_split_count = len(text.split())
+    if target_length:
+        target = int(target_length)
+        tol = _effective_word_band_tolerance(target_length)
+        lower = max(TARGET_LENGTH_MIN_WORDS, target - tol)
+        upper = min(TARGET_LENGTH_MAX_WORDS, target + tol)
+        # Use the canonical stripped count as the single source of truth.
+        # The split count is tracked for diagnostics but does NOT gate the
+        # contract — punctuation-heavy financial text (→, $, %, —) creates a
+        # natural 15-30 word divergence between split() and _count_words(),
+        # making a dual-counter AND gate effectively impossible to satisfy.
+        if not (lower <= final_word_count <= upper):
+            missing_requirements.append(
+                f"Final word-count band violation: expected {lower}-{upper}, got split={final_split_count}, stripped={final_word_count}."
+            )
+
+    if not micro_plaintext_mode:
+        # Always run section-completeness for sectioned memo outputs.
+        completeness_issue = _make_section_completeness_validator(
+            include_health_rating=include_health_rating, target_length=target_length
+        )(text)
+        if completeness_issue:
+            missing_requirements.append(completeness_issue)
+
+    for validator in quality_validators or []:
+        validator_name = getattr(validator, "__name__", None) or getattr(
+            validator, "__qualname__", repr(validator)
+        )
+        issue = validator(text)
+        if issue:
+            quality_issues.append(f"{validator_name}: {issue}")
+        else:
+            quality_checks_passed.append(str(validator_name))
+
+    exec_quotes = 0
+    mdna_quotes = 0
+    quote_count_total = 0
+    key_metrics_numeric_rows = 0
+    if not micro_plaintext_mode:
+        exec_quotes = _count_direct_quotes_in_section(text, "Executive Summary")
+        mdna_quotes = _count_direct_quotes_in_section(
+            text, "Management Discussion & Analysis"
+        )
+        quote_count_total = exec_quotes + mdna_quotes
+
+        key_metrics_body = _extract_markdown_section_body(text, "Key Metrics") or ""
+        key_metrics_issue, key_metrics_numeric_rows = _validate_key_metrics_numeric_block(
+            key_metrics_body,
+            min_rows=5,
+            require_markers=True,
+        )
+        if key_metrics_issue:
+            missing_requirements.append(key_metrics_issue)
+
+        if enforce_quote_contract:
+            if not (filing_language_snippets or "").strip():
+                missing_requirements.append(
+                    "Insufficient filing-language evidence for quote contract. Re-ingest filing text with richer narrative context."
+                )
+            else:
+                # Scale quote requirements with target length to avoid
+                # consuming excessive word budget on short summaries.
+                _effective_target = int(target_length) if target_length else 0
+                if _effective_target < 400:
+                    _scaled_min_quotes = 1
+                elif _effective_target < 800:
+                    _scaled_min_quotes = 2
+                else:
+                    _scaled_min_quotes = max(3, _summary_min_verified_quotes())
+                quote_issue = _make_quote_grounding_validator(
+                    source_text=source_text,
+                    require_quotes=True,
+                    min_required_quotes=_scaled_min_quotes,
+                    max_allowed_quotes=_summary_max_verified_quotes(),
+                )(text)
+                if quote_issue:
+                    missing_requirements.append(quote_issue)
+                if _scaled_min_quotes >= 2 and exec_quotes < 1:
+                    missing_requirements.append(
+                        "Executive Summary must include at least one verified direct quote."
+                    )
+                if _scaled_min_quotes >= 2 and mdna_quotes < 1:
+                    missing_requirements.append(
+                        "Management Discussion & Analysis must include at least one verified direct quote."
+                    )
+
+    if quality_issues:
+        missing_requirements.extend(quality_issues)
+
+    # De-duplicate while preserving order.
+    deduped_missing: List[str] = []
+    seen_missing: Set[str] = set()
+    for item in missing_requirements:
+        key = " ".join((item or "").split()).strip().lower()
+        if not key or key in seen_missing:
+            continue
+        seen_missing.add(key)
+        deduped_missing.append(item)
+
+    meta: Dict[str, Any] = {
+        "target_length": int(target_length) if target_length else None,
+        "final_word_count": final_word_count,
+        "final_split_word_count": final_split_count,
+        "verified_quote_count": quote_count_total,
+        "key_metrics_numeric_row_count": int(key_metrics_numeric_rows),
+        "quality_checks_passed": quality_checks_passed,
+        "quality_issues": quality_issues,
+    }
+    return deduped_missing, meta
+
+
+def _collect_section_body_word_counts(
+    summary_text: str, *, include_health_rating: bool
+) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    titles = [
+        "Financial Health Rating",
+        "Executive Summary",
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Risk Factors",
+        "Key Metrics",
+        "Closing Takeaway",
+    ]
+    if not include_health_rating:
+        titles = [title for title in titles if title != "Financial Health Rating"]
+    for title in titles:
+        body = _extract_markdown_section_body(summary_text or "", title) or ""
+        counts[title] = len(re.findall(r"\b\w+\b", body))
+    return counts
+
+
+def _parse_summary_contract_missing_requirements(
+    missing_requirements: Optional[List[str]],
+) -> Dict[str, Any]:
+    flags: Dict[str, Any] = {
+        "word_band_issue": False,
+        "quote_distribution_issue": False,
+        "quote_grounding_issue": False,
+        "quote_evidence_gap": False,
+        "quote_issue": False,
+        "bridge_issue": False,
+        "closing_trigger_issue": False,
+        "section_balance_issue": False,
+        "key_metrics_issue": False,
+        "section_balance_underweight_titles": [],
+        "section_balance_overweight_titles": [],
+        "number_repetition_issue": False,
+        "theme_repetition_issue": False,
+        "question_framing_repetition_issue": False,
+        "leading_word_repetition_issue": False,
+        "leading_word_repetition_sections": [],
+        "numbers_discipline_issue": False,
+        "numbers_discipline_sections": [],
+        "closing_parenthetical_issue": False,
+        "editorial_quality_issue": False,
+        "needs_editorial_deterministic_repair": False,
+        "needs_deterministic_repair": False,
+    }
+    section_balance_re = re.compile(
+        r"section balance issue:\s*'([^']+)'\s+is\s+(underweight|overweight)",
+        re.IGNORECASE,
+    )
+    numbers_discipline_section_re = re.compile(
+        r"numbers discipline:\s*([^:]+?)\s+is\s+too\s+numeric",
+        re.IGNORECASE,
+    )
+    leading_word_repetition_re = re.compile(
+        r"leading-word repetition in\s+([^:]+?)\s*:",
+        re.IGNORECASE,
+    )
+    for item in missing_requirements or []:
+        raw = str(item or "")
+        normalized = " ".join(raw.split()).strip().lower()
+        if not normalized:
+            continue
+        if "word-count band violation" in normalized:
+            flags["word_band_issue"] = True
+        if "verified direct quote" in normalized or (
+            "verified short direct quote" in normalized
+            and "executive summary/md&a" in normalized
+        ):
+            flags["quote_distribution_issue"] = True
+        if "quoted phrase is not grounded in filing text" in normalized:
+            flags["quote_grounding_issue"] = True
+        if "insufficient filing-language evidence for quote contract" in normalized:
+            flags["quote_evidence_gap"] = True
+        if "explicit bridge into" in normalized:
+            flags["bridge_issue"] = True
+        if "closing takeaway" in normalized and (
+            "trigger" in normalized
+            or "what must stay true" in normalized
+            or "what breaks the thesis" in normalized
+        ):
+            flags["closing_trigger_issue"] = True
+        if "key metrics" in normalized or "data_grid" in normalized:
+            flags["key_metrics_issue"] = True
+        if "section balance issue:" in normalized:
+            flags["section_balance_issue"] = True
+            match = section_balance_re.search(raw)
+            if match:
+                title = str(match.group(1) or "").strip()
+                direction = str(match.group(2) or "").strip().lower()
+                key = (
+                    "section_balance_underweight_titles"
+                    if direction == "underweight"
+                    else "section_balance_overweight_titles"
+                )
+                existing = set(flags.get(key) or [])
+                if title and title not in existing:
+                    flags[key].append(title)
+        if "number repetition across sections:" in normalized:
+            flags["number_repetition_issue"] = True
+        if "theme over-repetition:" in normalized:
+            flags["theme_repetition_issue"] = True
+        if "question-framing repetition:" in normalized:
+            flags["question_framing_repetition_issue"] = True
+        if "leading-word repetition in" in normalized:
+            flags["leading_word_repetition_issue"] = True
+            lwr_match = leading_word_repetition_re.search(raw)
+            if lwr_match:
+                section_title = " ".join(str(lwr_match.group(1) or "").split()).strip()
+                if section_title:
+                    existing_sections = set(
+                        flags.get("leading_word_repetition_sections") or []
+                    )
+                    if section_title not in existing_sections:
+                        flags["leading_word_repetition_sections"].append(section_title)
+        if "numbers discipline:" in normalized:
+            flags["numbers_discipline_issue"] = True
+            numbers_match = numbers_discipline_section_re.search(raw)
+            if numbers_match:
+                section_title = " ".join(str(numbers_match.group(1) or "").split()).strip()
+                if section_title:
+                    existing_sections = set(flags.get("numbers_discipline_sections") or [])
+                    if section_title not in existing_sections:
+                        flags["numbers_discipline_sections"].append(section_title)
+        if "closing takeaway" in normalized and "parenthetical" in normalized:
+            flags["closing_parenthetical_issue"] = True
+    flags["quote_issue"] = bool(
+        flags["quote_distribution_issue"]
+        or flags["quote_grounding_issue"]
+        or flags["quote_evidence_gap"]
+    )
+    flags["editorial_quality_issue"] = bool(
+        flags["number_repetition_issue"]
+        or flags["theme_repetition_issue"]
+        or flags["question_framing_repetition_issue"]
+        or flags["leading_word_repetition_issue"]
+        or flags["numbers_discipline_issue"]
+        or flags["closing_parenthetical_issue"]
+        or flags["section_balance_issue"]
+    )
+    flags["needs_editorial_deterministic_repair"] = bool(
+        flags["number_repetition_issue"]
+        or flags["theme_repetition_issue"]
+        or flags["question_framing_repetition_issue"]
+        or flags["leading_word_repetition_issue"]
+        or flags["numbers_discipline_issue"]
+        or flags["closing_parenthetical_issue"]
+    )
+    flags["needs_deterministic_repair"] = bool(
+        flags["quote_distribution_issue"]
+        or flags["bridge_issue"]
+        or flags["closing_trigger_issue"]
+        or flags["key_metrics_issue"]
+    )
+    return flags
+
+
+def _select_short_form_structural_failure_requirements(
+    *,
+    summary_text: str,
+    missing_requirements: Optional[List[str]],
+    include_health_rating: bool,
+) -> List[str]:
+    """Select structural failures that must remain fatal for short sectioned memos."""
+    text = str(summary_text or "").strip()
+    items = [str(item) for item in (missing_requirements or []) if str(item or "").strip()]
+    if not text:
+        return items
+
+    required_titles = [
+        title
+        for title, _minimum in SUMMARY_SECTION_REQUIREMENTS
+        if include_health_rating or title != "Financial Health Rating"
+    ]
+    allowed_titles = set(required_titles)
+    heading_re = re.compile(r"^\s*##\s+(.+?)\s*$", re.MULTILINE)
+    existing_by_norm = {
+        " ".join(item.split()).strip().lower(): item for item in items
+    }
+    fatal: List[str] = []
+    seen_norms: Set[str] = set()
+
+    def _append(requirement: str) -> None:
+        normalized = " ".join(str(requirement or "").split()).strip().lower()
+        if not normalized or normalized in seen_norms:
+            return
+        seen_norms.add(normalized)
+        fatal.append(requirement)
+
+    def _append_matching(default_requirement: str, *snippets: str) -> None:
+        snippet_norms = [
+            " ".join(str(snippet or "").split()).strip().lower()
+            for snippet in snippets
+            if str(snippet or "").strip()
+        ]
+        for normalized, original in existing_by_norm.items():
+            if any(snippet in normalized for snippet in snippet_norms):
+                _append(original)
+                return
+        _append(default_requirement)
+
+    seen_titles: Set[str] = set()
+    for match in heading_re.finditer(text):
+        raw_heading = (match.group(1) or "").strip()
+        canon = _standard_section_name_from_heading(f"## {raw_heading}")
+        if canon in seen_titles and canon in allowed_titles:
+            _append_matching(
+                (
+                    f"Duplicate section heading detected: '## {raw_heading}'. "
+                    "Each required section may appear only once. Merge duplicate content into a single canonical section."
+                ),
+                "duplicate section heading detected",
+            )
+        seen_titles.add(canon)
+        if canon not in allowed_titles:
+            _append_matching(
+                (
+                    f"Extra section heading detected: '## {raw_heading}'. "
+                    "Only use the required canonical memo headings."
+                ),
+                "extra section heading detected",
+            )
+
+    for title in required_titles:
+        body = _extract_markdown_section_body(text, title)
+        if body is not None and body.strip():
+            continue
+        _append_matching(
+            f"Missing the heading '## {title}'. Use that exact markdown heading (no prefixes) and include substantive content beneath it.",
+            f"missing the heading '## {title.lower()}",
+            f"the '{title.lower()}' section is too brief",
+        )
+
+    key_metrics_body = _extract_markdown_section_body(text, "Key Metrics") or ""
+    key_metrics_issue, key_metrics_numeric_rows = _validate_key_metrics_numeric_block(
+        key_metrics_body,
+        min_rows=5,
+        require_markers=True,
+    )
+    if key_metrics_issue:
+        if key_metrics_numeric_rows < 5:
+            _append_matching(
+                key_metrics_issue,
+                "key metrics must include at least 5 numeric rows",
+            )
+        else:
+            _append_matching(
+                key_metrics_issue,
+                "key metrics must be numeric data_grid rows only",
+                "data_grid",
+            )
+
+    closing_body = _extract_markdown_section_body(text, "Closing Takeaway") or ""
+    if closing_body and not re.search(r"\b(buy|hold|sell)\b", closing_body, re.IGNORECASE):
+        _append_matching(
+            "Closing Takeaway is missing an explicit Buy/Hold/Sell recommendation.",
+            "closing takeaway is missing an explicit buy/hold/sell recommendation",
+        )
+
+    for _snippet in (
+        "question-framing repetition:",
+        "verbatim repetition detected",
+    ):
+        for normalized, original in existing_by_norm.items():
+            if _snippet in normalized:
+                _append(original)
+                break
+
+    if _summary_has_incomplete_tail(text):
+        _append_matching(
+            "Final summary still ends mid-thought after cleanup. Finish the closing sentence cleanly.",
+            "the 'closing takeaway' section is too brief",
+            "final summary still ends mid-thought",
+        )
+
+    return fatal
+
+
+def _select_short_form_editorial_failure_requirements(
+    *,
+    missing_requirements: Optional[List[str]],
+) -> List[str]:
+    """Keep short summaries clean by failing unresolved editorial slop after repair."""
+    items = [str(item) for item in (missing_requirements or []) if str(item or "").strip()]
+    if not items:
+        return []
+
+    fatal_snippets = (
+        "verbatim repetition detected",
+        "question-framing repetition",
+        "theme over-repetition",
+        "number repetition across sections",
+        "leading-word repetition",
+        "section is too brief",
+        "generic filler detected",
+        "excessive generic filler",
+        "instruction leak detected",
+        "forbidden phrase detected",
+        "over-repetition detected",
+        "repetition-by-structure detected",
+    )
+    fatal: List[str] = []
+    seen: Set[str] = set()
+    for item in items:
+        normalized = " ".join(item.split()).strip().lower()
+        if not normalized:
+            continue
+        if any(snippet in normalized for snippet in fatal_snippets):
+            if normalized not in seen:
+                seen.add(normalized)
+                fatal.append(item)
+    return fatal
+
+
+def _select_one_shot_contract_failure_requirements(
+    *,
+    missing_requirements: Optional[List[str]],
+    target_length: Optional[int],
+) -> List[str]:
+    """Scope one-shot hard-fail to the target-length contract only.
+
+    For micro plaintext summaries, the full exact-word/anti-slop validator is the
+    contract and every missing requirement remains fatal.
+
+    For sectioned long-form summaries, preserve one-shot behavior but only hard-fail
+    on length-band misses. Structural quote/key-metrics/section-balance checks are
+    still captured in diagnostics but should not block the request in one-shot mode.
+    """
+    items = [str(item) for item in (missing_requirements or []) if str(item or "").strip()]
+    if not items:
+        return []
+    if _is_micro_plaintext_target(target_length):
+        return items
+
+    fatal: List[str] = []
+    for item in items:
+        normalized = " ".join(item.split()).strip().lower()
+        if "word-count band violation" in normalized:
+            fatal.append(item)
+            continue
+        if "missing the heading '## " in normalized:
+            fatal.append(item)
+            continue
+        if "duplicate section heading detected" in normalized:
+            fatal.append(item)
+            continue
+        if "extra section heading detected" in normalized:
+            fatal.append(item)
+            continue
+        if (
+            "consecutive duplicate token" in normalized
+            or "repeated tail" in normalized
+            or "tail loop" in normalized
+            or "repeated ending" in normalized
+        ):
+            fatal.append(item)
+    return fatal
+
+
+def _summary_contract_scope_for_target(target_length: Optional[int]) -> str:
+    return "micro_exact" if _is_micro_plaintext_target(target_length) else "long_form_one_shot"
+
+
+def _summary_target_band_payload(target_length: Optional[int]) -> Optional[Dict[str, int]]:
+    if not target_length:
+        return None
+    target = int(target_length)
+    if _is_micro_plaintext_target(target):
+        return None
+    tol = _effective_word_band_tolerance(target)
+    return {
+        "lower": int(max(TARGET_LENGTH_MIN_WORDS, target - tol)),
+        "upper": int(min(TARGET_LENGTH_MAX_WORDS, target + tol)),
+    }
+
+
+def _record_summary_422_observability(
+    *,
+    filing_id: Any,
+    detail: Any,
+    summary_request_id: Optional[str] = None,
+    fallback_target_length: Optional[int] = None,
+) -> None:
+    """Persist progress error detail and emit structured logging for summary 422s."""
+    payload: Dict[str, Any]
+    if isinstance(detail, dict):
+        payload = dict(detail)
+    else:
+        payload = {"detail": str(detail)}
+
+    failure_code = str(payload.get("failure_code") or "SUMMARY_422").strip() or "SUMMARY_422"
+    target_length = payload.get("target_length", fallback_target_length)
+    try:
+        target_length_int = int(target_length) if target_length not in (None, "", 0, "0") else None
+    except (TypeError, ValueError):
+        target_length_int = None
+
+    actual_word_count = payload.get("actual_word_count")
+    try:
+        actual_word_count_int = (
+            int(actual_word_count)
+            if actual_word_count not in (None, "", "null")
+            else None
+        )
+    except (TypeError, ValueError):
+        actual_word_count_int = None
+
+    missing_requirements = (
+        payload.get("missing_requirements")
+        if isinstance(payload.get("missing_requirements"), list)
+        else None
+    )
+    diagnostic_missing_requirements = (
+        payload.get("diagnostic_missing_requirements")
+        if isinstance(payload.get("diagnostic_missing_requirements"), list)
+        else None
+    )
+
+    progress_message = str(payload.get("detail") or "Summary request failed.").strip()
+    try:
+        set_summary_progress(
+            str(filing_id),
+            status=progress_message[:160],
+            stage_percent=0,
+            error=True,
+            last_failure_code=failure_code,
+            last_error_message=progress_message,
+            last_error_details=payload,
+        )
+    except Exception as progress_exc:  # noqa: BLE001
+        logger.debug("Unable to persist summary progress error for %s: %s", filing_id, progress_exc)
+
+    logger.warning(
+        "Summary 422 failure: filing_id=%s request_id=%s failure_code=%s target_length=%s actual_word_count=%s revision=%s output_format=%s contract_scope=%s target_band=%s missing_requirements=%s diagnostic_missing_requirements=%s",
+        filing_id,
+        summary_request_id,
+        failure_code,
+        target_length_int,
+        actual_word_count_int,
+        str(os.getenv("K_REVISION") or "").strip() or None,
+        payload.get("output_format"),
+        payload.get("contract_scope"),
+        payload.get("target_band"),
+        missing_requirements[:8] if missing_requirements else None,
+        diagnostic_missing_requirements[:8] if diagnostic_missing_requirements else None,
+    )
+
+
+def _estimate_contract_quote_pool_size(
+    filing_language_snippets: str, *, target_quotes: int
+) -> int:
+    snippets = str(filing_language_snippets or "")
+    if not snippets.strip():
+        return 0
+
+    def _dedupe(values: List[str]) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        for item in values:
+            normalized = re.sub(r"\s+", " ", str(item or "").strip().lower()).strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            out.append(" ".join(str(item or "").split()).strip())
+        return out
+
+    quote_pool = _dedupe(_extract_quotes_from_filing_snippets(snippets))
+    if len(quote_pool) >= int(target_quotes):
+        return len(quote_pool)
+
+    management_patterns = [
+        r"(?:we|the company|management)\s+(?:believe|expect|anticipate|continue|remain|plan|intend)[^.]{10,120}\.",
+        r"(?:our|the)\s+(?:strategy|focus|priority|goal|objective)[^.]{10,120}\.",
+    ]
+    fallback_quotes: List[str] = []
+    for pattern in management_patterns:
+        for match in re.finditer(pattern, snippets, re.IGNORECASE):
+            candidate = str(match.group(0) or "").strip().rstrip(".")
+            if 10 <= len(candidate.split()) <= 30:
+                fallback_quotes.append(candidate)
+        if len(quote_pool) + len(fallback_quotes) >= int(target_quotes):
+            break
+    quote_pool = _dedupe(quote_pool + fallback_quotes)
+    return len(quote_pool)
+
+
+def _build_precision_section_balance_guidance(
+    *,
+    summary_text: str,
+    target_length: Optional[int],
+    include_health_rating: bool,
+    missing_requirements: Optional[List[str]],
+) -> str:
+    if not target_length:
+        return ""
+    issue_flags = _parse_summary_contract_missing_requirements(missing_requirements)
+    if not issue_flags.get("section_balance_issue"):
+        return ""
+
+    budgets = _calculate_section_word_budgets(
+        int(target_length), include_health_rating=include_health_rating
+    )
+    if not budgets:
+        return ""
+    counts = _collect_section_body_word_counts(
+        summary_text or "", include_health_rating=include_health_rating
+    )
+    lines: List[str] = []
+    preferred_under = set(issue_flags.get("section_balance_underweight_titles") or [])
+    preferred_over = set(issue_flags.get("section_balance_overweight_titles") or [])
+    narrative_titles = [
+        title
+        for title in _SUMMARY_NARRATIVE_REPETITION_SECTIONS
+        if include_health_rating or title != "Financial Health Rating"
+    ]
+    under_candidates: List[Tuple[int, str, int, int]] = []
+    over_candidates: List[Tuple[int, str, int, int]] = []
+    for title in narrative_titles:
+        expected = int(budgets.get(title, 0) or 0)
+        observed = int(counts.get(title, 0) or 0)
+        if expected <= 0:
+            continue
+        delta = observed - expected
+        if delta < 0:
+            under_candidates.append((abs(delta), title, observed, expected))
+        elif delta > 0:
+            over_candidates.append((delta, title, observed, expected))
+
+    under_candidates.sort(
+        key=lambda item: (
+            item[1] not in preferred_under,
+            -item[0],
+            _summary_repetition_section_priority(item[1]),
+        )
+    )
+    over_candidates.sort(
+        key=lambda item: (
+            item[1] not in preferred_over,
+            -item[0],
+            _summary_repetition_section_priority(item[1]),
+        )
+    )
+
+    for deficit, title, observed, expected in under_candidates[:4]:
+        lines.append(
+            f"- EXPAND '{title}' by about {deficit}-{deficit + 12} words (current {observed}, target ~{expected})."
+        )
+    for excess, title, observed, expected in over_candidates[:3]:
+        lines.append(
+            f"- TIGHTEN '{title}' by about {max(5, excess - 8)}-{excess} words (current {observed}, target ~{expected})."
+        )
+    if not lines:
+        return ""
+    return (
+        "\nSECTION BALANCE PRIORITY:\n"
+        + "\n".join(lines)
+        + "\nKeep all quotes, the Health→Executive bridge, Key Metrics format, and Closing triggers intact while rebalancing."
+    )
+
+
+def _sub_outside_direct_quotes(
+    text: str,
+    pattern: re.Pattern[str],
+    repl,
+    *,
+    count: int = 0,
+) -> Tuple[str, int]:
+    """Apply regex replacement only outside direct-quote spans."""
+    if not text:
+        return text, 0
+
+    quote_span_re = re.compile(r"[“\"][^“”\"\n]{0,260}[”\"]")
+    out_parts: List[str] = []
+    last = 0
+    total_replacements = 0
+    remaining = int(count) if count else 0
+
+    def _apply(segment: str) -> Tuple[str, int]:
+        nonlocal remaining
+        if not segment:
+            return segment, 0
+        if count and remaining <= 0:
+            return segment, 0
+        seg_count = remaining if count else 0
+        new_segment, made = pattern.subn(repl, segment, count=seg_count)
+        if count:
+            remaining -= int(made)
+        return new_segment, int(made)
+
+    for quote_match in quote_span_re.finditer(text):
+        segment = text[last : quote_match.start()]
+        new_segment, made = _apply(segment)
+        out_parts.append(new_segment)
+        out_parts.append(quote_match.group(0))
+        total_replacements += int(made)
+        last = quote_match.end()
+
+    tail = text[last:]
+    new_tail, made_tail = _apply(tail)
+    out_parts.append(new_tail)
+    total_replacements += int(made_tail)
+    return "".join(out_parts), total_replacements
+
+
+def _replace_literal_outside_direct_quotes(
+    text: str,
+    literal: str,
+    replacement: str,
+    *,
+    count: int = 1,
+) -> Tuple[str, int]:
+    if not literal:
+        return text, 0
+    return _sub_outside_direct_quotes(
+        text,
+        re.compile(re.escape(literal)),
+        replacement,
+        count=count,
+    )
+
+
+def _summary_repetition_section_priority(title: str) -> int:
+    order = {
+        "Financial Performance": 0,
+        "Management Discussion & Analysis": 1,
+        "Financial Health Rating": 2,
+        "Executive Summary": 3,
+        "Risk Factors": 4,
+        "Closing Takeaway": 5,
+    }
+    return int(order.get(str(title or "").strip(), 99))
+
+
+def _sorted_repetition_sections(section_titles: List[str]) -> List[str]:
+    input_order = {title: idx for idx, title in enumerate(section_titles or [])}
+    return sorted(
+        [str(title or "").strip() for title in section_titles if str(title or "").strip()],
+        key=lambda t: (_summary_repetition_section_priority(t), input_order.get(t, 999)),
+    )
+
+
+def _normalize_closing_prose_spacing(body: str) -> str:
+    out = str(body or "")
+    out = re.sub(r"\s+([,.;:!?])", r"\1", out)
+    out = re.sub(r"\(\s+", "(", out)
+    out = re.sub(r"\s+\)", ")", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    out = re.sub(r"\s+\.", ".", out)
+    return out.strip()
+
+
+def _remove_low_signal_closing_parentheticals(body: str) -> Tuple[str, int]:
+    if not body:
+        return body, 0
+
+    parenthetical_filler_re = re.compile(
+        r"\((?:on a forward basis|from a portfolio perspective|as things stand|in this environment|at this stage)\)",
+        re.IGNORECASE,
+    )
+    legacy_parenthetical_filler_re = re.compile(
+        r"\((?:key swing factor|primary swing factor|near term factors|in practical terms|fundamental catalyst|structural driver|"
+        r"operating backdrop|valuation context|execution priority|capital intensity backdrop|on a forward basis|relative to the cycle|"
+        r"across the enterprise|from a risk standpoint|on a relative basis|under current conditions|given the trajectory|within this framework)\)",
+        re.IGNORECASE,
+    )
+    parenthetical_chunk_re = re.compile(r"\(([^)\n]{1,60})\)")
+
+    removed = 0
+
+    def _drop_known_fillers(match: re.Match[str]) -> str:
+        nonlocal removed
+        removed += 1
+        return ""
+
+    out, _ = _sub_outside_direct_quotes(
+        body, parenthetical_filler_re, _drop_known_fillers, count=0
+    )
+    out, _ = _sub_outside_direct_quotes(
+        out, legacy_parenthetical_filler_re, _drop_known_fillers, count=0
+    )
+
+    def _maybe_drop_chunk(match: re.Match[str]) -> str:
+        nonlocal removed
+        chunk = str(match.group(1) or "")
+        chunk_norm = " ".join(chunk.lower().split()).strip()
+        if not chunk_norm:
+            removed += 1
+            return ""
+        if re.search(
+            r"\d|%|\$|buy|hold|sell|if|unless|q[1-4]|fy\d{2}",
+            chunk_norm,
+            re.IGNORECASE,
+        ):
+            return match.group(0)
+        if len(chunk_norm.split()) <= 5:
+            removed += 1
+            return ""
+        return match.group(0)
+
+    out, _ = _sub_outside_direct_quotes(
+        out, parenthetical_chunk_re, _maybe_drop_chunk, count=0
+    )
+    return _normalize_closing_prose_spacing(out), int(removed)
+
+
+def _cap_closing_takeaway_sentences_preserve_triggers(
+    body: str,
+    *,
+    max_sentences: Optional[int] = None,
+    budget_words: Optional[int] = None,
+) -> Tuple[str, int]:
+    """Cap closing sentences while preserving stance/trigger structure."""
+    if not body:
+        return body, 0
+    if max_sentences is None:
+        max_sentences = _closing_sentence_cap_for_budget(budget_words)
+    sentences = [
+        s.strip()
+        for s in re.split(r"(?<=[.!?])\s+", str(body or "").strip())
+        if s.strip()
+    ]
+    max_allowed = max(1, int(max_sentences))
+    if len(sentences) <= max_allowed:
+        return body, 0
+
+    stance_re = re.compile(r"\b(buy|hold|sell|neutral)\b", re.IGNORECASE)
+    trigger_indexes = {
+        idx
+        for idx, sentence in enumerate(sentences)
+        if _is_closing_trigger_sentence_for_balance_trim(sentence)
+    }
+    first_stance_idx: Optional[int] = None
+    for idx, sentence in enumerate(sentences):
+        if stance_re.search(sentence):
+            first_stance_idx = idx
+            break
+
+    protected: Set[int] = {0}
+    protected.update(trigger_indexes)
+    if first_stance_idx is not None:
+        protected.add(int(first_stance_idx))
+
+    keep = [True] * len(sentences)
+    current = len(sentences)
+
+    # First remove excess non-protected sentences from the tail.
+    for idx in range(len(sentences) - 1, -1, -1):
+        if current <= max_allowed:
+            break
+        if idx in protected:
+            continue
+        keep[idx] = False
+        current -= 1
+
+    # If still too long (rare: many protected sentences), keep the first sentence and
+    # up to two trigger sentences, then trim remaining protected sentences from the tail.
+    if current > max_allowed:
+        kept_trigger_count = sum(1 for idx in trigger_indexes if keep[idx])
+        for idx in range(len(sentences) - 1, -1, -1):
+            if current <= max_allowed:
+                break
+            if not keep[idx]:
+                continue
+            if idx == 0:
+                continue
+            if idx in trigger_indexes and kept_trigger_count <= 2:
+                continue
+            if idx == first_stance_idx and idx != 0:
+                continue
+            if idx in trigger_indexes:
+                kept_trigger_count -= 1
+            keep[idx] = False
+            current -= 1
+
+    rebuilt = " ".join(
+        sentences[idx] for idx in range(len(sentences)) if keep[idx]
+    ).strip()
+    rebuilt = _normalize_closing_prose_spacing(rebuilt)
+    if rebuilt and not rebuilt.endswith((".", "!", "?")):
+        rebuilt += "."
+    removed = max(0, len(sentences) - sum(1 for flag in keep if flag))
+    return rebuilt or body, int(removed)
+
+
+def _replace_repeated_figure_once_outside_quotes(
+    body: str,
+    *,
+    normalized_figure: str,
+    replacement: str,
+) -> Tuple[str, int]:
+    if not body or not normalized_figure:
+        return body, 0
+
+    replaced = False
+
+    def _figure_repl(match: re.Match[str]) -> str:
+        nonlocal replaced
+        if replaced:
+            return match.group(0)
+        raw = str(match.group(0) or "")
+        if _normalize_repeated_figure_token(raw) != normalized_figure:
+            return raw
+        replaced = True
+        return replacement
+
+    out, _ = _sub_outside_direct_quotes(body, _SUMMARY_REPEATED_FIGURE_RE, _figure_repl)
+    return out, 1 if replaced else 0
+
+
+def _theme_context_reference(theme_name: str) -> str:
+    replacements = {
+        "cash conversion": "cash realization",
+        "free cash flow": "cash generation",
+        "margin pressure": "profitability pressure",
+        "reinvestment": "investment cadence",
+        "balance sheet flexibility": "financial flexibility",
+        "working capital": "short-term operating timing",
+        "below the line": "non-operating support",
+        "earnings quality": "profit quality",
+    }
+    return replacements.get(theme_name, "this dynamic")
+
+
+def _replace_theme_once_outside_quotes(
+    body: str,
+    *,
+    theme_name: str,
+) -> Tuple[str, int]:
+    pattern = _SUMMARY_THEME_PATTERNS.get(theme_name)
+    if not body or pattern is None:
+        return body, 0
+
+    replacement = _theme_context_reference(theme_name)
+    out, made = _sub_outside_direct_quotes(body, pattern, replacement, count=1)
+    return out, int(made)
+
+
+def _scrub_executive_summary_numeric_density(
+    summary_text: str,
+    *,
+    target_length: Optional[int],
+    quality_profile: Optional[SummaryFlowQualityProfile] = None,
+) -> Tuple[str, int]:
+    text = (summary_text or "").strip()
+    if not text:
+        return summary_text, 0
+
+    caps = _numbers_discipline_caps(
+        target_length,
+        closing_numeric_cap_override=(
+            quality_profile.closing_numeric_anchor_cap if quality_profile else None
+        ),
+    )
+    max_exec = int(caps.get("Executive Summary", 4))
+    exec_body = _extract_markdown_section_body(text, "Executive Summary")
+    if not exec_body:
+        return summary_text, 0
+
+    exec_count = _count_numeric_tokens(exec_body)
+    if exec_count <= max_exec:
+        return summary_text, 0
+
+    keep_anchor_count = min(2, max_exec)
+    numeric_re = re.compile(r"\b[\w$€£]*\d[\w%/.\-]*\b")
+    seen_numeric = 0
+    replaced = 0
+
+    def _numeric_repl(match: re.Match[str]) -> str:
+        nonlocal seen_numeric, replaced
+        token = str(match.group(0) or "")
+        seen_numeric += 1
+        if seen_numeric <= keep_anchor_count:
+            return token
+        replaced += 1
+        lowered = token.lower()
+        if "%" in token:
+            return "that percentage level"
+        if any(sym in token for sym in ("$", "€", "£")):
+            return "the cited amount"
+        if lowered.startswith("fy") or lowered.startswith("q"):
+            return "that period"
+        return "that figure"
+
+    cleaned_exec, _ = _sub_outside_direct_quotes(exec_body, numeric_re, _numeric_repl)
+    cleaned_exec = _normalize_closing_prose_spacing(cleaned_exec)
+    if _count_numeric_tokens(cleaned_exec) >= exec_count:
+        return summary_text, 0
+    out = _replace_markdown_section_body(text, "Executive Summary", cleaned_exec)
+    return out, int(replaced)
+
+
+def _scrub_section_numeric_density(
+    summary_text: str,
+    *,
+    section_title: str,
+    target_length: Optional[int],
+    quality_profile: Optional[SummaryFlowQualityProfile] = None,
+) -> Tuple[str, int]:
+    """Reduce numeric-token density in a narrative section without touching quotes."""
+    text = (summary_text or "").strip()
+    if not text or not section_title:
+        return summary_text, 0
+
+    caps = _numbers_discipline_caps(
+        target_length,
+        closing_numeric_cap_override=(
+            quality_profile.closing_numeric_anchor_cap if quality_profile else None
+        ),
+    )
+    max_allowed = int(caps.get(section_title, 0) or 0)
+    if max_allowed <= 0:
+        return summary_text, 0
+
+    body = _extract_markdown_section_body(text, section_title)
+    if not body:
+        return summary_text, 0
+    current_count = _count_numeric_tokens(body)
+    if current_count <= max_allowed:
+        return summary_text, 0
+
+    anchor_keep_defaults = {
+        "Executive Summary": min(2, max_allowed),
+        "Financial Performance": min(5, max_allowed),
+        "Management Discussion & Analysis": min(3, max_allowed),
+        "Risk Factors": min(2, max_allowed),
+        "Closing Takeaway": min(1, max_allowed),
+    }
+    keep_anchor_count = max(1, int(anchor_keep_defaults.get(section_title, 2)))
+    numeric_re = re.compile(r"\b[\w$€£]*\d[\w%/.\-]*\b")
+    seen_numeric = 0
+    replaced = 0
+
+    def _numeric_repl(match: re.Match[str]) -> str:
+        nonlocal seen_numeric, replaced
+        token = str(match.group(0) or "")
+        seen_numeric += 1
+        if seen_numeric <= keep_anchor_count:
+            return token
+        replaced += 1
+        lowered = token.lower()
+        if "%" in token:
+            return "that percentage level"
+        if any(sym in token for sym in ("$", "€", "£")):
+            return "the cited amount"
+        if lowered.startswith("fy") or re.match(r"^q[1-4]", lowered):
+            return "that period"
+        if lowered.endswith("x"):
+            return "that leverage level"
+        return "that figure"
+
+    cleaned_body, _ = _sub_outside_direct_quotes(body, numeric_re, _numeric_repl)
+    cleaned_body = _normalize_closing_prose_spacing(cleaned_body)
+    if _count_numeric_tokens(cleaned_body) >= current_count:
+        return summary_text, 0
+    out = _replace_markdown_section_body(text, section_title, cleaned_body)
+    return out, int(replaced)
+
+
+def _dedupe_cross_section_numbers_in_summary(
+    summary_text: str,
+    *,
+    max_sections_per_figure: int,
+) -> Tuple[str, int]:
+    text = (summary_text or "").strip()
+    if not text:
+        return summary_text, 0
+    max_allowed = max(1, int(max_sections_per_figure))
+    replaced_total = 0
+
+    figure_section_map: Dict[str, set] = {}
+    for section_title in _SUMMARY_NARRATIVE_REPETITION_SECTIONS:
+        body = _extract_markdown_section_body(text, section_title)
+        if not body:
+            continue
+        for fig_match in _SUMMARY_REPEATED_FIGURE_RE.finditer(body):
+            norm = _normalize_repeated_figure_token(fig_match.group(0))
+            if not norm:
+                continue
+            figure_section_map.setdefault(norm, set()).add(section_title)
+
+    for norm_figure, sections in figure_section_map.items():
+        section_list = _sorted_repetition_sections(list(sections))
+        if len(section_list) <= max_allowed:
+            continue
+        keep_sections = set(section_list[:max_allowed])
+        excess_sections = [s for s in section_list if s not in keep_sections]
+        for section_title in excess_sections:
+            body = _extract_markdown_section_body(text, section_title)
+            if not body:
+                continue
+            replacement = (
+                "that percentage level"
+                if "%" in norm_figure
+                else "the previously cited figure"
+            )
+            new_body, made = _replace_repeated_figure_once_outside_quotes(
+                body,
+                normalized_figure=norm_figure,
+                replacement=replacement,
+            )
+            if made and new_body != body:
+                text = _replace_markdown_section_body(text, section_title, new_body)
+                replaced_total += int(made)
+    return text, int(replaced_total)
+
+
+def _dedupe_cross_section_themes_in_summary(
+    summary_text: str,
+    *,
+    max_sections_per_theme: int,
+) -> Tuple[str, int]:
+    text = (summary_text or "").strip()
+    if not text:
+        return summary_text, 0
+    max_allowed = max(1, int(max_sections_per_theme))
+    replaced_total = 0
+
+    theme_section_map: Dict[str, set] = {}
+    for section_title in _SUMMARY_NARRATIVE_REPETITION_SECTIONS:
+        body = _extract_markdown_section_body(text, section_title)
+        if not body:
+            continue
+        for theme_name, pattern in _SUMMARY_THEME_PATTERNS.items():
+            if pattern.search(body):
+                theme_section_map.setdefault(theme_name, set()).add(section_title)
+
+    for theme_name, sections in theme_section_map.items():
+        section_list = _sorted_repetition_sections(list(sections))
+        if len(section_list) <= max_allowed:
+            continue
+        keep_sections = set(section_list[:max_allowed])
+        excess_sections = [s for s in section_list if s not in keep_sections]
+        for section_title in excess_sections:
+            body = _extract_markdown_section_body(text, section_title)
+            if not body:
+                continue
+            _theme_pattern = _SUMMARY_THEME_PATTERNS.get(theme_name)
+            if _theme_pattern is None:
+                continue
+            new_body, made = _sub_outside_direct_quotes(
+                body,
+                _theme_pattern,
+                _theme_context_reference(theme_name),
+                count=0,
+            )
+            if made and new_body != body:
+                text = _replace_markdown_section_body(text, section_title, new_body)
+                replaced_total += int(made)
+    return text, int(replaced_total)
+
+
+def _dedupe_cross_section_question_framing_in_summary(summary_text: str) -> Tuple[str, int]:
+    """Keep thesis-question framing once, then force later sections to answer directly."""
+    text = (summary_text or "").strip()
+    if not text:
+        return summary_text, 0
+
+    removed_total = 0
+    seen_question_frame = False
+    for section_title in _SUMMARY_NARRATIVE_REPETITION_SECTIONS:
+        body = _extract_markdown_section_body(text, section_title)
+        if not body:
+            continue
+
+        sentences = [
+            s.strip() for s in re.split(r"(?<=[.!?])\s+", body.strip()) if s.strip()
+        ]
+        if not sentences:
+            continue
+
+        kept: List[str] = []
+        local_removed = 0
+        for sentence in sentences:
+            is_question_frame = any(
+                pattern.search(sentence) for pattern in _SUMMARY_QUESTION_FRAMING_PATTERNS
+            )
+            if not is_question_frame:
+                kept.append(sentence)
+                continue
+            if not seen_question_frame:
+                kept.append(sentence)
+                seen_question_frame = True
+                continue
+            local_removed += 1
+
+        if local_removed <= 0 or not kept:
+            continue
+        rebuilt_body = " ".join(kept).strip()
+        rebuilt_body = _normalize_closing_prose_spacing(rebuilt_body)
+        if rebuilt_body and not rebuilt_body.endswith((".", "!", "?")):
+            rebuilt_body += "."
+        text = _replace_markdown_section_body(text, section_title, rebuilt_body)
+        removed_total += int(local_removed)
+
+    return text, int(removed_total)
+
+
+_LWR_TRANSITION_BANK: Tuple[str, ...] = (
+    "Additionally, ",
+    "Moreover, ",
+    "In particular, ",
+    "Notably, ",
+    "Furthermore, ",
+    "Separately, ",
+    "Meanwhile, ",
+    "On top of that, ",
+    "Beyond that, ",
+)
+
+
+def _repair_section_leading_word_repetition(
+    body: str,
+    *,
+    max_same_opening: int,
+) -> Tuple[str, int]:
+    if not body:
+        return body, 0
+
+    sentences = [
+        s.strip() for s in re.split(r"(?<=[.!?])\s+", str(body or "").strip()) if s.strip()
+    ]
+    if len(sentences) < 5:
+        return body, 0
+
+    stopwords = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "so",
+        "to",
+        "of",
+        "in",
+        "on",
+        "for",
+        "with",
+        "as",
+        "at",
+        "by",
+        "from",
+        "this",
+        "that",
+        "these",
+        "those",
+    }
+    max_allowed = max(1, int(max_same_opening))
+    prefixes = list(_LWR_TRANSITION_BANK)
+
+    def _is_quoted_sentence(sentence: str) -> bool:
+        return '"' in sentence or "“" in sentence or "”" in sentence
+
+    def _strip_known_prefix(sentence: str) -> Tuple[str, bool]:
+        for pref in prefixes:
+            if sentence.lower().startswith(pref.lower()):
+                return sentence[len(pref) :].lstrip(), True
+        return sentence, False
+
+    def _leading_word(sentence: str) -> str:
+        stripped, _ = _strip_known_prefix(sentence)
+        if not stripped:
+            return ""
+        first = stripped.split()[0].lower().rstrip(".,;:")
+        if first.startswith("#") or first in stopwords:
+            return ""
+        return first
+
+    lwr_counts: Dict[str, List[int]] = {}
+    for idx, sentence in enumerate(sentences):
+        if len(sentence.split()) < 6:
+            continue
+        word = _leading_word(sentence)
+        if word:
+            lwr_counts.setdefault(word, []).append(idx)
+
+    rewrites = 0
+    prefix_idx = 0
+    for _word, indexes in lwr_counts.items():
+        if len(indexes) <= max_allowed:
+            continue
+        kept = 0
+        for sent_idx in indexes:
+            if kept < max_allowed:
+                kept += 1
+                continue
+            original = sentences[sent_idx]
+            if not original or _is_quoted_sentence(original):
+                continue
+            stripped, already_prefixed = _strip_known_prefix(original)
+            if already_prefixed:
+                # Avoid stacking prefixes; leave as-is and count as effectively rewritten.
+                continue
+            if not stripped:
+                continue
+            while prefix_idx < len(prefixes):
+                prefix = prefixes[prefix_idx]
+                prefix_idx += 1
+                if not original.lower().startswith(prefix.lower()):
+                    break
+            else:
+                break
+            if len(stripped) == 1:
+                rebuilt = prefix + stripped.lower()
+            else:
+                rebuilt = prefix + stripped[0].lower() + stripped[1:]
+            sentences[sent_idx] = rebuilt
+            rewrites += 1
+
+    if rewrites <= 0:
+        return body, 0
+
+    rebuilt_body = " ".join(sentences).strip()
+    rebuilt_body = _normalize_closing_prose_spacing(rebuilt_body)
+    if rebuilt_body and not rebuilt_body.endswith((".", "!", "?")):
+        rebuilt_body += "."
+    return rebuilt_body or body, int(rewrites)
+
+
+def _repair_leading_word_repetition_in_summary(
+    summary_text: str,
+    *,
+    max_same_opening: int,
+    target_sections: Optional[List[str]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    text = (summary_text or "").strip()
+    info: Dict[str, Any] = {"changed": False, "rewrites": 0, "sections": []}
+    if not text:
+        return summary_text, info
+
+    allowed_sections = (
+        [s for s in (target_sections or []) if s]
+        if target_sections
+        else list(_SUMMARY_NARRATIVE_REPETITION_SECTIONS)
+    )
+    for section_title in allowed_sections:
+        if section_title == "Key Metrics":
+            continue
+        body = _extract_markdown_section_body(text, section_title)
+        if not body:
+            continue
+        new_body, rewrites = _repair_section_leading_word_repetition(
+            body,
+            max_same_opening=max_same_opening,
+        )
+        if rewrites > 0 and new_body != body:
+            text = _replace_markdown_section_body(text, section_title, new_body)
+            info["changed"] = True
+            info["rewrites"] = int(info.get("rewrites", 0) or 0) + int(rewrites)
+            info["sections"].append(section_title)
+    return text, info
+
+
+def _apply_editorial_contract_repairs(
+    summary_text: str,
+    *,
+    target_length: Optional[int],
+    include_health_rating: bool,
+    quality_profile: SummaryFlowQualityProfile,
+    missing_requirements: Optional[List[str]] = None,
+    issue_flags: Optional[Dict[str, Any]] = None,
+    generation_stats: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    text = (summary_text or "").strip()
+    info: Dict[str, Any] = {
+        "changed": False,
+        "actions": [],
+        "closing_parenthetical_removals": 0,
+        "exec_numeric_scrub_replacements": 0,
+        "perf_numeric_scrub_replacements": 0,
+        "mdna_numeric_scrub_replacements": 0,
+        "generic_numeric_scrub_replacements": 0,
+        "number_dedupe_replacements": 0,
+        "theme_dedupe_replacements": 0,
+        "question_framing_rewrites": 0,
+        "leading_word_repetition_rewrites": 0,
+        "leading_word_repetition_fix_sections": [],
+    }
+    if not text:
+        return summary_text, info
+
+    flags = issue_flags or _parse_summary_contract_missing_requirements(missing_requirements)
+    if not flags.get("needs_editorial_deterministic_repair"):
+        return summary_text, info
+
+    if flags.get("closing_parenthetical_issue"):
+        closing_body = _extract_markdown_section_body(text, "Closing Takeaway")
+        if closing_body:
+            cleaned_closing, removed = _remove_low_signal_closing_parentheticals(
+                closing_body
+            )
+            if removed and cleaned_closing != closing_body:
+                text = _replace_markdown_section_body(text, "Closing Takeaway", cleaned_closing)
+                info["changed"] = True
+                info["closing_parenthetical_removals"] = int(removed)
+                info["actions"].append("closing_parenthetical_cleanup")
+
+    if flags.get("number_repetition_issue"):
+        updated, replaced_count = _dedupe_cross_section_numbers_in_summary(
+            text,
+            max_sections_per_figure=quality_profile.max_sections_per_repeated_number,
+        )
+        if replaced_count and updated != text:
+            text = updated
+            info["changed"] = True
+            info["number_dedupe_replacements"] = int(replaced_count)
+            info["actions"].append("cross_section_number_dedupe")
+
+    if flags.get("theme_repetition_issue"):
+        updated, replaced_count = _dedupe_cross_section_themes_in_summary(
+            text,
+            max_sections_per_theme=quality_profile.max_sections_per_theme,
+        )
+        if replaced_count and updated != text:
+            text = updated
+            info["changed"] = True
+            info["theme_dedupe_replacements"] = int(replaced_count)
+            info["actions"].append("cross_section_theme_dedupe")
+
+    if flags.get("question_framing_repetition_issue"):
+        updated, replaced_count = _dedupe_cross_section_question_framing_in_summary(text)
+        if replaced_count and updated != text:
+            text = updated
+            info["changed"] = True
+            info["question_framing_rewrites"] = int(replaced_count)
+            info["actions"].append("cross_section_question_framing_dedupe")
+
+    if flags.get("leading_word_repetition_issue"):
+        updated, lwr_info = _repair_leading_word_repetition_in_summary(
+            text,
+            max_same_opening=max(1, int(getattr(quality_profile, "max_same_opening", 2) or 2)),
+            target_sections=list(flags.get("leading_word_repetition_sections") or []),
+        )
+        if lwr_info.get("changed") and updated != text:
+            text = updated
+            info["changed"] = True
+            info["leading_word_repetition_rewrites"] = int(
+                lwr_info.get("rewrites", 0) or 0
+            )
+            info["leading_word_repetition_fix_sections"] = list(
+                lwr_info.get("sections") or []
+            )
+            info["actions"].append("leading_word_repetition_fix")
+
+    if flags.get("numbers_discipline_issue"):
+        flagged_sections = set(flags.get("numbers_discipline_sections") or [])
+        if not flagged_sections:
+            flagged_sections = {"Executive Summary"}
+
+        if "Executive Summary" in flagged_sections:
+            updated, replaced_count = _scrub_executive_summary_numeric_density(
+                text,
+                target_length=target_length,
+                quality_profile=quality_profile,
+            )
+            if replaced_count and updated != text:
+                text = updated
+                info["changed"] = True
+                info["exec_numeric_scrub_replacements"] = int(replaced_count)
+                info["generic_numeric_scrub_replacements"] = int(
+                    info.get("generic_numeric_scrub_replacements", 0) or 0
+                ) + int(replaced_count)
+                info["actions"].append("exec_numeric_density_scrub")
+
+        for section_title, action_name, info_key in (
+            (
+                "Financial Performance",
+                "financial_performance_numeric_density_scrub",
+                "perf_numeric_scrub_replacements",
+            ),
+            (
+                "Management Discussion & Analysis",
+                "mdna_numeric_density_scrub",
+                "mdna_numeric_scrub_replacements",
+            ),
+            ("Risk Factors", "risk_numeric_density_scrub", None),
+            ("Closing Takeaway", "closing_numeric_density_scrub", None),
+        ):
+            if section_title not in flagged_sections:
+                continue
+            updated, replaced_count = _scrub_section_numeric_density(
+                text,
+                section_title=section_title,
+                target_length=target_length,
+                quality_profile=quality_profile,
+            )
+            if replaced_count and updated != text:
+                text = updated
+                info["changed"] = True
+                info["generic_numeric_scrub_replacements"] = int(
+                    info.get("generic_numeric_scrub_replacements", 0) or 0
+                ) + int(replaced_count)
+                if info_key:
+                    info[info_key] = int(replaced_count)
+                info["actions"].append(action_name)
+
+    closing_body = _extract_markdown_section_body(text, "Closing Takeaway")
+    if closing_body:
+        capped_closing, removed_sentences = _cap_closing_takeaway_sentences_preserve_triggers(
+            closing_body,
+            budget_words=_closing_takeaway_budget_for_target(
+                target_length, include_health_rating=include_health_rating
+            ),
+        )
+        capped_closing = _normalize_closing_prose_spacing(capped_closing)
+        if removed_sentences > 0 and capped_closing != closing_body:
+            text = _replace_markdown_section_body(
+                text, "Closing Takeaway", capped_closing
+            )
+            info["changed"] = True
+            info["actions"].append("closing_sentence_cap")
+
+    if info["changed"]:
+        if generation_stats is not None:
+            generation_stats.setdefault("editorial_repair_actions", []).extend(
+                info["actions"]
+            )
+            generation_stats["editorial_repair_changed_text"] = True
+            generation_stats["closing_parenthetical_removals"] = int(
+                generation_stats.get("closing_parenthetical_removals", 0) or 0
+            ) + int(info["closing_parenthetical_removals"])
+            generation_stats["exec_numeric_scrub_replacements"] = int(
+                generation_stats.get("exec_numeric_scrub_replacements", 0) or 0
+            ) + int(info["exec_numeric_scrub_replacements"])
+            generation_stats["leading_word_repetition_rewrites"] = int(
+                generation_stats.get("leading_word_repetition_rewrites", 0) or 0
+            ) + int(info.get("leading_word_repetition_rewrites", 0) or 0)
+            if info.get("leading_word_repetition_fix_sections"):
+                generation_stats["leading_word_repetition_fix_sections"] = list(
+                    {
+                        *(
+                            generation_stats.get(
+                                "leading_word_repetition_fix_sections", []
+                            )
+                            or []
+                        ),
+                        *(info.get("leading_word_repetition_fix_sections") or []),
+                    }
+                )
+            if int(info.get("perf_numeric_scrub_replacements", 0) or 0) > 0:
+                generation_stats["perf_numeric_scrub_replacements"] = int(
+                    generation_stats.get("perf_numeric_scrub_replacements", 0) or 0
+                ) + int(info["perf_numeric_scrub_replacements"])
+            if int(info.get("mdna_numeric_scrub_replacements", 0) or 0) > 0:
+                generation_stats["mdna_numeric_scrub_replacements"] = int(
+                    generation_stats.get("mdna_numeric_scrub_replacements", 0) or 0
+                ) + int(info["mdna_numeric_scrub_replacements"])
+    return text, info
+
+
+def _is_closing_trigger_sentence_for_balance_trim(sentence: str) -> bool:
+    if not sentence:
+        return False
+    lowered = sentence.lower()
+    if not re.search(r"\b(if|unless|would|trigger|flip|change)\b", lowered):
+        return False
+    if not re.search(
+        r"(\$?\d+(?:\.\d+)?\s*(?:%|x|pp|b|m|bn|mm)?|\babove\b|\bbelow\b|\bat least\b|\bless than\b|\bmore than\b)",
+        sentence,
+        re.IGNORECASE,
+    ):
+        return False
+    if not re.search(
+        r"\b(next|quarter|quarters|month|months|year|years|period|periods|q[1-4]|fy\d{2})\b",
+        sentence,
+        re.IGNORECASE,
+    ):
+        return False
+    return True
+
+
+def _section_balance_top_up_sentence(
+    section_title: str,
+    *,
+    attempt: int = 0,
+    calculated_metrics: Optional[Dict[str, Any]] = None,
+    health_score_data: Optional[Dict[str, Any]] = None,
+    risk_factors_excerpt: str = "",
+) -> str:
+    metrics = calculated_metrics or {}
+    operating_margin = metrics.get("operating_margin")
+    free_cash_flow = metrics.get("free_cash_flow")
+    operating_cash_flow = metrics.get("operating_cash_flow")
+    cash = metrics.get("cash")
+    total_debt = metrics.get("total_debt") or metrics.get("total_liabilities")
+    score_band = (health_score_data or {}).get("score_band")
+
+    if section_title == "Financial Health Rating":
+        variants = [
+            "Profitability, cash conversion, and balance-sheet flexibility still frame the financial baseline for the period.",
+            (
+                f"The score band remains constrained by whether operating margin of {operating_margin:.1f}% can keep converting into durable cash generation."
+                if operating_margin is not None
+                else "The score ultimately depends on whether profitability is durable enough to support internal funding capacity."
+            ),
+            (
+                f"Free cash flow of {_format_metric_value_for_text('free_cash_flow', free_cash_flow)} matters because it determines how much reinvestment the company can absorb without weakening financial flexibility."
+                if free_cash_flow is not None
+                else "Cash conversion matters because it determines how much reinvestment the company can absorb without weakening financial flexibility."
+            ),
+            (
+                f"The balance-sheet question is whether available liquidity can stay comfortably ahead of debt obligations of {_format_metric_value_for_text('total_debt', total_debt)}."
+                if total_debt is not None
+                else "The balance-sheet question is whether liquidity remains comfortably ahead of fixed obligations."
+            ),
+            (
+                f"That is why the {score_band.lower()} rating hinges on durability rather than on a single period's accounting outcome."
+                if score_band
+                else "That is why the rating hinges on durability rather than on a single period's accounting outcome."
+            ),
+        ]
+        return variants[min(attempt, len(variants) - 1)]
+
+    if section_title == "Risk Factors":
+        excerpt_terms = [
+            token
+            for token in re.findall(r"[A-Za-z]{5,}", risk_factors_excerpt or "")
+            if token.lower() not in {"their", "about", "these", "those", "which"}
+        ]
+        anchor_term = excerpt_terms[min(attempt, len(excerpt_terms) - 1)] if excerpt_terms else "the filing-specific operating model"
+        variants = [
+            "The downside only matters if it can travel through margins, cash generation, or balance-sheet flexibility with real force.",
+            f"That risk deserves weight because the filing's language around {anchor_term} implies a mechanism investors can monitor before the income statement fully reflects the damage.",
+            (
+                f"A weakening bridge from {_format_metric_value_for_text('operating_cash_flow', operating_cash_flow)} of operating cash flow to {_format_metric_value_for_text('free_cash_flow', free_cash_flow)} of free cash flow would be an especially important early-warning signal."
+                if operating_cash_flow is not None and free_cash_flow is not None
+                else "An early-warning signal matters because risks become investable only when there is a concrete way to see them building before they fully hit results."
+            ),
+            (
+                f"If liquidity tightens relative to cash resources of {_format_metric_value_for_text('cash', cash)}, management loses room to absorb the downside without changing capital-allocation priorities."
+                if cash is not None
+                else "If liquidity tightens, management loses room to absorb the downside without changing capital-allocation priorities."
+            ),
+        ]
+        return variants[min(attempt, len(variants) - 1)]
+
+    if section_title == "Closing Takeaway":
+        variants = [
+            "The conclusion is strongest when it stays tied to a small set of measurable signals and a clear stance.",
+            "What must stay true is that the healthier parts of the model keep funding reinvestment rather than merely masking weaker unit economics for one more quarter.",
+            "What breaks the thesis is the point at which margin pressure and cash-conversion weakness start reinforcing one another instead of offsetting each other.",
+            "That distinction matters because capital allocation, valuation support, and downside containment all depend on whether the cash engine remains self-funding.",
+        ]
+        return variants[min(attempt, len(variants) - 1)]
+
+    top_up_map: Dict[str, str] = {
+        "Executive Summary": "The investment decision turns on whether operating quality can stay durable as the next set of pressures builds.",
+        "Financial Performance": "The period's revenue mix, margin behavior, and cash conversion explain what actually changed beneath the headline results.",
+        "Management Discussion & Analysis": "Management's capital allocation and execution priorities will determine whether today's economics improve or erode.",
+    }
+    return top_up_map.get(
+        section_title,
+        "Add company-specific context that sharpens the investment implication in this section.",
+    )
+
+
+def _append_section_balance_sentence(
+    body: str,
+    *,
+    section_title: str,
+    sentence: str,
+) -> str:
+    clean_body = str(body or "").strip()
+    clean_sentence = str(sentence or "").strip()
+    if not clean_sentence:
+        return clean_body
+    if section_title == "Risk Factors":
+        risk_pattern = re.compile(
+            r"(\*\*[^*:\n]{2,120}:\*\*\s*.+?)(?=(?:\n\s*\*\*[^*]+:\*\*)|\Z)",
+            re.DOTALL,
+        )
+        matches = list(risk_pattern.finditer(clean_body))
+        if matches:
+            last = matches[-1]
+            last_entry = (last.group(1) or "").strip()
+            if last_entry and not last_entry.endswith((".", "!", "?")):
+                last_entry += "."
+            updated_entry = f"{last_entry} {clean_sentence}".strip()
+            return (
+                clean_body[: last.start()] + updated_entry + clean_body[last.end() :]
+            ).strip()
+    if clean_body and not clean_body.endswith((".", "!", "?")):
+        clean_body += "."
+    return f"{clean_body} {clean_sentence}".strip() if clean_body else clean_sentence
+
+
+def _trim_section_for_balance(
+    body: str,
+    *,
+    section_title: str,
+    max_words_to_trim: int,
+) -> Tuple[str, int]:
+    if not body:
+        return body, 0
+    sentences = [
+        s.strip() for s in re.split(r"(?<=[.!?])\s+", body.strip()) if s.strip()
+    ]
+    if len(sentences) <= 1:
+        return body, 0
+
+    bridge_sentence = "This frames the thesis in the Executive Summary that follows."
+    trimmed_words = 0
+    kept = list(sentences)
+    for idx in range(len(kept) - 1, -1, -1):
+        if len(kept) <= 1 or trimmed_words >= max_words_to_trim:
+            break
+        sentence = kept[idx]
+        if not sentence:
+            continue
+        if '"' in sentence or "“" in sentence or "”" in sentence:
+            continue
+        if bridge_sentence in sentence:
+            continue
+        if section_title == "Closing Takeaway":
+            if re.search(r"\b(buy|hold|sell|neutral)\b", sentence, re.IGNORECASE):
+                continue
+            if _is_closing_trigger_sentence_for_balance_trim(sentence):
+                continue
+        sentence_wc = len(re.findall(r"\b\w+\b", sentence or ""))
+        if sentence_wc <= 4:
+            continue
+        if trimmed_words > 0 and sentence_wc > max_words_to_trim:
+            continue
+        del kept[idx]
+        trimmed_words += int(sentence_wc)
+
+    if trimmed_words <= 0:
+        return body, 0
+    new_body = " ".join(kept).strip()
+    new_body = _normalize_closing_prose_spacing(new_body)
+    if new_body and not new_body.endswith((".", "!", "?")):
+        new_body += "."
+    return new_body, int(trimmed_words)
+
+
+def _rebalance_section_budgets_deterministically(
+    summary_text: str,
+    *,
+    target_length: Optional[int],
+    include_health_rating: bool,
+    missing_requirements: Optional[List[str]] = None,
+    issue_flags: Optional[Dict[str, Any]] = None,
+    generation_stats: Optional[Dict[str, Any]] = None,
+    calculated_metrics: Optional[Dict[str, Any]] = None,
+    health_score_data: Optional[Dict[str, Any]] = None,
+    risk_factors_excerpt: str = "",
+) -> Tuple[str, Dict[str, Any]]:
+    text = (summary_text or "").strip()
+    info: Dict[str, Any] = {
+        "changed": False,
+        "applied": False,
+        "actions": [],
+        "words_added": 0,
+        "words_trimmed": 0,
+        "inferred_underweight_targets": [],
+    }
+    if not text or not target_length:
+        return summary_text, info
+
+    flags = issue_flags or _parse_summary_contract_missing_requirements(missing_requirements)
+    if not flags.get("section_balance_issue"):
+        return summary_text, info
+
+    target = int(target_length)
+    long_form = _is_long_form_target(target)
+    short_quality_mode = _is_short_quality_sensitive_target(target)
+    _section_wc = lambda value: len(re.findall(r"\b\w+\b", value or ""))
+    budgets = _calculate_section_word_budgets(target, include_health_rating=include_health_rating)
+    if not budgets:
+        return summary_text, info
+
+    counts = _collect_section_body_word_counts(text, include_health_rating=include_health_rating)
+    tol_total = _effective_word_band_tolerance(target_length)
+    upper_total = min(TARGET_LENGTH_MAX_WORDS, target + tol_total)
+    lower_total = max(TARGET_LENGTH_MIN_WORDS, target - tol_total)
+
+    narrative_titles = [
+        title
+        for title in _SUMMARY_NARRATIVE_REPETITION_SECTIONS
+        if include_health_rating or title != "Financial Health Rating"
+    ]
+
+    parsed_under_titles = [
+        t
+        for t in (flags.get("section_balance_underweight_titles") or [])
+        if t and t != "Key Metrics"
+    ]
+    parsed_over_titles = [
+        t
+        for t in (flags.get("section_balance_overweight_titles") or [])
+        if t and t != "Key Metrics"
+    ]
+
+    section_meta: Dict[str, Dict[str, int]] = {}
+    inferred_under: List[Tuple[int, str]] = []
+    inferred_over: List[Tuple[int, str]] = []
+    for section_title in narrative_titles:
+        expected = int(budgets.get(section_title, 0) or 0)
+        if expected <= 0:
+            continue
+        observed = int(counts.get(section_title, 0) or 0)
+        tol = _section_budget_tolerance_words(expected, max_tolerance=10)
+        min_allowed = max(1, expected - tol)
+        max_allowed = expected + tol
+        section_meta[section_title] = {
+            "expected": expected,
+            "observed": observed,
+            "tol": tol,
+            "min_allowed": min_allowed,
+            "max_allowed": max_allowed,
+        }
+        if observed < min_allowed:
+            inferred_under.append((min_allowed - observed, section_title))
+        if observed > max_allowed:
+            inferred_over.append((observed - max_allowed, section_title))
+
+    def _dedupe_titles(values: List[str]) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        for title in values:
+            t = str(title or "").strip()
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+        return out
+
+    long_form_recipient_priority = {
+        "Risk Factors": 0,
+        "Management Discussion & Analysis": 1,
+        "Executive Summary": 2,
+        "Financial Performance": 3,
+        "Financial Health Rating": 4,
+        "Closing Takeaway": 5,
+    }
+    under_titles = _dedupe_titles(
+        parsed_under_titles
+        + [
+            title
+            for _deficit, title in sorted(
+                inferred_under,
+                key=lambda item: (
+                    -int(item[0]),
+                    int(long_form_recipient_priority.get(item[1], 99))
+                    if long_form
+                    else _summary_repetition_section_priority(item[1]),
+                ),
+            )
+        ]
+    )
+    over_titles = _dedupe_titles(
+        parsed_over_titles
+        + [
+            title
+            for _excess, title in sorted(
+                inferred_over,
+                key=lambda item: (
+                    item[1] not in set(parsed_over_titles),
+                    -int(item[0]),
+                    _summary_repetition_section_priority(item[1]),
+                ),
+            )
+        ]
+    )
+    if not under_titles and not over_titles:
+        return summary_text, info
+
+    if not parsed_under_titles and under_titles:
+        info["inferred_underweight_targets"] = list(under_titles[:4])
+
+    # Trim explicitly overweight / inferred overweight sections first, even if the
+    # total memo is currently underweight. This fixes overweight-only validator cases
+    # by redistributing words to shorter sections later in this helper.
+    current_total = _count_words(text)
+    overflow_trim_needed = max(0, current_total - upper_total)
+    trim_budget = int(overflow_trim_needed)
+    for section_title in over_titles:
+        meta = section_meta.get(section_title) or {}
+        excess_to_max = max(
+            0, int(meta.get("observed", 0) or 0) - int(meta.get("max_allowed", 0) or 0)
+        )
+        if excess_to_max <= 0:
+            continue
+        trim_budget += int(excess_to_max)
+
+    trimmed_named_overweight = False
+    trim_remaining = int(trim_budget)
+    for donor_title in over_titles:
+        if trim_remaining <= 0:
+            break
+        donor_body = _extract_markdown_section_body(text, donor_title)
+        if not donor_body:
+            continue
+        meta = section_meta.get(donor_title) or {}
+        excess_to_max = max(
+            0, int(meta.get("observed", 0) or 0) - int(meta.get("max_allowed", 0) or 0)
+        )
+        if excess_to_max <= 0 and overflow_trim_needed <= 0:
+            continue
+        trim_cap = (
+            max(10, min(160, excess_to_max + 16))
+            if long_form
+            else max(6, min(30, excess_to_max + 8))
+        )
+        new_body, trimmed_wc = _trim_section_for_balance(
+            donor_body,
+            section_title=donor_title,
+            max_words_to_trim=max(6, trim_cap),
+        )
+        if trimmed_wc > 0 and new_body != donor_body:
+            text = _replace_markdown_section_body(text, donor_title, new_body)
+            trim_remaining = max(0, trim_remaining - trimmed_wc)
+            info["words_trimmed"] += int(trimmed_wc)
+            info["changed"] = True
+            info["applied"] = True
+            if donor_title in set(parsed_over_titles):
+                trimmed_named_overweight = True
+
+    counts = _collect_section_body_word_counts(text, include_health_rating=include_health_rating)
+    post_trim_inferred_under: List[Tuple[int, str]] = []
+    for section_title in narrative_titles:
+        meta = section_meta.get(section_title) or {}
+        min_allowed = int(meta.get("min_allowed", 0) or 0)
+        observed = int(counts.get(section_title, 0) or 0)
+        if min_allowed > 0 and observed < min_allowed:
+            post_trim_inferred_under.append((min_allowed - observed, section_title))
+    if post_trim_inferred_under:
+        post_trim_titles = [
+            title
+            for _deficit, title in sorted(
+                post_trim_inferred_under,
+                key=lambda item: (
+                    -int(item[0]),
+                    int(long_form_recipient_priority.get(item[1], 99))
+                    if long_form
+                    else _summary_repetition_section_priority(item[1]),
+                ),
+            )
+        ]
+        under_titles = _dedupe_titles(list(under_titles) + post_trim_titles)
+
+    # On clean-first short targets, never synthesize generic top-up prose just to
+    # satisfy a section-balance warning. Let targeted section repair or a 422 handle it.
+    if short_quality_mode:
+        if (not long_form) and _count_words(text) < lower_total and info["words_trimmed"] > 0:
+            return summary_text, {
+                "changed": False,
+                "applied": False,
+                "actions": [],
+                "words_added": 0,
+                "words_trimmed": 0,
+                "inferred_underweight_targets": [],
+            }
+        if info["applied"]:
+            if info["words_trimmed"] > 0:
+                info["actions"].append("section_balance_trim_donors")
+            if generation_stats is not None:
+                generation_stats["section_balance_repair_applied"] = True
+                if trimmed_named_overweight:
+                    generation_stats["section_balance_overweight_trim_applied"] = True
+                if info.get("inferred_underweight_targets"):
+                    generation_stats["section_balance_inferred_underweight_targets"] = list(
+                        info["inferred_underweight_targets"]
+                    )
+                generation_stats.setdefault("editorial_repair_actions", []).extend(
+                    info["actions"]
+                )
+        return text, info
+
+    # Expand underweight sections (parsed or inferred) with larger allowance for long-form.
+    current_total = _count_words(text)
+    add_room = max(0, upper_total - current_total)
+    expanded_titles: List[str] = []
+    for section_title in under_titles:
+        if add_room <= 0:
+            break
+        if section_title == "Key Metrics":
+            continue
+        body = _extract_markdown_section_body(text, section_title)
+        if body is None:
+            continue
+        expected = int(budgets.get(section_title, 0) or 0)
+        if expected <= 0:
+            continue
+        section_tol = _section_budget_tolerance_words(expected, max_tolerance=10)
+        min_allowed = max(1, expected - section_tol)
+        max_allowed = expected + section_tol
+        observed = int(counts.get(section_title, 0) or 0)
+        deficit = max(0, min_allowed - observed)
+        if deficit <= 0:
+            continue
+        if not long_form and deficit > 20:
+            continue
+        if long_form and deficit > 140:
+            deficit = 140
+
+        new_body = str(body or "").strip()
+        max_loops = 6 if long_form else 2
+        loops = 0
+        while _section_wc(new_body) < min_allowed and loops < max_loops and add_room > 0:
+            addition = _section_balance_top_up_sentence(
+                section_title,
+                attempt=loops,
+                calculated_metrics=calculated_metrics,
+                health_score_data=health_score_data,
+                risk_factors_excerpt=risk_factors_excerpt,
+            )
+            projected_add = _section_wc(addition)
+            if projected_add > add_room and add_room <= 8:
+                break
+            new_body = _append_section_balance_sentence(
+                new_body,
+                section_title=section_title,
+                sentence=addition,
+            )
+            loops += 1
+        remaining = max(0, min_allowed - _section_wc(new_body))
+        if 0 < remaining <= min(8, add_room):
+            new_body = _micro_pad_tail_words(new_body, remaining)
+        new_body_wc = _section_wc(new_body)
+        if new_body_wc > max_allowed:
+            over_by = new_body_wc - max_allowed
+            if 0 < over_by <= 18:
+                tokens = new_body.split()
+                if len(tokens) > over_by + 1:
+                    new_body = " ".join(tokens[: len(tokens) - over_by]).strip()
+                    if new_body and not new_body.endswith((".", "!", "?")):
+                        new_body += "."
+        if new_body != body:
+            before = _section_wc(body)
+            after = _section_wc(new_body)
+            added = max(0, after - before)
+            if added > 0:
+                text = _replace_markdown_section_body(text, section_title, new_body)
+                counts[section_title] = int(after)
+                add_room = max(0, add_room - added)
+                info["words_added"] += int(added)
+                info["changed"] = True
+                info["applied"] = True
+                expanded_titles.append(section_title)
+
+    # Guardrail: avoid making a short draft shorter when there is no offsetting expansion
+    # on short/medium targets. Long-form underflow is handled by a dedicated deterministic
+    # expansion helper later in the retry loop.
+    if (not long_form) and _count_words(text) < lower_total and info["words_trimmed"] > 0 and info["words_added"] <= 0:
+        # Best effort: roll back trims by returning original text if we fell below band.
+        return summary_text, {
+            "changed": False,
+            "applied": False,
+            "actions": [],
+            "words_added": 0,
+            "words_trimmed": 0,
+            "inferred_underweight_targets": [],
+        }
+
+    if info["applied"]:
+        if expanded_titles:
+            info["actions"].append("section_balance_expand_underweight")
+        if info["words_trimmed"] > 0:
+            info["actions"].append("section_balance_trim_donors")
+        if generation_stats is not None:
+            generation_stats["section_balance_repair_applied"] = True
+            if trimmed_named_overweight:
+                generation_stats["section_balance_overweight_trim_applied"] = True
+            if info.get("inferred_underweight_targets"):
+                generation_stats["section_balance_inferred_underweight_targets"] = list(
+                    info["inferred_underweight_targets"]
+                )
+            generation_stats.setdefault("editorial_repair_actions", []).extend(
+                info["actions"]
+            )
+    return text, info
+
+
+def _expand_underweight_narrative_sections_for_long_form_underflow(
+    summary_text: str,
+    *,
+    target_length: Optional[int],
+    include_health_rating: bool,
+    issue_flags: Optional[Dict[str, Any]] = None,
+    generation_stats: Optional[Dict[str, Any]] = None,
+    max_deficit_words: int = 220,
+    calculated_metrics: Optional[Dict[str, Any]] = None,
+    health_score_data: Optional[Dict[str, Any]] = None,
+    risk_factors_excerpt: str = "",
+) -> Tuple[str, Dict[str, Any]]:
+    text = (summary_text or "").strip()
+    info: Dict[str, Any] = {
+        "changed": False,
+        "applied": False,
+        "words_added": 0,
+        "actions": [],
+    }
+    if not text or not target_length:
+        return summary_text, info
+    if not _is_long_form_target(target_length):
+        return summary_text, info
+
+    flags = issue_flags or {}
+    if not flags.get("word_band_issue"):
+        return summary_text, info
+    if flags.get("quote_issue") or flags.get("key_metrics_issue"):
+        return summary_text, info
+
+    target = int(target_length)
+    tol = _effective_word_band_tolerance(target_length)
+    lower_total = max(TARGET_LENGTH_MIN_WORDS, target - tol)
+    upper_total = min(TARGET_LENGTH_MAX_WORDS, target + tol)
+    current_total = _count_words(text)
+    deficit_total = max(0, lower_total - current_total)
+    max_deficit = max(1, int(max_deficit_words or 220))
+    if deficit_total <= 0 or deficit_total > max_deficit:
+        return summary_text, info
+
+    budgets = _calculate_section_word_budgets(target, include_health_rating=include_health_rating)
+    if not budgets:
+        return summary_text, info
+    counts = _collect_section_body_word_counts(text, include_health_rating=include_health_rating)
+
+    recipient_priority = {
+        "Risk Factors": 0,
+        "Management Discussion & Analysis": 1,
+        "Executive Summary": 2,
+        "Financial Performance": 3,
+        "Financial Health Rating": 4,
+        "Closing Takeaway": 5,
+    }
+    narrative_titles = [
+        title
+        for title in _SUMMARY_NARRATIVE_REPETITION_SECTIONS
+        if include_health_rating or title != "Financial Health Rating"
+    ]
+    preferred = [t for t in (flags.get("section_balance_underweight_titles") or []) if t in narrative_titles]
+    recipients = list(preferred)
+    for title in sorted(
+        narrative_titles,
+        key=lambda t: (
+            -(int(budgets.get(t, 0) or 0) - int(counts.get(t, 0) or 0)),
+            recipient_priority.get(t, 99),
+        ),
+    ):
+        if title not in recipients:
+            recipients.append(title)
+
+    _section_wc = lambda value: len(re.findall(r"\b\w+\b", value or ""))
+    room = max(0, upper_total - current_total)
+    to_add = min(int(deficit_total), int(room))
+    if to_add <= 0:
+        return summary_text, info
+
+    for section_title in recipients:
+        if to_add <= 0:
+            break
+        if section_title == "Key Metrics":
+            continue
+        body = _extract_markdown_section_body(text, section_title)
+        if body is None:
+            continue
+        expected = int(budgets.get(section_title, 0) or 0)
+        if expected <= 0:
+            continue
+        observed = int(counts.get(section_title, 0) or 0)
+        section_tol = _section_budget_tolerance_words(expected, max_tolerance=10)
+        max_allowed = expected + section_tol
+        target_fill = max(12, min(max_allowed - observed, to_add))
+        if target_fill <= 0:
+            continue
+
+        new_body = str(body or "").strip()
+        before_wc = _section_wc(new_body)
+        loops = 0
+        while (_section_wc(new_body) - before_wc) < target_fill and loops < 4 and to_add > 0:
+            addition = _section_balance_top_up_sentence(
+                section_title,
+                attempt=loops,
+                calculated_metrics=calculated_metrics,
+                health_score_data=health_score_data,
+                risk_factors_excerpt=risk_factors_excerpt,
+            )
+            new_body = _append_section_balance_sentence(
+                new_body,
+                section_title=section_title,
+                sentence=addition,
+            )
+            loops += 1
+            if _section_wc(new_body) >= max_allowed:
+                break
+
+        gained = max(0, _section_wc(new_body) - before_wc)
+        if gained <= 0:
+            continue
+        if _section_wc(new_body) > max_allowed:
+            over_by = _section_wc(new_body) - max_allowed
+            if 0 < over_by <= 18:
+                tokens = new_body.split()
+                if len(tokens) > over_by + 1:
+                    new_body = " ".join(tokens[: len(tokens) - over_by]).strip()
+                    if new_body and not new_body.endswith((".", "!", "?")):
+                        new_body += "."
+                gained = max(0, _section_wc(new_body) - before_wc)
+        if gained <= 0 or new_body == body:
+            continue
+        text = _replace_markdown_section_body(text, section_title, new_body)
+        counts[section_title] = before_wc + gained
+        to_add = max(0, to_add - gained)
+        info["words_added"] += int(gained)
+        info["changed"] = True
+        info["applied"] = True
+
+    if info["applied"]:
+        info["actions"].append("long_form_underflow_section_expansion")
+        if generation_stats is not None:
+            generation_stats["long_form_underflow_recovery_used"] = True
+            generation_stats["long_form_underflow_recovery_words_added"] = int(
+                generation_stats.get("long_form_underflow_recovery_words_added", 0) or 0
+            ) + int(info["words_added"])
+            generation_stats.setdefault("editorial_repair_actions", []).extend(
+                info["actions"]
+            )
+    return text, info
+
+
+def _apply_strict_contract_seal(
+    summary_text: str,
+    *,
+    include_health_rating: bool,
+    target_length: Optional[int],
+    calculated_metrics: Optional[Dict[str, Any]],
+    metrics_lines: str,
+    filing_language_snippets: str,
+    strict_quote_contract: bool,
+    company_name: Optional[str] = None,
+    persona_requested: bool = False,
+    generation_stats: Optional[Dict[str, Any]] = None,
+    quality_profile: Optional[SummaryFlowQualityProfile] = None,
+    final_issue_flags: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Apply deterministic, contract-preserving repairs in a fixed order."""
+    text = (summary_text or "").strip()
+    if not text:
+        return summary_text
+
+    text = _apply_contract_structural_repairs(
+        text,
+        include_health_rating=include_health_rating,
+        target_length=target_length,
+        calculated_metrics=calculated_metrics,
+    )
+
+    if strict_quote_contract:
+        min_quotes_required = max(3, _summary_min_verified_quotes())
+        max_quotes_allowed = _summary_max_verified_quotes()
+        exec_quotes = _count_direct_quotes_in_section(text, "Executive Summary")
+        mdna_quotes = _count_direct_quotes_in_section(
+            text, "Management Discussion & Analysis"
+        )
+        total_quotes = exec_quotes + mdna_quotes
+        needs_quote_rebalance = (
+            total_quotes < min_quotes_required
+            or total_quotes > max_quotes_allowed
+            or exec_quotes < 1
+            or mdna_quotes < 1
+        )
+        if needs_quote_rebalance:
+            text = _rebalance_contract_quotes(
+                text,
+                filing_language_snippets=filing_language_snippets,
+                min_required_quotes=min_quotes_required,
+                max_allowed_quotes=max_quotes_allowed,
+            )
+        # Quote counts can be "correct" while the wording is ungrounded. In that case,
+        # rebuild quote placements from filing snippets so strict quote-grounding passes.
+        grounding_issue = _make_quote_grounding_validator(
+            source_text=filing_language_snippets,
+            require_quotes=True,
+            min_required_quotes=min_quotes_required,
+            max_allowed_quotes=max_quotes_allowed,
+        )(text)
+        if grounding_issue and "not grounded in filing text" in grounding_issue.lower():
+            text = _rebalance_contract_quotes(
+                text,
+                filing_language_snippets=filing_language_snippets,
+                min_required_quotes=min_quotes_required,
+                max_allowed_quotes=max_quotes_allowed,
+            )
+
+    if include_health_rating:
+        text = _ensure_health_to_exec_bridge(text, target_length=target_length)
+
+    if (metrics_lines or "").strip():
+        text = _canonicalize_key_metrics_section(text, metrics_lines)
+        key_metrics_body = _extract_markdown_section_body(text, "Key Metrics") or ""
+        key_metrics_issue, _ = _validate_key_metrics_numeric_block(
+            key_metrics_body,
+            min_rows=5,
+            require_markers=True,
+        )
+        if key_metrics_issue:
+            text = _canonicalize_key_metrics_section(text, metrics_lines)
+            if not re.search(r"^\s*##\s*(?:Key\s)", text, re.IGNORECASE | re.MULTILINE):
+                closing_match = re.search(
+                    r"(^\s*##\s*Closing\s+Takeaway)",
+                    text,
+                    re.IGNORECASE | re.MULTILINE,
+                )
+                if closing_match:
+                    inject_block = f"\n\n## Key Metrics\n{metrics_lines}\n\n"
+                    text = (
+                        text[: closing_match.start()]
+                        + inject_block
+                        + text[closing_match.start() :]
+                    )
+                else:
+                    text = text.rstrip() + f"\n\n## Key Metrics\n{metrics_lines}\n"
+
+    # Final editorial polish inside the seal: run after structural repairs but before
+    # final word-band enforcement so the seal's band logic remains the last length authority.
+    _seal_flags = final_issue_flags or {}
+    _seal_profile = quality_profile or SummaryFlowQualityProfile()
+    if _seal_flags.get("leading_word_repetition_issue"):
+        text, _seal_lwr_info = _repair_leading_word_repetition_in_summary(
+            text,
+            max_same_opening=max(
+                1, int(getattr(_seal_profile, "max_same_opening", 2) or 2)
+            ),
+            target_sections=list(_seal_flags.get("leading_word_repetition_sections") or []),
+        )
+        if generation_stats is not None and _seal_lwr_info.get("rewrites"):
+            generation_stats["leading_word_repetition_rewrites"] = int(
+                generation_stats.get("leading_word_repetition_rewrites", 0) or 0
+            ) + int(_seal_lwr_info.get("rewrites", 0) or 0)
+            if _seal_lwr_info.get("sections"):
+                generation_stats["leading_word_repetition_fix_sections"] = list(
+                    {
+                        *(
+                            generation_stats.get(
+                                "leading_word_repetition_fix_sections", []
+                            )
+                            or []
+                        ),
+                        *(_seal_lwr_info.get("sections") or []),
+                    }
+                )
+
+    if _seal_flags.get("numbers_discipline_issue"):
+        flagged_sections = set(_seal_flags.get("numbers_discipline_sections") or [])
+        if not flagged_sections:
+            flagged_sections = {"Executive Summary"}
+        if "Executive Summary" in flagged_sections:
+            text, _seal_exec_replaced = _scrub_executive_summary_numeric_density(
+                text,
+                target_length=target_length,
+                quality_profile=_seal_profile,
+            )
+            if generation_stats is not None and _seal_exec_replaced > 0:
+                generation_stats["exec_numeric_scrub_replacements"] = int(
+                    generation_stats.get("exec_numeric_scrub_replacements", 0) or 0
+                ) + int(_seal_exec_replaced)
+        for _seal_section in (
+            "Financial Performance",
+            "Management Discussion & Analysis",
+            "Risk Factors",
+            "Closing Takeaway",
+        ):
+            if _seal_section not in flagged_sections:
+                continue
+            text, _seal_replaced = _scrub_section_numeric_density(
+                text,
+                section_title=_seal_section,
+                target_length=target_length,
+                quality_profile=_seal_profile,
+            )
+            if generation_stats is not None and _seal_replaced > 0:
+                if _seal_section == "Financial Performance":
+                    generation_stats["perf_numeric_scrub_replacements"] = int(
+                        generation_stats.get("perf_numeric_scrub_replacements", 0) or 0
+                    ) + int(_seal_replaced)
+                if _seal_section == "Management Discussion & Analysis":
+                    generation_stats["mdna_numeric_scrub_replacements"] = int(
+                        generation_stats.get("mdna_numeric_scrub_replacements", 0) or 0
+                    ) + int(_seal_replaced)
+
+    if target_length:
+        final_target = int(target_length)
+        strict_tolerance = _effective_word_band_tolerance(target_length)
+        allow_padding = _allow_padding_for_target(
+            final_target, _count_words(text or "")
+        )
+        text = _ensure_final_strict_word_band(
+            text,
+            final_target,
+            include_health_rating=include_health_rating,
+            tolerance=strict_tolerance,
+            generation_stats=generation_stats,
+            allow_padding=allow_padding,
+        )
+        text = _enforce_whitespace_word_band(
+            text,
+            final_target,
+            tolerance=strict_tolerance,
+            allow_padding=_allow_padding_for_target(
+                final_target, _count_words(text or "")
+            ),
+            dedupe=True,
+        )
+
+    closing_body = _extract_markdown_section_body(text, "Closing Takeaway")
+    if closing_body:
+        capped_closing, removed_sentences = _cap_closing_takeaway_sentences_preserve_triggers(
+            closing_body,
+            budget_words=_closing_takeaway_budget_for_target(
+                target_length, include_health_rating=include_health_rating
+            ),
+        )
+        capped_closing = _normalize_closing_prose_spacing(capped_closing)
+        if removed_sentences > 0 and capped_closing != closing_body:
+            text = _replace_markdown_section_body(
+                text, "Closing Takeaway", capped_closing
+            )
+
+    text = _repair_closing_recommendation_in_summary(
+        text,
+        company_name=str(company_name or "").strip() or "the company",
+        calculated_metrics=calculated_metrics,
+        persona_requested=bool(persona_requested),
+    )
+
+    return text
 
 
 def _make_persona_exclusivity_validator(
@@ -7184,41 +14815,175 @@ def _make_persona_exclusivity_validator(
     return _validator
 
 
+def _normalize_typography(value: str) -> str:
+    """Normalize smart quotes, em-dashes, ellipses, and non-breaking spaces."""
+    return (
+        (value or "")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+        .replace("\u2014", "-")
+        .replace("\u2013", "-")
+        .replace("\u2026", "...")
+        .replace("\u00a0", " ")
+    )
+
+
+def _make_quote_grounding_validator(
+    *,
+    source_text: Optional[str],
+    require_quotes: bool,
+    min_required_quotes: int = 1,
+    max_allowed_quotes: int = 3,
+) -> Callable[[str], Optional[str]]:
+    source = " ".join(_normalize_typography(source_text or "").split()).strip().lower()
+    source_alnum = re.sub(r"[^a-z0-9 ]+", "", source)
+    source_alnum = re.sub(r"\s+", " ", source_alnum).strip()
+    source_tokens = source_alnum.split()
+    source_token_positions: Dict[str, List[int]] = {}
+    for idx, token in enumerate(source_tokens):
+        positions = source_token_positions.setdefault(token, [])
+        if len(positions) < 24:
+            positions.append(idx)
+    quote_re = re.compile(r"[“\"]([^“”\"\n]{8,260})[”\"]")
+
+    def _normalize(value: str) -> str:
+        normalized = (
+            " ".join(_normalize_typography(value or "").split()).strip().lower()
+        )
+        return normalized
+
+    def _fuzzy_quote_in_source(quote_alnum: str) -> bool:
+        tokens = [tok for tok in quote_alnum.split() if tok]
+        if len(tokens) < 5 or not source_tokens:
+            return False
+
+        # Probe a handful of candidate windows around quote anchor tokens.
+        anchors = [tokens[0], tokens[len(tokens) // 2], tokens[-1]]
+        starts: List[int] = []
+        for anchor in anchors:
+            for pos in source_token_positions.get(anchor, []):
+                starts.append(max(0, pos - (len(tokens) // 2)))
+                if len(starts) >= 30:
+                    break
+            if len(starts) >= 30:
+                break
+
+        if not starts:
+            return False
+
+        quote_joined = " ".join(tokens)
+        seen_windows: Set[str] = set()
+        for start in starts:
+            for pad in (0, 3, 6, 10):
+                end = min(len(source_tokens), start + len(tokens) + pad)
+                if end <= start:
+                    continue
+                window = " ".join(source_tokens[start:end]).strip()
+                if not window or window in seen_windows:
+                    continue
+                seen_windows.add(window)
+                if SequenceMatcher(None, quote_joined, window).ratio() >= 0.78:
+                    return True
+        return False
+
+    def _validator(text: str) -> Optional[str]:
+        if not text:
+            return None
+
+        exec_body = _extract_markdown_section_body(text, "Executive Summary") or ""
+        mdna_body = (
+            _extract_markdown_section_body(text, "Management Discussion & Analysis")
+            or ""
+        )
+        quote_candidates = list(quote_re.finditer(f"{exec_body}\n{mdna_body}"))
+        max_quotes = max(1, int(max_allowed_quotes))
+        if len(quote_candidates) > max_quotes:
+            return (
+                f"Executive Summary/MD&A include too many direct quotes ({len(quote_candidates)}). "
+                f"Use at most {max_quotes} short, high-signal quotes."
+            )
+        verified_quotes = 0
+
+        for match in quote_candidates:
+            raw_quote = (match.group(1) or "").strip()
+            if len(raw_quote.split()) < 3:
+                continue
+            if not source:
+                verified_quotes += 1
+                continue
+            norm_quote = _normalize(raw_quote)
+            if norm_quote and norm_quote in source:
+                verified_quotes += 1
+                continue
+            quote_alnum = re.sub(r"[^a-z0-9 ]+", "", norm_quote)
+            quote_alnum = re.sub(r"\s+", " ", quote_alnum).strip()
+            if quote_alnum and quote_alnum in source_alnum:
+                verified_quotes += 1
+                continue
+            if quote_alnum and _fuzzy_quote_in_source(quote_alnum):
+                verified_quotes += 1
+                continue
+            return (
+                f'Quoted phrase is not grounded in filing text: "{raw_quote[:120]}". '
+                "Use verbatim wording from the provided filing snippets."
+            )
+
+        min_quotes = max(0, int(min_required_quotes))
+        if require_quotes and verified_quotes < min_quotes:
+            return f"Executive Summary/MD&A must include at least {min_quotes} verified short direct quote(s) from filing snippets."
+        return None
+
+    return _validator
+
+
 def _make_risk_specificity_validator(
     *, risk_factors_excerpt: Optional[str]
 ) -> Callable[[str], Optional[str]]:
     excerpt_raw = risk_factors_excerpt or ""
     excerpt_norm = " ".join(excerpt_raw.split()).lower()
-
-    def _norm_for_search(value: str) -> str:
-        cleaned = re.sub(r"[^a-z0-9]+", " ", (value or "").lower())
-        return " ".join(cleaned.split())
-
-    excerpt_search = _norm_for_search(excerpt_raw)
+    stop_words = {
+        "that",
+        "with",
+        "from",
+        "this",
+        "there",
+        "their",
+        "which",
+        "under",
+        "would",
+        "could",
+        "have",
+        "been",
+        "into",
+        "over",
+        "only",
+        "than",
+        "while",
+        "such",
+        "when",
+        "where",
+        "about",
+        "after",
+        "before",
+        "between",
+        "through",
+    }
+    excerpt_terms = {
+        token
+        for token in re.findall(r"[a-z]{5,}", excerpt_norm)
+        if token not in stop_words
+    }
 
     risk_item_pattern = re.compile(
         r"\*\*(?P<name>[^*]{2,120})\*\*\s*:\s*(?P<body>.+?)(?=(?:\n\s*\*\*[^*]+\*\*\s*:)|\Z)",
         re.DOTALL,
     )
-
-    quote_pattern = re.compile(r"[\"“](.+?)[\"”]")
-
-    def _has_grounded_quote(body: str) -> bool:
-        if not excerpt_norm:
-            return True
-        if not body:
-            return False
-        for match in quote_pattern.finditer(body):
-            quote = " ".join((match.group(1) or "").split())
-            if not quote:
-                continue
-            word_count = len(quote.split())
-            if word_count < 4 or word_count > 12:
-                continue
-            quote_search = _norm_for_search(quote)
-            if quote_search and quote_search in excerpt_search:
-                return True
-        return False
+    generic_risk_name_re = re.compile(
+        r"\b(macro(?:economic)?|competition|competitive pressure|regulatory risk|margin compression|liquidity risk|cash flow risk)\b",
+        re.IGNORECASE,
+    )
 
     def _validator(text: str) -> Optional[str]:
         risk_body = _extract_markdown_section_body(text, "Risk Factors")
@@ -7229,11 +14994,10 @@ def _make_risk_specificity_validator(
         if len(items) < 2:
             return (
                 "Risk Factors are not in the required format. Provide 2-3 risks using: "
-                "**Risk Name**: 2-3 sentences with company-specific mechanisms."
+                "**Risk Name**: budget-aware narrative with company-specific mechanisms."
             )
 
         seen_names: set[str] = set()
-        grounded_quotes = 0
 
         for match in items:
             name = (match.group("name") or "").strip()
@@ -7242,21 +15006,52 @@ def _make_risk_specificity_validator(
             if canon in seen_names:
                 return "Risk Factors contain duplicate risk names. Use distinct, non-overlapping drivers."
             seen_names.add(canon)
+            if generic_risk_name_re.search(name):
+                return (
+                    f"Risk name '{name}' is too generic. Name the specific exposure, "
+                    "counterparty, regulation, or product/segment at risk."
+                )
 
             if len(body.split()) < 18:
-                return f"Risk Factors are too thin under '{name}'. Expand each risk to 2-3 substantive sentences with a clear mechanism."
+                return f"Risk Factors are too thin under '{name}'. Expand each risk with enough sentence depth to explain the mechanism, transmission path, and early-warning signal."
 
-            if not re.search(r"\d", body):
-                return f"Risk Factors under '{name}' must include at least one numeric anchor from this memo (%, $, ratio) to quantify impact."
-
-            if excerpt_norm and _has_grounded_quote(body):
-                grounded_quotes += 1
-
-        if excerpt_norm and grounded_quotes < min(2, len(items)):
-            return (
-                "Risk Factors are too generic relative to the filing text. "
-                "For at least two risks, include a short verbatim quote (4-10 words) from the provided RISK FACTORS excerpt in quotation marks."
+            mechanism_re = re.compile(
+                r"\b(because|driven by|if|unless|leads to|results in|pressure|compress|dilute|erode|funding|liquidity|working capital|pricing|churn|renewal|mix shift|substitution|execution slip)\b",
+                re.IGNORECASE,
             )
+            if not mechanism_re.search(body):
+                return f"Risk Factors under '{name}' need a concrete mechanism (what causes the risk and how it hits revenue, margins, cash flow, or balance sheet)."
+
+            transmission_re = re.compile(
+                r"\b(revenue|pricing|volume|mix|margin|gross margin|operating margin|cash flow|free cash flow|liquidity|refinancing|debt|balance sheet|working capital|capex|opex|demand|backlog|bookings)\b",
+                re.IGNORECASE,
+            )
+            if not transmission_re.search(body):
+                return (
+                    f"Risk Factors under '{name}' must explain transmission path "
+                    "(how the risk would hit revenue, margins, cash flow, or balance-sheet flexibility)."
+                )
+
+            has_warning_signal = bool(
+                re.search(
+                    r"\b(early[- ]warning|watch|signal|trigger|threshold|leading indicator|renewal|bookings|backlog|churn|pipeline|pricing|utilization|adoption|attrition|downtime|default|refinancing)\b",
+                    body,
+                    re.IGNORECASE,
+                )
+            )
+            if not has_warning_signal:
+                return (
+                    f"Risk Factors under '{name}' should include a concrete early-warning signal "
+                    "(operational/strategic signal or numeric threshold)."
+                )
+
+            if excerpt_terms:
+                body_tokens = set(re.findall(r"[a-z]{5,}", body.lower()))
+                if not (body_tokens & excerpt_terms):
+                    return (
+                        f"Risk Factors under '{name}' are too generic relative to filing language. "
+                        "Tie the mechanism to company-specific terms from the provided excerpt."
+                    )
 
         return None
 
@@ -7266,33 +15061,33 @@ def _make_risk_specificity_validator(
 def _build_preference_instructions(
     preferences: Optional[FilingSummaryPreferences],
     company_name: Optional[str] = None,
+    *,
+    selected_persona_name: Optional[str] = None,
+    persona_requested: bool = False,
 ) -> str:
-    """Convert user-provided preferences into prompt guidance."""
+    """Convert user preferences into concise, narrative-first prompt guidance."""
     if not preferences or preferences.mode == "default":
         base = (
-            "- Use the standard structure below with a balanced, neutral tone suitable for institutional investors.\n"
-            "- NO PERSONA: Write as a neutral professional analyst. Use third-person language ('The company...', 'The data indicates...').\n"
-            "- FORBIDDEN: First-person language ('I', 'my view'), any famous investor voices/catchphrases, folksy analogies.\n"
-            "- FOCUS ON: Quantitative metrics, objective analysis, evidence-based conclusions."
+            "- Write in neutral institutional analyst voice (third person unless explicitly requested).\n"
+            "- Keep analysis metric-anchored, non-repetitive, and decision-focused.\n"
+            "- Avoid meta-instructions, checklist narration, and persona name-dropping."
         )
         target_length = (
             _clamp_target_length(preferences.target_length) if preferences else None
         )
         if target_length:
+            tol = _effective_word_band_tolerance(target_length)
             base += (
-                f"\nTarget length: {target_length} words (must land within ±10 words). "
-                "Do not add filler or repeat framework sentences to manipulate length."
+                f"\nTARGET LENGTH: {target_length} words "
+                f"(final output must land within ±{tol} words)."
             )
         if preferences and preferences.tone:
             base += f"\nTone must remain {preferences.tone}."
         return base
 
     instructions: List[str] = [
-        "=== USER CUSTOMIZATION REQUIREMENTS (MANDATORY - ZERO TOLERANCE FOR DEVIATION) ===",
-        "The user has provided SPECIFIC customization preferences. You MUST follow ALL of these exactly:",
-        "",
-        "CRITICAL: These user preferences OVERRIDE any default behavior. Failure to comply = invalid output.",
-        "",
+        "User customization priorities:",
+        "- Follow the user preferences below before default style rules.",
     ]
 
     investor_focus = (
@@ -7306,46 +15101,27 @@ def _build_preference_instructions(
         )
         instructions.append(f"Investor brief (absolute priority): {focus_clause}")
         instructions.append(
-            "Adopt the user's requested persona as an editorial filter (what you emphasize, what you de-emphasize, and how you weigh trade-offs). "
-            "However, the output must still read like an institutional-grade memo: decisive, hierarchical, and non-repetitive."
-        )
-        instructions.append(
             "- Do NOT name-drop any investors/framework labels in the prose (including the persona name)."
         )
-        instructions.append(
-            "- Do NOT switch personas or lenses mid-memo. Maintain ONE consistent identity and one consistent recommendation end-to-end."
-        )
-        # NOTE: Investor Lens section removed - persona voice is now integrated into Executive Summary directly
-        instructions.append(
-            "- Persona flavor should be subtle and decision-oriented. Avoid process narration and self-referential doctrine ('I always...', 'I care about...', 'what I watch...')."
-        )
-        instructions.append(
-            "- If you use first-person at all, confine it to (a) a single stance sentence in Executive Summary and (b) the Closing Takeaway verdict. The rest should be written in an institutional, third-person research style."
-        )
-        instructions.append(
-            "- CRITICAL FOR MD&A: If the 'Management Discussion & Analysis' section is not explicitly labeled or appears missing, you MUST infer management's perspective from the 'FULL TEXT CONTEXT' provided at the end of the input. Do NOT state that the section is missing. Extract insights on strategy, R&D, and future outlook from the available text."
-        )
+    if persona_requested:
+        if selected_persona_name:
+            instructions.append(
+                f"- Persona lens enabled: use subtle {selected_persona_name}-aligned framing (no mimicry or catchphrases)."
+            )
+        else:
+            instructions.append(
+                "- Persona lens enabled: keep first-person framing subtle, institutional, and non-theatrical."
+            )
     else:
-        # No persona selected - enforce objective, neutral analysis
         instructions.append(
-            "=== NO PERSONA - OBJECTIVE ANALYST MODE ===\n"
-            "No investor persona was selected. You MUST write as a NEUTRAL PROFESSIONAL ANALYST.\n\n"
-            "FORBIDDEN (DO NOT USE):\n"
-            "- First-person language: 'I', 'my view', 'I would', 'I believe', 'my conviction'\n"
-            "- Any famous investor voices or catchphrases\n"
-            "- Folksy analogies or colorful investor expressions\n\n"
-            "REQUIRED (ALWAYS USE):\n"
-            "- Third-person objective language: 'The analysis indicates...', 'The data suggests...'\n"
-            "- Professional research analyst tone\n"
-            "- Quantitative focus: revenue growth %, margins, ROE, valuation multiples\n"
-            "- Evidence-based conclusions tied to specific financial metrics"
+            "- No persona selected: write as a neutral professional analyst in third person."
         )
 
     if preferences.focus_areas:
         joined = ", ".join(preferences.focus_areas)
         instructions.append(
             f"Primary focus areas (cover strictly in this order and dedicate space):\n{joined}\n"
-            f"EACH focus area MUST have its own dedicated paragraph or subsection."
+            "EACH focus area MUST have its own dedicated paragraph or subsection."
         )
         ordered_lines = "\n".join(
             f"   {idx + 1}. {area}" for idx, area in enumerate(preferences.focus_areas)
@@ -7353,122 +15129,49 @@ def _build_preference_instructions(
         instructions.append("Focus area execution order:\n" + ordered_lines)
 
     if preferences.tone:
-        instructions.append(
-            f"Tone must remain {preferences.tone}. Use this tone consistently across ALL sections. If tone drifts, rewrite."
-        )
+        instructions.append(f"Tone must remain {preferences.tone}.")
 
     detail_prompt = DETAIL_LEVEL_PROMPTS.get((preferences.detail_level or "").lower())
     if detail_prompt:
-        detail_upper = (preferences.detail_level or "").upper()
-        instructions.append(
-            f"\n=== DETAIL LEVEL (USER-SPECIFIED: {detail_upper}) ===\n"
-            f"{detail_prompt}\n"
-            f"You MUST match this detail level exactly. Too brief = invalid. Too verbose = invalid."
-        )
+        instructions.append(f"Detail level preference: {detail_prompt}")
 
     output_prompt = OUTPUT_STYLE_PROMPTS.get((preferences.output_style or "").lower())
     if output_prompt:
-        style_upper = (preferences.output_style or "").upper()
-        instructions.append(
-            f"\n=== OUTPUT STYLE (USER-SPECIFIED: {style_upper}) ===\n"
-            f"{output_prompt}\n"
-            f"Follow this format strictly throughout the document."
-        )
+        instructions.append(f"Output style preference: {output_prompt}")
 
     complexity_prompt = COMPLEXITY_LEVEL_PROMPTS.get(
         (preferences.complexity or "intermediate").lower()
     )
     if complexity_prompt:
-        complexity_upper = (preferences.complexity or "intermediate").upper()
+        instructions.append(f"Complexity preference: {complexity_prompt}")
+
+    if getattr(preferences, "include_key_takeaways", False):
         instructions.append(
-            f"\n=== COMPLEXITY LEVEL (USER-SPECIFIED: {complexity_upper}) ===\n"
-            f"{complexity_prompt}"
+            "KEY TAKEAWAYS: Open the summary with a '## Key Takeaways' section "
+            "containing 3-5 concise bullet points that capture the most important "
+            "findings. This section's word count is drawn from the overall target "
+            "length budget (approximately 8-12% of target). Keep bullets specific "
+            "and evidence-backed, not generic."
         )
 
     target_length = _clamp_target_length(preferences.target_length)
     if target_length:
+        tol = _effective_word_band_tolerance(target_length)
         instructions.append(
-            f"""
-=== LENGTH GUIDANCE (HARD CAP) ===
-TARGET LENGTH: {target_length} words (must land within ±10 words).
-
-RULES:
-- You MUST land between {max(1, int(target_length) - 10)}–{int(target_length) + 10} words total.
-- Do NOT pad with generic "framework" sentences, meta-process narration, or repeated constraints.
-- If you are outside the band, rewrite by adding/removing substantive sentences (numbers + mechanisms), not filler.
-=== END LENGTH GUIDANCE ===
-"""
+            f"TARGET LENGTH: {target_length} words (hard target, final output must land within ±{tol} words)."
+        )
+        instructions.append(
+            f"Allowed range: {max(1, int(target_length) - tol)} to {int(target_length) + tol} words."
         )
 
-    instructions.append(
-        """
-CRITICAL COMPLETENESS INSTRUCTION:
-- You MUST complete all sections. Do not stop mid-sentence.
-- Allocate your word count wisely. Do not spend too many words on early sections if it means cutting off the end.
-- The 'Key Metrics' section MUST be included before the Closing Takeaway.
-"""
-    )
-
-    instructions.append(
-        """
-=== FLOW AND QUALITY REQUIREMENTS ===
-- Ensure each section transitions naturally to the next. The summary should read as a cohesive document.
-- Avoid one-sentence paragraphs in narrative sections (Health/Exec/Financial Performance/MD&A/Closing). Use 2-4 sentence paragraphs for flow.
-- NEVER repeat the same sentence or phrase anywhere in the summary. Each point should be made ONCE.
-- Vary your sentence structure and openings to maintain reader engagement.
-- The Financial Health Rating section should flow naturally into the Executive Summary.
-- Avoid redundancy: if you mention a metric in one section, do not repeat the same observation elsewhere.
-"""
-    )
-
-    # Add mandatory closing verdict for persona-based analyses
-    if investor_focus:
-        instructions.append(
-            """
-=== CLOSING TAKEAWAY - PERSONA VOICE REQUIREMENT (CRITICAL) ===
-
-After the 'Key Metrics' section, you MUST include a '## Closing Takeaway' section.
-
-THIS SECTION MUST:
-1. Be written ENTIRELY in the first-person voice of your selected persona
-2. Use the persona's SIGNATURE PHRASES and MENTAL MODELS
-3. Apply their specific DECISION FRAMEWORK to reach a verdict
-4. Sound like the ACTUAL INVESTOR wrote it - not a generic analyst
-
-REQUIRED CONTENT (5-7 sentences):
-1. QUALITY VERDICT: Is this a wonderful/fair/poor business? (Use persona's language)
-2. INVESTMENT STANCE: BUY / HOLD / SELL / WAIT - stated clearly
-3. KEY REASONING: The #1 factor driving your decision (in persona's framework)
-4. SUPPORTING FACTORS: Secondary considerations that reinforce your stance
-5. ACTIONABLE CONDITION: What would change your mind (price target, metric threshold, or catalyst)
-6. PERSONAL CLOSING (MANDATORY): End with a first-person BUY/HOLD/SELL recommendation (wording should vary; avoid repeating fixed phrases like "I personally would") - this should feel like genuine advice from the persona to a friend
-
-CRITICAL CONSISTENCY RULES:
-- Do NOT name-drop other investors or frameworks.
-- Do NOT include persona labels like "Value Investor Default" or "Magic Formula" unless the user explicitly asked for that persona/lens in the investor brief.
-- Do NOT contradict your own stance: use ONE recommendation (Buy/Hold/Sell) consistently in Executive Summary and Closing Takeaway.
-DO NOT end with incomplete sentences. Every thought must be finished.
-IMPORTANT: This section counts toward your total word count. Stay within the user's requested length.
-=== END CLOSING REQUIREMENT ===
-"""
-        )
-
-    # Add compliance summary
-    instructions.append(
-        """
-=== COMPLIANCE CHECKLIST (VERIFY BEFORE SUBMITTING) ===
-Before you finish, verify you have followed ALL user requirements:
-[ ] Persona/viewpoint maintained throughout EVERY section
-[ ] All specified focus areas covered with dedicated content
-[ ] Tone matches user specification consistently
-[ ] Detail level matches user specification
-[ ] Output style matches user specification  
-[ ] Word count within specified range
-[ ] Closing Takeaway in persona voice (if persona specified)
-
-If ANY checkbox would be unchecked, REVISE your output before submitting.
-=== END USER CUSTOMIZATION REQUIREMENTS ===
-"""
+    instructions.extend(
+        [
+            "Narrative quality requirements:",
+            "- Keep complete sentences and smooth transitions across sections.",
+            "- State each major point once; avoid repeated phrasing.",
+            "- Keep one consistent recommendation stance from Executive Summary to Closing Takeaway.",
+            "- Avoid chains of parenthetical fragments and avoid checklist-like sentence spam.",
+        ]
     )
 
     return "\n".join(instructions)
@@ -7527,6 +15230,7 @@ def _build_health_rating_instructions(
     # budget-aware so they do not fight the fixed distribution requirements.
     health_budget_min: Optional[int] = None
     health_budget_max: Optional[int] = None
+    health_shape = None
     if target_length and int(target_length) > 0:
         try:
             budgets = _calculate_section_word_budgets(
@@ -7534,12 +15238,14 @@ def _build_health_rating_instructions(
             )
             budget = int(budgets.get("Financial Health Rating", 0) or 0)
             if budget > 0:
+                health_shape = get_financial_health_shape(budget)
                 tol = _section_budget_tolerance_words(budget, max_tolerance=10)
                 health_budget_min = max(1, budget - tol)
                 health_budget_max = budget + tol
         except Exception:
             health_budget_min = None
             health_budget_max = None
+            health_shape = None
 
     # Build header based on whether user has customized
     if is_custom_mode:
@@ -7591,7 +15297,7 @@ def _build_health_rating_instructions(
                 "MANDATORY FORMAT (YOU MUST INCLUDE ALL ELEMENTS):",
                 "1. The score (0-100) with rating label (Very Healthy/Healthy/Watch/At Risk)",
                 "2. NO letter grades or abbreviations in parentheses",
-                "3. A MANDATORY explanation of 3-5 sentences (length must fit the memo's Financial Health Rating word budget if provided)",
+                "3. A MANDATORY explanation that fits the memo's Financial Health Rating word budget if provided",
                 "",
                 "YOUR EXPLANATION MUST COVER:",
                 "- What drove the score (specific metrics with values)",
@@ -7619,7 +15325,7 @@ def _build_health_rating_instructions(
                 "",
                 "MANDATORY FORMAT (YOU MUST INCLUDE ALL ELEMENTS):",
                 "1. The score (0-100) with traffic light: 70-100=GREEN, 50-69=YELLOW, 0-49=RED",
-                "2. A MANDATORY explanation of 3-4 sentences (length must fit the memo's Financial Health Rating word budget if provided)",
+                "2. A MANDATORY explanation that fits the memo's Financial Health Rating word budget if provided",
                 "",
                 "YOUR EXPLANATION MUST COVER:",
                 "- What drove the score (specific metrics with values)",
@@ -7640,7 +15346,7 @@ def _build_health_rating_instructions(
                 "",
                 "MANDATORY FORMAT - EXTENDED NARRATIVE REQUIRED:",
                 "1. The score (0-100) with rating label",
-                "2. A DETAILED narrative paragraph of 4-7 sentences (length must fit the memo's Financial Health Rating word budget if provided)",
+                "2. A DETAILED narrative explanation that fits the memo's Financial Health Rating word budget if provided",
                 "",
                 "YOUR NARRATIVE MUST ANALYZE:",
                 "- Profitability metrics (margins, ROE, ROA) with specific values",
@@ -7659,7 +15365,7 @@ def _build_health_rating_instructions(
             [
                 "MANDATORY FORMAT - EXPLANATION REQUIRED:",
                 "1. The score (0-100) with rating label",
-                "2. A MANDATORY explanation of 3-4 sentences (40-75 words)",
+                "2. A MANDATORY explanation that fits the current section budget",
                 "",
                 "YOUR EXPLANATION MUST COVER:",
                 "- What metrics drove the score",
@@ -7704,6 +15410,19 @@ def _build_health_rating_instructions(
             )
             if (health_budget_min is not None and health_budget_max is not None)
             else "If you write fewer than 40 words for this section, your output is INVALID.",
+            (
+                "STRUCTURE: Use "
+                + describe_sentence_range(
+                    int(health_shape.min_sentences), int(health_shape.max_sentences)
+                )
+                + " across "
+                + describe_paragraph_range(
+                    int(health_shape.min_paragraphs), int(health_shape.max_paragraphs)
+                )
+                + "."
+            )
+            if health_shape is not None
+            else "STRUCTURE: Use the shortest form that fully explains the score and bridges into the operating analysis.",
             "=== END LENGTH + CONTENT REQUIREMENT ===",
         ]
     )
@@ -8165,7 +15884,9 @@ def _load_document_excerpt(
 
             # Hard safety cap: PDF text extraction can be unexpectedly slow for some
             # filings (embedded fonts/images, large pages). Keep the API responsive.
-            parse_timeout_raw = os.getenv("SUMMARY_PDF_PARSE_TIMEOUT_SECONDS", "8") or "8"
+            parse_timeout_raw = (
+                os.getenv("SUMMARY_PDF_PARSE_TIMEOUT_SECONDS", "8") or "8"
+            )
             try:
                 parse_timeout_s = float(parse_timeout_raw)
             except ValueError:
@@ -8174,7 +15895,10 @@ def _load_document_excerpt(
             parse_started = time.monotonic()
 
             for i in page_indices:
-                if parse_timeout_s and (time.monotonic() - parse_started) > parse_timeout_s:
+                if (
+                    parse_timeout_s
+                    and (time.monotonic() - parse_started) > parse_timeout_s
+                ):
                     print(
                         f"⚠️ PDF text extraction timed out after {parse_timeout_s:.1f}s (pages_read={len(parts)})."
                     )
@@ -8439,6 +16163,359 @@ def _extract_labeled_excerpt(
     if max_chars and max_chars > 0 and len(excerpt) > max_chars:
         excerpt = excerpt[:max_chars].rstrip()
     return excerpt
+
+
+def _build_balanced_context_excerpt(document_text: str, *, max_chars: int) -> str:
+    """Build a section-aware context window instead of naive front truncation.
+
+    Keeps balanced slices for:
+    - filing head
+    - MD&A
+    - Risk Factors
+    - strategy/outlook language
+    - filing tail
+    """
+    source = (document_text or "").strip()
+    if not source or max_chars <= 0:
+        return ""
+    if len(source) <= max_chars:
+        return source
+
+    segment_chars = max(4000, int(max_chars // 5))
+    outlook_chars = max(2000, int(segment_chars // 2))
+
+    mdna_excerpt = (
+        _extract_labeled_excerpt(
+            source, "MANAGEMENT DISCUSSION & ANALYSIS", max_chars=segment_chars
+        )
+        or _extract_labeled_excerpt(
+            source, "MANAGEMENT DISCUSSION AND ANALYSIS", max_chars=segment_chars
+        )
+        or _extract_labeled_excerpt(
+            source, "MANAGEMENT'S DISCUSSION AND ANALYSIS", max_chars=segment_chars
+        )
+    )
+    risk_excerpt = _extract_labeled_excerpt(
+        source, "RISK FACTORS", max_chars=segment_chars
+    )
+    strategy_excerpt = (
+        _extract_labeled_excerpt(source, "BUSINESS", max_chars=outlook_chars)
+        or _extract_labeled_excerpt(source, "OUTLOOK", max_chars=outlook_chars)
+        or _extract_labeled_excerpt(
+            source, "FORWARD-LOOKING STATEMENTS", max_chars=outlook_chars
+        )
+    )
+
+    candidates: List[Tuple[str, str]] = [
+        ("HEAD", source[:segment_chars]),
+        ("MD&A", mdna_excerpt or ""),
+        ("RISK FACTORS", risk_excerpt or ""),
+        ("BUSINESS/OUTLOOK", strategy_excerpt or ""),
+        ("TAIL", source[-segment_chars:]),
+    ]
+
+    blocks: List[str] = []
+    seen_norm: Set[str] = set()
+    remaining = int(max_chars)
+    for label, text in candidates:
+        snippet = (text or "").strip()
+        if not snippet or remaining <= 0:
+            continue
+        norm = re.sub(r"\s+", " ", snippet).strip().lower()
+        if not norm or norm in seen_norm:
+            continue
+        seen_norm.add(norm)
+        header = f"[{label}]\n"
+        allowance = max(0, remaining - len(header) - 2)
+        if allowance <= 0:
+            continue
+        clipped = snippet[:allowance].rstrip()
+        if not clipped:
+            continue
+        block = f"{header}{clipped}".strip()
+        blocks.append(block)
+        remaining -= len(block) + 2
+
+    if not blocks:
+        return source[:max_chars].rstrip()
+
+    merged = "\n\n".join(blocks).strip()
+    if len(merged) > max_chars:
+        merged = merged[:max_chars].rstrip()
+    return merged
+
+
+def _build_filing_language_snippets(
+    document_text: str, *, max_quotes: int = 6, max_chars: int = 1_800
+) -> str:
+    """Extract short verbatim filing snippets to anchor direct quotes in prose."""
+    if not document_text:
+        return ""
+
+    source = (document_text or "").strip()
+    if not source:
+        return ""
+
+    quotes: List[str] = []
+    seen: Set[str] = set()
+
+    def _try_add(candidate: str) -> None:
+        cleaned = " ".join((candidate or "").split()).strip()
+        if not cleaned:
+            return
+        words = cleaned.split()
+        if len(words) < 6 or len(words) > 36:
+            return
+        norm = re.sub(r"[^a-z0-9 ]+", "", cleaned.lower())
+        norm = re.sub(r"\s+", " ", norm).strip()
+        if not norm or norm in seen:
+            return
+        # Filter obviously table-like noise.
+        alpha_chars = sum(1 for ch in cleaned if ch.isalpha())
+        digit_chars = sum(1 for ch in cleaned if ch.isdigit())
+        if cleaned.count("|") >= 2 or cleaned.count("\t") >= 1:
+            return
+        if len(re.findall(r"\b(?:\d+(?:\.\d+)?%?|[$€£]\s*\d+)\b", cleaned)) > 6:
+            return
+        if re.search(r"\b(?:item|note)\s+\d+[a-z]?\b", cleaned, re.IGNORECASE):
+            return
+        if alpha_chars < 24 or digit_chars > alpha_chars:
+            return
+        seen.add(norm)
+        quotes.append(cleaned)
+
+    # Prioritize management/outlook language first so MD&A and executive sections
+    # can use genuinely strategic quotes instead of numeric/table fragments.
+    mgmt_blocks: List[str] = []
+    for label in (
+        "MANAGEMENT DISCUSSION & ANALYSIS",
+        "MANAGEMENT DISCUSSION AND ANALYSIS",
+        "MANAGEMENT'S DISCUSSION AND ANALYSIS",
+        "BUSINESS",
+        "OUTLOOK",
+        "FORWARD-LOOKING STATEMENTS",
+    ):
+        excerpt = _extract_labeled_excerpt(source, label, max_chars=25_000)
+        if excerpt:
+            mgmt_blocks.append(excerpt)
+    prioritized_source = "\n\n".join(mgmt_blocks).strip() or source
+
+    mgmt_sentence_re = re.compile(
+        r"\b(expect|expects|plan|plans|planned|focus|focused|priorit|guidance|outlook|strategy|invest|investment|expand|expansion|execution|pipeline|roadmap|demand|pricing)\b",
+        re.IGNORECASE,
+    )
+    for sentence in re.split(r"(?<=[.!?])\s+", prioritized_source):
+        if not mgmt_sentence_re.search(sentence or ""):
+            continue
+        _try_add(sentence.strip().strip('"“”'))
+        if len(quotes) >= max_quotes:
+            break
+
+    if len(quotes) < max_quotes:
+        for match in re.finditer(r"[“\"]([^“”\"\n]{20,260})[”\"]", prioritized_source):
+            _try_add(match.group(1))
+            if len(quotes) >= max_quotes:
+                break
+
+    if len(quotes) < max_quotes:
+        # Fallback: extract management-forward statements as pseudo-quote snippets.
+        keyword_re = re.compile(
+            r"\b(expect|expects|plan|plans|planned|focus|focused|remain|remains|target|targets|guidance|demand|pricing|outlook|strategy|execute|execution)\b",
+            re.IGNORECASE,
+        )
+        for sentence in re.split(r"(?<=[.!?])\s+", source):
+            if not keyword_re.search(sentence or ""):
+                continue
+            _try_add(sentence.strip().strip('"“”'))
+            if len(quotes) >= max_quotes:
+                break
+
+    if not quotes:
+        return ""
+
+    block = "\n".join(f'- "{snippet}"' for snippet in quotes[:max_quotes]).strip()
+    if max_chars and len(block) > max_chars:
+        block = block[:max_chars].rstrip()
+    return block
+
+
+def _has_usable_primary_docs_context(context_text: Optional[str]) -> bool:
+    normalized = " ".join((context_text or "").split()).strip()
+    if not normalized:
+        return False
+    if _looks_like_financial_statements_json(normalized[:9000]):
+        return False
+    word_count = _count_words(normalized)
+    if word_count >= 12:
+        return True
+    alpha_chars = sum(1 for ch in normalized if ch.isalpha())
+    return alpha_chars >= 200
+
+
+def _build_primary_docs_context(
+    *,
+    context: Dict[str, Any],
+    settings,
+    base_document_text: Optional[str],
+    max_chars: int,
+    timeout_seconds: int,
+) -> Tuple[str, Dict[str, bool]]:
+    """Build hidden context strictly from primary filing documents.
+
+    Sources:
+    - Current filing narrative text (required baseline when available)
+    - Prior comparable SEC filings (same form)
+    - SEC exhibit-rich fetches when available via the same SEC URL path
+    """
+    filing = context.get("filing") or {}
+    company = context.get("company") or {}
+    timeout_s = max(
+        1, int(timeout_seconds or DEFAULT_SUMMARY_PRIMARY_DOCS_TIMEOUT_SECONDS)
+    )
+    deadline = time.monotonic() + timeout_s
+
+    source_blocks: List[str] = []
+    metadata = {
+        "used_current_filing": False,
+        "used_prior_filing": False,
+        "used_sec_exhibit": False,
+    }
+
+    def _time_remaining() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    def _timed_out() -> bool:
+        return _time_remaining() <= 0.0
+
+    def _compress_context(value: str, limit: int) -> str:
+        text = (value or "").strip()
+        if not text or len(text) <= limit:
+            return text
+        third = max(1, limit // 3)
+        head = text[:third]
+        mid_start = max(0, (len(text) // 2) - (third // 2))
+        mid = text[mid_start : mid_start + third]
+        tail = text[-third:]
+        return f"{head}\n\n--- MIDDLE ---\n\n{mid}\n\n--- END ---\n\n{tail}".strip()
+
+    def _append_block(label: str, body: Optional[str]) -> bool:
+        cleaned = " ".join((body or "").split()).strip()
+        if not _has_usable_primary_docs_context(cleaned):
+            return False
+        source_blocks.append(f"{label}\n{cleaned}")
+        return True
+
+    if _append_block("CURRENT FILING NARRATIVE:", base_document_text):
+        metadata["used_current_filing"] = True
+
+    if _timed_out():
+        return _compress_context(
+            "\n\n---\n\n".join(source_blocks).strip(), max_chars
+        ), metadata
+
+    cik = _normalize_cik_value(company.get("cik"))
+    filing_type = str(filing.get("filing_type") or "").upper().strip()
+    target_date = str(
+        filing.get("period_end")
+        or filing.get("report_date")
+        or filing.get("filing_date")
+        or ""
+    )
+    current_url = str(filing.get("source_doc_url") or "").strip()
+    storage_dir = _ensure_storage_dir(settings)
+    filing_id_str = str(filing.get("id") or uuid4())
+
+    def _load_from_sec_url(sec_url: str, *, label: str) -> bool:
+        if not sec_url or not _is_sec_document_url(sec_url) or _timed_out():
+            return False
+        tmp_path = _build_local_document_path(
+            storage_dir, f"{filing_id_str}-ctx-{uuid4().hex[:8]}"
+        )
+        try:
+            if not download_filing(sec_url, str(tmp_path), force_best_exhibit=True):
+                return False
+            limit_chars = max(30_000, min(120_000, max_chars // 2))
+            excerpt = _load_document_excerpt(
+                tmp_path,
+                limit=limit_chars,
+                max_pages=_summary_pdf_max_pages(),
+            )
+            return _append_block(label, excerpt)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Primary-doc context fetch failed for %s: %s", sec_url, exc)
+            return False
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    # Try upgrading the current filing URL via exhibit-first SEC download.
+    if current_url and _load_from_sec_url(
+        current_url, label="CURRENT FILING EXHIBIT CONTEXT:"
+    ):
+        metadata["used_sec_exhibit"] = True
+
+    if not cik or filing_type not in {"10-K", "10-Q", "8-K", "6-K"} or _timed_out():
+        combined = "\n\n---\n\n".join(source_blocks).strip()
+        return _compress_context(combined, max_chars), metadata
+
+    try:
+        sec_candidates = get_company_filings(
+            cik=cik,
+            filing_types=[filing_type],
+            max_results=40,
+            target_date=target_date,
+            include_historical=True,
+            max_historical_files=12,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Unable to fetch comparable SEC filings for context: %s", exc)
+        sec_candidates = []
+
+    current_dt = _parse_iso_date(target_date)
+    picked: List[Dict[str, Any]] = []
+    seen_urls: Set[str] = {current_url} if current_url else set()
+    for candidate in sec_candidates:
+        if _timed_out() or len(picked) >= 2:
+            break
+        if not isinstance(candidate, dict):
+            continue
+        cand_url = str(candidate.get("url") or "").strip()
+        if not cand_url or cand_url in seen_urls:
+            continue
+        if not _is_sec_document_url(cand_url):
+            continue
+        cand_dt = _parse_iso_date(
+            candidate.get("filing_date") or candidate.get("period_end")
+        )
+        if current_dt and cand_dt and cand_dt > current_dt:
+            continue
+        seen_urls.add(cand_url)
+        picked.append(candidate)
+
+    # Fallback: closest filing if time window filtering produced nothing.
+    if not picked and sec_candidates:
+        best = _pick_best_sec_filing_match(
+            sec_candidates, target_date=target_date, max_diff_days=730
+        )
+        if isinstance(best, dict):
+            picked = [best]
+
+    for idx, candidate in enumerate(picked, start=1):
+        if _timed_out():
+            break
+        cand_url = str(candidate.get("url") or "").strip()
+        cand_date = str(
+            candidate.get("filing_date") or candidate.get("period_end") or ""
+        ).strip()
+        label = f"PRIOR COMPARABLE FILING #{idx} ({filing_type} {cand_date}):"
+        if _load_from_sec_url(cand_url, label=label):
+            metadata["used_prior_filing"] = True
+            metadata["used_sec_exhibit"] = True
+
+    combined = "\n\n---\n\n".join(source_blocks).strip()
+    return _compress_context(combined, max_chars), metadata
 
 
 def _extract_latest_numeric(line_item: Any) -> Optional[float]:
@@ -8822,6 +16899,65 @@ def _build_calculated_metrics(
     }
 
     return {key: value for key, value in metrics.items() if value is not None}
+
+
+def _build_statement_only_summary_context(
+    *,
+    company_name: str,
+    filing_type: str,
+    filing_date: str,
+    statements: Optional[Dict[str, Any]],
+    prior_statements: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Synthesize a safe fallback context for data-only filings.
+
+    Some legacy/imported filings have usable financial statements but no
+    narrative source document. In those cases, build a deterministic context
+    that makes the evidence limits explicit so the model stays metric-grounded
+    and does not invent management commentary.
+    """
+    calculated_metrics = _build_calculated_metrics(statements)
+    metrics_lines = _build_key_metrics_block(
+        calculated_metrics,
+        include_health_rating=False,
+    )
+    metric_rows = [
+        line.strip()
+        for line in str(metrics_lines or "").splitlines()
+        if "|" in line and re.search(r"\d", line)
+    ]
+    if len(metric_rows) < 5:
+        return ""
+
+    financial_snapshot = _build_financial_snapshot(statements)
+    prior_metrics = (
+        _build_calculated_metrics(prior_statements) if prior_statements else {}
+    )
+    prior_period_delta_block = _build_prior_period_delta_reference_block(
+        filing_type=str(filing_type or ""),
+        current_period_end=str((statements or {}).get("period_end") or ""),
+        prior_period_end=str((prior_statements or {}).get("period_end") or ""),
+        current_metrics=calculated_metrics,
+        prior_metrics=prior_metrics,
+    )
+
+    parts: List[str] = [
+        (
+            "PRIMARY FILING NARRATIVE IS UNAVAILABLE\n"
+            f"Company: {company_name or 'Unknown'}\n"
+            f"Filing Type: {filing_type or 'Unknown'}\n"
+            f"Filing Date: {filing_date or 'Unknown'}\n"
+            "Use only the reported financial statements and deterministic period comparisons below. "
+            "Do not quote management, do not attribute claims to management or filing language, "
+            "and do not write that the filing says, notes, highlights, emphasizes, or discusses anything."
+        )
+    ]
+    if financial_snapshot:
+        parts.append(f"FINANCIAL SNAPSHOT\n{financial_snapshot}")
+    if prior_period_delta_block:
+        parts.append(f"PERIOD COMPARISON\n{prior_period_delta_block.strip()}")
+    parts.append(f"DETERMINISTIC KEY METRICS\n{metrics_lines.strip()}")
+    return "\n\n".join(part for part in parts if str(part or "").strip()).strip()
 
 
 def _safe_iso_date(value: Optional[str]) -> Optional[date]:
@@ -9263,11 +17399,7 @@ def _build_key_metrics_block(
     include_health_rating: bool = True,
     health_score_data: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Build the deterministic Key Metrics data appendix block.
-
-    The frontend parses the DATA_GRID_START/END block into a dedicated UI. Keep the
-    content numeric and scannable; omit missing metrics rather than rendering zeros.
-    """
+    """Build compact deterministic key-metric rows for frontend parsing."""
 
     def _get(key: str) -> Any:
         return calculated_metrics.get(key)
@@ -9289,165 +17421,92 @@ def _build_key_metrics_block(
     def _fmt_pct(value: Optional[float]) -> Optional[str]:
         if value is None:
             return None
-        try:
-            return f"{float(value):.1f}%"
-        except Exception:
-            return None
+        return f"{float(value):.1f}%"
 
     def _fmt_ratio(value: Optional[float], *, decimals: int = 1) -> Optional[str]:
         if value is None:
             return None
-        try:
-            return f"{float(value):.{decimals}f}x"
-        except Exception:
-            return None
+        return f"{float(value):.{decimals}f}x"
 
     revenue = _to_float(_get("revenue") or _get("total_revenue"))
     operating_income = _to_float(_get("operating_income"))
     operating_margin = _to_float(_get("operating_margin"))
-    net_income = _to_float(_get("net_income"))
     net_margin = _to_float(_get("net_margin"))
     operating_cash_flow = _to_float(_get("operating_cash_flow"))
-    capital_expenditures = _to_float(_get("capital_expenditures"))
     free_cash_flow = _to_float(_get("free_cash_flow"))
-
+    fcf_margin = _to_float(_get("fcf_margin"))
+    total_debt = _to_float(_get("total_debt"))
+    current_assets = _to_float(_get("current_assets"))
+    current_liabilities = _to_float(_get("current_liabilities"))
+    total_assets = _to_float(_get("total_assets"))
+    total_liabilities = _to_float(_get("total_liabilities"))
     cash_raw = _to_float(_get("cash"))
     securities_raw = _to_float(_get("marketable_securities"))
+
+    if fcf_margin is None and revenue and revenue != 0 and free_cash_flow is not None:
+        try:
+            fcf_margin = (free_cash_flow / revenue) * 100
+        except Exception:
+            fcf_margin = None
+
     cash_and_securities = None
     if cash_raw is not None or securities_raw is not None:
         cash_and_securities = float(cash_raw or 0.0) + float(securities_raw or 0.0)
-
-    total_debt = _to_float(_get("total_debt"))
-    total_assets = _to_float(_get("total_assets"))
-    total_liabilities = _to_float(_get("total_liabilities"))
-    current_assets = _to_float(_get("current_assets"))
-    current_liabilities = _to_float(_get("current_liabilities"))
-    inventory = _to_float(_get("inventory"))
-    interest_expense = _to_float(_get("interest_expense"))
-    dividends_paid = _to_float(_get("dividends_paid"))
-
-    equity = None
-    if total_assets is not None and total_liabilities is not None:
-        equity = total_assets - total_liabilities
-
-    working_capital = None
-    if current_assets is not None and current_liabilities is not None:
-        working_capital = current_assets - current_liabilities
 
     current_ratio = None
     if current_assets is not None and current_liabilities and current_liabilities != 0:
         current_ratio = current_assets / current_liabilities
 
-    quick_ratio = None
-    if (
-        current_assets is not None
-        and current_liabilities
-        and current_liabilities != 0
-        and inventory is not None
-    ):
-        quick_ratio = (current_assets - inventory) / current_liabilities
-
     net_debt = None
     if total_debt is not None and cash_and_securities is not None:
         net_debt = total_debt - cash_and_securities
-
-    capex_pct_revenue = None
-    if capital_expenditures is not None and revenue and revenue != 0:
-        capex_pct_revenue = abs(capital_expenditures) / revenue * 100
-
-    ocf_margin = None
-    if operating_cash_flow is not None and revenue and revenue != 0:
-        ocf_margin = operating_cash_flow / revenue * 100
-
-    fcf_margin = None
-    if free_cash_flow is not None and revenue and revenue != 0:
-        fcf_margin = free_cash_flow / revenue * 100
-
-    fcf_conversion = None
-    if free_cash_flow is not None and operating_cash_flow and operating_cash_flow != 0:
-        fcf_conversion = free_cash_flow / operating_cash_flow * 100
-
-    interest_coverage = None
-    if operating_income is not None and interest_expense and interest_expense != 0:
-        interest_coverage = operating_income / abs(interest_expense)
 
     leverage_ratio = None
     if total_liabilities is not None and total_assets and total_assets != 0:
         leverage_ratio = total_liabilities / total_assets
 
-    debt_to_equity = None
-    if total_debt is not None and equity and equity != 0:
-        debt_to_equity = total_debt / equity
-
-    roe = None
-    if net_income is not None and equity and equity > 0:
-        roe = net_income / equity * 100
-
-    def _row(label: str, value: Optional[str], icon: str) -> Optional[str]:
-        if value is None or not str(value).strip():
-            return None
-        # Add whitespace around pipes so both backend and frontend word-count/tokenizers
-        # treat the grid as multiple tokens (and never as a single "Revenue|$X|📈" word).
-        return f"{label} | {value} | {icon}"
+    candidate_rows: List[Tuple[str, Optional[str]]] = [
+        ("Revenue", _fmt_money(revenue)),
+        ("Operating Income", _fmt_money(operating_income)),
+        ("Operating Margin", _fmt_pct(operating_margin)),
+        ("Net Margin", _fmt_pct(net_margin)),
+        ("Operating Cash Flow", _fmt_money(operating_cash_flow)),
+        ("Free Cash Flow", _fmt_money(free_cash_flow)),
+        ("FCF Margin", _fmt_pct(fcf_margin)),
+        ("Cash + Securities", _fmt_money(cash_and_securities)),
+        ("Total Debt", _fmt_money(total_debt)),
+        ("Current Ratio", _fmt_ratio(current_ratio)),
+        ("Net Debt", _fmt_money(net_debt)),
+        ("Liabilities / Assets", _fmt_ratio(leverage_ratio, decimals=2)),
+    ]
 
     rows: List[str] = []
-    rows.extend(
-        [
-            _row("Revenue", _fmt_money(revenue), "📈"),
-            _row("Operating Income", _fmt_money(operating_income), "🏭"),
-            _row("Operating Margin", _fmt_pct(operating_margin), "📐"),
-            _row("Net Income", _fmt_money(net_income), "💰"),
-            _row("Net Margin", _fmt_pct(net_margin), "📐"),
-            _row("Operating Cash Flow", _fmt_money(operating_cash_flow), "🧾"),
-            _row(
-                "Capex",
-                _fmt_money(
-                    abs(capital_expenditures)
-                    if capital_expenditures is not None
-                    else None
-                ),
-                "🏗️",
-            ),
-            _row("Free Cash Flow", _fmt_money(free_cash_flow), "💸"),
-            _row("OCF Margin", _fmt_pct(ocf_margin), "🧾"),
-            _row("FCF Margin", _fmt_pct(fcf_margin), "💸"),
-            _row("FCF / OCF", _fmt_pct(fcf_conversion), "💸"),
-            _row("Capex % Revenue", _fmt_pct(capex_pct_revenue), "🏗️"),
-            _row("Cash + Securities", _fmt_money(cash_and_securities), "🏦"),
-            _row("Total Debt", _fmt_money(total_debt), "📉"),
-            _row("Net Debt", _fmt_money(net_debt), "🧱"),
-            _row("Current Assets", _fmt_money(current_assets), "📦"),
-            _row("Current Liabilities", _fmt_money(current_liabilities), "📦"),
-            _row("Working Capital", _fmt_money(working_capital), "🧮"),
-            _row("Current Ratio", _fmt_ratio(current_ratio), "📌"),
-            _row("Quick Ratio", _fmt_ratio(quick_ratio), "📌"),
-            _row("Total Assets", _fmt_money(total_assets), "🗂️"),
-            _row("Total Liabilities", _fmt_money(total_liabilities), "📊"),
-            _row("Equity", _fmt_money(equity), "📚"),
-            _row("Liabilities / Assets", _fmt_ratio(leverage_ratio, decimals=2), "📊"),
-            _row(
-                "Interest Expense",
-                _fmt_money(
-                    abs(interest_expense) if interest_expense is not None else None
-                ),
-                "🏦",
-            ),
-            _row("Interest Coverage", _fmt_ratio(interest_coverage), "📌"),
-            _row("Debt / Equity", _fmt_ratio(debt_to_equity, decimals=2), "📌"),
-            _row("ROE", _fmt_pct(roe), "💰"),
-            _row(
-                "Dividends Paid",
-                _fmt_money(abs(dividends_paid) if dividends_paid is not None else None),
-                "💵",
-            ),
-        ]
-    )
+    for label, value in candidate_rows:
+        if not value or not str(value).strip():
+            continue
+        rows.append(f"{label} | {value}")
+        if len(rows) >= 12:
+            break
 
-    rows = [row for row in rows if row]
     if not rows:
         return ""
 
-    table_lines = ["DATA_GRID_START", *rows, "DATA_GRID_END"]
+    if len(rows) < 8:
+        extra_rows: List[Tuple[str, Optional[str]]] = [
+            ("Current Assets", _fmt_money(current_assets)),
+            ("Current Liabilities", _fmt_money(current_liabilities)),
+            ("Total Assets", _fmt_money(total_assets)),
+            ("Total Liabilities", _fmt_money(total_liabilities)),
+        ]
+        for label, value in extra_rows:
+            if len(rows) >= 8:
+                break
+            if value and str(value).strip():
+                rendered = f"{label} | {value}"
+                if rendered not in rows:
+                    rows.append(rendered)
+
+    table_lines = ["DATA_GRID_START", *rows[:12], "DATA_GRID_END"]
     return "\n".join(table_lines).strip()
 
 
@@ -9715,21 +17774,32 @@ def _build_health_score_line(
     elif cash_str:
         clauses.append(f"{cash_str} of cash on hand supports near-term flexibility")
 
-    if clauses:
-        if len(clauses) >= 3:
-            clauses_text = ", ".join(clauses[:2]) + f", and {clauses[2]}"
-        elif len(clauses) == 2:
-            clauses_text = " and ".join(clauses)
-        else:
-            clauses_text = clauses[0]
-        return (
-            f"{company_name} receives a Financial Health Rating of {score:.0f}/100{band_text} "
-            f"because {clauses_text}."
-        )
+    top_clause = clauses[0] if clauses else "profitability and cash conversion"
 
+    band_clean = (band_label or "").strip()
+    if band_clean == "Very Healthy":
+        return (
+            f"{company_name} earns a {score:.0f}/100 {band_text.strip()} health rating, "
+            f"anchored by {top_clause}."
+        )
+    elif band_clean == "Healthy":
+        return (
+            f"{company_name}'s financial health scores {score:.0f}/100{band_text}, "
+            f"supported by {top_clause}."
+        )
+    elif band_clean == "Watch":
+        return (
+            f"At {score:.0f}/100{band_text}, {company_name}'s financial health "
+            f"reflects {top_clause}."
+        )
+    elif band_clean == "At Risk":
+        return (
+            f"{company_name} carries a {score:.0f}/100{band_text} health rating, "
+            f"constrained by {top_clause}."
+        )
     return (
-        f"{company_name} receives a Financial Health Rating of {score:.0f}/100{band_text} "
-        "because profitability, cash conversion, and balance-sheet resilience all feed into the score."
+        f"{company_name} receives a Financial Health Rating of {score:.0f}/100{band_text}, "
+        f"driven primarily by {top_clause}."
     )
 
 
@@ -9750,6 +17820,28 @@ def _ensure_health_rating_section(
     band = health_score_data.get("score_band")
     if score is None:
         return summary_text
+
+    # If the draft contains multiple Financial Health Rating sections, merge them
+    # deterministically before score-line normalization so we always end with one block.
+    health_block_re = re.compile(
+        r"^\s*##\s*Financial Health Rating\s*\n+([\s\S]*?)(?=^\s*##\s|\Z)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    health_blocks = list(health_block_re.finditer(summary_text))
+    if len(health_blocks) > 1:
+        merged_parts: List[str] = []
+        for match in health_blocks:
+            body = " ".join((match.group(1) or "").split()).strip()
+            if body:
+                merged_parts.append(body)
+        merged_body = "\n\n".join(merged_parts).strip()
+        text_without_health = health_block_re.sub("", summary_text or "").strip()
+        text_without_health = re.sub(r"\n{3,}", "\n\n", text_without_health)
+        summary_text = (
+            f"## Financial Health Rating\n{merged_body}\n\n{text_without_health}".strip()
+            if merged_body
+            else text_without_health
+        )
 
     def _score_to_band(score_val: float) -> str:
         for threshold, _abbr, label in RATING_SCALE:
@@ -9787,6 +17879,14 @@ def _ensure_health_rating_section(
         health_score_data=health_data_for_narrative,
         health_rating_config=health_rating_config,
         target_length=target_length,
+        budget_words=int(
+            _calculate_section_word_budgets(
+                int(target_length), include_health_rating=True
+            ).get("Financial Health Rating", 0)
+            or 0
+        )
+        if target_length
+        else None,
     )
 
     lines = summary_text.splitlines()
@@ -9865,7 +17965,15 @@ def _ensure_health_rating_section(
         r"^\s*(Profitability|Risk|Liquidity|Growth)\s*:", re.IGNORECASE
     )
     pillar_lines = [line for line in filtered_body[1:] if pillar_re.match(line)]
-    narrative_lines = [line for line in filtered_body[1:] if not pillar_re.match(line)]
+    narrative_lines = []
+    for line in filtered_body[1:]:
+        if pillar_re.match(line):
+            continue
+        if re.search(r"/100", line) or re.search(
+            r"financial\s+health\s+rating", line, re.IGNORECASE
+        ):
+            continue
+        narrative_lines.append(line)
     narrative_text = "\n".join(narrative_lines).strip()
 
     if target_length and target_length >= 550:
@@ -9874,6 +17982,16 @@ def _ensure_health_rating_section(
         min_narrative_words = 65
     else:
         min_narrative_words = 45
+    rich_existing_narrative = (
+        bool(target_length and int(target_length) >= 700)
+        and _count_words(narrative_text) >= max(120, int(target_length * 0.06))
+        and (
+            narrative_text.count(".")
+            + narrative_text.count("!")
+            + narrative_text.count("?")
+        )
+        >= 4
+    )
     has_reasoning = bool(
         re.search(
             r"\b(because|driven|reflects|due to|offset|tempered|supported by)\b",
@@ -9902,6 +18020,8 @@ def _ensure_health_rating_section(
         )
         or not (has_reasoning and has_tradeoff)
     )
+    if rich_existing_narrative:
+        needs_rebuild = False
     if needs_rebuild:
         narrative_text = narrative
 
@@ -9956,9 +18076,12 @@ def _build_health_narrative(
     health_score_data: Optional[Dict[str, Any]] = None,
     health_rating_config: Optional[Dict[str, Any]] = None,
     target_length: Optional[int] = None,
+    budget_words: Optional[int] = None,
 ) -> str:
     """Compose a metric-backed health explanation that reads like a mini-paragraph."""
     band = (health_score_data or {}).get("score_band")
+    shape = get_financial_health_shape(int(budget_words or 180))
+    target_sentence_count = int(shape.max_sentences)
 
     framework = (health_rating_config or {}).get("framework")
     weighting = (health_rating_config or {}).get("primary_factor_weighting")
@@ -9979,21 +18102,9 @@ def _build_health_narrative(
     }
 
     sentences: List[str] = []
+
     lens = framework_labels.get(framework)
     focus = weighting_labels.get(weighting)
-    if focus:
-        # Avoid repeating the literal phrase "under a value-investor lens" across memos.
-        # If the user selected a non-default framework, acknowledge it once; otherwise
-        # explain the weighting in plain English.
-        if lens and framework and framework != "value_investor_default":
-            sentences.append(
-                f"Using {lens}, the score weights {focus} most heavily because it best captures durability in this setup."
-            )
-        else:
-            sentences.append(
-                f"The score weights {focus} most heavily because it best captures durability in this setup."
-            )
-
     operating_margin = calculated_metrics.get("operating_margin")
     net_margin = calculated_metrics.get("net_margin")
     revenue = calculated_metrics.get("revenue") or calculated_metrics.get(
@@ -10001,10 +18112,32 @@ def _build_health_narrative(
     )
     operating_cash_flow = calculated_metrics.get("operating_cash_flow")
     free_cash_flow = calculated_metrics.get("free_cash_flow")
+    total_debt = calculated_metrics.get("total_debt")
+    total_liabilities = calculated_metrics.get("total_liabilities")
+    cash = calculated_metrics.get("cash")
+    marketable_securities = calculated_metrics.get("marketable_securities")
+    current_ratio = calculated_metrics.get("current_ratio")
+    capital_expenditures = calculated_metrics.get("capital_expenditures")
+    fcf_str = _format_dollar(free_cash_flow) if free_cash_flow is not None else None
     ocf_str = (
         _format_dollar(operating_cash_flow) if operating_cash_flow is not None else None
     )
-    fcf_str = _format_dollar(free_cash_flow) if free_cash_flow is not None else None
+    cash_total = None
+    if cash is not None:
+        cash_total = float(cash) + float(marketable_securities or 0)
+    cash_total_str = _format_dollar(cash_total) if cash_total is not None else None
+    debt_str = _format_dollar(total_debt) if total_debt is not None else None
+    liabilities_str = (
+        _format_dollar(total_liabilities) if total_liabilities is not None else None
+    )
+    capex_str = (
+        _format_dollar(capital_expenditures)
+        if capital_expenditures is not None
+        else None
+    )
+    verbose = int(budget_words or 0) > 420
+    revenue_str = _format_dollar(revenue) if revenue is not None else None
+
     fcf_margin = None
     if free_cash_flow is not None and revenue:
         try:
@@ -10012,137 +18145,174 @@ def _build_health_narrative(
         except Exception:
             fcf_margin = None
 
-    cash = calculated_metrics.get("cash")
-    liabilities = calculated_metrics.get("total_liabilities")
-    cash_str = _format_dollar(cash) if cash is not None else None
-    liab_str = _format_dollar(liabilities) if liabilities is not None else None
-
-    if operating_margin is not None and net_margin is not None:
-        gap = net_margin - operating_margin
-        gap_clause = ""
-        if abs(gap) >= 5:
-            gap_clause = (
-                " with meaningful below-the-line drag"
-                if gap < 0
-                else " helped by below-the-line items"
-            )
+    if focus and lens and framework and framework != "value_investor_default":
         sentences.append(
-            f"Operating margin of {operating_margin:.1f}% and net margin of {net_margin:.1f}% describe the profitability profile{gap_clause}."
+            f"Using {lens}, the score leans most heavily on {focus}, which is why the rating reflects durability of earnings and financing flexibility rather than only the headline income statement."
+        )
+
+    if operating_margin is not None and fcf_str:
+        margin_note = f" with free cash flow of {fcf_str}" + (
+            f" ({fcf_margin:.1f}% of revenue)" if fcf_margin is not None else ""
+        )
+        sentences.append(
+            f"Operating margin of {operating_margin:.1f}%{margin_note} indicates that the business still turns a meaningful share of revenue into cash, which is the clearest reason the score sits in its current band instead of drifting toward a weaker watch-level assessment."
+            if verbose
+            else f"Operating margin of {operating_margin:.1f}%{margin_note} captures the profitability-to-cash picture."
         )
     elif operating_margin is not None:
         sentences.append(
-            f"Operating margin of {operating_margin:.1f}% provides the clearest read on core profitability."
-        )
-    elif net_margin is not None:
-        sentences.append(
-            f"Net margin of {net_margin:.1f}% is the headline profitability signal, though non-operating items can distort the trend."
-        )
-
-    if ocf_str and fcf_str:
-        margin_clause = (
-            f" (FCF margin {fcf_margin:.1f}%)" if fcf_margin is not None else ""
-        )
-        sentences.append(
-            f"Operating cash flow of {ocf_str} translating to free cash flow of {fcf_str}{margin_clause} supports financial flexibility."
+            f"Operating margin of {operating_margin:.1f}% anchors the profitability read and shows the core model still has room to absorb normal operating volatility."
+            if verbose
+            else f"Operating margin of {operating_margin:.1f}% anchors the profitability read."
         )
     elif fcf_str:
         sentences.append(
-            f"Free cash flow of {fcf_str} provides an important buffer for reinvestment and resilience."
+            f"Free cash flow of {fcf_str} is the clearest profitability signal available, because it shows whether accounting earnings are converting into deployable capital after reinvestment."
+            if verbose
+            else f"Free cash flow of {fcf_str} is the clearest profitability signal available."
+        )
+    elif net_margin is not None:
+        sentences.append(
+            f"Net margin of {net_margin:.1f}% is the headline profitability metric, although the quality of that margin still depends on whether non-operating support is doing too much of the work."
         )
     elif ocf_str:
         sentences.append(
-            f"Operating cash flow of {ocf_str} supports reinvestment capacity and near-term resilience."
+            f"Operating cash flow of {ocf_str} is the primary cash-generation signal and matters because financing flexibility depends on internal cash generation more than reported earnings alone."
         )
 
-    if cash_str and liab_str:
-        leverage_clause = ""
-        if cash and liabilities:
-            if cash > liabilities:
-                leverage_clause = ", leaving the balance sheet net-cash overall"
-            elif liabilities > cash * 3:
-                leverage_clause = (
-                    ", with liabilities more than 3x cash and higher refinancing risk"
-                )
+    if verbose and revenue_str and operating_margin is not None:
         sentences.append(
-            f"Cash of {cash_str} against liabilities of {liab_str} frames the leverage and refinancing risk{leverage_clause}."
-        )
-    elif liab_str:
-        sentences.append(
-            f"Liabilities of {liab_str} are the main balance-sheet constraint and deserve close attention."
-        )
-    elif cash_str:
-        sentences.append(
-            f"Cash on hand of {cash_str} provides a liquidity cushion against shocks."
+            f"Scale also matters to the score: a revenue base of {revenue_str} paired with operating margin of {operating_margin:.1f}% suggests the company still has enough fixed-cost absorption and pricing room to fund strategic spending without every incremental investment immediately destabilizing the earnings base."
         )
 
-    current_assets = calculated_metrics.get("current_assets")
-    current_liabilities = calculated_metrics.get("current_liabilities")
-    if current_assets and current_liabilities:
-        try:
-            current_ratio = (
-                current_assets / current_liabilities
-                if current_liabilities != 0
-                else None
-            )
-        except Exception:
-            current_ratio = None
-        if current_ratio is not None:
-            sentences.append(
-                f"A current ratio around {current_ratio:.1f}x suggests near-term obligations are manageable."
-            )
-
-    # Add a forward-looking, underwriting-style linkage so this section doesn't read like
-    # a disconnected list of metrics.
-    if (
-        operating_margin is not None
-        and net_margin is not None
-        and abs(net_margin - operating_margin) >= 5
-    ):
+    if ocf_str and fcf_str and capex_str:
         sentences.append(
-            "Because net margin can be flattered by non-operating items, the health signal should be underwritten off operating profitability and cash conversion."
+            f"The operating cash flow to free cash flow bridge also matters: {ocf_str} of operating cash flow converting to {fcf_str} after capex of {capex_str} suggests the company can still fund investment internally, but it also defines how much room remains if the next reinvestment cycle turns more capital intensive."
         )
-    sentences.append(
-        "The score tends to move with sustained free cash flow conversion and balance-sheet flexibility because those inputs determine resilience; margin compression or rising leverage would pull it lower."
-    )
+    elif ocf_str and fcf_str:
+        sentences.append(
+            f"The cash-conversion bridge from {ocf_str} of operating cash flow to {fcf_str} of free cash flow is important because it shows whether the current earnings base is carrying its own reinvestment burden or depending on timing benefits that could fade."
+        )
+
+    if net_margin is not None and operating_margin is not None:
+        sentences.append(
+            f"The spread between operating margin of {operating_margin:.1f}% and net margin of {net_margin:.1f}% also informs the rating, because a narrow gap usually supports earnings quality while a wider gap can imply that below-the-line items are flattering the end result."
+        )
+
+    if verbose and fcf_margin is not None:
+        sentences.append(
+            f"Free-cash-flow margin of {fcf_margin:.1f}% gives the rating another anchor because it captures how much real cash is left after reinvestment, which is the practical resource management can use for buybacks, debt reduction, acquisitions, or a heavier capex cycle if competitive intensity increases."
+        )
+
+    if cash_total_str and debt_str:
+        sentences.append(
+            f"Balance-sheet flexibility remains a major support for the rating because {cash_total_str} of cash and securities against {debt_str} of debt gives management room to fund capex, absorb working-capital swings, and avoid turning a temporary slowdown into a financing problem."
+        )
+    elif cash_total_str and liabilities_str:
+        sentences.append(
+            f"Balance-sheet flexibility remains part of the case because {cash_total_str} of cash and securities provides a cushion against {liabilities_str} of liabilities, limiting the odds that strategy has to be dictated by near-term liquidity pressure."
+        )
+    elif current_ratio is not None:
+        sentences.append(
+            f"Near-term liquidity, reflected in a current ratio of {current_ratio:.1f}x, is not the whole story, but it does indicate whether the business can absorb normal operating volatility without forcing defensive capital-allocation decisions."
+        )
+
+    if verbose and current_ratio is not None:
+        sentences.append(
+            f"Liquidity therefore matters beyond a simple solvency check: a current ratio of {current_ratio:.1f}x supports working-capital flexibility, vendor confidence, and the ability to keep operating plans intact if receivables slow, inventory turns deteriorate, or customers stretch payment behavior in a weaker demand environment."
+        )
 
     if band == "Very Healthy":
         sentences.append(
-            "Overall, the metrics support a Very Healthy profile provided cash conversion remains consistent."
+            "The score stays in the top tier only if cash conversion remains consistent, reinvestment does not outrun operating returns, and leverage stays contained even as management funds the next phase of growth."
         )
     elif band == "Healthy":
-        if fcf_str:
-            sentences.append(
-                "Free cash flow remains meaningful in absolute terms; the watch item is whether conversion trends with capex intensity rather than drifting lower."
-            )
         sentences.append(
-            "Overall, this lands in the Healthy range, with leverage and cash conversion determining whether the score drifts higher or lower."
+            "What keeps the score out of the very top tier is that conversion durability still has to be proven through reinvestment cycles, especially if incremental growth requires more capex, working capital, or pricing support than the current margin structure implies."
         )
     elif band == "Watch":
         sentences.append(
-            "Overall, this is a Watch profile: the fundamentals are workable, but the weaker inputs leave less room for error."
+            "Weaker inputs leave less room for error, so the score only improves if operating margin, cash conversion, or liquidity flexibility starts to recover in a way that looks repeatable rather than quarter-specific."
         )
     elif band == "At Risk":
         sentences.append(
-            "Overall, this is an At Risk profile: the balance between cash generation and obligations looks tight and the margin for error is thin."
-        )
-
-    if band:
-        sentences.append(
-            f"Taken together, these drivers explain why the score sits in the {band} range rather than a materially higher rating."
+            "The lower score reflects a thinner margin for error between cash generation and obligations, which means even modest pressure on demand, margins, or funding costs can damage financial resilience quickly."
         )
     else:
         sentences.append(
-            "Taken together, these drivers explain why the score sits where it does rather than a materially higher rating."
+            "Cash-conversion durability and balance-sheet flexibility will mostly determine whether the score moves, because those are the variables that decide whether current reported performance is truly financeable through the next cycle."
+        )
+
+    if verbose:
+        sentences.append(
+            "That distinction is especially important when reported earnings are helped by accounting timing, depreciation assumptions, or working-capital seasonality, because those factors can temporarily flatter the income statement while doing much less to improve the real cash capacity that underwrites strategic flexibility."
+        )
+        sentences.append(
+            "The practical downside limiter is not just whether the company can spend, but whether it can spend efficiently enough that higher reinvestment does not erode the very cash engine that currently justifies the rating."
         )
 
     sentences.append(
-        "This health snapshot provides the balance-sheet backdrop for the operating analysis that follows."
+        "This health snapshot sets the balance-sheet backdrop for the operating analysis that follows."
     )
+    selected: List[str] = []
+    for sentence in sentences:
+        if not sentence:
+            continue
+        selected.append(sentence)
+        if len(selected) >= target_sentence_count:
+            break
 
-    if target_length and target_length < 500:
-        sentences = sentences[:5]
+    if not selected:
+        selected = [
+            "Cash-conversion durability and balance-sheet flexibility remain the primary drivers of the score.",
+            "This health snapshot sets the balance-sheet backdrop for the operating analysis that follows.",
+        ]
 
-    return " ".join(sentences).strip()
+    if selected[-1] != "This health snapshot sets the balance-sheet backdrop for the operating analysis that follows.":
+        bridge = "This health snapshot sets the balance-sheet backdrop for the operating analysis that follows."
+        if len(selected) >= target_sentence_count:
+            selected[-1] = bridge
+        else:
+            selected.append(bridge)
+
+    if verbose and budget_words and _count_words(" ".join(selected)) < max(320, int(budget_words) - 110):
+        verbose_suffixes = [
+            ", which matters because internally funded growth usually preserves strategic flexibility when demand softens.",
+            ", and that scale cushion reduces the odds that one weak quarter immediately forces defensive cuts to the operating plan.",
+            ", leaving the real constraint to be return on incremental capital rather than access to capital itself.",
+            ", making earnings quality more important than a single headline profit print.",
+            ", and that residual cash capacity is what ultimately supports both offense and defense in capital allocation.",
+            ", which gives management optionality to keep investing instead of reacting from a position of balance-sheet stress.",
+            ", before supplier terms, customer timing, or refinancing pressure can become the dominant story.",
+            ", which is why the rating still depends on proof that returns remain ahead of reinvestment needs.",
+            ", so investors should treat cash capacity, not just accounting margin, as the test of resilience.",
+            ", and that baseline informs how much operating volatility the next sections can reasonably absorb.",
+        ]
+        expanded_selected: List[str] = []
+        desired_words = max(320, int(budget_words) - 20)
+        running_words = 0
+        for idx, sentence in enumerate(selected):
+            clean_sentence = str(sentence or "").strip()
+            if not clean_sentence:
+                continue
+            if (
+                running_words < desired_words
+                and idx < len(verbose_suffixes)
+                and clean_sentence.endswith((".", "!", "?"))
+            ):
+                clean_sentence = clean_sentence[:-1] + verbose_suffixes[idx]
+            running_words += _count_words(clean_sentence)
+            expanded_selected.append(clean_sentence)
+        selected = expanded_selected
+
+    if int(shape.preferred_paragraphs or 1) > 1 and len(selected) >= 4:
+        split_idx = max(2, len(selected) // 2)
+        return (
+            " ".join(selected[:split_idx]).strip()
+            + "\n\n"
+            + " ".join(selected[split_idx:]).strip()
+        ).strip()
+    return " ".join(selected).strip()
 
 
 def _prepare_filing_response(raw_filing: Dict[str, Any], settings) -> Filing:
@@ -10792,7 +18962,9 @@ def _looks_like_sec_cover_doc(
     return True
 
 
-def _looks_like_ixbrl_noise_document(text_head: str, *, file_size: Optional[int] = None) -> bool:
+def _looks_like_ixbrl_noise_document(
+    text_head: str, *, file_size: Optional[int] = None
+) -> bool:
     """Heuristic: detect cached iXBRL-heavy SEC HTML that is mostly taxonomy noise."""
     if not text_head:
         return False
@@ -10982,6 +19154,7 @@ def _ensure_local_document(
     settings,
     *,
     allow_network: bool = True,
+    prefer_historical: bool = False,
 ) -> Optional[Path]:
     filing = context["filing"]
     company = context["company"]
@@ -11112,7 +19285,10 @@ def _ensure_local_document(
                     # still detect gross mismatches when an "as of" year is far from the
                     # filing's expected period (e.g., 2016 filing pointing to 2024 doc).
                     as_of_year = _extract_as_of_year(head)
-                    if as_of_year and abs(int(as_of_year) - int(expected_date.year)) > 3:
+                    if (
+                        as_of_year
+                        and abs(int(as_of_year) - int(expected_date.year)) > 3
+                    ):
                         if not allow_network:
                             return None
                         logger.warning(
@@ -11202,7 +19378,9 @@ def _ensure_local_document(
     filing_type = (filing.get("filing_type") or "").upper()
     filing_date = filing.get("filing_date")
     period_end = filing.get("period_end") or filing.get("report_date")
-    sec_max_results_raw = (os.getenv("SPOTLIGHT_SEC_MAX_RESULTS") or "").strip() or "1500"
+    sec_max_results_raw = (
+        os.getenv("SPOTLIGHT_SEC_MAX_RESULTS") or ""
+    ).strip() or "1500"
     try:
         sec_max_results = int(sec_max_results_raw)
     except ValueError:
@@ -11311,7 +19489,8 @@ def _ensure_local_document(
                     filing_types=filing_types_to_try,
                     max_results=sec_max_results,
                     target_date=str(target) if target else None,
-                    include_historical=False,
+                    include_historical=prefer_historical,
+                    max_historical_files=12 if prefer_historical else 3,
                 )
                 if sec_filings:
                     candidates = [
@@ -11355,7 +19534,8 @@ def _ensure_local_document(
                         filing_types=filing_types_to_try,
                         max_results=sec_max_results,
                         target_date=str(target) if target else None,
-                        include_historical=False,
+                        include_historical=prefer_historical,
+                        max_historical_files=12 if prefer_historical else 3,
                     )
                     if sec_filings:
                         candidates = [
@@ -11847,7 +20027,24 @@ async def fetch_filings(request: FilingsFetchRequest):
             raise HTTPException(status_code=404, detail="Company not found")
 
         company = _ensure_company_country(company_response.data[0], supabase=supabase)
-    except HTTPException:
+    except HTTPException as exc:
+        if int(getattr(exc, "status_code", 0) or 0) == 422:
+            _raw_target_for_error = locals().get("target_length")
+            try:
+                _fallback_target_for_error = (
+                    int(_raw_target_for_error)
+                    if _raw_target_for_error not in (None, "", 0, "0")
+                    else None
+                )
+            except (TypeError, ValueError):
+                _fallback_target_for_error = None
+            _record_summary_422_observability(
+                filing_id=filing_id,
+                detail=getattr(exc, "detail", None),
+                summary_request_id=str(locals().get("summary_request_id") or "").strip()
+                or None,
+                fallback_target_length=_fallback_target_for_error,
+            )
         raise
     except Exception as e:
         if is_supabase_table_missing_error(e):
@@ -12079,7 +20276,22 @@ async def get_filing(filing_id: str):
             raise HTTPException(status_code=404, detail="Filing not found")
         return _prepare_filing_response(response.data[0], settings)
 
-    except HTTPException:
+    except HTTPException as exc:
+        if int(getattr(exc, "status_code", 0) or 0) == 422:
+            try:
+                _record_summary_422_observability(
+                    filing_id=filing_id,
+                    detail=exc.detail,
+                    summary_request_id=str(locals().get("summary_request_id") or "").strip()
+                    or None,
+                    fallback_target_length=int(target_length) if target_length else None,
+                )
+            except Exception as obs_exc:  # noqa: BLE001
+                logger.debug(
+                    "Unable to persist early 422 observability for %s: %s",
+                    filing_id,
+                    obs_exc,
+                )
         raise
     except Exception as e:
         if is_supabase_table_missing_error(e):
@@ -12156,15 +20368,85 @@ def generate_filing_summary(
     """
     settings = get_settings()
     preferences = preferences or FilingSummaryPreferences()
+    explicit_target_requested = preferences.target_length is not None
     target_length = _clamp_target_length(preferences.target_length)
+    short_quality_mode = _is_short_quality_sensitive_target(target_length)
+    summary_output_format = _summary_output_format_for_target(target_length)
+    micro_plaintext_mode = summary_output_format == "plain_text_micro"
     use_default_cache = preferences.mode == "default"
+    strict_contract_requested = bool(getattr(preferences, "strict_contract", False))
+    strict_contract_opt_in = bool(
+        strict_contract_requested and _summary_allow_request_strict_contract()
+    )
+    one_shot_deterministic_policy = bool(
+        micro_plaintext_mode or strict_contract_opt_in
+    )
+    summary_runtime_cap_seconds = max(1, int(SUMMARY_TOTAL_TIMEOUT_SECONDS))
+    summary_runtime_started_at = time.monotonic()
+    summary_runtime_deadline = (
+        summary_runtime_started_at + float(summary_runtime_cap_seconds)
+    )
+
+    def _remaining_summary_runtime_seconds() -> float:
+        return max(0.0, float(summary_runtime_deadline - time.monotonic()))
+
+    def _require_summary_runtime_budget(stage: str) -> float:
+        remaining = _remaining_summary_runtime_seconds()
+        if remaining <= 0.0:
+            raise TimeoutError(
+                f"Summary generation exceeded {summary_runtime_cap_seconds} seconds at {stage}."
+            )
+        return remaining
+
+    long_form_target = bool(_is_long_form_target(target_length))
+    fast_summary_mode = bool(
+        _summary_fast_mode_default()
+        and not strict_contract_opt_in
+        and not one_shot_deterministic_policy
+        and not long_form_target
+    )
+    allow_fast_explicit_target_length_recovery = bool(
+        fast_summary_mode
+        and _allow_fast_explicit_target_length_recovery(
+            target_length=target_length,
+            explicit_target_requested=explicit_target_requested,
+        )
+    )
+    quality_mode = (
+        "one_shot_deterministic"
+        if one_shot_deterministic_policy
+        else ("fast" if fast_summary_mode else "strict")
+    )
+    fast_runtime_cap_seconds = _fast_summary_max_runtime_seconds()
+    fast_cost_cap_usd = _fast_summary_max_cost_usd()
+    fast_max_rewrites = _fast_summary_max_rewrites()
+    fast_degraded = False
+    fast_degraded_reason: Optional[str] = None
+    fast_warnings: List[str] = []
+    fast_cache_key: Optional[str] = None
+    if fast_summary_mode:
+        fast_cache_key = _build_fast_summary_cache_key(
+            filing_id=str(filing_id),
+            preferences=preferences,
+            target_length=target_length,
+            quality_mode=quality_mode,
+        )
+        if strict_contract_requested and not strict_contract_opt_in:
+            fast_warnings.append(
+                "Strict contract request ignored by server policy; returned fast-mode best-effort summary."
+            )
 
     include_health_rating = bool(
         preferences.health_rating and preferences.health_rating.enabled
     )
 
     # Reset progress - Initialize time-based progress tracking
-    start_summary_progress(filing_id, expected_total_seconds=120)
+    start_summary_progress(
+        filing_id,
+        expected_total_seconds=(
+            fast_runtime_cap_seconds if fast_summary_mode else SUMMARY_TOTAL_TIMEOUT_SECONDS
+        ),
+    )
     set_summary_progress(filing_id, status="Initializing AI Agent...", stage_percent=5)
 
     usage_status = get_summary_usage_status(user.id)
@@ -12189,13 +20471,18 @@ def generate_filing_summary(
         )
         raise HTTPException(status_code=402, detail=detail)
 
-    # Check cache first
-    if (
-        use_default_cache and False
-    ):  # Cache disabled to force regeneration with new prompts
-        cached_summary = fallback_filing_summaries.get(str(filing_id))
-        if cached_summary:
+    # Check process-local fast cache first (best-effort; non-authoritative).
+    if fast_summary_mode and fast_cache_key:
+        cached_payload = _get_fast_summary_cached_response(fast_cache_key)
+        if cached_payload:
             complete_summary_progress(filing_id)
+            cached_payload["cached"] = True
+            cached_payload["cache_hit"] = True
+            cached_payload.setdefault("quality_mode", quality_mode)
+            cached_payload.setdefault("degraded", False)
+            cached_payload.setdefault("degraded_reason", None)
+            cached_payload.setdefault("warnings", [])
+            cached_payload.setdefault("contract_warnings", [])
             record_summary_generated_event(
                 summary_id=str(filing_id),
                 company_id=None,
@@ -12204,13 +20491,7 @@ def generate_filing_summary(
                 cached=True,
                 source=None,
             )
-            return JSONResponse(
-                content={
-                    "filing_id": filing_id,
-                    "summary": cached_summary,
-                    "cached": True,
-                }
-            )
+            return JSONResponse(content=cached_payload)
 
     # Get filing context
     try:
@@ -12240,13 +20521,50 @@ def generate_filing_summary(
                 filing_id,
                 exc,
             )
-    except HTTPException:
+    except HTTPException as exc:
+        if int(getattr(exc, "status_code", 0) or 0) == 422:
+            try:
+                _record_summary_422_observability(
+                    filing_id=filing_id,
+                    detail=exc.detail,
+                    summary_request_id=str(locals().get("summary_request_id") or "").strip()
+                    or None,
+                    fallback_target_length=int(target_length) if target_length else None,
+                )
+            except Exception as obs_exc:  # noqa: BLE001
+                logger.debug(
+                    "Unable to persist early 422 observability for %s: %s",
+                    filing_id,
+                    obs_exc,
+                )
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Error resolving filing: {exc}")
 
+    filing_type = str(filing.get("filing_type", "") or "")
+    filing_date = str(filing.get("filing_date", "") or "")
+    filing_period = str(
+        filing.get("period_end")
+        or filing.get("report_date")
+        or filing.get("filing_date")
+        or ""
+    )
+    company_name = str(company.get("name", company.get("ticker", "Unknown")) or "Unknown")
+    prior_filing: Optional[Dict[str, Any]] = None
+    prior_statements: Optional[Dict[str, Any]] = None
+    statement_only_source_mode = False
+    source_context_mode = "primary_documents"
+
     # Get document content
     local_document = _ensure_local_document(context, settings)
+    used_historical_document_retry = False
+    if not local_document or not local_document.exists():
+        local_document = _ensure_local_document(
+            context, settings, prefer_historical=True
+        )
+        used_historical_document_retry = bool(
+            local_document and local_document.exists()
+        )
     set_summary_progress(
         filing_id, status="Extracting Financial Data...", stage_percent=30
     )
@@ -12286,68 +20604,327 @@ def generate_filing_summary(
             logger.warning(f"Failed to process local document for summary: {read_exc}")
 
     if not document_text:
-        # Fallback to financial statements
-        if statements:
-            try:
-                safe_statements = jsonable_encoder(statements)
-                document_text = json.dumps(safe_statements, indent=2)
-            except (TypeError, ValueError) as serialization_error:
-                logger.warning(
-                    "Failed to serialize financial statements for filing %s: %s",
-                    filing_id,
-                    serialization_error,
-                )
-                document_text = json.dumps(
-                    jsonable_encoder({"statements": statements}), indent=2
-                )
+        if not used_historical_document_retry:
+            retry_doc = _ensure_local_document(
+                context, settings, prefer_historical=True
+            )
+            if retry_doc and retry_doc.exists():
+                try:
+                    document_text = _load_document_excerpt(
+                        retry_doc,
+                        limit=_summary_document_excerpt_limit(),
+                        max_pages=_summary_pdf_max_pages(),
+                    )
+                    local_document = retry_doc
+                except Exception as retry_exc:
+                    logger.warning(
+                        "Historical document retry failed for summary %s: %s",
+                        filing_id,
+                        retry_exc,
+                    )
+
+    if not document_text:
+        prior_filing, prior_statements = _load_prior_statements_for_summary(
+            filing=filing, context_source=str(context.get("source") or "")
+        )
+        statement_only_context = _build_statement_only_summary_context(
+            company_name=company_name,
+            filing_type=filing_type,
+            filing_date=filing_date,
+            statements=statements,
+            prior_statements=prior_statements,
+        )
+        if statement_only_context:
+            document_text = statement_only_context
+            statement_only_source_mode = True
+            source_context_mode = "financial_statements_only"
+            set_summary_progress(
+                filing_id,
+                status="Using financial-statement fallback context...",
+                stage_percent=38,
+            )
         else:
+            _record_summary_422_observability(
+                filing_id=filing_id,
+                detail={
+                    "detail": (
+                        "No narrative filing text is available for this filing. "
+                        "Upload or re-ingest the source filing document and try again."
+                    ),
+                    "target_length": int(target_length) if target_length else None,
+                },
+                fallback_target_length=int(target_length) if target_length else None,
+            )
             raise HTTPException(
-                status_code=400,
-                detail="No document content available for summarization",
+                status_code=422,
+                detail=(
+                    "No narrative filing text is available for this filing. "
+                    "Upload or re-ingest the source filing document and try again."
+                ),
             )
 
+    if statement_only_source_mode:
+        primary_docs_context = ""
+        primary_docs_meta = {
+            "used_current_filing": False,
+            "used_prior_filing": False,
+            "used_sec_exhibit": False,
+            "used_statement_only_fallback": True,
+        }
+        has_primary_docs_context = False
+        analysis_document_text = document_text
+    else:
+        primary_docs_context, primary_docs_meta = _build_primary_docs_context(
+            context=context,
+            settings=settings,
+            base_document_text=document_text,
+            max_chars=MAX_OPENAI_CONTEXT_CHARS,
+            timeout_seconds=_summary_primary_docs_timeout_seconds(),
+        )
+        require_primary_docs = _summary_primary_docs_required()
+        has_primary_docs_context = _has_usable_primary_docs_context(primary_docs_context)
+        if require_primary_docs and not has_primary_docs_context:
+            _record_summary_422_observability(
+                filing_id=filing_id,
+                detail={
+                    "detail": (
+                        "Required primary-document narrative context could not be retrieved for this filing. "
+                        "Re-ingest the filing source documents and try again."
+                    ),
+                    "target_length": int(target_length) if target_length else None,
+                },
+                fallback_target_length=int(target_length) if target_length else None,
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Required primary-document narrative context could not be retrieved for this filing. "
+                    "Re-ingest the filing source documents and try again."
+                ),
+            )
+        analysis_document_text = (
+            primary_docs_context if has_primary_docs_context else document_text
+        )
+
     logger.debug(
-        "Generating summary for filing %s (%s) using document=%s statements=%s",
+        "Generating summary for filing %s (%s) using document=%s statements=%s primary_context=%s",
         filing_id,
         filing.get("filing_type"),
         bool(local_document),
         bool(statements),
+        primary_docs_meta,
     )
 
-    # Generate summary with Gemini
+    summary_text: str = ""
+    response_data: Optional[Dict[str, Any]] = None
+    section_budgets: Dict[str, int] = {}
+    final_section_word_counts: Dict[str, int] = {}
+    missing_requirements: List[str] = []
+    summary_meta: Dict[str, Any] = {
+        "target_length": int(target_length) if target_length else None,
+        "final_word_count": 0,
+        "verified_quote_count": 0,
+        "quality_checks_passed": [],
+    }
+    prompt_budget_state: Dict[str, Any] = {
+        "research_mode": "skipped",
+        "prompt_budget_adapted": False,
+        "budget_adjustments_attempted": [],
+        "preflight_expected_output_tokens": 0,
+        "preflight_prompt_tokens_estimated": 0,
+        "runtime_expected_output_tokens": 0,
+        "runtime_prompt_tokens_estimated": 0,
+        "effective_prompt_token_cap": None,
+    }
+    generation_stats: Dict[str, Any] = {}
+    preflight_cost_estimate: Dict[str, float] = {}
+    preflight_key_metrics_numeric_rows = 0
+    strict_contract_required = False
+    strict_one_shot_failure_mode = False
+    budget_cap_usd = float(_summary_budget_cap_usd(target_length=target_length))
+    estimated_min_cost_usd = 0.0
+    estimated_bounded_cost_usd = 0.0
+    actual_cost_usd = 0.0
+    within_budget = True
+    two_agent_result: Optional[TwoAgentSummaryPipelineResult] = None
+
+    def _build_timeout_best_effort_response(reason: str) -> Optional[JSONResponse]:
+        draft_summary = str(summary_text or "").strip()
+        if not draft_summary:
+            return None
+
+        payload: Dict[str, Any]
+        if isinstance(response_data, dict) and str(
+            response_data.get("summary") or ""
+        ).strip():
+            payload = dict(response_data)
+        else:
+            final_word_count = int(
+                summary_meta.get("final_word_count") or _count_words(draft_summary)
+            )
+            current_section_counts = _collect_section_body_word_counts(
+                draft_summary,
+                include_health_rating=include_health_rating,
+            )
+            payload = {
+                "filing_id": filing_id,
+                "summary": draft_summary,
+                "cached": False,
+                "cache_hit": False,
+                "quality_mode": quality_mode,
+                "company_country": company.get("country"),
+                "summary_meta": {
+                    "pipeline_mode": (
+                        str(generation_stats.get("pipeline_mode"))
+                        if generation_stats.get("pipeline_mode")
+                        else (
+                            two_agent_result.pipeline_mode
+                            if two_agent_result
+                            else "two_agent"
+                        )
+                    ),
+                    "model_used": _summary_locked_model_name(
+                        target_length=target_length
+                    ),
+                    "target_length": int(target_length) if target_length else None,
+                    "final_word_count": final_word_count,
+                    "final_word_delta": (
+                        final_word_count - int(target_length) if target_length else 0
+                    ),
+                    "verified_quote_count": int(
+                        summary_meta.get("verified_quote_count") or 0
+                    ),
+                    "key_metrics_numeric_row_count": int(
+                        summary_meta.get("key_metrics_numeric_row_count")
+                        or preflight_key_metrics_numeric_rows
+                        or 0
+                    ),
+                    "section_word_budgets": dict(section_budgets or {}),
+                    "section_word_counts": dict(current_section_counts or {}),
+                    "section_word_ranges": {
+                        section_name: {
+                            "lower": max(
+                                1,
+                                int(words)
+                                - int(
+                                    canonical_section_budget_tolerance_words(
+                                        section_name, int(words)
+                                    )
+                                ),
+                            ),
+                            "upper": int(words)
+                            + int(
+                                canonical_section_budget_tolerance_words(
+                                    section_name, int(words)
+                                )
+                            ),
+                        }
+                        for section_name, words in dict(section_budgets or {}).items()
+                        if int(words or 0) > 0
+                    },
+                    "research_mode": str(
+                        prompt_budget_state.get("research_mode") or "skipped"
+                    ),
+                    "prompt_budget_adapted": bool(
+                        prompt_budget_state.get("prompt_budget_adapted") or False
+                    ),
+                    "budget_adjustments_attempted": list(
+                        prompt_budget_state.get("budget_adjustments_attempted") or []
+                    ),
+                    "prompt_tokens_estimated": int(
+                        prompt_budget_state.get("runtime_prompt_tokens_estimated")
+                        or prompt_budget_state.get("preflight_prompt_tokens_estimated")
+                        or 0
+                    ),
+                    "expected_output_tokens": int(
+                        prompt_budget_state.get("runtime_expected_output_tokens")
+                        or prompt_budget_state.get("preflight_expected_output_tokens")
+                        or 0
+                    ),
+                    "budget_cap_usd": float(budget_cap_usd or 0.0),
+                    "estimated_cost_usd": float(
+                        estimated_min_cost_usd
+                        or preflight_cost_estimate.get("minimum_path_usd")
+                        or 0.0
+                    ),
+                    "estimated_bounded_cost_usd": float(
+                        estimated_bounded_cost_usd
+                        or preflight_cost_estimate.get("bounded_total_usd")
+                        or 0.0
+                    ),
+                    "actual_cost_usd": float(actual_cost_usd or 0.0),
+                    "within_budget": bool(within_budget),
+                    "contract_missing_requirements": list(missing_requirements or []),
+                    "contract_strict_required": bool(strict_contract_required),
+                    "contract_hard_fail": bool(
+                        strict_one_shot_failure_mode and target_length
+                    ),
+                    "quality_mode": quality_mode,
+                    "fast_summary_mode": bool(fast_summary_mode),
+                    "output_format": summary_output_format,
+                    "source_context_mode": source_context_mode,
+                    "generation_policy": _summary_generation_policy_name(
+                        target_length=target_length,
+                        one_shot_deterministic_policy=one_shot_deterministic_policy,
+                        generation_stats=generation_stats,
+                    ),
+                },
+            }
+
+        payload["degraded"] = True
+        payload["degraded_reason"] = str(reason or "timeout")
+        merged_warnings = list(payload.get("warnings") or [])
+        merged_warnings.append(
+            "Summary hit the runtime limit and returned the best full draft available."
+        )
+        payload["warnings"] = list(dict.fromkeys(merged_warnings))
+        payload["contract_warnings"] = list(
+            dict.fromkeys(payload.get("contract_warnings") or [])
+        )
+        return JSONResponse(content=payload)
+
+    # Generate summary with GPT-5.2
     try:
-        if not settings.gemini_api_key or settings.gemini_api_key.strip() == "":
-            raise HTTPException(status_code=400, detail="GEMINI_API_KEY not configured")
+        _require_summary_runtime_budget("summary_pipeline_start")
+        api_key = getattr(settings, "openai_api_key", "")
+        if not api_key or api_key.strip() == "":
+            raise HTTPException(status_code=400, detail="OPENAI_API_KEY not configured")
 
-        gemini_client = get_gemini_client()
         summary_request_id = uuid4().hex
-        set_usage_context = getattr(gemini_client, "set_usage_context", None)
-        if callable(set_usage_context):
-            try:
-                set_usage_context(
-                    {
-                        "request_id": summary_request_id,
-                        "request_type": "filing_summary",
-                        "user_id": user.id,
-                        "filing_id": str(filing_id),
-                        "company_id": str(company.get("id"))
-                        if company.get("id")
-                        else None,
-                    }
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("Unable to set Gemini usage context: %s", exc)
 
-        filing_type = filing.get("filing_type", "")
-        filing_date = filing.get("filing_date", "")
-        company_name = company.get("name", company.get("ticker", "Unknown"))
+        # Reset the global padding budget for this generation.
+        _reset_padding_budget()
+
+        def _apply_usage_context(
+            client: Any, model_name: str, *, pipeline_mode: Optional[str] = None
+        ) -> Dict[str, Any]:
+            payload: Dict[str, Any] = {
+                "request_id": summary_request_id,
+                "request_type": "filing_summary",
+                "user_id": user.id,
+                "filing_id": str(filing_id),
+                "company_id": str(company.get("id")) if company.get("id") else None,
+                "model": model_name,
+            }
+            if pipeline_mode:
+                payload["pipeline_mode"] = str(pipeline_mode).strip()
+
+            set_usage_context = getattr(client, "set_usage_context", None)
+            if not callable(set_usage_context):
+                return payload
+            try:
+                set_usage_context(payload)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Unable to set AI usage context: %s", exc)
+            return payload
 
         financial_snapshot = _build_financial_snapshot(statements)
         calculated_metrics = _build_calculated_metrics(statements)
 
-        prior_filing, prior_statements = _load_prior_statements_for_summary(
-            filing=filing, context_source=str(context.get("source") or "")
-        )
+        if prior_filing is None and prior_statements is None:
+            prior_filing, prior_statements = _load_prior_statements_for_summary(
+                filing=filing, context_source=str(context.get("source") or "")
+            )
         prior_metrics: Dict[str, Any] = (
             _build_calculated_metrics(prior_statements) if prior_statements else {}
         )
@@ -12394,7 +20971,7 @@ def generate_filing_summary(
                         calculated_metrics["gross_margin"] / 100
                     )
                 ai_growth_assessment = generate_growth_assessment(
-                    filing_text=document_text,
+                    filing_text=analysis_document_text,
                     company_name=company_name,
                     weighting_preference=weighting_preset,
                     ratios=ratios_for_growth,
@@ -12442,30 +21019,98 @@ def generate_filing_summary(
             include_health_rating=include_health_rating,
             health_score_data=pre_calculated_health,
         )
-        token_budget: Optional[TokenBudget] = _summary_token_budget()
+        preflight_key_metrics_numeric_rows = 0
+        if target_length and not micro_plaintext_mode:
+            preflight_key_metrics_issue, preflight_key_metrics_numeric_rows = (
+                _validate_key_metrics_numeric_block(
+                    metrics_lines,
+                    min_rows=5,
+                    require_markers=True,
+                )
+            )
+            if preflight_key_metrics_issue:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "detail": "Insufficient numeric Key Metrics evidence for strict summary contract.",
+                        "failure_code": "INSUFFICIENT_NUMERIC_KEY_METRICS",
+                        "numeric_row_count": int(preflight_key_metrics_numeric_rows),
+                        "issue": preflight_key_metrics_issue,
+                    },
+                )
+        # Determine model first so budget calculations use correct rates.
+        active_model_name = _summary_locked_model_name(target_length=target_length)
+        token_budget: Optional[TokenBudget] = _summary_token_budget(
+            target_length=target_length, model_name=active_model_name
+        )
         if token_budget.total_tokens <= 0:
             token_budget = None
+        cost_budget: SummaryCostBudget = _summary_cost_budget(
+            model_name=active_model_name, target_length=target_length
+        )
+        if fast_summary_mode:
+            # Clamp budgets for fast mode to reduce runaway latency/cost. This is a
+            # best-effort cap; we still prefer returning a usable summary over 422.
+            if not target_length or int(target_length) <= 1000:
+                cost_budget.budget_cap_usd = min(
+                    float(cost_budget.budget_cap_usd), float(fast_cost_cap_usd)
+                )
+            if token_budget is not None:
+                # Keep a bounded token envelope in fast mode and leave headroom for
+                # one generation pass only (no expensive rewrite loops).
+                fast_token_cap = max(
+                    2000,
+                    int(_fast_summary_output_token_cap(target_length, 4000) * 3),
+                )
+                token_budget.total_tokens = min(
+                    int(token_budget.total_tokens), int(fast_token_cap)
+                )
+                token_budget.remaining_tokens = min(
+                    int(token_budget.remaining_tokens), int(token_budget.total_tokens)
+                )
+        logger.warning(
+            "Summary budget init: model=%s target=%s token_total=%s "
+            "cost_cap=%.4f cost_input_rate=%.4f cost_output_rate=%.4f",
+            active_model_name,
+            target_length,
+            (token_budget.total_tokens if token_budget else "None"),
+            cost_budget.budget_cap_usd,
+            cost_budget.input_rate_per_1m,
+            cost_budget.output_rate_per_1m,
+        )
+        preflight_cost_estimate: Dict[str, float] = {}
         max_output_tokens = _summary_max_output_tokens()
-        context_excerpt = (
-            document_text
-            if len(document_text) <= MAX_GEMINI_CONTEXT_CHARS
-            else document_text[:MAX_GEMINI_CONTEXT_CHARS]
+        if fast_summary_mode:
+            max_output_tokens = _fast_summary_output_token_cap(
+                target_length, max_output_tokens
+            )
+        context_excerpt = _build_balanced_context_excerpt(
+            analysis_document_text,
+            max_chars=(
+                _fast_summary_context_max_chars(target_length)
+                if fast_summary_mode
+                else MAX_OPENAI_CONTEXT_CHARS
+            ),
         )
         truncated_note = (
             ""
-            if len(context_excerpt) == len(document_text)
-            else "\n\nNote: Filing text truncated to fit model context."
+            if len(context_excerpt) == len(analysis_document_text)
+            else "\n\nNote: Filing context was section-balanced and truncated to fit model context."
         )
         risk_factors_excerpt = _extract_labeled_excerpt(
-            document_text, "RISK FACTORS", max_chars=15_000
+            analysis_document_text,
+            "RISK FACTORS",
+            max_chars=(6_000 if fast_summary_mode else 15_000),
         )
         risk_factors_block = (
             f"\n\nRISK FACTORS (FILING EXCERPT - USE THIS FOR THE 'Risk Factors' SECTION):\n{risk_factors_excerpt}\n"
             if risk_factors_excerpt
             else ""
         )
-        company_kpi_context = _build_company_kpi_context(
-            document_text, max_chars=40_000
+        company_kpi_context = (
+            ""
+            if fast_summary_mode
+            else _build_company_kpi_context(analysis_document_text, max_chars=40_000)
         )
         spotlight_block = ""
         if company_kpi_context and company_kpi_context not in context_excerpt:
@@ -12473,39 +21118,48 @@ def generate_filing_summary(
                 "\nCOMPANY SPOTLIGHT CONTEXT (use ONLY for the company-specific KPI lines):\n"
                 f"{company_kpi_context}\n"
             )
+        filing_language_snippets = (
+            ""
+            if statement_only_source_mode
+            else _build_filing_language_snippets(
+                context_excerpt,
+                max_quotes=(4 if fast_summary_mode else 10),
+                max_chars=(1_200 if fast_summary_mode else 3_000),
+            )
+        )
+        filing_language_block = (
+            "\n\nFILING LANGUAGE SNIPPETS (verbatim lines available for short direct quotes):\n"
+            f"{filing_language_snippets}\n"
+            if filing_language_snippets
+            else ""
+        )
         company_label = company.get("name") or company.get("ticker") or "the company"
-        preference_block = _build_preference_instructions(preferences, company_label)
-
-        # Extract persona name if a persona is selected
         investor_focus = (
             preferences.investor_focus.strip()
             if preferences and preferences.investor_focus
             else None
         )
-        selected_persona_name = _extract_persona_name(investor_focus)
+        persona_id_from_request = (preferences.persona_id or "").strip().lower()
+        selected_persona_name = _persona_name_from_id(persona_id_from_request)
+        if not selected_persona_name:
+            selected_persona_name = _extract_persona_name(investor_focus)
+        persona_requested = bool(persona_id_from_request or selected_persona_name)
+        preference_block = _build_preference_instructions(
+            preferences,
+            company_label,
+            selected_persona_name=selected_persona_name,
+            persona_requested=persona_requested,
+        )
+        persona_id_for_health = persona_id_from_request or _persona_id_from_name(
+            selected_persona_name
+        )
+        if persona_id_for_health and persona_id_for_health not in PERSONA_ID_TO_NAME:
+            persona_id_for_health = None
 
         if include_health_rating:
             set_summary_progress(
                 filing_id, status="Computing Health Score...", stage_percent=75
             )
-
-        # Convert full persona name to persona_id for health rating instructions
-        persona_id_for_health = None
-        if selected_persona_name:
-            # Map full names to persona IDs
-            name_to_id = {
-                "warren buffett": "buffett",
-                "charlie munger": "munger",
-                "benjamin graham": "graham",
-                "peter lynch": "lynch",
-                "ray dalio": "dalio",
-                "cathie wood": "wood",
-                "joel greenblatt": "greenblatt",
-                "john bogle": "bogle",
-                "howard marks": "marks",
-                "bill ackman": "ackman",
-            }
-            persona_id_for_health = name_to_id.get(selected_persona_name.lower())
 
         health_config = None
         health_rating_block = None
@@ -12521,15 +21175,34 @@ def generate_filing_summary(
             health_directives_section = (
                 f"\n HEALTH RATING DIRECTIVES\n {health_rating_block}\n"
             )
+        source_limitations_block = (
+            "\nSOURCE LIMITATION:\n"
+            "- Primary filing narrative text is unavailable for this filing.\n"
+            "- Base the memo only on reported financial statements, deterministic key metrics, and period-over-period deltas.\n"
+            "- Do not quote management, do not attribute commentary to management, and do not claim the filing says/discusses/highlights anything.\n"
+            if statement_only_source_mode
+            else ""
+        )
         section_descriptions: List[Tuple[str, str]] = []
 
-        # Section budgets (body words, headings excluded) are used as soft guidance.
-        # Do NOT treat them as strict quotas; avoid padding and repetition to "hit" a number.
+        # Section budgets are body-word targets. Prompts and recovery logic treat
+        # them as explicit section ranges so the memo stays balanced end-to-end.
         section_budgets: Dict[str, int] = {}
         if target_length and target_length > 0:
-            section_budgets = _calculate_section_word_budgets(
-                int(target_length), include_health_rating=include_health_rating
+            # Use section_weight_overrides from the frontend when provided.
+            user_weight_overrides = (
+                preferences.section_weight_overrides
+                if preferences and preferences.section_weight_overrides
+                else None
             )
+            section_budgets = _calculate_section_word_budgets(
+                int(target_length),
+                include_health_rating=include_health_rating,
+                weight_overrides=user_weight_overrides,
+            )
+
+        # Two-agent pipeline is now the canonical summary path:
+        # Agent 1 (internet background) -> Agent 2 (full filing summary).
 
         health_budget = int(section_budgets.get("Financial Health Rating", 0) or 0)
         exec_budget = int(section_budgets.get("Executive Summary", 0) or 0)
@@ -12540,22 +21213,47 @@ def generate_filing_summary(
         risk_budget = int(section_budgets.get("Risk Factors", 0) or 0)
         key_metrics_budget = int(section_budgets.get("Key Metrics", 0) or 0)
         closing_budget = int(section_budgets.get("Closing Takeaway", 0) or 0)
+        is_long_form_target = _is_long_form_target(target_length)
 
         def _budget_sentence(section: str, budget: int) -> str:
             if budget <= 0:
                 return ""
+            budget_tol = _section_budget_tolerance_words(budget, max_tolerance=10)
+            lower_budget = max(1, int(budget) - int(budget_tol))
+            upper_budget = int(budget) + int(budget_tol)
+            if is_long_form_target:
+                return (
+                    f"Target length: {lower_budget}-{upper_budget} body words (target {budget}). "
+                    "Count body words only; headings do not count. Deliver substantive, filing-grounded analysis and do not repeat the section title inside the body."
+                )
             return (
-                f"SUGGESTED LENGTH: up to ~{budget} words for this section body. "
-                "It is acceptable to be shorter if additional words would be repetitive."
+                f"Target length: {lower_budget}-{upper_budget} body words (target {budget}). "
+                "Count body words only; headings do not count. Stay concise, complete the argument, and do not repeat the section title inside the body."
             )
 
         health_budget_sentence = _budget_sentence(
             "Financial Health Rating", health_budget
         )
+        health_shape = (
+            get_financial_health_shape(int(health_budget))
+            if int(health_budget or 0) > 0
+            else None
+        )
+        health_structure_instruction = (
+            f"Use {describe_sentence_range(health_shape.min_sentences, health_shape.max_sentences)} across "
+            f"{describe_paragraph_range(health_shape.min_paragraphs, health_shape.max_paragraphs)}."
+            if health_shape is not None
+            else "Use a coherent explanation sized to the section budget."
+        )
         exec_budget_sentence = _budget_sentence("Executive Summary", exec_budget)
         perf_budget_sentence = _budget_sentence("Financial Performance", perf_budget)
         mdna_budget_sentence = _budget_sentence(
             "Management Discussion & Analysis", mdna_budget
+        )
+        risk_shape = (
+            get_risk_factors_shape(int(risk_budget))
+            if int(risk_budget or 0) > 0
+            else None
         )
         risk_budget_sentence = _budget_sentence("Risk Factors", risk_budget)
         key_metrics_budget_sentence = _budget_sentence(
@@ -12563,6 +21261,49 @@ def generate_filing_summary(
         )
         risk_budget_sentence_block = (
             f"{risk_budget_sentence}\n" if risk_budget_sentence else ""
+        )
+        risk_structure_instruction = (
+            f"Write exactly {int(risk_shape.risk_count or 0)} structured risks. "
+            f"Each risk should use {describe_sentence_range(int(risk_shape.per_risk_min_sentences or 2), int(risk_shape.per_risk_max_sentences or 3))} "
+            "and must include the company-specific mechanism, the transmission path into revenue, margins, cash flow, or balance-sheet flexibility, and one early-warning signal."
+            if risk_shape is not None
+            else "Write 2-3 structured risks with company-specific mechanisms, transmission paths, and early-warning signals."
+        )
+        exec_structure_instruction = (
+            "Write 2-3 connected paragraphs (roughly 6-10 sentences) with one clear through-line."
+            if is_long_form_target
+            else (
+                "Write one tight paragraph of flowing narrative prose."
+                if short_quality_mode
+                else "Write 3-4 sentences of flowing narrative prose."
+            )
+        )
+        perf_structure_instruction = (
+            "Write 2-3 connected paragraphs that test the thesis with evidence and implications."
+            if is_long_form_target
+            else (
+                "Write one tight paragraph that directly tests the Executive Summary tension with only the most decision-relevant evidence."
+                if short_quality_mode
+                else "Write connected prose that directly tests the Executive Summary tension."
+            )
+        )
+        mdna_structure_instruction = (
+            "Write 2-3 connected paragraphs centered on management decisions, execution mechanisms, and forward implications."
+            if is_long_form_target
+            else "Write one focused paragraph on management choices and execution mechanisms."
+        )
+        quote_instruction = (
+            "Primary filing narrative text is unavailable. Do not invent management quotes or narrative attribution."
+            if statement_only_source_mode
+            else (
+                (
+                    "When filing language snippets are provided, direct quotes are optional. Use at most 1 short direct quote total and only when it materially sharpens the analysis."
+                    if short_quality_mode
+                    else "When filing language snippets are provided, use 3-5 short direct quotes (<=20 words) total, with at least one in Executive Summary and one in MD&A, and keep them verbatim."
+                )
+                if filing_language_snippets
+                else "Do not invent management quotes."
+            )
         )
         if health_rating_block:
             if pre_calculated_score is not None and pre_calculated_band:
@@ -12575,10 +21316,10 @@ def generate_filing_summary(
                     f"2. DO NOT write 1/100, 62/100, or ANY other score - ONLY {pre_calculated_score:.0f}/100\n"
                     f"3. The band is '{pre_calculated_band}' - use this EXACT label\n"
                     f"4. Start the section with: '{pre_calculated_score:.0f}/100 - {pre_calculated_band}. ...'\n"
-                    f"5. Then EXPLAIN why this score was assigned based on the metrics.\n"
-                    f"   - {health_budget_sentence or 'Write a cohesive paragraph of 6-8 sentences (~90-130 words).'}\n"
-                    f"   - Use specific figures (margins, cash flow, leverage/liquidity).\n"
-                    f"   - Avoid one-sentence paragraphs and disconnected one-liners.\n"
+                    f"5. Then explain why this score and not higher or lower in coherent prose sized to the section budget.\n"
+                    f"   - {health_budget_sentence or 'Write a cohesive, budget-aware explanation.'}\n"
+                    f"   - {health_structure_instruction}\n"
+                    f"   - Anchor on the 2-3 metrics that most influenced the score — do not list every available number.\n"
                     f"   - End with one sentence that sets up the operating analysis that follows.\n\n"
                     f"FORBIDDEN: Calculating your own score. The score {pre_calculated_score:.1f} is mathematically computed from actual financial ratios.\n"
                     f"NO letter grades (A, B, C, D). Use the numeric score and band label only."
@@ -12587,13 +21328,11 @@ def generate_filing_summary(
                 health_rating_description = (
                     "Provide the 0-100 score with descriptive label (Very Healthy 85-100, Healthy 70-84, Watch 50-69, At Risk 0-49). "
                     "NO letter grades (A, B, C, D). Format: '72/100 - Healthy'. "
-                    "Explain why the score landed there with specific metrics: margins, cash flow, leverage, liquidity. "
-                    "A company with 60%+ margins should score 70+ unless there are severe balance sheet issues.\n\n"
-                    "STRUCTURE (FLOW IS MANDATORY):\n"
-                    f"- {health_budget_sentence or 'After the score line, write 6-8 sentences (~90-130 words) as one cohesive paragraph.'}\n"
-                    "- Use at least 3 concrete figures (%, $ amounts, ratios).\n"
-                    "- Avoid one-sentence paragraphs and disconnected one-liners.\n"
-                    "- End with one sentence that sets up the operating analysis that follows."
+                    "Then explain why this score and not higher or lower in coherent prose sized to the section budget.\n\n"
+                    f"{health_budget_sentence or 'After the score line, write a cohesive, budget-aware explanation.'}\n"
+                    f"{health_structure_instruction}\n"
+                    "Anchor on the 2-3 metrics that most influenced the score — do not list every available number. "
+                    "End with one sentence that sets up the operating analysis that follows."
                 )
             section_descriptions.append(
                 ("Financial Health Rating", health_rating_description)
@@ -12602,126 +21341,124 @@ def generate_filing_summary(
             [
                 (
                     "Executive Summary",
-                    "THIS IS THE HERO SECTION - the premium insight users pay for.\n"
-                    f"{exec_budget_sentence or 'LENGTH TARGET: 80-110 words for this section body.'}\n\n"
-                    "HIERARCHY (MANDATORY): Present decisions, not a narrated framework.\n"
-                    "- One PRIMARY constraint dominates the memo (pick exactly one: margin structure, cash conversion quality, leverage/liquidity, or reinvestment intensity).\n"
-                    "- Two to three SECONDARY risks are acknowledged.\n"
-                    "- Everything else is subordinate or omitted.\n\n"
-                    "STRUCTURE (FLOW IS MANDATORY):\n"
-                    "- Write 2 cohesive paragraphs (2-4 sentences each).\n"
-                    "- Keep paragraphs short and breathable (aim for ≤4 sentences; if you need 'and also', split).\n"
-                    "- Avoid one-sentence paragraphs and staccato one-liners.\n"
-                    "- End with a sentence that sets up the Financial Performance section.\n\n"
-                    "VOICE DISCIPLINE (MANDATORY):\n"
-                    "- Do NOT describe your process ('this analysis/memo will...', 'I looked at...', 'the framework is...'). State conclusions; let structure imply process.\n"
-                    "- Conviction tone MUST match the action: if the stance is HOLD/WAIT, explicitly name the blocking factor and the trigger that clears it.\n\n"
-                    "CHANGE FOCUS (MANDATORY): State the single most important thing that changed versus the immediately prior comparable period (QoQ for 10-Q, YoY for 10-K) and why it matters.\n\n"
-                    "NUMBERS DISCIPLINE (MANDATORY):\n"
-                    "- Keep this section mostly qualitative. Use at most 1-2 anchor figures total.\n"
-                    "- Do NOT stack multiple metrics in a single sentence; save density for Financial Performance / Key Metrics.\n\n"
-                    "CONTENT (MANDATORY):\n"
-                    "1) Stance + conviction (Bullish/Neutral/Bearish; High/Medium/Low).\n"
-                    "2) Primary constraint (one sentence, with one anchor metric if relevant).\n"
-                    "3) Two to three secondary risks (one sentence each; no re-explaining prior points).\n"
-                    "4) What changes the stance (1-2 concrete triggers; measurable; time-bound).\n\n"
-                    "CRITICAL: End with a clear, actionable stance. Do NOT use vague process phrases like 'I want to see...' or 'I need to determine...'.",
+                    (
+                        "This is the hero section — the thesis that the entire memo will prove or disprove.\n"
+                        f"{exec_budget_sentence or 'Target ~80-110 words for this section body.'}\n\n"
+                        f"{exec_structure_instruction} Identify ONE central tension "
+                        "(e.g., strong profitability vs. rising reinvestment risk, or exceptional cash conversion "
+                        "vs. uncertain durability) and state it clearly. This tension is the thread that every "
+                        "subsequent section will pull on.\n\n"
+                    )
+                    + (
+                        "End with a sentence that naturally raises the question Financial Performance will answer "
+                        "(e.g., 'Whether that margin holds under rising capex is the operating question below.').\n\n"
+                        if not short_quality_mode
+                        else "Frame the core issue once here, then let later sections answer it directly without restating the thesis as a question.\n\n"
+                    )
+                    + f"{quote_instruction}\n"
+                    + "Use at most 1-2 anchor figures — this section is about framing, not numbers. "
+                    + "No bullet lists, no process narration, no meta language.",
                 ),
                 (
                     "Financial Performance",
-                    f"{perf_budget_sentence or 'Quantitative analysis (100-135 words).'}\n"
-                    "Cover KEY metrics:\n"
-                    "- Revenue with YoY% change and mix shifts (e.g., Mobility vs Delivery)\n"
-                    "- Margin bridge: revenue growth → operating margin → net margin gap (explain drivers)\n"
-                    "- Cash conversion: OCF to FCF, QoQ changes, capex context\n\n"
-                    "COMPANY-SPOTLIGHT SIGNAL (MANDATORY): Include 1–2 *company-specific* operational lines pulled from the filing context (NOT generic finance). Prefer one of:\n"
-                    "- Segment/product revenue lines (best): write them literally as '<Segment/Product> revenue was $X.XB' (or 'revenues were') for at least TWO segments when available.\n"
-                    "- Business-model KPI lines: subscribers, MAU/DAU, ARPU, NDR, take rate, GMV/TPV, AUM, backlog, RevPAR, occupancy.\n"
-                    "CRITICAL: Use ONLY numbers that appear in the CONTEXT or COMPANY SPOTLIGHT CONTEXT excerpts; do not invent or estimate.\n\n"
-                    "Q/Q (OR Y/Y) DELTA BRIDGE (MANDATORY): Start this section with EXACTLY 6 short lines. Each line MUST start with '- ' and follow THIS exact pattern:\n"
-                    "- Metric: Prior → Current (Δ ...) — Why it changed — Why it matters\n"
-                    "Use ONLY the numbers in the 'Q/Q DELTA BRIDGE NUMBERS' reference block above. Do NOT hedge with words like 'hypothetical' or 'roughly'.\n"
-                    "If that reference block is missing, SKIP the delta bridge entirely (do not invent prior-period numbers).\n\n"
-                    "CHANGE FOCUS (MANDATORY): Use this section to explain WHAT CHANGED versus the immediately prior comparable period (QoQ for 10-Q, YoY for 10-K) — not to re-teach the thesis.\n"
-                    "- Paragraph 1 should expand on the operating deltas (revenue/margins) with one driver per change.\n"
-                    "- Paragraph 2 should expand on the cash deltas (OCF→FCF, capex/working capital) with one driver per change.\n\n"
-                    "STRUCTURE (FLOW IS MANDATORY):\n"
-                    "- After the delta bridge lines, write 2 paragraphs.\n"
-                    "- Paragraph 1: revenue + margins + the operating vs net bridge.\n"
-                    "- Paragraph 2: cash conversion + earnings quality + sustainability.\n\n"
-                    "FLOW: Connect numbers: 'Revenue grew X% but margins compressed Y% due to Z; cash conversion improved/eroded because...'.\n"
-                    "NUMBERS DISCIPLINE: Do not list more than 2 metrics in any single sentence; tie each figure to a cause-and-effect interpretation.\n"
-                    "Explain what numbers mean for sustainability and earnings quality.\n\n"
-                    "FORBIDDEN: 'Additional detail covers...', 'Capital allocation remarks...' - write real analysis.",
+                    (
+                        f"{perf_budget_sentence or 'Quantitative analysis (~100-135 words).'}\n"
+                        "This section answers the Executive Summary tension with evidence.\n\n"
+                        f"{perf_structure_instruction}\n"
+                        "Pick the 2-3 numbers that most directly test the Executive Summary's tension. "
+                        "Weave them into a causal argument — not a metrics list. Interpret what each number "
+                        "means for the thesis rather than just stating it.\n\n"
+                    )
+                    + (
+                        "End by surfacing one finding that raises a management execution question — "
+                        "this becomes the natural bridge into MD&A.\n\n"
+                        if not short_quality_mode
+                        else "Do not restate the thesis as a question and do not pad with generic caveats.\n\n"
+                    )
+                    + "Do not repeat figures already used in the Health Rating or Executive Summary. "
+                    + "If FCF margin exceeds 100%, qualify it as working-capital-driven. "
+                    + "Write connected prose; every figure must earn its place by advancing the argument.",
                 ),
                 (
                     "Management Discussion & Analysis",
-                    f"{mdna_budget_sentence or 'Expanded management assessment (125-175 words).'}\n"
-                    "Focus on:\n"
-                    "1. Strategy and capital deployment priorities (R&D, incentives, capex, buybacks/M&A)\n"
-                    "2. Alignment check: do the claims MATCH operating margin trajectory and cash conversion?\n"
-                    "3. Earnings quality: reconcile operating income vs net income and call out one-offs\n\n"
-                    "CHANGE FOCUS (MANDATORY): Explicitly call out what management changed versus the prior comparable period (guidance posture, capex pacing, cost discipline, capital return) and whether the numbers corroborate it.\n\n"
-                    "STRUCTURE (FLOW IS MANDATORY):\n"
-                    "- Write 2 cohesive paragraphs.\n"
-                    "- Avoid slogan-y one-liners; integrate conclusions into the paragraph.\n"
-                    "- End with a sentence that naturally leads into the Risk Factors section.\n\n"
-                    "FLOW: 'Management stated X → results show Y → this implies Z for margins/cash/investment pacing.'\n\n"
-                    "CRITICAL: This must read like a real filing summary, not disconnected sentences.",
+                    (
+                        f"{mdna_budget_sentence or 'Expanded management assessment (~125-175 words).'}\n"
+                        "This section is about UNDERSTANDING THE BUSINESS — not reciting metrics.\n"
+                        "One theme: did management's capital choices and strategic direction support or undermine the thesis?\n\n"
+                        f"{mdna_structure_instruction}\n"
+                        "REQUIRED CONTENT:\n"
+                        + (
+                            "- There is no narrative filing text for this filing. Infer likely capital-allocation priorities, operating mechanisms, and execution trade-offs only from the financial evidence. Do not attribute commentary to management.\n"
+                            if statement_only_source_mode
+                            else "- Quote or closely paraphrase management's own words about strategy, priorities, or outlook "
+                        )
+                    )
+                    + (
+                        ""
+                        if statement_only_source_mode
+                        else (
+                            "from the filing excerpts. Quotes are optional; use at most one short verbatim quote if it materially adds signal.\n"
+                            if short_quality_mode
+                            else "from the filing excerpts. Use at least one verbatim quote if snippets are available.\n"
+                        )
+                    )
+                    + "- Explain the business model mechanism: HOW does this company make money, and what is management "
+                    + "doing to protect/grow that mechanism?\n"
+                    + "- Discuss management's forward-looking plans: investments, market expansion, product roadmap, "
+                    + "capital allocation philosophy.\n"
+                    + "- Use at most 2 anchor figures — this section is about MECHANISM and STRATEGY, not measurement.\n\n"
+                    + f"{quote_instruction}\n"
+                    + (
+                        "End by surfacing what could go wrong with this strategy — this becomes the natural bridge into Risk Factors.\n\n"
+                        if not short_quality_mode
+                        else "Keep this section mechanism-first, not a second Executive Summary or a quote inventory.\n\n"
+                    )
+                    + "FORBIDDEN: Leading with revenue or operating income figures. Restating metrics already covered in "
+                    + "Financial Performance. Saying 'Management discusses...' or speculating beyond filing evidence.",
                 ),
                 (
                     "Risk Factors",
-                    "2-3 MATERIAL, company-specific risks (concise but substantive).\n"
+                    "2-3 GENUINE BUSINESS RISKS that directly threaten the thesis from the Executive Summary.\n"
                     f"{risk_budget_sentence_block}"
-                    "FORMAT (MANDATORY): No intro paragraph and no closing recap. Output ONLY the 2-3 risks in the required format.\n"
-                    "Each MUST:\n"
-                    "1. Have a clear name that includes the *specific driver* (segment/product/platform/regulation). Avoid generic labels like 'Margin Compression Risk' unless you tie it to a named driver (e.g., TAC, capex, incentives, insurance).\n"
-                    "2. Be 2-4 sentences with concrete mechanisms and quantified impact where possible\n"
-                    "3. Be specific to THIS business model (not generic macro filler)\n"
-                    "4. Be distinct: no duplicate names or overlapping drivers\n"
-                    "5. Be grounded in the filing's RISK FACTORS excerpt in the prompt (do not invent risks)\n"
-                    "6. For EACH risk, cite (a) a filing-specific driver from the excerpt and (b) at least one numeric metric from this memo (margins, OCF→FCF, capex, cash vs liabilities).\n"
-                    "7. If a RISK FACTORS excerpt is provided above, include a SHORT verbatim quote (4-10 words) from that excerpt in quotation marks inside EACH risk to prove grounding.\n"
-                    "8. WEIGHTING (MANDATORY): For each risk, explicitly state severity/likelihood (High/Med/Low) and include one sentence on why it does NOT dominate the thesis yet (and what would make it dominate).\n"
-                    "9. CHANGE SIGNAL (MANDATORY): For each risk, name one concrete sign it is worsening versus the prior comparable period (a metric moving, a cost line drifting, a cash item deteriorating).\n"
-                    "Format: **Risk Name**: Explanation with specifics.\n"
-                    "Skip generic macro risks unless the filing clearly makes them company-specific.",
+                    f"{risk_structure_instruction}\n"
+                    "REQUIRED: Each risk must be about BUSINESS EXPOSURE, not metric decline:\n"
+                    "- Competitive threats: who could take market share and how?\n"
+                    "- Regulatory/legal: what rules or lawsuits could disrupt operations?\n"
+                    "- Technology disruption: what innovations could make the business model obsolete?\n"
+                    "- Customer/supplier concentration: dangerous dependencies?\n"
+                    "- Market dynamics: secular shifts that could erode demand?\n\n"
+                    "Format: **Risk Name**: explanation.\n"
+                    "Each risk: name it, explain the mechanism with budget-aware depth, trace the financial transmission path, and name one early-warning signal.\n"
+                    "Risks must connect to specific vulnerabilities surfaced in the preceding sections.\n\n"
+                    "FORBIDDEN: 'Operating margin compression' or 'revenue deceleration' as standalone risks — "
+                    "those are SYMPTOMS, not risks. Name the underlying business cause. "
+                    "No generic macro filler, no textbook truisms. Numbers are OPTIONAL support — "
+                    "do not turn Risk Factors into another metrics section.",
                 ),
                 (
                     "Key Metrics",
-                    "Scannable data appendix (arrow format).\n"
+                    "Scannable data appendix (numeric DATA_GRID format only).\n"
                     f"{key_metrics_budget_sentence or ''}\n"
-                    "CRITICAL: This section should be ~10% of the total memo length (fixed distribution). "
-                    "Include ENOUGH metric rows to match the Key Metrics word budget; do not keep it artificially short.\n\n"
-                    "FORMAT RULES:\n"
-                    "- Use arrow lines only (start each line with '→ ').\n"
-                    "- NO narrative paragraphs, NO emojis, NO formulas/equations (no '=' signs).\n"
-                    "- Use ONLY metrics provided in the 'KEY METRICS' reference block above (do not invent numbers).\n"
-                    "- If a metric is missing, OMIT the line (no 'N/A' placeholders).\n\n"
-                    "SUGGESTED ROWS (include what is available):\n"
-                    "→ Revenue: $X.XB\n"
-                    "→ Revenue YoY: X.X%\n"
-                    "→ Gross Margin: X.X%\n"
-                    "→ Operating Margin: X.X%\n"
-                    "→ Net Margin: X.X%\n"
-                    "→ Operating Cash Flow: $X.XB\n"
-                    "→ Free Cash Flow: $X.XB\n"
-                    "→ FCF Margin: X.X%\n"
-                    "→ Cash + Securities: $X.XB\n"
-                    "→ Total Debt: $X.XB\n"
-                    "→ Current Ratio: X.Xx\n\n"
-                    "If Health Rating is enabled, also include a sub-block:\n"
-                    "Health Score Drivers:\n"
-                    "→ Profitability: ...\n"
-                    "→ Cash conversion: ...\n"
-                    "→ Balance sheet: ...\n"
-                    "→ Liquidity: ...\n",
+                    "Use numeric rows only in `Label | Value` form within DATA_GRID_START/END markers. No narrative paragraphs, no formulas, no invented numbers.\n"
+                    "If a metric is missing, omit the line.\n\n"
+                    "Suggested rows (include what is available):\n"
+                    "Revenue | $X.XB\n"
+                    "Revenue YoY | X.X%\n"
+                    "Gross Margin | X.X%\n"
+                    "Operating Margin | X.X%\n"
+                    "Net Margin | X.X%\n"
+                    "Operating Cash Flow | $X.XB\n"
+                    "Free Cash Flow | $X.XB\n"
+                    "FCF Margin | X.X%\n"
+                    "Cash + Securities | $X.XB\n"
+                    "Total Debt | $X.XB\n"
+                    "Current Ratio | X.Xx\n",
                 ),
                 _build_closing_takeaway_description(
                     selected_persona_name,
                     company_name,
                     target_length=target_length,
-                    persona_requested=bool(investor_focus),
+                    persona_requested=persona_requested,
                     budget_words=closing_budget,
                 ),
             ]
@@ -12735,35 +21472,14 @@ def generate_filing_summary(
         output_style = preferences.output_style or "paragraph"
 
         # Build no-persona block for objective analysis only when the user did NOT provide any persona.
-        if investor_focus:
+        if persona_requested:
             no_persona_block = ""
         else:
             no_persona_block = """
-=== NO PERSONA MODE - OBJECTIVE ANALYSIS ===
-CRITICAL: No investor persona was selected. You MUST write as a NEUTRAL PROFESSIONAL ANALYST.
-
-FORBIDDEN - NEVER USE:
-- First-person language: 'I', 'my view', 'I would', 'I believe', 'my conviction', 'I see'
-- Any famous investor voices, names, or catchphrases
-- Folksy analogies or colorful investor expressions
-- Investment club language ('I would buy/sell/hold')
-
-REQUIRED - ALWAYS USE:
-- Third-person objective language: 'The analysis indicates...', 'The data suggests...', 'This company demonstrates...'
-- Professional research analyst tone
-- Quantitative focus: revenue growth %, margins, ROE, valuation multiples
-- Evidence-based conclusions tied directly to financial metrics
-
-EXAMPLE CORRECT PHRASING:
-- 'The company's 35% gross margin expansion indicates operational improvement.'
-- 'Revenue growth of 22% YoY suggests strong market positioning.'
-- 'Based on the financial data, a Hold rating appears warranted.'
-
-EXAMPLE INCORRECT PHRASING (DO NOT USE):
-- 'I would hold this stock because...' (first person)
-- 'This is a wonderful business with a wide moat.' (famous-investor catchphrase)
-- 'Inverting the question, what could go wrong?' (famous-investor catchphrase)
-=== END NO PERSONA MODE ===
+NO PERSONA SELECTED:
+- Use neutral, third-person institutional language.
+- Do not use first-person voice or famous-investor catchphrases.
+- Keep tone evidence-driven and specific to filing metrics.
 """
 
         # Build the opening identity based on whether a persona is selected
@@ -12771,56 +21487,78 @@ EXAMPLE INCORRECT PHRASING (DO NOT USE):
             identity_block = f"""You are a senior analyst writing an institutional investment memo for portfolio managers.
 You are filtering the analysis through the priorities of {selected_persona_name}, but you must NOT mimic catchphrases or produce self-referential manifesto language.
 Your goal is to provide actionable, differentiated insight with clear hierarchy and minimal repetition."""
-        elif investor_focus:
-            identity_block = """You are a senior analyst writing an institutional investment memo for portfolio managers.
-You are filtering the analysis through the investor persona described in the user customization requirements above, but you must NOT produce self-referential manifesto language.
-Your goal is to provide actionable, differentiated insight with clear hierarchy and minimal repetition."""
         else:
-            identity_block = """=== CRITICAL: NO PERSONA MODE ===
-YOU ARE A NEUTRAL, OBJECTIVE FINANCIAL ANALYST. 
-
-ABSOLUTE PROHIBITION - READ THIS FIRST:
-- You have NOT been assigned any investor persona
-- Do NOT adopt ANY famous investor's voice or perspective
-- Do NOT use first-person language ('I', 'my view', 'I would', 'I believe', 'my conviction')
-- Do NOT imitate or mention any famous investor
-
-REQUIRED WRITING STYLE:
-- Write in THIRD PERSON only ('The analysis indicates...', 'The data suggests...', 'The company demonstrates...')
-- Use professional equity research tone (like Goldman Sachs or Morgan Stanley analyst reports)
-- Focus on quantitative metrics and evidence-based conclusions
-
-THIS IS YOUR PRIMARY DIRECTIVE. VIOLATION = INVALID OUTPUT.
-=== END CRITICAL INSTRUCTION ===
-
-You are a professional equity research analyst writing a financial briefing.
-Your goal is to provide actionable, differentiated insight, not just a summary of facts."""
+            identity_block = """You are a neutral, objective equity research analyst writing for institutional investors.
+Write in third person, stay metric-anchored, and avoid persona mimicry or catchphrases."""
 
         section_header_example = (
             "Financial Health Rating, Executive Summary, Financial Performance, etc."
         )
         if not include_health_rating:
             section_header_example = "Executive Summary, Financial Performance, etc."
+        if short_quality_mode:
+            narrative_arc_line = (
+                "SHORT-FORM NARRATIVE CONTRACT (HIGHEST PRIORITY — READ BEFORE ANYTHING ELSE):\n"
+                "Identify ONE central tension for this company and state it clearly in Executive Summary only.\n"
+                "Every later section must answer that tension directly instead of re-framing it as a new question.\n"
+                "Use one tight paragraph per narrative section. Keep transitions natural, but do not force each section to end by teeing up the next with a question.\n"
+                "Do not pad to a round number, do not add generic fallback language, and do not use 'watchpoint' or 'future filings will clarify' style prose."
+            )
+        else:
+            narrative_arc_line = (
+                "NARRATIVE CHAIN (HIGHEST PRIORITY — READ BEFORE ANYTHING ELSE):\n"
+                "Identify ONE central tension for this company "
+                "(e.g., 'Can this exceptional margin quality survive rising reinvestment?' or 'Is this cash conversion real or timing-driven?').\n"
+                "Every section must pull on this thread:\n"
+                + (
+                    "  - Health Rating: establishes the starting position\n"
+                    if include_health_rating
+                    else ""
+                )
+                + "  - Executive Summary: frames the tension\n"
+                + "  - Financial Performance: tests it with 2-3 key numbers\n"
+                + "  - MD&A: shows whether management actions support or undermine it\n"
+                + "  - Risk Factors: names what could break it\n"
+                + "  - Closing Takeaway: resolves it with a verdict\n\n"
+                + "CRITICAL: The last sentence of each section must raise a question or implication "
+                + "that the NEXT section opens with. The reader should never feel a 'topic change' between sections."
+            )
         health_constraint_line = (
             "- Do NOT repeat the Financial Health Rating in the Key Metrics section.\n"
             if include_health_rating
             else ""
         )
 
-        anti_repetition_rules = (
-            " - EDITING DISCIPLINE (MANDATORY): If an idea is stated clearly once, do NOT restate it later unless you add NEW information (new number, new mechanism, new trade-off, or a new conditional trigger).\n"
-            " - ONE-TIME IDEAS RULE: Every idea earns exactly ONE paragraph in the entire memo. If you catch yourself repeating, delete the weaker instance or merge and move on.\n"
-            " - BAN VERBATIM LOOPS: Do not repeat sentences or near-identical paragraph structure across sections.\n"
-            " - BAN CATCHPHRASE SPAM: Mention each of these phrases at most ONCE in the entire memo (use synonyms or implicit references after):\n"
-            "   'cash conversion vs margins', 'durability through the cycle', 'don\\'t buy growth with incentives', 'bridge from operating margin to free cash flow', 'margin for error'.\n"
-            " - NO PROCESS NARRATION: Do NOT write meta-thinking lines (e.g., 'what I care about', 'what I watch', 'what could matter', 'this could be important', 'this could falsify the thesis'). Present conclusions and triggers.\n"
-            " - FORBIDDEN DEFINITIONS: Do NOT explain basic definitions (e.g., 'Free cash flow is the difference between...'). Assume the reader is financially literate.\n"
-            " - PRIOR-PERIOD INTEGRITY: If a 'Q/Q DELTA BRIDGE NUMBERS' block is present, you MUST use it for all sequential claims. NEVER use the words 'hypothetical', 'roughly', or 'assume' for those comparisons.\n"
-            " - PARAGRAPH DISCIPLINE: One paragraph = one idea. If you need 'and also', start a new paragraph.\n"
-            ' - OPINION-TO-EVIDENCE: Every strong opinion must (a) interpret a number, OR (b) explain a trade-off, OR (c) state a conditional ("if X, then Y breaks"). Otherwise, remove it.\n'
-            " - STANCE CONSISTENCY: State the base stance ONCE (in Executive Summary). Do NOT oscillate between BUY/HOLD/constructive later.\n"
-            ' - NO MINI-CONCLUSIONS: Avoid repeated "takeaway" or "so what" restatements. Use ONE forward-linking transition sentence at the end of each section, not a recap.\n'
-        )
+        if short_quality_mode:
+            anti_repetition_rules = (
+                "WRITING RULES (NON-NEGOTIABLE):\n"
+                " 1. NUMBERS ARE SUPPORT, NOT STRUCTURE: use only the few figures that change the underwriting view.\n"
+                " 2. QUALITATIVE FIRST: lead with business meaning, then support it with evidence.\n"
+                " 3. Frame the central question only in Executive Summary; do not repeat 'the key question is whether' elsewhere.\n"
+                " 4. Quotes are optional. If used, cap direct quotes at 1 total and keep it short.\n"
+                " 5. No generic fallback language, no 'watchpoint' phrasing, no 'future filings will clarify' filler, and no padding to hit a round number.\n"
+                " 6. Do not repeat the same thesis, clause ending, or sentence opening across sections.\n"
+                " 7. Keep each narrative section to one tight paragraph unless the section budget clearly requires more.\n"
+                " 8. Stop once the memo is complete, even if that leaves the draft modestly under target.\n"
+            )
+        else:
+            anti_repetition_rules = (
+                "WRITING RULES (NON-NEGOTIABLE):\n"
+                " 1. NUMBERS ARE SUPPORT, NOT STRUCTURE: MAX 2 dollar/percentage figures per narrative section "
+                "(Executive Summary, MD&A, Risk Factors, Closing Takeaway). Financial Performance gets up to 4. "
+                "Every number must be immediately followed by what it MEANS for the business.\n"
+                " 2. QUALITATIVE FIRST: Lead every paragraph with a business insight, competitive observation, or "
+                "strategic implication. Numbers come second as evidence. If a sentence starts with a dollar figure, restructure it.\n"
+                " 3. Every sentence must add a NEW fact, mechanism, or conclusion. "
+                "If you could delete a sentence and the argument doesn't change, delete it now.\n"
+                " 4. Connect sections: the last sentence of each section raises a question; "
+                "the first sentence of the next section answers it. The reader should feel momentum, not topic changes.\n"
+                " 5. QUOTES ARE MANDATORY when filing language snippets are provided: include at least 3 short direct "
+                "quotes, with at least one in Executive Summary and one in MD&A — keep them verbatim and drawn from the snippets only.\n"
+                " 6. Do not repeat sentence openings across a section (e.g., multiple sentences starting with the same first word).\n"
+                " 7. Do not end consecutive sentences with the same clause or repeated wording.\n"
+                " 8. Stop writing once the memo is complete and within the target band; do not pad to a round number.\n"
+            )
 
         company_profile_lines: List[str] = []
         if company.get("ticker"):
@@ -12839,19 +21577,118 @@ Your goal is to provide actionable, differentiated insight, not just a summary o
             else ""
         )
 
+        company_research_block_placeholder = "__COMPANY_RESEARCH_BLOCK__"
+        spotlight_context_block_placeholder = "__SPOTLIGHT_CONTEXT_BLOCK__"
+        filing_language_block_placeholder = "__FILING_LANGUAGE_BLOCK__"
+        risk_factors_block_placeholder = "__RISK_FACTORS_BLOCK__"
+        prompt_component_blocks: Dict[str, str] = {
+            "spotlight_context_block": str(spotlight_block or "").strip(),
+            "filing_language_block": str(filing_language_block or "").strip(),
+            "risk_factors_block": str(risk_factors_block or "").strip(),
+        }
+
+        production_section_contract_enabled = bool(
+            target_length
+            and int(target_length) >= 300
+            and not micro_plaintext_mode
+        )
+        strict_length_contract_enabled = bool(
+            production_section_contract_enabled
+            or (
+                target_length
+                and strict_contract_opt_in
+                and _summary_strict_target_contract_required()
+            )
+        )
+
+        # Build section budget instruction for the prompt.
+        # In strict mode we target the exact user length to reduce contract misses.
+        # In non-strict mode we allow modest overshoot to absorb cleanup trimming.
+        section_budget_instruction = ""
+        if section_budgets and target_length:
+            overshoot_factor = (
+                1.0 if (strict_length_contract_enabled or one_shot_deterministic_policy) else 1.20
+            )
+            _budget_tol = _effective_word_band_tolerance(target_length)
+            budget_lines = "\n".join(
+                (
+                    f"- {section}: "
+                    f"{max(1, int(words * overshoot_factor) - _section_budget_tolerance_words(int(words), max_tolerance=10))}-"
+                    f"{int(words * overshoot_factor) + _section_budget_tolerance_words(int(words), max_tolerance=10)} "
+                    f"body words (target {int(words * overshoot_factor)})"
+                )
+                for section, words in section_budgets.items()
+                if words > 0
+            )
+            generation_target_for_budget = (
+                int(target_length)
+                if strict_length_contract_enabled
+                else int(int(target_length) * overshoot_factor)
+            )
+            section_budget_instruction = (
+                f"\nSECTION LENGTH TARGETS (non-negotiable body-word ranges):\n"
+                f"{budget_lines}\n"
+                f"Total target: {generation_target_for_budget} words (±{_budget_tol} words). "
+                f"Count section body words only; headings do not count. Hit each section's target, do not front-load words into early sections, and do not repeat section titles inside bodies.\n"
+            )
+
+        # In strict mode, ask for the exact user target.
+        # In non-strict mode, overshoot slightly to absorb deterministic cleanup.
+        generation_overshoot = (
+            0
+            if (not target_length or strict_length_contract_enabled or one_shot_deterministic_policy)
+            else int(target_length * 0.20)
+        )
+        generation_target = (
+            int(target_length) + generation_overshoot if target_length else None
+        )
+        _prompt_tol = _effective_word_band_tolerance(target_length) if target_length else 0
         target_length_line = (
-            f"4. Target Length: {target_length} words total (must land within ±10 words; no filler)"
+            f"4. Target Length: {generation_target} words total target (acceptable final band {max(1, generation_target - _prompt_tol)} to {generation_target + _prompt_tol} words). "
+            f"Prioritize substance density and coherence. Do NOT pad with filler or repeated phrasing. Stop when the memo is complete and in-band."
             if target_length
             else "4. Target Length: keep concise; prioritize substance over length"
         )
+        structured_output_contract = ""
+        if production_section_contract_enabled and section_budgets:
+            structured_output_contract = build_structured_output_contract(
+                section_budgets=section_budgets,
+                include_health_rating=include_health_rating,
+                target_length=target_length,
+            )
 
-        base_prompt = f"""
+        if micro_plaintext_mode and target_length:
+            base_prompt_template = _build_micro_plaintext_summary_prompt(
+                identity_block=identity_block,
+                company_name=str(company_name or ""),
+                ticker=str(company.get("ticker") or ""),
+                filing_type=str(filing_type or ""),
+                filing_date=str(filing_date or ""),
+                tone=str(tone or "objective"),
+                detail_level=str(detail_level or "comprehensive"),
+                output_style=str(output_style or "paragraph"),
+                target_length=int(target_length),
+                context_excerpt=str(context_excerpt or ""),
+                truncated_note=str(truncated_note or ""),
+                financial_snapshot=str(financial_snapshot or ""),
+                metrics_lines=str(metrics_lines or ""),
+                prior_period_delta_block=str(prior_period_delta_block or ""),
+                risk_factors_block=str(risk_factors_block or ""),
+                preference_block=str(preference_block or ""),
+                company_profile_block=str(company_profile_block or ""),
+                company_research_block_placeholder=company_research_block_placeholder,
+            )
+        else:
+            base_prompt_template = f"""
 {identity_block}
 Analyze the following filing for {company_name} ({filing_type}, {filing_date}).
 {company_profile_block}
-
+{company_research_block_placeholder}
+{source_limitations_block}
 CONTEXT:
-{context_excerpt}{truncated_note}{spotlight_block}
+{context_excerpt}{truncated_note}
+{spotlight_context_block_placeholder}
+{filing_language_block_placeholder}
 
 FINANCIAL SNAPSHOT (Reference only):
 {financial_snapshot}
@@ -12859,234 +21696,580 @@ FINANCIAL SNAPSHOT (Reference only):
 KEY METRICS (Use these for calculations and evidence):
 {metrics_lines}
 {prior_period_delta_block}
-{risk_factors_block}
+{risk_factors_block_placeholder}
 
 INSTRUCTIONS:
 1. Tone: {tone.title()} (Professional, Insightful, Direct)
 2. Detail Level: {detail_level.title()}
 3. Output Style: {output_style.title()}
 {target_length_line}
-
+{section_budget_instruction}
 STRUCTURE & CONTENT REQUIREMENTS:
 {section_requirements}
 {health_directives_section}
 {preference_block}
 
-=== MANDATORY FORMATTING RULES (CRITICAL) ===
-1. Each section MUST start on its own line with the ## header
-2. There MUST be a blank line BEFORE each section header
-3. There MUST be a blank line AFTER each section header before the content
-4. NEVER put a section header inline with content from the previous section
+FORMAT LOCK:
+- Use exactly the required section headers ({section_header_example}) in order.
+- Keep each header on its own line with a blank line before section body text.
+- Do not add extra sections or inline headers.
 
-CORRECT FORMAT:
-```
-...previous section content ends here.
-
-## Executive Summary
-
-This section content starts on a new line after the header.
-```
-
-INCORRECT FORMAT (DO NOT DO THIS):
-```
-...previous section content ends here. ## Executive Summary This section content...
-```
-
-EVERY section header ({section_header_example}) MUST:
-- Be on its own line
-- Start with "## "
-- Have blank lines before and after
-=== END FORMATTING RULES ===
-
-=== USER CUSTOMIZATION PRIORITY (READ CAREFULLY) ===
-If the user has specified ANY custom preferences (persona, tone, focus areas, detail level, output style,
-health score configuration), these OVERRIDE default behavior. Your output MUST:
-
-1. PERSONA/VIEWPOINT: If specified, maintain this voice in EVERY section, not just the introduction.
-   - Use first-person language throughout
-   - Apply their specific mental models and vocabulary
-   - The Closing Takeaway MUST sound exactly like the persona
-
-2. HEALTH SCORE: If configured, follow the user's framework, weighting, risk tolerance, and display format EXACTLY.
-   - Score must reflect their specified primary factor weighting
-   - Apply their specified risk tolerance when penalizing/rewarding
-   - Use ONLY their selected display format (score only, pillars, traffic light, etc.)
-
-3. TONE/DETAIL/STYLE: Match user specifications consistently throughout. No switching mid-document.
-
-4. FOCUS AREAS: If specified, these topics get PRIORITY coverage with dedicated sections.
-
-Failure to follow user customizations = INVALID OUTPUT. Re-read the preference block above if unsure.
-=== END USER CUSTOMIZATION PRIORITY ===
+USER PREFERENCES (HIGHEST PRIORITY):
+- Apply selected persona/tone/focus/detail preferences consistently across all sections.
+- Apply health-rating configuration exactly when provided.
+- Do not echo or restate these instructions in the output.
 {no_persona_block}
-     CRITICAL RULES:
-     - MAINTAIN CONSISTENT TONE throughout the entire document. Do NOT switch tones mid-document.
-     - Do NOT use markdown bolding (**) within the narrative body except where explicitly required (e.g., Risk Factors labels).
-     - Ensure every claim is backed by the provided text or metrics.
-     - If data is missing, omit that data point rather than saying "not disclosed" or "not available".
-     - SYNTHESIZE, DO NOT SUMMARIZE. Tell us what the numbers mean, not just what they are.
-     - SPECIFY TIME PERIODS: Always label figures with their time period (FY24, Q3 FY25, TTM, etc.).
-     - CHANGE FOCUS (MANDATORY): This memo is most useful as a "what changed" read.
-       - If this is a quarterly filing (10-Q), explicitly compare THIS quarter vs the IMMEDIATELY PRIOR quarter throughout narrative sections.
-       - If this is an annual filing (10-K), explicitly compare THIS year vs the PRIOR year throughout narrative sections.
-       - Do not repeat the same comparison in multiple sections; each section should add a NEW angle on change (operating, cash, capital posture, risk).
-       - If prior-period data is unavailable, DO NOT invent it and DO NOT say "hypothetical"; skip the comparison and focus on within-period drivers.
-     - NO REDUNDANCY: Avoid repeating the same metric across multiple sections. Executive Summary should be mostly qualitative; keep dense figures in Financial Performance / Key Metrics.
-    {anti_repetition_rules}
-     - **SUSTAINABILITY**: Do NOT mention sustainability or ESG efforts unless they are a primary revenue driver (e.g., for a solar company). For most companies, this is fluff.
-     - **MD&A**: Do NOT say "Management discusses..." or "In the MD&A section...". Just state the facts found there.
- - USE TRANSITIONS: Connect sections logically. Each section should flow naturally from the previous one.
-
-=== #1 PRIORITY: SENTENCE COMPLETION (UNDER THE WORD CAP) ===
-THIS IS YOUR SINGLE MOST IMPORTANT RULE.
-
-FUNDAMENTAL PRINCIPLE: Never cut off mid-sentence. If you're near the word cap, finish the sentence, then tighten earlier sentences to stay under the cap. It is always acceptable to stop early rather than pad with filler.
-
-EVERY SENTENCE MUST BE COMPLETE. ZERO EXCEPTIONS. ZERO TOLERANCE.
-
-FORBIDDEN CUT-OFF PATTERNS (YOUR OUTPUT WILL BE REJECTED IF ANY APPEAR):
-   - "...and." or "...and the..." (INCOMPLETE - finish the thought)
-   - "...give." or "...competitors give." (INCOMPLETE - what do they give?)
-   - "...of." or "...percentage of." (INCOMPLETE - percentage of what?)
-   - "...$1." or "...$3." (CUT-OFF NUMBER - write the full amount)
-   - "...as I." or "...as wide as I." (INCOMPLETE - finish the sentence)
-   - "...in accelerated." (INCOMPLETE - accelerated what?)
-   - "...I would..." (INCOMPLETE - finish with what you would do)
-   - "...which is..." (INCOMPLETE - which is what?)
-   - "...because I..." (INCOMPLETE - because you what?)
-
-REAL EXAMPLES OF CUT-OFFS TO AVOID:
-   BAD: "...the cyclical nature of the semiconductor industry and." 
-   GOOD: "...the cyclical nature of the semiconductor industry and its potential impact on long-term returns."
-   
-   BAD: "...represent a significant percentage of."
-   GOOD: "...represent a significant percentage of total revenue, creating concentration risk."
-   
-   BAD: "...Capital expenditures total $1."
-   GOOD: "...Capital expenditures total $1.2B, directed primarily toward manufacturing capacity."
-   
-   BAD: "...the moat may not be as wide as I."
-   GOOD: "...the moat may not be as wide as I would prefer for a long-term holding."
-
-HOW TO HANDLE WORD COUNT VS COMPLETION:
-- If you're near the cap and need a few words to finish a sentence, finish it — then tighten earlier sentences so the TOTAL stays under the cap.
-- If you're at the cap, do NOT start a new thought you can't finish.
-- Plan your sections so you have room to complete the Closing Takeaway fully.
-
-BEFORE SUBMITTING - MANDATORY CHECK:
-Read the LAST WORD of EVERY sentence. If it's an article, preposition, conjunction, pronoun, or incomplete number, REWRITE IT.
-
-=== END SENTENCE COMPLETION REQUIREMENT ===
-
-NARRATIVE QUALITY:
-- Start each section with a clear topic sentence that states the key insight.
-- End each section with a forward-looking implication or action item that is COMPLETE.
-- Do NOT end sections with a string of short generic one-liners ("staccato" filler). If you need words, expand with a cohesive paragraph tied to the specific metrics above.
-- Avoid starting consecutive sentences with the same word.
-- Vary sentence length and structure for readability.
-- THE LAST SENTENCE OF EACH SECTION MUST BE A COMPLETE THOUGHT ending in a period, question mark, or exclamation point.
-- If you write a subordinate clause (starting with "which", "that", "although", "while", "but", "however"), you MUST complete it.
-
-=== FINAL PRE-SUBMISSION CHECKLIST (MANDATORY) ===
-Before you output anything, verify:
-[ ] Every sentence ends with . ? or ! (not with "and", "the", "of", "I", etc.)
-[ ] All dollar amounts are complete (e.g., "$18.77B" not "$18.")
-[ ] The Closing Takeaway section is FULLY complete with a clear verdict
-[ ] No section ends mid-thought
-[ ] If you're near the cap, it's OK to be shorter — do NOT pad with filler; incomplete sentences are NOT OK
-=== END CHECKLIST ===
+CORE WRITING CONTRACT (MANDATORY):
+{narrative_arc_line}
+- Use fact → interpretation → implication sequencing in each narrative section.
+- Compare the latest period with the prior comparable period in narrative prose (QoQ for 10-Q, YoY for 10-K) when data exists.
+- Enforce metric hierarchy: identify at most 3 primary drivers for the memo; treat all other figures as supporting evidence.
+- Executive Summary and Closing Takeaway must each use at most 2 numeric anchors.
+- Do not invent missing data; omit unavailable points without adding placeholder commentary.
+- If filing language snippets are provided, {("use quotes sparingly (0-1 total) and only when they materially sharpen the analysis." if short_quality_mode else "include at least 3 short direct quotes, with at least one in Executive Summary and one in MD&A, and keep them verbatim.")} 
+- Avoid process/meta language ("this memo should", "this section should", "as instructed", "per guidelines").
+- Keep sentences complete and fully punctuated; never end mid-thought or mid-number.
+FLOW AND QUALITY RULES:
+{anti_repetition_rules}
+{structured_output_contract}
 """
 
-        # Enforce per-summary token budget by trimming the CONTEXT block (input)
-        # before we make any Gemini calls.
-        if token_budget:
-            max_prompt_tokens = max(
-                0, token_budget.remaining_tokens - max_output_tokens
+        # Base prompt without Agent 1 research; used for deterministic budget
+        # trimming and cost/telemetry baselines.
+        base_prompt = base_prompt_template.replace(
+            company_research_block_placeholder, ""
+        )
+        preflight_budget_adjustments: List[str] = []
+        preflight_budget_debug: Dict[str, Any] = {}
+        # Agent 1 (research) always runs on GPT-5.2 regardless of the Agent 2
+        # model, so estimate its cost using the primary (GPT-5.2) rates.
+        preflight_agent1_cost_usd = _estimate_summary_call_cost_usd(
+            prompt_tokens=_estimate_summary_tokens(
+                build_company_research_prompt(
+                    company_name=str(company_name or ""),
+                    ticker=str(company.get("ticker") or ""),
+                    sector=str(company.get("sector") or ""),
+                    industry=str(company.get("industry") or ""),
+                    filing_type=str(filing_type or ""),
+                )
+            ),
+            output_tokens=_summary_agent1_max_output_tokens(),
+            input_rate_per_1m=_summary_cost_input_rate_per_1m(),
+            output_rate_per_1m=_summary_cost_output_rate_per_1m(),
+        )
+        preflight_cost_budget = SummaryCostBudget(
+            budget_cap_usd=float(cost_budget.budget_cap_usd),
+            input_rate_per_1m=float(cost_budget.input_rate_per_1m),
+            output_rate_per_1m=float(cost_budget.output_rate_per_1m),
+            spent_usd=float(preflight_agent1_cost_usd),
+        )
+        (
+            base_prompt,
+            _preflight_research_mode,
+            _preflight_prompt_budget_adapted,
+            preflight_budget_adjustments,
+        ) = _build_budget_adapted_summary_prompt(
+            base_prompt_template=base_prompt_template,
+            company_research_block_placeholder=company_research_block_placeholder,
+            company_research_block="",
+            target_length=target_length,
+            max_output_tokens=max_output_tokens,
+            token_budget=token_budget,
+            cost_budget=preflight_cost_budget,
+            spotlight_context_block_placeholder=spotlight_context_block_placeholder,
+            filing_language_block_placeholder=filing_language_block_placeholder,
+            risk_factors_block_placeholder=risk_factors_block_placeholder,
+            prompt_component_blocks=prompt_component_blocks,
+            failure_stage="preflight_budget_estimate",
+            prompt_debug_prefix="preflight",
+            reserve_tokens=_summary_research_token_reserve_tokens(),
+            budget_debug=preflight_budget_debug,
+        )
+
+        preflight_cost_estimate = _estimate_two_agent_summary_cost_preflight(
+            company_name=str(company_name or ""),
+            ticker=str(company.get("ticker") or ""),
+            sector=str(company.get("sector") or ""),
+            industry=str(company.get("industry") or ""),
+            filing_type=str(filing_type or ""),
+            base_prompt=base_prompt,
+            target_length=target_length,
+            max_output_tokens=max_output_tokens,
+            rewrite_attempt_cap=int(
+                0
+                if one_shot_deterministic_policy
+                else (MAX_REWRITE_ATTEMPTS if not fast_summary_mode else fast_max_rewrites)
+            ),
+            budget=cost_budget,
+            # Agent 1 always runs on GPT-5.2 — use primary rates for its estimate.
+            agent1_input_rate_per_1m=_summary_cost_input_rate_per_1m(),
+            agent1_output_rate_per_1m=_summary_cost_output_rate_per_1m(),
+        )
+        minimum_path_cost = float(
+            preflight_cost_estimate.get("minimum_path_usd") or 0.0
+        )
+        bounded_total_cost = float(
+            preflight_cost_estimate.get("bounded_total_usd") or 0.0
+        )
+        budget_cap_usd = float(cost_budget.budget_cap_usd)
+        preflight_budget_debug["preflight_expected_output_tokens"] = int(
+            preflight_cost_estimate.get("expected_output_tokens") or 0
+        )
+        preflight_budget_debug["preflight_prompt_tokens_estimated"] = int(
+            _estimate_summary_tokens(base_prompt)
+        )
+        if minimum_path_cost > float(cost_budget.budget_cap_usd):
+            if fast_summary_mode:
+                fast_degraded = True
+                if not fast_degraded_reason:
+                    fast_degraded_reason = "budget_cap"
+                fast_warnings.append(
+                    "Preflight estimate exceeded fast-mode budget cap; proceeding best-effort with reduced context."
+                )
+            else:
+                preflight_detail = _decorate_budget_exceeded_detail(
+                    {
+                        "detail": (
+                            "Summary request cannot fit under the strict per-request budget cap."
+                        ),
+                        "budget_cap_usd": float(cost_budget.budget_cap_usd),
+                        "estimated_min_cost_usd": minimum_path_cost,
+                        "estimated_bounded_cost_usd": bounded_total_cost,
+                        "preflight_expected_output_tokens": int(
+                            preflight_budget_debug.get("preflight_expected_output_tokens")
+                            or 0
+                        ),
+                        "preflight_prompt_tokens_estimated": int(
+                            preflight_budget_debug.get("preflight_prompt_tokens_estimated")
+                            or 0
+                        ),
+                        "effective_prompt_token_cap": preflight_budget_debug.get(
+                            "effective_prompt_token_cap"
+                        ),
+                    },
+                    stage="preflight_budget_estimate",
+                    target_length=int(target_length) if target_length else None,
+                    budget_adjustments_attempted=preflight_budget_adjustments,
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail=preflight_detail,
+                )
+        # Reserve Agent 1 estimated spend so all downstream runtime guards
+        # enforce the cap against full two-agent cost, not Agent 2 alone.
+        cost_budget.spent_usd = float(
+            preflight_cost_estimate.get("agent1_cost_usd") or 0.0
+        )
+
+        generation_stats = _init_summary_generation_telemetry(token_budget)
+        strict_contract_required = bool(
+            target_length
+            and strict_contract_opt_in
+            and _summary_strict_target_contract_required()
+            and not one_shot_deterministic_policy
+        )
+        generation_stats["fast_summary_mode"] = bool(fast_summary_mode)
+        generation_stats["one_shot_deterministic_policy"] = bool(
+            one_shot_deterministic_policy
+        )
+        generation_stats["summary_output_format"] = str(summary_output_format)
+        generation_stats["fast_max_rewrites"] = int(fast_max_rewrites)
+        generation_stats["fast_runtime_cap_seconds"] = int(fast_runtime_cap_seconds)
+        generation_stats["fast_runtime_deadline_ts"] = float(
+            time.time() + float(fast_runtime_cap_seconds)
+        ) if fast_summary_mode else 0.0
+        generation_stats["summary_runtime_deadline_monotonic"] = float(
+            summary_runtime_deadline
+        )
+        generation_stats["summary_runtime_cap_seconds"] = int(
+            summary_runtime_cap_seconds
+        )
+        generation_stats["fast_cost_cap_usd"] = float(fast_cost_cap_usd)
+        generation_stats["quality_mode"] = quality_mode
+        generation_stats["contract_recovery_used"] = False
+        generation_stats["contract_recovery_generation_calls"] = 0
+        generation_stats["contract_recovery_cost_guard_blocked"] = False
+        generation_stats["contract_retry_iterations"] = []
+        generation_stats["pre_contract_split_word_count"] = 0
+        generation_stats["pre_contract_stripped_word_count"] = 0
+        # active_model_name already resolved above with target_length awareness.
+        v2_enabled = (
+            _summary_flow_rewrite_v2_enabled()
+            and not fast_summary_mode
+            and not one_shot_deterministic_policy
+        )
+        continuous_v2_enabled = bool(
+            _summary_continuous_v2_requested_for_target(target_length)
+            and not fast_summary_mode
+            and not one_shot_deterministic_policy
+        )
+        flash_first_enabled = _summary_flow_rewrite_v2_flash_first()
+        is_flash_model = _is_flash_model_name(active_model_name)
+        quality_profile = _build_summary_quality_profile(
+            target_length=target_length,
+            is_flash_model=is_flash_model,
+            flash_first_enabled=flash_first_enabled,
+        )
+        if micro_plaintext_mode and target_length:
+            quality_validators = [
+                _make_micro_plaintext_summary_validator(int(target_length)),
+                _make_instruction_leak_validator(),
+            ]
+        else:
+            quality_validators = [
+                _make_section_completeness_validator(
+                    include_health_rating, target_length=target_length
+                )
+            ]
+            quality_validators.append(
+                _make_no_extra_sections_validator(include_health_rating)
             )
-            max_prompt_chars = max_prompt_tokens * CHARS_PER_TOKEN_ESTIMATE
-            if max_prompt_chars > 0 and len(base_prompt) > max_prompt_chars:
-                base_prompt = _truncate_prompt_to_token_budget(
-                    base_prompt,
-                    max_prompt_chars=max_prompt_chars,
-                    budget_note="\n\nNote: Filing text truncated to fit per-summary token budget.",
+            quality_validators.append(
+                _make_risk_specificity_validator(risk_factors_excerpt=risk_factors_excerpt)
+            )
+            quality_validators.append(
+                _make_quote_grounding_validator(
+                    source_text=context_excerpt,
+                    require_quotes=bool(filing_language_snippets) and not short_quality_mode,
+                    min_required_quotes=_summary_min_verified_quotes(),
+                    max_allowed_quotes=_summary_max_verified_quotes(),
+                )
+            )
+            quality_validators.append(
+                _make_numbers_discipline_validator(
+                    target_length,
+                    closing_numeric_cap_override=quality_profile.closing_numeric_anchor_cap,
+                )
+            )
+            quality_validators.append(_make_metric_priority_validator(target_length))
+            quality_validators.append(
+                _make_section_transition_validator(
+                    include_health_rating=include_health_rating,
+                    target_length=target_length,
+                )
+            )
+            quality_validators.append(_make_verbatim_repetition_validator())
+            quality_validators.append(_make_phrase_limits_validator())
+            quality_validators.append(_make_instruction_leak_validator())
+            quality_validators.append(
+                _make_sentence_stem_repetition_validator(
+                    max_same_opening=quality_profile.max_same_opening
+                )
+            )
+            quality_validators.append(_make_cross_section_question_framing_validator())
+            quality_validators.append(
+                _make_cross_section_number_repetition_validator(
+                    max_sections_per_figure=quality_profile.max_sections_per_repeated_number
+                )
+            )
+            quality_validators.append(_make_generic_filler_validator())
+            quality_validators.append(
+                _make_cross_section_theme_repetition_validator(
+                    max_sections_per_theme=quality_profile.max_sections_per_theme
+                )
+            )
+            quality_validators.append(
+                _make_period_delta_bridge_validator(
+                    require_bridge=bool((prior_period_delta_block or "").strip())
+                )
+            )
+            quality_validators.append(
+                _make_closing_recommendation_validator(
+                    persona_requested=persona_requested, company_name=company_name
+                )
+            )
+            quality_validators.append(_make_closing_structure_validator())
+            quality_validators.append(
+                _make_persona_exclusivity_validator(
+                    persona_requested=persona_requested,
+                    selected_persona_name=selected_persona_name,
+                )
+            )
+            quality_validators.append(_make_stance_consistency_validator())
+            if v2_enabled and target_length:
+                quality_validators.append(
+                    _make_section_balance_validator(
+                        include_health_rating=include_health_rating,
+                        target_length=int(target_length),
+                    )
+                )
+        model_plan = SummaryModelPlan(
+            selected_model=active_model_name,
+            fallback_model=active_model_name,
+            estimated_generation_cost_usd=float(
+                preflight_cost_estimate.get("agent2_generation_cost_usd") or 0.0
+            ),
+            estimated_rewrite_cost_usd=float(
+                preflight_cost_estimate.get("rewrite_cost_per_attempt_usd") or 0.0
+            ),
+            estimated_total_cost_usd=float(
+                preflight_cost_estimate.get("minimum_path_usd") or 0.0
+            ),
+            estimated_fallback_retry_cost_usd=0.0,
+            estimated_fallback_total_cost_usd=float(
+                preflight_cost_estimate.get("bounded_total_usd") or 0.0
+            ),
+            budget_cap_usd=_float_env(
+                "OPENAI_COST_PER_SUMMARY_USD", DEFAULT_SUMMARY_BUDGET_USD
+            ),
+            primary_model_affordable=True,
+            used_fallback=False,
+        )
+        two_agent_result: Optional[TwoAgentSummaryPipelineResult] = None
+
+        logger.info(
+            "Summary model routing locked to GPT-5.2: pipeline=two_agent model=%s",
+            active_model_name,
+        )
+
+        summary_client = _get_summary_openai_client(model_name=active_model_name)
+        summary_usage_context = _apply_usage_context(
+            summary_client,
+            active_model_name,
+            pipeline_mode="two_agent",
+        )
+        prompt_budget_state: Dict[str, Any] = {
+            "research_mode": "skipped",
+            "prompt_budget_adapted": False,
+            "budget_adjustments_attempted": list(preflight_budget_adjustments or []),
+            "preflight_expected_output_tokens": int(
+                preflight_budget_debug.get("preflight_expected_output_tokens") or 0
+            ),
+            "preflight_prompt_tokens_estimated": int(
+                preflight_budget_debug.get("preflight_prompt_tokens_estimated") or 0
+            ),
+            "runtime_expected_output_tokens": 0,
+            "runtime_prompt_tokens_estimated": 0,
+            "effective_prompt_token_cap": preflight_budget_debug.get(
+                "effective_prompt_token_cap"
+            ),
+        }
+        last_agent2_prompt: str = ""
+
+        def _build_pipeline_prompt(company_research_block: str) -> str:
+            nonlocal last_agent2_prompt
+            (
+                prompt,
+                research_mode,
+                prompt_budget_adapted,
+                budget_adjustments_attempted,
+            ) = _build_budget_adapted_summary_prompt(
+                base_prompt_template=base_prompt_template,
+                company_research_block_placeholder=company_research_block_placeholder,
+                company_research_block=company_research_block or "",
+                target_length=target_length,
+                max_output_tokens=max_output_tokens,
+                token_budget=token_budget,
+                cost_budget=cost_budget,
+                spotlight_context_block_placeholder=spotlight_context_block_placeholder,
+                filing_language_block_placeholder=filing_language_block_placeholder,
+                risk_factors_block_placeholder=risk_factors_block_placeholder,
+                prompt_component_blocks=prompt_component_blocks,
+                failure_stage="agent_2_summary_generation",
+                prompt_debug_prefix="runtime",
+                reserve_tokens=0,
+                budget_debug=prompt_budget_state,
+            )
+            prompt_budget_state["research_mode"] = research_mode
+            prompt_budget_state["prompt_budget_adapted"] = bool(prompt_budget_adapted)
+            prompt_budget_state["budget_adjustments_attempted"] = list(
+                budget_adjustments_attempted or []
+            )
+            generation_stats["budget_adjustments_attempted"] = list(
+                budget_adjustments_attempted or []
+            )
+            last_agent2_prompt = prompt or ""
+            return prompt
+
+        def _generate_agent2_summary(prompt: str, timeout_seconds: float) -> str:
+            remaining_total = _require_summary_runtime_budget(
+                "agent_2_summary_generation"
+            )
+            effective_timeout = float(
+                timeout_seconds or summary_runtime_cap_seconds
+            )
+            effective_timeout = min(effective_timeout, float(remaining_total))
+            if effective_timeout <= 0.0:
+                raise TimeoutError(
+                    f"Summary generation exceeded {summary_runtime_cap_seconds} seconds."
+                )
+            if fast_summary_mode:
+                deadline_ts = float(
+                    generation_stats.get("fast_runtime_deadline_ts") or 0.0
+                )
+                if deadline_ts > 0:
+                    remaining = max(0.0, float(deadline_ts - time.time()))
+                    if remaining <= 0.0:
+                        raise TimeoutError(
+                            "Fast summary runtime cap reached before Agent 2 generation."
+                        )
+                    effective_timeout = min(effective_timeout, float(remaining))
+            return _generate_summary_with_quality_control(
+                summary_client,
+                prompt,
+                target_length=target_length,
+                quality_validators=quality_validators,
+                filing_id=filing_id,
+                timeout_seconds=effective_timeout,
+                token_budget=token_budget,
+                cost_budget=cost_budget,
+                max_output_tokens=max_output_tokens,
+                generation_stats=generation_stats,
+                persona_requested=persona_requested,
+                section_budgets=section_budgets,
+                include_health_rating=include_health_rating,
+                budget_adjustments_attempted=list(
+                    prompt_budget_state.get("budget_adjustments_attempted") or []
+                ),
+                allow_llm_rewrites=not one_shot_deterministic_policy,
+            )
+
+        def _runtime_capped_rewrite_timeout(stage: str) -> float:
+            remaining = _require_summary_runtime_budget(stage)
+            return max(1.0, min(float(_summary_rewrite_timeout_seconds()), remaining))
+
+        def _two_agent_progress(status: str, stage_percent: int) -> None:
+            set_summary_progress(
+                filing_id, status=status, stage_percent=int(stage_percent)
+            )
+
+        if USE_THREE_AGENT_PIPELINE or continuous_v2_enabled:
+            # ─── Three-Agent Pipeline ─────────────────────────────
+            def _three_agent_progress(status: str, stage_percent: int) -> None:
+                set_summary_progress(
+                    filing_id, status=status, stage_percent=int(stage_percent)
                 )
 
-        set_summary_progress(
-            filing_id, status="Synthesizing Investor Insights...", stage_percent=85
-        )
-        quality_validators: List[Callable[[str], Optional[str]]] = [
-            _make_section_completeness_validator(
-                include_health_rating, target_length=target_length
+            # Extract MD&A excerpt for Agent 2 (not separately available in 2-agent flow)
+            _mda_excerpt_for_3agent = (
+                _extract_labeled_excerpt(
+                    analysis_document_text, "MANAGEMENT DISCUSSION", max_chars=15_000
+                )
+                or ""
             )
-        ]
-        quality_validators.append(
-            _make_no_extra_sections_validator(include_health_rating)
-        )
-        quality_validators.append(
-            _make_risk_specificity_validator(risk_factors_excerpt=risk_factors_excerpt)
-        )
-        quality_validators.append(_make_numbers_discipline_validator(target_length))
-        quality_validators.append(_make_verbatim_repetition_validator())
-        quality_validators.append(_make_phrase_limits_validator())
-        quality_validators.append(_make_sentence_stem_repetition_validator())
-        quality_validators.append(
-            _make_period_delta_bridge_validator(
-                require_bridge=bool((prior_period_delta_block or "").strip())
-            )
-        )
-        quality_validators.append(
-            _make_closing_recommendation_validator(
-                persona_requested=bool(investor_focus), company_name=company_name
-            )
-        )
-        quality_validators.append(
-            _make_persona_exclusivity_validator(
-                persona_requested=bool(investor_focus),
-                selected_persona_name=selected_persona_name,
-            )
-        )
-        quality_validators.append(_make_stance_consistency_validator())
 
-        summary_text = _generate_summary_with_quality_control(
-            gemini_client,
-            base_prompt,
-            target_length=target_length,
-            quality_validators=quality_validators,
-            filing_id=filing_id,
-            timeout_seconds=SUMMARY_TOTAL_TIMEOUT_SECONDS,
-            token_budget=token_budget,
-            max_output_tokens=max_output_tokens,
-        )
+            _require_summary_runtime_budget("three_agent_pipeline_start")
+            three_agent_result = run_summary_agent_pipeline(
+                company_name=str(company_name or ""),
+                ticker=str(company.get("ticker") or ""),
+                sector=str(company.get("sector") or ""),
+                industry=str(company.get("industry") or ""),
+                filing_type=str(filing_type or ""),
+                filing_period=str(filing_period or filing_date or ""),
+                filing_date=str(filing_date or ""),
+                target_length=target_length,
+                context_excerpt=context_excerpt,
+                mda_excerpt=_mda_excerpt_for_3agent,
+                risk_factors_excerpt=risk_factors_excerpt or "",
+                company_kpi_context=company_kpi_context or "",
+                financial_snapshot=financial_snapshot,
+                metrics_lines=metrics_lines,
+                prior_period_delta_block=prior_period_delta_block,
+                filing_language_snippets=filing_language_snippets or "",
+                calculated_metrics=calculated_metrics,
+                health_score_data=pre_calculated_health,
+                include_health_rating=include_health_rating,
+                section_budgets=section_budgets,
+                preferences=preferences,
+                persona_name=selected_persona_name,
+                persona_requested=persona_requested,
+                investor_focus=investor_focus,
+                openai_client=summary_client,
+                progress_callback=_three_agent_progress,
+            )
+            summary_text = three_agent_result.summary_text
+            gemini_client = summary_client
+            generation_stats["three_agent_total_llm_calls"] = int(
+                three_agent_result.total_llm_calls
+            )
+            generation_stats["three_agent_agent_timings"] = dict(
+                three_agent_result.agent_timings or {}
+            )
+            generation_stats["pipeline_mode"] = (
+                "three_agent_sectioned_v2" if continuous_v2_enabled else "three_agent"
+            )
+            if continuous_v2_enabled and getattr(three_agent_result, "metadata", None):
+                generation_stats["summary_continuous_v2"] = True
+                generation_stats["structured_section_generation_used"] = True
+                generation_stats["summary_continuous_v2_metadata"] = dict(
+                    three_agent_result.metadata or {}
+                )
+        else:
+            # ─── Two-Agent Pipeline (production fallback) ─────────
+            if fast_summary_mode:
+                _two_agent_progress("Synthesizing Investor Insights...", 85)
+                _fast_prompt = _build_pipeline_prompt("")
+                _fast_summary_timeout = min(
+                    float(_require_summary_runtime_budget("fast_summary_generation")),
+                    float(fast_runtime_cap_seconds),
+                )
+                summary_text = _generate_agent2_summary(
+                    _fast_prompt, _fast_summary_timeout
+                )
+                gemini_client = summary_client
+                two_agent_result = TwoAgentSummaryPipelineResult(
+                    summary_text=summary_text or "",
+                    model_used=active_model_name,
+                    pipeline_mode="two_agent_fast",
+                    background_used=False,
+                    background_text="",
+                    agent_timings={},
+                    agent_stage_calls=[
+                        {
+                            "stage": "agent_2_summary",
+                            "api": "responses",
+                            "duration_seconds": 0.0,
+                        }
+                    ],
+                    total_llm_calls=1,
+                )
+                generation_stats["two_agent_total_llm_calls"] = 1
+                generation_stats["two_agent_background_used"] = False
+                generation_stats["two_agent_agent_timings"] = {}
+            else:
+                remaining_for_two_agent = float(
+                    _require_summary_runtime_budget("two_agent_pipeline_start")
+                )
+                long_form_summary_timeout_seconds = (
+                    remaining_for_two_agent if long_form_target else None
+                )
+                two_agent_result = run_two_agent_summary_pipeline(
+                    company_name=str(company_name or ""),
+                    ticker=str(company.get("ticker") or ""),
+                    sector=str(company.get("sector") or ""),
+                    industry=str(company.get("industry") or ""),
+                    filing_type=str(filing_type or ""),
+                    filing_date=str(filing_date or ""),
+                    model_name=active_model_name,
+                    build_summary_prompt=_build_pipeline_prompt,
+                    generate_summary=_generate_agent2_summary,
+                    progress_callback=_two_agent_progress,
+                    summary_timeout_seconds=long_form_summary_timeout_seconds,
+                    total_timeout_seconds=remaining_for_two_agent,
+                    agent2_min_reserved_seconds=(90.0 if long_form_target else None),
+                    usage_context=summary_usage_context,
+                )
+                summary_text = two_agent_result.summary_text
+                gemini_client = summary_client
+                generation_stats["two_agent_total_llm_calls"] = int(
+                    two_agent_result.total_llm_calls
+                )
+                generation_stats["two_agent_background_used"] = bool(
+                    two_agent_result.background_used
+                )
+                generation_stats["two_agent_agent_timings"] = dict(
+                    two_agent_result.agent_timings or {}
+                )
 
+        continuous_v2_route_mode = bool(
+            continuous_v2_enabled and generation_stats.get("summary_continuous_v2")
+        )
         set_summary_progress(filing_id, status="Polishing Output...", stage_percent=95)
-        # Post-processing to ensure structure
-        summary_text = _fix_inline_section_headers(
-            summary_text
-        )  # CRITICAL: Fix headers appearing inline first
-        summary_text = _normalize_section_headings(summary_text, include_health_rating)
-        summary_text = _fix_trailing_ellipsis(
-            summary_text
-        )  # Fix sentences ending with ...
-        summary_text = _validate_complete_sentences(
-            summary_text
-        )  # Fix other incomplete sentences
-        summary_text = _remove_filler_phrases(
-            summary_text
-        )  # Remove filler phrases that slipped through
-        summary_text = _remove_generic_heuristic_paragraphs(summary_text)
-        summary_text = _normalize_casing(
-            summary_text
-        )  # Convert shouty/all-caps body text to sentence case
-        summary_text = _strip_directive_lines(summary_text)
-        summary_text = _dedupe_consecutive_sentences(summary_text)
-        summary_text = _dedupe_repeated_paragraphs(summary_text)
-        summary_text = _merge_staccato_paragraphs(summary_text)
-        # Final pass to normalize headings and ensure required sections exist.
-        if target_length:
-            summary_text = _fix_inline_section_headers(summary_text)
-            summary_text = _normalize_section_headings(
-                summary_text, include_health_rating
-            )
+
+        if (
+            not continuous_v2_route_mode
+            and (target_length or re.search(r"^\s*##\s", summary_text or "", re.MULTILINE))
+        ):
             summary_text = _ensure_required_sections(
                 summary_text,
                 include_health_rating=include_health_rating,
@@ -13097,54 +22280,10 @@ Before you output anything, verify:
                 risk_factors_excerpt=risk_factors_excerpt,
                 health_rating_config=health_config,
                 persona_name=selected_persona_name,
-                persona_requested=bool(investor_focus),
+                persona_requested=persona_requested,
                 target_length=target_length,
             )
-            # Enforce a strict band (land within ±10 words).
-            summary_text = _enforce_whitespace_word_band(
-                summary_text, int(target_length), tolerance=10, allow_padding=True
-            )
-        else:
-            # When no target_length, only backfill sections if the model produced headers
-            if re.search(r"^\s*##\s", summary_text or "", re.MULTILINE):
-                summary_text = _ensure_required_sections(
-                    summary_text,
-                    include_health_rating=include_health_rating,
-                    metrics_lines=metrics_lines,
-                    calculated_metrics=calculated_metrics,
-                    health_score_data=pre_calculated_health,
-                    company_name=company_name,
-                    risk_factors_excerpt=risk_factors_excerpt,
-                    health_rating_config=health_config,
-                    persona_name=selected_persona_name,
-                    persona_requested=bool(investor_focus),
-                    target_length=target_length,
-                )
 
-        # Final ellipsis cleanup after all length adjustments
-        summary_text = _fix_trailing_ellipsis(summary_text)
-        summary_text = _remove_filler_phrases(summary_text)  # Final filler removal
-        summary_text = _remove_generic_heuristic_paragraphs(summary_text)
-        summary_text = _normalize_casing(summary_text)
-        summary_text = _strip_directive_lines(summary_text)
-        summary_text = _dedupe_consecutive_sentences(summary_text)
-        summary_text = _dedupe_repeated_paragraphs(summary_text)
-        summary_text = _merge_staccato_paragraphs(summary_text)
-
-        # Fix health score if AI generated a different score than pre-calculated
-        if pre_calculated_score is not None and pre_calculated_band:
-            summary_text = _fix_health_score_in_summary(
-                summary_text,
-                pre_calculated_score,
-                pre_calculated_band,
-            )
-
-            if target_length:
-                summary_text = _enforce_whitespace_word_band(
-                    summary_text, int(target_length), tolerance=10, allow_padding=True
-                )
-
-        # Use pre-calculated health score data (computed before summary generation)
         health_score_data = pre_calculated_health
         has_health_section = bool(
             re.search(
@@ -13153,9 +22292,12 @@ Before you output anything, verify:
                 re.IGNORECASE | re.MULTILINE,
             )
         )
-
-        # Final cleanup after any length adjustments to remove stray directives
-        if include_health_rating and (target_length is not None or has_health_section):
+        if (
+            include_health_rating
+            and not micro_plaintext_mode
+            and not continuous_v2_route_mode
+            and (target_length is not None or has_health_section)
+        ):
             summary_text = _ensure_health_rating_section(
                 summary_text,
                 health_score_data or {},
@@ -13164,187 +22306,2773 @@ Before you output anything, verify:
                 health_rating_config=health_config,
                 target_length=target_length,
             )
-            summary_text = _inject_health_drivers(
-                summary_text, calculated_metrics, health_score_data or {}
-            )
-        summary_text = _enforce_section_order(
-            summary_text, include_health_rating=include_health_rating
-        )
-        summary_text = _strip_directive_lines(summary_text)
-        summary_text = _dedupe_consecutive_sentences(summary_text)
-        summary_text = _dedupe_repeated_paragraphs(summary_text)
-        summary_text = _normalize_casing(summary_text)
-        summary_text = _merge_staccato_paragraphs(summary_text)
-        if target_length:
-            # Hard cap only (never pad); additional cleanup below handles any artifacts from trimming.
-            summary_text = _enforce_whitespace_word_band(
-                summary_text, int(target_length), tolerance=10, allow_padding=True
-            )
 
-        # Final backfill to guarantee Closing Takeaway and Key Metrics survive trims
-        if target_length or re.search(r"^\s*##\s", summary_text or "", re.MULTILINE):
-            summary_text = _ensure_required_sections(
-                summary_text,
-                include_health_rating=include_health_rating,
-                metrics_lines=metrics_lines,
-                calculated_metrics=calculated_metrics,
-                health_score_data=pre_calculated_health,
-                company_name=company_name,
-                risk_factors_excerpt=risk_factors_excerpt,
-                health_rating_config=health_config,
-                persona_name=selected_persona_name,
-                persona_requested=bool(investor_focus),
-                target_length=target_length,
-            )
-            summary_text = _enforce_section_order(
-                summary_text, include_health_rating=include_health_rating
-            )
-            if target_length:
-                summary_text = _enforce_whitespace_word_band(
-                    summary_text, int(target_length), tolerance=0, allow_padding=False
-                )
-
-        # Final quality cleanup before enforcing the user-visible band.
-        # (Do this before the last word-band pass so any removals can be compensated.)
-        summary_text = _normalize_underwriting_questions_formatting(summary_text)
-        summary_text = _merge_underwriting_question_lines(summary_text)
-        summary_text = _relocate_underwriting_questions_to_mdna(summary_text)
-        summary_text = _remove_filler_phrases(summary_text)
-        summary_text = _remove_generic_heuristic_paragraphs(summary_text)
-        summary_text = _dedupe_consecutive_sentences(summary_text)
-        summary_text = _dedupe_repeated_paragraphs(summary_text)
-        summary_text = _merge_staccato_paragraphs(summary_text)
-        summary_text = _tone_down_emotive_adjectives(summary_text)
-        summary_text = _cleanup_sentence_artifacts(summary_text)
-        summary_text = _validate_complete_sentences(summary_text)
-
-        # Final health-rating normalization (prevents dangling "68/100 -" lines and
-        # keeps the section readable after trims/padding).
-        if include_health_rating:
-            # Even if the scorer failed (health_score_data empty), we should still fix
-            # common formatting issues like "64/100 -" by inferring the band from the score.
-            health_fix_data: Dict[str, Any] = dict(health_score_data or {})
-
-            if (
-                health_fix_data.get("overall_score") is None
-                and pre_calculated_score is not None
-            ):
-                health_fix_data["overall_score"] = pre_calculated_score
-            if (
-                health_fix_data.get("score_band") is None
-                or str(health_fix_data.get("score_band") or "").strip() == ""
-            ) and pre_calculated_band:
-                health_fix_data["score_band"] = pre_calculated_band
-
-            if health_fix_data.get("overall_score") is None:
-                m = re.search(
-                    r"(?is)##\s*Financial\s+Health\s+Rating\b[\s\S]*?(\d{1,3})(?:\.\d+)?/100",
-                    summary_text or "",
-                )
-                if m:
-                    try:
-                        health_fix_data["overall_score"] = float(m.group(1))
-                    except Exception:
-                        pass
-
-            if (
-                health_fix_data.get("score_band") is None
-                or str(health_fix_data.get("score_band") or "").strip() == ""
-            ) and health_fix_data.get("overall_score") is not None:
-                try:
-                    score_val = float(health_fix_data.get("overall_score"))
-                    inferred = None
-                    for threshold, _abbr, label in RATING_SCALE:
-                        if score_val >= threshold:
-                            inferred = label
-                            break
-                    health_fix_data["score_band"] = inferred or "At Risk"
-                except Exception:
-                    pass
-
-            if health_fix_data.get("overall_score") is not None:
-                summary_text = _ensure_health_rating_section(
-                    summary_text,
-                    health_fix_data,
-                    calculated_metrics,
-                    company_name,
-                    health_rating_config=health_config,
-                    target_length=target_length,
-                )
-                summary_text = _inject_health_drivers(
-                    summary_text, calculated_metrics, health_fix_data
-                )
-                summary_text = _merge_staccato_paragraphs(summary_text)
-
-        if target_length:
-            # Enforce hard max (UI/tests count raw whitespace tokens too); allow padding for precision.
-            summary_text = _enforce_whitespace_word_band(
-                summary_text, int(target_length), tolerance=10, allow_padding=True
-            )
-
-        # Final backfill AFTER trimming to prevent missing sections from surviving caps.
-        if target_length or re.search(r"^\s*##\s", summary_text or "", re.MULTILINE):
-            summary_text = _ensure_required_sections(
-                summary_text,
-                include_health_rating=include_health_rating,
-                metrics_lines=metrics_lines,
-                calculated_metrics=calculated_metrics,
-                health_score_data=pre_calculated_health,
-                company_name=company_name,
-                risk_factors_excerpt=risk_factors_excerpt,
-                health_rating_config=health_config,
-                persona_name=selected_persona_name,
-                persona_requested=bool(investor_focus),
-                target_length=target_length,
-            )
-            summary_text = _enforce_section_order(
-                summary_text, include_health_rating=include_health_rating
-            )
-            if target_length:
-                summary_text = _enforce_whitespace_word_band(
-                    summary_text, int(target_length), tolerance=0, allow_padding=False
-                )
-
-        # Post-band formatting: safe (does not change token/word counts meaningfully).
-        summary_text = _normalize_underwriting_questions_formatting(summary_text)
-        summary_text = _relocate_underwriting_questions_to_mdna(summary_text)
-        summary_text = _merge_staccato_paragraphs(summary_text)
-
-        # Do not enforce per-section padding/distribution here: it encourages repetition
-        # and low-signal filler at high target lengths. We only enforce a hard max cap.
-
-        # Final guard: ensure the document ends with punctuation for substantive outputs
         if (
-            summary_text
-            and _count_words(summary_text) >= 5
-            and not summary_text.rstrip().endswith((".", "!", "?"))
+            pre_calculated_score is not None
+            and pre_calculated_band
+            and not continuous_v2_route_mode
         ):
-            summary_text = summary_text.rstrip() + "."
-
-        # Absolute last pass: enforce the hard max after *all* text mutations.
-        if target_length:
-            # Final polish AFTER trimming: remove any stray quote/fragments and re-validate
-            # sentence completeness (trimming can reintroduce cut-offs near section boundaries).
-            summary_text = _cleanup_sentence_artifacts(summary_text)
-            summary_text = _validate_complete_sentences(summary_text)
-            summary_text = _dedupe_consecutive_sentences(summary_text)
-            summary_text = _deduplicate_sentences(summary_text)
-            summary_text = _enforce_section_order(
-                summary_text, include_health_rating=include_health_rating
+            summary_text = _fix_health_score_in_summary(
+                summary_text,
+                pre_calculated_score,
+                pre_calculated_band,
             )
-            # Final strict band: ensure we're within ±10 words of the requested target.
-            summary_text = _enforce_strict_target_band(
+
+        if not continuous_v2_route_mode:
+            summary_text = _run_summary_cleanup_pass(
+                summary_text,
+                include_health_rating=include_health_rating,
+                calculated_metrics=calculated_metrics,
+                company_name=company_name,
+            )
+        if strict_contract_required and not continuous_v2_route_mode:
+            summary_text = _apply_contract_structural_repairs(
+                summary_text,
+                include_health_rating=include_health_rating,
+                target_length=target_length,
+                calculated_metrics=calculated_metrics,
+            )
+
+        # Run readability cleanup BEFORE band enforcement so that the
+        # generation overshoot survives cleanup.  Previous ordering:
+        #   1. cleanup → 2. enforce band (trim to target) → 3. readability cleanup (strip more)
+        # resulted in the overshoot being trimmed away before readability could strip words,
+        # causing persistent underflow.  New ordering:
+        #   1. cleanup → 2. readability cleanup → 3. enforce band (trim to exact target)
+        if target_length and not continuous_v2_route_mode:
+            summary_text = _remove_metric_echo_loops(summary_text)
+            summary_text = _merge_staccato_paragraphs(summary_text)
+            summary_text = _cap_closing_sentences_filings(
+                summary_text,
+                max_sentences=_closing_sentence_cap_for_target(
+                    target_length, include_health_rating=include_health_rating
+                ),
+            )
+
+        if target_length and fast_summary_mode and not continuous_v2_route_mode:
+            # Best-effort length shaping only (deterministic, no extra LLM spend).
+            fast_tol = max(
+                _effective_word_band_tolerance(target_length),
+                60 if _is_long_form_target(target_length) else 25,
+            )
+            summary_text = _finalize_length_band(
                 summary_text,
                 int(target_length),
+                tolerance=int(fast_tol),
+            )
+
+        final_target = int(target_length) if target_length else 0
+        strict_tolerance = (
+            _effective_word_band_tolerance(target_length)
+            if target_length
+            else FINAL_STRICT_WORD_BAND_TOLERANCE
+        )
+        final_lower = max(TARGET_LENGTH_MIN_WORDS, final_target - strict_tolerance)
+        final_upper = (
+            min(TARGET_LENGTH_MAX_WORDS, final_target + strict_tolerance)
+            if target_length
+            else TARGET_LENGTH_MAX_WORDS
+        )
+        current_wc = _count_words(summary_text or "")
+        one_shot_long_form_band_miss = (
+            one_shot_deterministic_policy
+            and _is_long_form_target(final_target)
+            and (current_wc < final_lower or current_wc > final_upper)
+        )
+        if target_length and not fast_summary_mode and not continuous_v2_route_mode and (
+            not one_shot_deterministic_policy or one_shot_long_form_band_miss
+        ):
+            current_wc_for_rewrite = _count_words(summary_text)
+            if current_wc_for_rewrite < final_lower or current_wc_for_rewrite > final_upper:
+                rewritten_text, _rewrite_stats = _rewrite_summary_to_length(
+                    gemini_client,
+                    summary_text,
+                    final_target,
+                    quality_validators,
+                    current_words=_count_words(summary_text),
+                    token_budget=token_budget,
+                    cost_budget=cost_budget,
+                    max_output_tokens=max_output_tokens,
+                    generation_stats=generation_stats,
+                    persona_intensity=(
+                        "subtle"
+                        if generation_stats.get("persona_intensity_downgraded")
+                        else "strong"
+                    ),
+                    quality_issue_hint="Final length guard: expand substance without repetition.",
+                    allow_one_shot_rewrite=bool(one_shot_long_form_band_miss),
+                    timeout_seconds=_runtime_capped_rewrite_timeout(
+                        "final_length_guard_rewrite"
+                    ),
+                )
+                if rewritten_text:
+                    summary_text = rewritten_text
+                    summary_text = _run_summary_cleanup_pass(
+                        summary_text,
+                        include_health_rating=include_health_rating,
+                        calculated_metrics=calculated_metrics,
+                        company_name=company_name,
+                    )
+                    if strict_contract_required:
+                        summary_text = _apply_contract_structural_repairs(
+                            summary_text,
+                            include_health_rating=include_health_rating,
+                            target_length=target_length,
+                            calculated_metrics=calculated_metrics,
+                        )
+                    # Re-apply readability cleanup on the rewritten text
+                    summary_text = _remove_metric_echo_loops(summary_text)
+                    summary_text = _merge_staccato_paragraphs(summary_text)
+                    summary_text = _cap_closing_sentences_filings(
+                        summary_text,
+                        max_sentences=_closing_sentence_cap_for_target(
+                            target_length, include_health_rating=include_health_rating
+                        ),
+                    )
+
+            summary_text = _enforce_strict_target_band(
+                summary_text,
+                final_target,
                 calculated_metrics=calculated_metrics,
                 company_name=company_name,
                 include_health_rating=include_health_rating,
+                generation_stats=generation_stats,
+                prefer_narrative_padding=v2_enabled,
+                gemini_client=gemini_client,
+                quality_validators=quality_validators,
+                token_budget=token_budget,
+                cost_budget=cost_budget,
+                max_output_tokens=max_output_tokens,
+                persona_intensity=(
+                    "subtle"
+                    if generation_stats.get("persona_intensity_downgraded")
+                    else "strong"
+                ),
             )
-        else:
-            if _count_words(summary_text) > TARGET_LENGTH_MAX_WORDS:
-                summary_text = _truncate_text_to_word_limit(
-                    summary_text, TARGET_LENGTH_MAX_WORDS
+            summary_text = _ensure_final_strict_word_band(
+                summary_text,
+                final_target,
+                include_health_rating=include_health_rating,
+                tolerance=strict_tolerance,
+                generation_stats=generation_stats,
+                allow_padding=_allow_padding_for_target(
+                    final_target, _count_words(summary_text or "")
+                ),
+            )
+
+            if _needs_sentence_completion_pass(summary_text):
+                summary_text = _cleanup_sentence_artifacts(summary_text)
+                summary_text = _validate_complete_sentences(summary_text)
+                summary_text = _ensure_final_strict_word_band(
+                    summary_text,
+                    final_target,
+                    include_health_rating=include_health_rating,
+                    tolerance=strict_tolerance,
+                    generation_stats=generation_stats,
+                    allow_padding=_allow_padding_for_target(
+                        final_target, _count_words(summary_text or "")
+                    ),
                 )
+        elif (
+            not continuous_v2_route_mode
+            and _count_words(summary_text) > TARGET_LENGTH_MAX_WORDS
+        ):
+            summary_text = _truncate_text_to_word_limit(
+                summary_text, TARGET_LENGTH_MAX_WORDS
+            )
+
+        # Absolute final contract guard before response assembly.
+        if (
+            target_length
+            and not fast_summary_mode
+            and not one_shot_deterministic_policy
+            and not continuous_v2_route_mode
+        ):
+            final_target = int(target_length)
+            strict_tolerance = _effective_word_band_tolerance(target_length)
+            long_form_contract = _is_long_form_target(final_target)
+            summary_text = _ensure_final_strict_word_band(
+                summary_text,
+                final_target,
+                include_health_rating=include_health_rating,
+                tolerance=strict_tolerance,
+                generation_stats=generation_stats,
+                allow_padding=_allow_padding_for_target(
+                    final_target, _count_words(summary_text or "")
+                ),
+            )
+            pre_final_pad = summary_text
+            summary_text = _enforce_whitespace_word_band(
+                summary_text,
+                final_target,
+                tolerance=strict_tolerance,
+                allow_padding=_allow_padding_for_target(
+                    final_target, _count_words(summary_text or "")
+                ),
+                dedupe=True,
+            )
+            # Final idempotent clamp for both split-count and stripped-count bands.
+            lower = max(TARGET_LENGTH_MIN_WORDS, final_target - strict_tolerance)
+            upper = min(TARGET_LENGTH_MAX_WORDS, final_target + strict_tolerance)
+            split_wc = len((summary_text or "").split())
+            stripped_wc = _count_words(summary_text or "")
+            if not (lower <= split_wc <= upper and lower <= stripped_wc <= upper):
+                if (
+                    not short_quality_mode
+                    and stripped_wc < lower
+                    and split_wc < upper
+                ):
+                    summary_text = _micro_pad_tail_words(
+                        summary_text, max(1, lower - stripped_wc)
+                    )
+                summary_text = _ensure_final_strict_word_band(
+                    summary_text,
+                    final_target,
+                    include_health_rating=include_health_rating,
+                    tolerance=strict_tolerance,
+                    generation_stats=generation_stats,
+                    allow_padding=_allow_padding_for_target(
+                        final_target, _count_words(summary_text or "")
+                    ),
+                )
+            summary_text = _enforce_whitespace_word_band(
+                summary_text,
+                final_target,
+                tolerance=strict_tolerance,
+                allow_padding=_allow_padding_for_target(
+                    final_target, _count_words(summary_text or "")
+                ),
+                dedupe=True,
+            )
+            # Absolute final precision guard before contract checks. This closes
+            # occasional 1-word stripped-count underflows caused by markdown tokens.
+            final_lower = max(TARGET_LENGTH_MIN_WORDS, final_target - strict_tolerance)
+            final_upper = min(TARGET_LENGTH_MAX_WORDS, final_target + strict_tolerance)
+            final_split_wc = len((summary_text or "").split())
+            final_stripped_wc = _count_words(summary_text or "")
+            if not (
+                final_lower <= final_split_wc <= final_upper
+                and final_lower <= final_stripped_wc <= final_upper
+            ):
+                summary_text = _ensure_final_strict_word_band(
+                    summary_text,
+                    final_target,
+                    include_health_rating=include_health_rating,
+                    tolerance=strict_tolerance,
+                    generation_stats=generation_stats,
+                    allow_padding=_allow_padding_for_target(
+                        final_target, _count_words(summary_text or "")
+                    ),
+                )
+            summary_text = _enforce_whitespace_word_band(
+                summary_text,
+                final_target,
+                tolerance=strict_tolerance,
+                allow_padding=_allow_padding_for_target(
+                    final_target, _count_words(summary_text or "")
+                ),
+                dedupe=True,
+            )
+
+            severe_floor = max(TARGET_LENGTH_MIN_WORDS, (final_target + 1) // 2)
+            split_floor_wc = len((summary_text or "").split())
+            stripped_floor_wc = _count_words(summary_text or "")
+            if (
+                not short_quality_mode
+                and not long_form_contract
+                and (
+                split_floor_wc < severe_floor or stripped_floor_wc < severe_floor
+                )
+            ):
+                logger.warning(
+                    "Severe final underflow detected (split=%s stripped=%s target=%s). "
+                    "Applying one-time deterministic floor rescue.",
+                    split_floor_wc,
+                    stripped_floor_wc,
+                    final_target,
+                )
+                before_floor_rescue = summary_text
+                summary_text = _enforce_whitespace_word_band(
+                    summary_text,
+                    final_target,
+                    tolerance=strict_tolerance,
+                    allow_padding=True,
+                    dedupe=True,
+                )
+                floor_split_after = len((summary_text or "").split())
+                floor_stripped_after = _count_words(summary_text or "")
+                lower_bound = max(
+                    TARGET_LENGTH_MIN_WORDS, final_target - strict_tolerance
+                )
+                if (
+                    floor_split_after < lower_bound
+                    or floor_stripped_after < lower_bound
+                ):
+                    residual_deficit = max(
+                        lower_bound - floor_split_after,
+                        lower_bound - floor_stripped_after,
+                    )
+                    padding_block = _build_padding_block(residual_deficit)
+                    if padding_block:
+                        base = (summary_text or "").rstrip()
+                        if base and not base.endswith((".", "!", "?")):
+                            base += "."
+                        summary_text = f"{base} {padding_block}".strip()
+                _record_padding_telemetry(
+                    generation_stats,
+                    before_text=before_floor_rescue,
+                    after_text=summary_text,
+                )
+                summary_text = _ensure_final_strict_word_band(
+                    summary_text,
+                    final_target,
+                    include_health_rating=include_health_rating,
+                    tolerance=strict_tolerance,
+                    generation_stats=generation_stats,
+                    allow_padding=False,
+                )
+                summary_text = _enforce_whitespace_word_band(
+                    summary_text,
+                    final_target,
+                    tolerance=strict_tolerance,
+                    allow_padding=_allow_padding_for_target(
+                        final_target, _count_words(summary_text or "")
+                    ),
+                    dedupe=True,
+                )
+            _record_padding_telemetry(
+                generation_stats, before_text=pre_final_pad, after_text=summary_text
+            )
+
+            # Readability cleanup now runs BEFORE band enforcement (above),
+            # so we do NOT repeat it here.  The old placement here was the root
+            # cause of persistent underflow: band enforcement trimmed the overshot
+            # generation to target, then readability cleanup stripped more words
+            # with no recovery path.
+
+        post_final_profile = quality_profile
+        post_final_quality_validators: List[Callable[[str], Optional[str]]] = []
+        # Always run post-final validators; this is now part of the strict contract.
+        run_post_final_quality_validation = (
+            not fast_summary_mode
+            and not one_shot_deterministic_policy
+            and not continuous_v2_route_mode
+        )
+        if run_post_final_quality_validation:
+            post_final_profile = _build_summary_quality_profile(
+                target_length=target_length,
+                is_flash_model=_is_flash_model_name(active_model_name),
+                flash_first_enabled=flash_first_enabled,
+            )
+            post_final_quality_validators = _build_post_final_quality_validators(
+                include_health_rating=include_health_rating,
+                target_length=target_length,
+                profile=post_final_profile,
+                v2_enabled=v2_enabled,
+                persona_requested=persona_requested,
+                company_name=company_name,
+                source_text=context_excerpt,
+                require_quotes=bool(filing_language_snippets) and not short_quality_mode,
+            )
+            (
+                post_final_issue,
+                post_final_validator_name,
+            ) = _first_quality_validator_issue(
+                summary_text, post_final_quality_validators
+            )
+            generation_stats["post_final_quality_issue"] = post_final_issue
+
+            if post_final_issue:
+                logger.info(
+                    "Post-final quality validator fired: validator=%s issue=%s",
+                    post_final_validator_name,
+                    post_final_issue[:220],
+                )
+                max_existing_quality_rewrites = 2
+                rewrite_count = int(generation_stats.get("rewrite_call_count", 0) or 0)
+                can_use_post_final_rewrite = not bool(
+                    generation_stats.get("post_final_quality_rewrite_used")
+                ) and (not fast_summary_mode) and rewrite_count < min(
+                    max_existing_quality_rewrites, int(MAX_REWRITE_ATTEMPTS)
+                )
+                if can_use_post_final_rewrite:
+                    rewrite_target = (
+                        int(target_length)
+                        if target_length
+                        else max(
+                            _count_words(summary_text), TARGET_LENGTH_MIN_WORDS + 20
+                        )
+                    )
+                    rewritten_post_final, _ = _rewrite_summary_to_length(
+                        gemini_client,
+                        summary_text,
+                        rewrite_target,
+                        post_final_quality_validators,
+                        current_words=_count_words(summary_text),
+                        token_budget=token_budget,
+                        cost_budget=cost_budget,
+                        max_output_tokens=max_output_tokens,
+                        generation_stats=generation_stats,
+                        persona_intensity=(
+                            "subtle"
+                            if generation_stats.get("persona_intensity_downgraded")
+                            else "strong"
+                        ),
+                        quality_issue_hint=(
+                            f"Post-final quality issue ({post_final_validator_name}): {post_final_issue}"
+                        ),
+                        timeout_seconds=_runtime_capped_rewrite_timeout(
+                            "post_final_quality_rewrite"
+                        ),
+                    )
+                    if rewritten_post_final:
+                        generation_stats["post_final_quality_rewrite_used"] = True
+                        summary_text = rewritten_post_final
+                        summary_text = _run_summary_cleanup_pass(
+                            summary_text,
+                            include_health_rating=include_health_rating,
+                            calculated_metrics=calculated_metrics,
+                            company_name=company_name,
+                        )
+                        if strict_contract_required:
+                            summary_text = _apply_contract_structural_repairs(
+                                summary_text,
+                                include_health_rating=include_health_rating,
+                                target_length=target_length,
+                                calculated_metrics=calculated_metrics,
+                            )
+                        summary_text = _remove_metric_echo_loops(summary_text)
+                        summary_text = _merge_staccato_paragraphs(summary_text)
+                        summary_text = _cap_closing_sentences_filings(
+                            summary_text,
+                            max_sentences=_closing_sentence_cap_for_target(
+                                target_length, include_health_rating=include_health_rating
+                            ),
+                        )
+
+                        if target_length:
+                            final_target = int(target_length)
+                            strict_tolerance = _effective_word_band_tolerance(
+                                target_length
+                            )
+                            lower = max(
+                                TARGET_LENGTH_MIN_WORDS, final_target - strict_tolerance
+                            )
+                            upper = min(
+                                TARGET_LENGTH_MAX_WORDS, final_target + strict_tolerance
+                            )
+
+                            summary_text = _enforce_strict_target_band(
+                                summary_text,
+                                final_target,
+                                calculated_metrics=calculated_metrics,
+                                company_name=company_name,
+                                include_health_rating=include_health_rating,
+                                generation_stats=generation_stats,
+                                allow_padding_rescue=False,
+                                prefer_narrative_padding=True,
+                                gemini_client=gemini_client,
+                                quality_validators=quality_validators,
+                                token_budget=token_budget,
+                                cost_budget=cost_budget,
+                                max_output_tokens=max_output_tokens,
+                                persona_intensity=(
+                                    "subtle"
+                                    if generation_stats.get(
+                                        "persona_intensity_downgraded"
+                                    )
+                                    else "strong"
+                                ),
+                            )
+                            summary_text = _ensure_final_strict_word_band(
+                                summary_text,
+                                final_target,
+                                include_health_rating=include_health_rating,
+                                tolerance=strict_tolerance,
+                                generation_stats=generation_stats,
+                                allow_padding=False,
+                            )
+                            summary_text = _enforce_whitespace_word_band(
+                                summary_text,
+                                final_target,
+                                tolerance=strict_tolerance,
+                                allow_padding=False,
+                                dedupe=True,
+                            )
+                            final_split_wc = len((summary_text or "").split())
+                            final_wc = _count_words(summary_text or "")
+                            if final_split_wc > upper or final_wc > upper:
+                                summary_text = _trim_preserving_headings(
+                                    summary_text, upper
+                                )
+                            if final_split_wc < lower or final_wc < lower:
+                                summary_text = _enforce_strict_target_band(
+                                    summary_text,
+                                    final_target,
+                                    calculated_metrics=calculated_metrics,
+                                    company_name=company_name,
+                                    include_health_rating=include_health_rating,
+                                    generation_stats=generation_stats,
+                                    allow_padding_rescue=False,
+                                    prefer_narrative_padding=True,
+                                    gemini_client=gemini_client,
+                                    quality_validators=quality_validators,
+                                    token_budget=token_budget,
+                                    cost_budget=cost_budget,
+                                    max_output_tokens=max_output_tokens,
+                                    persona_intensity=(
+                                        "subtle"
+                                        if generation_stats.get(
+                                            "persona_intensity_downgraded"
+                                        )
+                                        else "strong"
+                                    ),
+                                )
+                else:
+                    logger.info(
+                        "Skipping post-final quality rewrite (rewrite_count=%s post_final_used=%s)",
+                        rewrite_count,
+                        generation_stats.get("post_final_quality_rewrite_used"),
+                    )
+
+        if (
+            target_length
+            and (not fast_summary_mode or allow_fast_explicit_target_length_recovery)
+            and not one_shot_deterministic_policy
+            and not continuous_v2_route_mode
+        ):
+            final_target = int(target_length)
+            strict_tolerance = _effective_word_band_tolerance(target_length)
+            lower = max(TARGET_LENGTH_MIN_WORDS, final_target - strict_tolerance)
+            upper = min(TARGET_LENGTH_MAX_WORDS, final_target + strict_tolerance)
+            final_split_wc = len((summary_text or "").split())
+            final_wc = _count_words(summary_text or "")
+            fast_explicit_length_recovery_eligible = bool(
+                allow_fast_explicit_target_length_recovery
+                and max(final_split_wc, final_wc)
+                >= max(TARGET_LENGTH_MIN_WORDS, int(final_target * 0.70))
+            )
+            if not (lower <= final_split_wc <= upper and lower <= final_wc <= upper):
+                logger.warning(
+                    "Final strict band check mismatch before return (split=%s stripped=%s target=%s)",
+                    final_split_wc,
+                    final_wc,
+                    final_target,
+                )
+                if final_split_wc > upper or final_wc > upper:
+                    summary_text = _trim_preserving_headings(summary_text, upper)
+                else:
+                    underflow_gap = max(
+                        lower - final_split_wc,
+                        lower - final_wc,
+                        0,
+                    )
+                    strict_contract_active = (
+                        bool(target_length)
+                        and _summary_strict_longform_contract_required()
+                    )
+                    if fast_summary_mode and not fast_explicit_length_recovery_eligible:
+                        logger.info(
+                            "Skipping fast explicit-target length rescue because draft is too incomplete for a late rewrite (split=%s stripped=%s target=%s)",
+                            final_split_wc,
+                            final_wc,
+                            final_target,
+                        )
+                    if _should_skip_final_underflow_rewrite(
+                        target_length=final_target,
+                        underflow_gap=underflow_gap,
+                        split_word_count=final_split_wc,
+                        stripped_word_count=final_wc,
+                        strict_contract_active=strict_contract_active,
+                    ) or (fast_summary_mode and not fast_explicit_length_recovery_eligible):
+                        # Avoid a final underflow rewrite only when the gap is very large
+                        # in long-form memos where a late-stage rewrite can collapse
+                        # otherwise substantive content. Short- and mid-form targets
+                        # should still attempt the rescue so they can land near the
+                        # requested length instead of returning materially short.
+                        logger.warning(
+                            "Skipping final underflow rewrite because long-form draft is above severe floor (split=%s stripped=%s floor=%s)",
+                            final_split_wc,
+                            final_wc,
+                            max(TARGET_LENGTH_MIN_WORDS, (final_target + 1) // 2),
+                        )
+                    else:
+                        emergency_rewrite_stats: Optional[Dict[str, Any]] = (
+                            generation_stats
+                        )
+                        if generation_stats is not None:
+                            rewrite_calls = int(
+                                generation_stats.get("rewrite_call_count", 0) or 0
+                            )
+                            if rewrite_calls >= int(MAX_REWRITE_ATTEMPTS):
+                                # Keep one emergency underflow-rescue rewrite available
+                                # at the final clamp stage even if earlier rewrites were consumed.
+                                emergency_rewrite_stats = None
+                        catastrophic_final_underflow = (
+                            strict_contract_active
+                            and _is_catastrophic_underflow(
+                                final_target, final_split_wc, final_wc
+                            )
+                        )
+                        rewritten_final, _ = _rewrite_summary_to_length(
+                            gemini_client,
+                            summary_text,
+                            final_target,
+                            quality_validators,
+                            current_words=final_wc,
+                            token_budget=(
+                                None if catastrophic_final_underflow else token_budget
+                            ),
+                            cost_budget=(
+                                None if catastrophic_final_underflow else cost_budget
+                            ),
+                            max_output_tokens=max_output_tokens,
+                            generation_stats=emergency_rewrite_stats,
+                            persona_intensity=(
+                                "subtle"
+                                if generation_stats.get("persona_intensity_downgraded")
+                                else "strong"
+                            ),
+                            quality_issue_hint=(
+                                f"Final strict-band underflow (current={final_wc}, target={final_target}±{strict_tolerance}). "
+                                "Expand with filing-grounded prose, no checklist padding."
+                            ),
+                            allow_over_target_recovery=True,
+                            ignore_max_rewrite_attempts=True,
+                            timeout_seconds=_runtime_capped_rewrite_timeout(
+                                "final_underflow_rewrite"
+                            ),
+                        )
+                        if rewritten_final and rewritten_final.strip():
+                            if (
+                                emergency_rewrite_stats is None
+                                and generation_stats is not None
+                            ):
+                                generation_stats[
+                                    "final_underflow_emergency_rewrite_used"
+                                ] = True
+                            summary_text = _run_summary_cleanup_pass(
+                                rewritten_final,
+                                include_health_rating=include_health_rating,
+                                calculated_metrics=calculated_metrics,
+                                company_name=company_name,
+                            )
+                            if strict_contract_required:
+                                summary_text = _apply_contract_structural_repairs(
+                                    summary_text,
+                                    include_health_rating=include_health_rating,
+                                    target_length=target_length,
+                                    calculated_metrics=calculated_metrics,
+                                )
+                            summary_text = _remove_metric_echo_loops(summary_text)
+                            summary_text = _merge_staccato_paragraphs(summary_text)
+                            summary_text = _cap_closing_sentences_filings(
+                                summary_text,
+                                max_sentences=_closing_sentence_cap_for_target(
+                                    target_length, include_health_rating=include_health_rating
+                                ),
+                            )
+                            rewritten_split_wc = len((summary_text or "").split())
+                            rewritten_wc = _count_words(summary_text or "")
+                            rewritten_in_band = bool(
+                                lower <= rewritten_split_wc <= upper
+                                and lower <= rewritten_wc <= upper
+                            )
+                            if generation_stats is not None and rewritten_in_band:
+                                generation_stats["late_length_rescue_in_band"] = True
+                            if not rewritten_in_band:
+                                summary_text = _enforce_strict_target_band(
+                                    summary_text,
+                                    final_target,
+                                    calculated_metrics=calculated_metrics,
+                                    company_name=company_name,
+                                    include_health_rating=include_health_rating,
+                                    generation_stats=generation_stats,
+                                    allow_padding_rescue=(
+                                        not v2_enabled
+                                        and _allow_padding_for_target(
+                                            final_target, _count_words(summary_text or "")
+                                        )
+                                    ),
+                                    prefer_narrative_padding=v2_enabled,
+                                    gemini_client=gemini_client,
+                                    quality_validators=quality_validators,
+                                    token_budget=token_budget,
+                                    cost_budget=cost_budget,
+                                    max_output_tokens=max_output_tokens,
+                                    persona_intensity=(
+                                        "subtle"
+                                        if generation_stats.get(
+                                            "persona_intensity_downgraded"
+                                        )
+                                        else "strong"
+                                    ),
+                                )
+                        else:
+                            summary_text = _enforce_strict_target_band(
+                                summary_text,
+                                final_target,
+                                calculated_metrics=calculated_metrics,
+                                company_name=company_name,
+                                include_health_rating=include_health_rating,
+                                generation_stats=generation_stats,
+                                allow_padding_rescue=(
+                                    not v2_enabled
+                                    and _allow_padding_for_target(
+                                        final_target, _count_words(summary_text or "")
+                                    )
+                                ),
+                                prefer_narrative_padding=v2_enabled,
+                                gemini_client=gemini_client,
+                                quality_validators=quality_validators,
+                                token_budget=token_budget,
+                                cost_budget=cost_budget,
+                                max_output_tokens=max_output_tokens,
+                                persona_intensity=(
+                                    "subtle"
+                                    if generation_stats.get(
+                                        "persona_intensity_downgraded"
+                                    )
+                                    else "strong"
+                                ),
+                            )
+                summary_text = _enforce_whitespace_word_band(
+                    summary_text,
+                    final_target,
+                    tolerance=strict_tolerance,
+                    allow_padding=False,
+                    dedupe=True,
+                )
+
+        if (
+            target_length
+            and one_shot_deterministic_policy
+            and not fast_summary_mode
+            and not continuous_v2_route_mode
+        ):
+            summary_text, _one_shot_length_rescue_info = (
+                _rescue_one_shot_long_form_length_underflow(
+                    summary_text,
+                    target_length=target_length,
+                    include_health_rating=include_health_rating,
+                    calculated_metrics=calculated_metrics,
+                    company_name=company_name,
+                    generation_stats=generation_stats,
+                    gemini_client=gemini_client,
+                    quality_validators=quality_validators,
+                    token_budget=token_budget,
+                    cost_budget=cost_budget,
+                    max_output_tokens=max_output_tokens,
+                    persona_intensity=(
+                        "subtle"
+                        if generation_stats.get("persona_intensity_downgraded")
+                        else "strong"
+                    ),
+                )
+            )
+            if generation_stats is not None and _one_shot_length_rescue_info.get("used"):
+                generation_stats["one_shot_long_form_length_rescue_applied"] = bool(
+                    _one_shot_length_rescue_info.get("applied")
+                )
+
+        contract_recovery_cost_diagnostic = None
+
+        if target_length and not continuous_v2_route_mode:
+            final_target = int(target_length)
+            strict_tolerance = _effective_word_band_tolerance(target_length)
+            long_form_contract = _is_long_form_target(final_target)
+            summary_text = _merge_duplicate_canonical_sections(
+                summary_text, include_health_rating=include_health_rating
+            )
+            late_length_rescue_in_band = bool(
+                generation_stats.get("late_length_rescue_in_band")
+                if isinstance(generation_stats, dict)
+                else False
+            )
+            if not late_length_rescue_in_band:
+                summary_text = _ensure_final_strict_word_band(
+                    summary_text,
+                    final_target,
+                    include_health_rating=include_health_rating,
+                    tolerance=strict_tolerance,
+                    generation_stats=generation_stats,
+                    allow_padding=_allow_padding_for_target(
+                        final_target, _count_words(summary_text or "")
+                    ),
+                )
+                summary_text = _enforce_whitespace_word_band(
+                    summary_text,
+                    final_target,
+                    tolerance=strict_tolerance,
+                    allow_padding=_allow_padding_for_target(
+                        final_target, _count_words(summary_text or "")
+                    ),
+                    dedupe=True,
+                )
+
+                # Hard final floor guard: never return below target-10 on stripped count.
+                floor = max(TARGET_LENGTH_MIN_WORDS, final_target - strict_tolerance)
+                stripped_wc = _count_words(summary_text or "")
+                if stripped_wc < floor and _allow_padding_for_target(
+                    final_target, stripped_wc
+                ):
+                    summary_text = _micro_pad_tail_words(
+                        summary_text, max(1, floor - stripped_wc)
+                    )
+                    summary_text = _enforce_whitespace_word_band(
+                        summary_text,
+                        final_target,
+                        tolerance=strict_tolerance,
+                        allow_padding=True,
+                        dedupe=True,
+                    )
+
+        strict_contract_required = bool(
+            target_length
+            and strict_contract_opt_in
+            and _summary_strict_target_contract_required()
+            and not one_shot_deterministic_policy
+        )
+        one_shot_longform_contract_repairs = bool(
+            one_shot_deterministic_policy and _is_long_form_target(target_length)
+        )
+        strict_quote_contract = bool(
+            (strict_contract_required or one_shot_longform_contract_repairs)
+            and (filing_language_snippets or "").strip()
+        )
+        if strict_contract_required or one_shot_longform_contract_repairs:
+            summary_text = _apply_strict_contract_seal(
+                summary_text,
+                include_health_rating=include_health_rating,
+                target_length=target_length,
+                calculated_metrics=calculated_metrics,
+                company_name=company_name,
+                persona_requested=persona_requested,
+                metrics_lines=metrics_lines or "",
+                filing_language_snippets=filing_language_snippets or "",
+                strict_quote_contract=strict_quote_contract,
+                generation_stats=generation_stats,
+            )
+        if micro_plaintext_mode and target_length:
+            summary_text = repair_summary_contract_deterministically(
+                summary_text or "",
+                target_words=int(target_length),
+                require_single_line=True,
+                forbid_markdown_headings=True,
+            )
+        if _is_short_form_sectioned_target(target_length):
+            summary_text = _apply_short_form_structural_seal(
+                summary_text,
+                include_health_rating=include_health_rating,
+                metrics_lines=metrics_lines or "",
+                calculated_metrics=calculated_metrics,
+                company_name=company_name,
+                risk_factors_excerpt=risk_factors_excerpt,
+                health_score_data=health_score_data,
+                health_rating_config=health_config,
+                persona_name=selected_persona_name,
+                persona_requested=persona_requested,
+                target_length=target_length,
+            )
+        contract_quality_validators = (
+            post_final_quality_validators
+            if post_final_quality_validators
+            else quality_validators
+        )
+        generation_stats["pre_contract_split_word_count"] = len(
+            (summary_text or "").split()
+        )
+        generation_stats["pre_contract_stripped_word_count"] = _count_words(
+            summary_text or ""
+        )
+        missing_requirements, summary_meta = _evaluate_summary_contract_requirements(
+            summary_text=summary_text,
+            target_length=target_length,
+            include_health_rating=include_health_rating,
+            quality_validators=contract_quality_validators,
+            source_text=context_excerpt,
+            filing_language_snippets=filing_language_snippets,
+            enforce_quote_contract=strict_quote_contract,
+        )
+        generation_stats["contract_missing_requirements"] = missing_requirements
+        generation_stats["contract_verified_quote_count"] = summary_meta.get(
+            "verified_quote_count", 0
+        )
+        generation_stats["contract_final_word_count"] = summary_meta.get(
+            "final_word_count", 0
+        )
+
+        if (strict_contract_required or one_shot_longform_contract_repairs) and missing_requirements:
+            logger.warning(
+                "Summary contract validation failed for filing=%s target=%s strict_required=%s one_shot=%s issues=%s",
+                filing_id,
+                target_length,
+                strict_contract_required,
+                one_shot_deterministic_policy,
+                missing_requirements,
+            )
+            contract_retry_attempts = max(
+                0, _int_env("SUMMARY_CONTRACT_RETRY_ATTEMPTS", 2)
+            )
+            if one_shot_longform_contract_repairs and not strict_contract_required:
+                # One-shot mode keeps retries disabled by default. Allow exactly one
+                # bounded long-form repair pass inside the existing guarded logic.
+                contract_retry_attempts = 1
+            contract_retry_used = False
+            contract_recovery_generation_calls = int(
+                generation_stats.get("contract_recovery_generation_calls", 0) or 0
+            )
+            last_contract_recovery_candidate: Optional[str] = None
+            one_shot_band_only_contract_retry = bool(
+                one_shot_longform_contract_repairs and not strict_contract_required
+            )
+            one_shot_retry_llm_timeout_seconds = (
+                min(float(_summary_rewrite_timeout_seconds()), 60.0)
+                if one_shot_band_only_contract_retry
+                else None
+            )
+
+            def _append_contract_missing_requirement(requirement: str) -> None:
+                if not requirement:
+                    return
+                normalized = " ".join(str(requirement).split()).strip().lower()
+                if not normalized:
+                    return
+                for existing in missing_requirements:
+                    existing_norm = " ".join(str(existing).split()).strip().lower()
+                    if existing_norm == normalized:
+                        return
+                missing_requirements.append(requirement)
+
+            def _run_contract_recovery_generation(
+                *,
+                observed_split_wc: int,
+                observed_stripped_wc: int,
+                requested_retry_target: int,
+                recovery_requirements: Optional[List[str]] = None,
+            ) -> Optional[str]:
+                nonlocal contract_recovery_generation_calls
+                nonlocal contract_recovery_cost_diagnostic
+                nonlocal last_contract_recovery_candidate
+                nonlocal cost_budget
+                nonlocal token_budget
+
+                max_recovery_generation_calls = (
+                    1
+                    if one_shot_band_only_contract_retry
+                    else (2 if _is_long_form_target(target_length) else 1)
+                )
+                if contract_recovery_generation_calls >= max_recovery_generation_calls:
+                    return None
+
+                base_recovery_prompt = (
+                    str(last_agent2_prompt or "").strip()
+                    or str(base_prompt or "").strip()
+                )
+                if not base_recovery_prompt:
+                    return None
+                effective_recovery_requirements = [
+                    str(item)
+                    for item in (recovery_requirements or missing_requirements or [])
+                    if str(item or "").strip()
+                ]
+                if not effective_recovery_requirements:
+                    effective_recovery_requirements = list(missing_requirements or [])
+
+                generation_stats["contract_recovery_used"] = True
+                contract_recovery_generation_calls += 1
+                generation_stats["contract_recovery_generation_calls"] = int(
+                    contract_recovery_generation_calls
+                )
+
+                recovery_target = int(requested_retry_target)
+                if target_length:
+                    final_target = int(target_length)
+                    strict_tolerance = _effective_word_band_tolerance(target_length)
+                    lower_bound = max(
+                        TARGET_LENGTH_MIN_WORDS, final_target - strict_tolerance
+                    )
+                    observed = max(int(observed_split_wc), int(observed_stripped_wc))
+                    deficit = max(0, lower_bound - observed)
+                    recovery_deficit_multiplier = (
+                        2.0 if _is_long_form_target(target_length) else 1.35
+                    )
+                    recovery_target = min(
+                        TARGET_LENGTH_MAX_WORDS,
+                        final_target
+                        + max(120, int(deficit * recovery_deficit_multiplier)),
+                    )
+
+                recovery_prompt = _build_contract_recovery_prompt(
+                    base_prompt=base_recovery_prompt,
+                    target_length=int(target_length or recovery_target),
+                    retry_target=int(recovery_target),
+                    missing_requirements=effective_recovery_requirements,
+                    section_budgets=section_budgets,
+                    include_health_rating=include_health_rating,
+                )
+
+                # Temporarily bypass cost and token budgets for catastrophic recovery —
+                # the higher long-form cap already authorizes this spend, and
+                # blocking recovery is the root cause of persistent 422s.
+                saved_cost_budget = cost_budget
+                saved_token_budget = token_budget
+                cost_budget = None
+                token_budget = None
+                try:
+                    recovery_timeout_seconds = (
+                        one_shot_retry_llm_timeout_seconds
+                        if one_shot_retry_llm_timeout_seconds is not None
+                        else float(_summary_rewrite_timeout_seconds())
+                    )
+                    regenerated_contract = _generate_agent2_summary(
+                        recovery_prompt,
+                        float(recovery_timeout_seconds),
+                    )
+                    if regenerated_contract and regenerated_contract.strip():
+                        last_contract_recovery_candidate = str(
+                            regenerated_contract or ""
+                        ).strip()
+                        return regenerated_contract
+                except SummaryBudgetExceededError as recovery_budget_exc:
+                    generation_stats["contract_recovery_cost_guard_blocked"] = True
+                    detail = (
+                        recovery_budget_exc.detail
+                        if isinstance(recovery_budget_exc.detail, dict)
+                        else {}
+                    )
+                    message = str(
+                        detail.get("detail")
+                        or "strict budget guard blocked recovery regeneration"
+                    ).strip()
+                    contract_recovery_cost_diagnostic = (
+                        "Contract recovery regeneration blocked by strict cost budget guard: "
+                        f"{message}."
+                    )
+                    _append_contract_missing_requirement(
+                        contract_recovery_cost_diagnostic
+                    )
+                except Exception as recovery_exc:  # noqa: BLE001
+                    logger.warning(
+                        "Contract recovery regeneration failed for filing=%s retry=%s: %s",
+                        filing_id,
+                        _retry_idx + 1,
+                        recovery_exc,
+                    )
+                finally:
+                    cost_budget = saved_cost_budget
+                    token_budget = saved_token_budget
+                return None
+
+            for _retry_idx in range(contract_retry_attempts):
+                if not missing_requirements:
+                    break
+                recovery_generation_applied = False
+                retry_iteration_event: Dict[str, Any] = {
+                    "retry_index": int(_retry_idx + 1),
+                    "pre_missing_requirements": list(missing_requirements[:12]),
+                }
+                retry_target = int(target_length or _count_words(summary_text))
+                retry_requirements_for_prompt = list(missing_requirements or [])
+                if one_shot_band_only_contract_retry:
+                    _fatal_retry_requirements = _select_one_shot_contract_failure_requirements(
+                        missing_requirements=missing_requirements,
+                        target_length=target_length,
+                    )
+                    if _fatal_retry_requirements:
+                        retry_requirements_for_prompt = list(_fatal_retry_requirements)
+                retry_iteration_event["one_shot_retry_requirements_scoped"] = bool(
+                    one_shot_band_only_contract_retry
+                    and retry_requirements_for_prompt != list(missing_requirements or [])
+                )
+                retry_issue_flags = _parse_summary_contract_missing_requirements(
+                    missing_requirements
+                )
+                retry_iteration_event["issue_flags"] = {
+                    key: value
+                    for key, value in retry_issue_flags.items()
+                    if key
+                    in {
+                        "word_band_issue",
+                        "quote_distribution_issue",
+                        "quote_grounding_issue",
+                        "quote_evidence_gap",
+                        "bridge_issue",
+                        "closing_trigger_issue",
+                        "section_balance_issue",
+                        "key_metrics_issue",
+                        "number_repetition_issue",
+                        "theme_repetition_issue",
+                        "leading_word_repetition_issue",
+                        "numbers_discipline_issue",
+                        "closing_parenthetical_issue",
+                    }
+                }
+                retry_iteration_event["pre_section_counts"] = (
+                    _collect_section_body_word_counts(
+                        summary_text or "", include_health_rating=include_health_rating
+                    )
+                )
+                retry_iteration_event["pre_exec_quotes"] = (
+                    _count_direct_quotes_in_section(
+                        summary_text or "", "Executive Summary"
+                    )
+                )
+                retry_iteration_event["pre_mdna_quotes"] = (
+                    _count_direct_quotes_in_section(
+                        summary_text or "", "Management Discussion & Analysis"
+                    )
+                )
+
+                if strict_quote_contract and retry_issue_flags.get("quote_issue"):
+                    _retry_min_quotes = max(3, _summary_min_verified_quotes())
+                    _retry_quote_pool_size = _estimate_contract_quote_pool_size(
+                        filing_language_snippets or "",
+                        target_quotes=_retry_min_quotes,
+                    )
+                    retry_iteration_event["available_snippet_quote_pool"] = int(
+                        _retry_quote_pool_size
+                    )
+                    if _retry_quote_pool_size < _retry_min_quotes:
+                        _append_contract_missing_requirement(
+                            "Quote contract evidence gap: filing snippets contain "
+                            f"only {_retry_quote_pool_size} usable quote candidate(s), below the required "
+                            f"{_retry_min_quotes}. Re-ingest richer narrative/MD&A filing text."
+                        )
+                        generation_stats.setdefault(
+                            "contract_retry_iterations", []
+                        ).append(retry_iteration_event)
+                        break
+
+                # Deterministic contract-preserving repairs can often fix bridge,
+                # quote distribution, closing trigger, and Key Metrics issues
+                # without an expensive rewrite. Re-evaluate before escalating.
+                _any_deterministic_repair_changed = False
+                _pre_deterministic_text = summary_text
+                if retry_issue_flags.get(
+                    "needs_deterministic_repair"
+                ) or retry_issue_flags.get("quote_issue"):
+                    summary_text = _apply_strict_contract_seal(
+                        summary_text,
+                        include_health_rating=include_health_rating,
+                        target_length=target_length,
+                        calculated_metrics=calculated_metrics,
+                        company_name=company_name,
+                        persona_requested=persona_requested,
+                        metrics_lines=metrics_lines or "",
+                        filing_language_snippets=filing_language_snippets or "",
+                        strict_quote_contract=strict_quote_contract,
+                        generation_stats=generation_stats,
+                    )
+                    retry_iteration_event["deterministic_repair_changed_text"] = bool(
+                        summary_text.strip() != (_pre_deterministic_text or "").strip()
+                    )
+                    _any_deterministic_repair_changed = bool(
+                        retry_iteration_event["deterministic_repair_changed_text"]
+                    )
+                    _pre_deterministic_text = summary_text
+
+                if retry_issue_flags.get("needs_editorial_deterministic_repair"):
+                    (
+                        summary_text,
+                        _editorial_repair_info,
+                    ) = _apply_editorial_contract_repairs(
+                        summary_text,
+                        target_length=target_length,
+                        include_health_rating=include_health_rating,
+                        quality_profile=post_final_profile,
+                        issue_flags=retry_issue_flags,
+                        generation_stats=generation_stats,
+                    )
+                    retry_iteration_event["editorial_repair_changed_text"] = bool(
+                        _editorial_repair_info.get("changed")
+                    )
+                    if _editorial_repair_info.get("actions"):
+                        retry_iteration_event["editorial_repair_actions"] = list(
+                            _editorial_repair_info.get("actions") or []
+                        )
+                    _any_deterministic_repair_changed = bool(
+                        _any_deterministic_repair_changed
+                        or _editorial_repair_info.get("changed")
+                    )
+                    _pre_deterministic_text = summary_text
+
+                if retry_issue_flags.get("section_balance_issue"):
+                    (
+                        summary_text,
+                        _section_balance_repair_info,
+                    ) = _rebalance_section_budgets_deterministically(
+                        summary_text,
+                        target_length=target_length,
+                        include_health_rating=include_health_rating,
+                        issue_flags=retry_issue_flags,
+                        generation_stats=generation_stats,
+                        calculated_metrics=calculated_metrics,
+                        health_score_data=health_score_data,
+                        risk_factors_excerpt=risk_factors_excerpt or "",
+                    )
+                    retry_iteration_event["section_balance_repair_applied"] = bool(
+                        _section_balance_repair_info.get("applied")
+                    )
+                    if _section_balance_repair_info.get("actions"):
+                        retry_iteration_event["section_balance_repair_actions"] = list(
+                            _section_balance_repair_info.get("actions") or []
+                        )
+                    _any_deterministic_repair_changed = bool(
+                        _any_deterministic_repair_changed
+                        or _section_balance_repair_info.get("changed")
+                    )
+
+                if (
+                    _is_long_form_target(target_length)
+                    and retry_issue_flags.get("word_band_issue")
+                    and not retry_issue_flags.get("quote_issue")
+                    and not retry_issue_flags.get("key_metrics_issue")
+                ):
+                    (
+                        summary_text,
+                        _long_form_underflow_info,
+                    ) = _expand_underweight_narrative_sections_for_long_form_underflow(
+                        summary_text,
+                        target_length=target_length,
+                        include_health_rating=include_health_rating,
+                        issue_flags=retry_issue_flags,
+                        generation_stats=generation_stats,
+                        calculated_metrics=calculated_metrics,
+                        health_score_data=health_score_data,
+                        risk_factors_excerpt=risk_factors_excerpt or "",
+                    )
+                    if _long_form_underflow_info.get("applied"):
+                        retry_iteration_event["long_form_underflow_recovery_used"] = True
+                        retry_iteration_event["long_form_underflow_recovery_words_added"] = int(
+                            _long_form_underflow_info.get("words_added", 0) or 0
+                        )
+                        _any_deterministic_repair_changed = bool(
+                            _any_deterministic_repair_changed
+                            or _long_form_underflow_info.get("changed")
+                        )
+
+                if _any_deterministic_repair_changed:
+                    generation_stats["pre_contract_split_word_count"] = len(
+                        (summary_text or "").split()
+                    )
+                    generation_stats["pre_contract_stripped_word_count"] = _count_words(
+                        summary_text or ""
+                    )
+                    missing_requirements, summary_meta = (
+                        _evaluate_summary_contract_requirements(
+                            summary_text=summary_text,
+                            target_length=target_length,
+                            include_health_rating=include_health_rating,
+                            quality_validators=contract_quality_validators,
+                            source_text=context_excerpt,
+                            filing_language_snippets=filing_language_snippets,
+                            enforce_quote_contract=strict_quote_contract,
+                        )
+                    )
+                    generation_stats["contract_missing_requirements"] = (
+                        missing_requirements
+                    )
+                    generation_stats["contract_verified_quote_count"] = (
+                        summary_meta.get("verified_quote_count", 0)
+                    )
+                    generation_stats["contract_final_word_count"] = summary_meta.get(
+                        "final_word_count", 0
+                    )
+                    retry_iteration_event["post_deterministic_missing_requirements"] = (
+                        list(missing_requirements[:12])
+                    )
+                    if not missing_requirements:
+                        retry_iteration_event["resolved_without_rewrite"] = True
+                        generation_stats.setdefault(
+                            "contract_retry_iterations", []
+                        ).append(retry_iteration_event)
+                        break
+                    retry_issue_flags = _parse_summary_contract_missing_requirements(
+                        missing_requirements
+                    )
+
+                current_split_wc = len((summary_text or "").split())
+                current_stripped_wc = _count_words(summary_text or "")
+                catastrophic_underflow = False
+                long_form_band_underflow = False
+                long_form_band_overflow = False
+                material_underflow = False
+                lower_bound = 0
+                upper_bound = TARGET_LENGTH_MAX_WORDS
+                if target_length:
+                    final_target = int(target_length)
+                    strict_tolerance = _effective_word_band_tolerance(target_length)
+                    lower_bound = max(
+                        TARGET_LENGTH_MIN_WORDS, final_target - strict_tolerance
+                    )
+                    upper_bound = min(
+                        TARGET_LENGTH_MAX_WORDS, final_target + strict_tolerance
+                    )
+                    observed_wc = max(current_split_wc, current_stripped_wc)
+                    material_underflow_reference_wc = int(observed_wc)
+                    band_min_wc = int(min(current_split_wc, current_stripped_wc))
+                    band_max_wc = int(max(current_split_wc, current_stripped_wc))
+                    catastrophic_underflow = _is_catastrophic_underflow(
+                        final_target, current_split_wc, current_stripped_wc
+                    )
+                    word_issue = next(
+                        (
+                            item
+                            for item in missing_requirements
+                            if "word-count band violation" in str(item).lower()
+                        ),
+                        "",
+                    )
+                    if word_issue:
+                        match = re.search(
+                            r"got split=(\d+), stripped=(\d+)",
+                            str(word_issue),
+                            re.IGNORECASE,
+                        )
+                        if match:
+                            parsed_split_wc = int(match.group(1))
+                            parsed_stripped_wc = int(match.group(2))
+                            band_min_wc = int(min(parsed_split_wc, parsed_stripped_wc))
+                            band_max_wc = int(max(parsed_split_wc, parsed_stripped_wc))
+                            material_underflow_reference_wc = int(band_max_wc)
+                            if band_max_wc < lower_bound:
+                                deficit = max(0, lower_bound - band_max_wc)
+                                # Ask the rewrite pass to overshoot when deeply
+                                # underweight so downstream cleanup can land in-band.
+                                retry_deficit_multiplier = (
+                                    2.0 if _is_long_form_target(target_length) else 1.35
+                                )
+                                retry_target = min(
+                                    TARGET_LENGTH_MAX_WORDS,
+                                    max(
+                                        retry_target,
+                                        final_target
+                                        + max(
+                                            120,
+                                            int(
+                                                round(
+                                                    deficit * retry_deficit_multiplier
+                                                )
+                                            ),
+                                        ),
+                                    ),
+                                )
+                    long_form_band_underflow = bool(
+                        _is_long_form_target(final_target)
+                        and int(band_min_wc) < lower_bound
+                    )
+                    long_form_band_overflow = bool(
+                        _is_long_form_target(final_target)
+                        and int(band_max_wc) > int(upper_bound)
+                    )
+                    material_underflow = bool(
+                        long_form_band_underflow
+                        and not _allow_padding_for_target(
+                            final_target, int(material_underflow_reference_wc)
+                        )
+                    )
+                retry_iteration_event["catastrophic_underflow"] = bool(catastrophic_underflow)
+                retry_iteration_event["long_form_band_underflow"] = bool(
+                    long_form_band_underflow
+                )
+                retry_iteration_event["long_form_band_overflow"] = bool(
+                    long_form_band_overflow
+                )
+                retry_iteration_event["material_underflow"] = bool(material_underflow)
+                one_shot_retry_eligible = bool(
+                    catastrophic_underflow
+                    or long_form_band_underflow
+                    or long_form_band_overflow
+                )
+                retry_iteration_event["one_shot_retry_eligible"] = bool(
+                    one_shot_retry_eligible
+                )
+                if (
+                    one_shot_longform_contract_repairs
+                    and not strict_contract_required
+                    and not one_shot_retry_eligible
+                ):
+                    retry_iteration_event["one_shot_retry_skipped_non_catastrophic"] = True
+                    generation_stats.setdefault("contract_retry_iterations", []).append(
+                        retry_iteration_event
+                    )
+                    break
+                retry_iteration_event["retry_target"] = int(retry_target)
+                preemptive_recovery_text: Optional[str] = None
+                should_preemptively_recover = bool(
+                    catastrophic_underflow
+                    or (
+                        one_shot_band_only_contract_retry
+                        and material_underflow
+                    )
+                )
+                if should_preemptively_recover:
+                    preemptive_recovery_text = _run_contract_recovery_generation(
+                        observed_split_wc=current_split_wc,
+                        observed_stripped_wc=current_stripped_wc,
+                        requested_retry_target=retry_target,
+                        recovery_requirements=retry_requirements_for_prompt,
+                    )
+
+                if preemptive_recovery_text and preemptive_recovery_text.strip():
+                    rewritten_contract = preemptive_recovery_text
+                    rewrite_noop = bool(
+                        rewritten_contract.strip() == summary_text.strip()
+                    )
+                else:
+                    # One-shot long-form contract repairs can legitimately need one
+                    # bounded extra pass. Do not let strict per-call guards block
+                    # the very recovery path that prevents permanent 422s.
+                    bypass_one_shot_retry_budget_guards = bool(
+                        one_shot_longform_contract_repairs and one_shot_retry_eligible
+                    )
+                    retry_hint = (
+                        "Strict contract validation failed. Resolve all issues exactly:\n- "
+                        + "\n- ".join(retry_requirements_for_prompt[:12])
+                    )
+                    rewritten_contract, _ = _rewrite_summary_to_length(
+                        gemini_client,
+                        summary_text,
+                        retry_target,
+                        None if one_shot_band_only_contract_retry else contract_quality_validators,
+                        current_words=_count_words(summary_text),
+                        token_budget=(
+                            None
+                            if (
+                                catastrophic_underflow
+                                or bypass_one_shot_retry_budget_guards
+                            )
+                            else token_budget
+                        ),
+                        cost_budget=(
+                            None
+                            if (
+                                catastrophic_underflow
+                                or bypass_one_shot_retry_budget_guards
+                            )
+                            else cost_budget
+                        ),
+                        max_output_tokens=max_output_tokens,
+                        generation_stats=generation_stats,
+                        persona_intensity=(
+                            "subtle"
+                            if generation_stats.get("persona_intensity_downgraded")
+                            else "strong"
+                        ),
+                        quality_issue_hint=retry_hint,
+                        allow_over_target_recovery=True,
+                        ignore_max_rewrite_attempts=True,
+                        allow_one_shot_rewrite=bool(
+                            one_shot_longform_contract_repairs
+                        ),
+                        timeout_seconds=one_shot_retry_llm_timeout_seconds,
+                    )
+                    rewrite_noop = bool(
+                        (not rewritten_contract)
+                        or (rewritten_contract.strip() == summary_text.strip())
+                    )
+
+                    if (
+                        (
+                            catastrophic_underflow
+                            or long_form_band_underflow
+                            or long_form_band_overflow
+                        )
+                        and contract_recovery_generation_calls < 1
+                    ):
+                        if generation_stats.get("rewrite_skipped_budget_guard"):
+                            if catastrophic_underflow:
+                                _append_contract_missing_requirement(
+                                    "Contract recovery rewrite was skipped by strict cost budget guard under catastrophic underflow."
+                                )
+                            elif material_underflow:
+                                _append_contract_missing_requirement(
+                                    "Contract recovery rewrite was skipped by strict cost budget guard under material long-form underflow."
+                                )
+                            elif long_form_band_underflow:
+                                _append_contract_missing_requirement(
+                                    "Contract recovery rewrite was skipped by strict cost budget guard under long-form underflow still outside the final word band."
+                                )
+                            elif long_form_band_overflow:
+                                _append_contract_missing_requirement(
+                                    "Contract recovery rewrite was skipped by strict cost budget guard under long-form overflow outside the final word band."
+                                )
+                        post_split_wc = (
+                            len((rewritten_contract or "").split())
+                            if rewritten_contract
+                            else current_split_wc
+                        )
+                        post_stripped_wc = (
+                            _count_words(rewritten_contract or "")
+                            if rewritten_contract
+                            else current_stripped_wc
+                        )
+                        post_still_catastrophic = bool(
+                            target_length
+                            and _is_catastrophic_underflow(
+                                int(target_length),
+                                int(post_split_wc),
+                                int(post_stripped_wc),
+                            )
+                        )
+                        post_observed_wc = max(int(post_split_wc), int(post_stripped_wc))
+                        post_still_long_form_band_underflow = bool(
+                            target_length
+                            and _is_long_form_target(int(target_length))
+                            and post_observed_wc < int(lower_bound or 0)
+                        )
+                        post_still_long_form_band_overflow = bool(
+                            target_length
+                            and _is_long_form_target(int(target_length))
+                            and post_observed_wc > int(upper_bound or TARGET_LENGTH_MAX_WORDS)
+                        )
+                        post_still_material_underflow = bool(
+                            post_still_long_form_band_underflow
+                            and not _allow_padding_for_target(
+                                int(target_length), post_observed_wc
+                            )
+                        )
+                        post_recovery_candidate_gap = max(
+                            0,
+                            int(lower_bound or 0) - int(post_observed_wc),
+                            int(post_observed_wc)
+                            - int(upper_bound or TARGET_LENGTH_MAX_WORDS),
+                        )
+                        one_shot_recovery_escalation_eligible = bool(
+                            not one_shot_band_only_contract_retry
+                            or catastrophic_underflow
+                            or post_recovery_candidate_gap > 200
+                        )
+                        if (
+                            rewrite_noop
+                            or post_still_catastrophic
+                            or post_still_long_form_band_underflow
+                            or post_still_long_form_band_overflow
+                        ):
+                            if not one_shot_recovery_escalation_eligible:
+                                retry_iteration_event[
+                                    "recovery_generation_skipped_small_band_gap"
+                                ] = True
+                            else:
+                                if (
+                                    (long_form_band_underflow or long_form_band_overflow)
+                                    and not catastrophic_underflow
+                                ):
+                                    if material_underflow:
+                                        retry_iteration_event[
+                                            "material_underflow_escalated_to_recovery_generation"
+                                        ] = True
+                                    elif long_form_band_underflow:
+                                        retry_iteration_event[
+                                            "band_underflow_escalated_to_recovery_generation"
+                                        ] = True
+                                    elif long_form_band_overflow:
+                                        retry_iteration_event[
+                                            "band_overflow_escalated_to_recovery_generation"
+                                        ] = True
+                                    logger.info(
+                                        "Escalating one-shot long-form band miss to contract recovery generation: filing=%s split=%s stripped=%s retry_target=%s material_underflow=%s overflow=%s",
+                                        filing_id,
+                                        post_split_wc,
+                                        post_stripped_wc,
+                                        retry_target,
+                                        material_underflow,
+                                        long_form_band_overflow,
+                                    )
+                                recovered_contract = _run_contract_recovery_generation(
+                                    observed_split_wc=int(post_split_wc),
+                                    observed_stripped_wc=int(post_stripped_wc),
+                                    requested_retry_target=retry_target,
+                                    recovery_requirements=retry_requirements_for_prompt,
+                                )
+                                if recovered_contract and recovered_contract.strip():
+                                    _recovery_candidate = str(recovered_contract or "").strip()
+                                    _baseline_for_recovery = str(
+                                        (
+                                            rewritten_contract
+                                            if rewritten_contract
+                                            else summary_text
+                                        )
+                                        or ""
+                                    ).strip()
+                                    _accept_recovery_candidate = True
+                                    if one_shot_band_only_contract_retry and target_length:
+                                        _rt = int(target_length)
+                                        _rt_tol = _effective_word_band_tolerance(_rt)
+                                        _rt_lower = max(TARGET_LENGTH_MIN_WORDS, _rt - _rt_tol)
+                                        _rt_upper = min(TARGET_LENGTH_MAX_WORDS, _rt + _rt_tol)
+
+                                        def _band_distance(_text: str) -> int:
+                                            _wc = _count_words(_text or "")
+                                            if _rt_lower <= _wc <= _rt_upper:
+                                                return 0
+                                            if _wc < _rt_lower:
+                                                return _rt_lower - _wc
+                                            return _wc - _rt_upper
+
+                                        _base_dist = _band_distance(_baseline_for_recovery)
+                                        _cand_dist = _band_distance(_recovery_candidate)
+                                        if _cand_dist > _base_dist and _cand_dist > 0:
+                                            _accept_recovery_candidate = False
+                                            retry_iteration_event[
+                                                "recovery_generation_rejected_worse_band_distance"
+                                            ] = True
+                                    if _accept_recovery_candidate:
+                                        rewritten_contract = recovered_contract
+                                        recovery_generation_applied = True
+                                        rewrite_noop = bool(
+                                            rewritten_contract.strip() == summary_text.strip()
+                                        )
+
+                if rewrite_noop:
+                    retry_iteration_event["rewrite_noop"] = True
+                    retry_iteration_event["post_missing_requirements"] = list(
+                        (missing_requirements or [])[:12]
+                    )
+                    generation_stats.setdefault("contract_retry_iterations", []).append(
+                        retry_iteration_event
+                    )
+                    if catastrophic_underflow:
+                        if contract_recovery_cost_diagnostic:
+                            _append_contract_missing_requirement(
+                                contract_recovery_cost_diagnostic
+                            )
+                        if contract_recovery_generation_calls < 1:
+                            continue
+                    break
+                contract_retry_used = True
+                summary_text = rewritten_contract
+                if recovery_generation_applied:
+                    summary_text = _fix_inline_section_headers(summary_text)
+                    summary_text = _normalize_section_headings(
+                        summary_text, include_health_rating
+                    )
+                    summary_text = _merge_duplicate_canonical_sections(
+                        summary_text, include_health_rating=include_health_rating
+                    )
+                    summary_text = _enforce_section_order(
+                        summary_text, include_health_rating=include_health_rating
+                    )
+                else:
+                    summary_text = _run_summary_cleanup_pass(
+                        summary_text,
+                        include_health_rating=include_health_rating,
+                        calculated_metrics=calculated_metrics,
+                        company_name=company_name,
+                    )
+                if strict_contract_required:
+                    summary_text = _apply_contract_structural_repairs(
+                        summary_text,
+                        include_health_rating=include_health_rating,
+                        target_length=target_length,
+                        calculated_metrics=calculated_metrics,
+                    )
+                if not recovery_generation_applied:
+                    summary_text = _remove_metric_echo_loops(summary_text)
+                    summary_text = _merge_staccato_paragraphs(summary_text)
+                    summary_text = _cap_closing_sentences_filings(
+                        summary_text,
+                        max_sentences=_closing_sentence_cap_for_target(
+                            target_length, include_health_rating=include_health_rating
+                        ),
+                    )
+                if target_length:
+                    final_target = int(target_length)
+                    strict_tolerance = _effective_word_band_tolerance(target_length)
+                    summary_text = _enforce_strict_target_band(
+                        summary_text,
+                        final_target,
+                        calculated_metrics=calculated_metrics,
+                        company_name=company_name,
+                        include_health_rating=include_health_rating,
+                        generation_stats=generation_stats,
+                        allow_padding_rescue=_allow_padding_for_target(
+                            final_target, _count_words(summary_text or "")
+                        ),
+                        prefer_narrative_padding=True,
+                        gemini_client=gemini_client,
+                        quality_validators=contract_quality_validators,
+                        token_budget=token_budget,
+                        cost_budget=cost_budget,
+                        max_output_tokens=max_output_tokens,
+                        persona_intensity=(
+                            "subtle"
+                            if generation_stats.get("persona_intensity_downgraded")
+                            else "strong"
+                        ),
+                    )
+                    summary_text = _ensure_final_strict_word_band(
+                        summary_text,
+                        final_target,
+                        include_health_rating=include_health_rating,
+                        tolerance=strict_tolerance,
+                        generation_stats=generation_stats,
+                        allow_padding=_allow_padding_for_target(
+                            final_target, _count_words(summary_text or "")
+                        ),
+                    )
+                    summary_text = _enforce_whitespace_word_band(
+                        summary_text,
+                        final_target,
+                        tolerance=strict_tolerance,
+                        allow_padding=_allow_padding_for_target(
+                            final_target, _count_words(summary_text or "")
+                        ),
+                        dedupe=True,
+                    )
+                if include_health_rating:
+                    summary_text = _ensure_health_to_exec_bridge(
+                        summary_text, target_length=target_length
+                    )
+                if (metrics_lines or "").strip():
+                    summary_text = _canonicalize_key_metrics_section(
+                        summary_text, metrics_lines
+                    )
+                key_metrics_body = (
+                    _extract_markdown_section_body(summary_text, "Key Metrics") or ""
+                )
+                key_metrics_issue, _ = _validate_key_metrics_numeric_block(
+                    key_metrics_body,
+                    min_rows=5,
+                    require_markers=True,
+                )
+                if key_metrics_issue and (metrics_lines or "").strip():
+                    summary_text = _canonicalize_key_metrics_section(
+                        summary_text, metrics_lines
+                    )
+                if key_metrics_issue and (metrics_lines or "").strip():
+                    if not re.search(
+                        r"^\s*##\s*(?:Key\s)",
+                        summary_text,
+                        re.IGNORECASE | re.MULTILINE,
+                    ):
+                        closing_match = re.search(
+                            r"(^\s*##\s*Closing\s+Takeaway)",
+                            summary_text,
+                            re.IGNORECASE | re.MULTILINE,
+                        )
+                        if closing_match:
+                            inject_block = f"\n\n## Key Metrics\n{metrics_lines}\n\n"
+                            summary_text = (
+                                summary_text[: closing_match.start()]
+                                + inject_block
+                                + summary_text[closing_match.start() :]
+                            )
+                        else:
+                            summary_text += f"\n\n## Key Metrics\n{metrics_lines}\n"
+                if strict_contract_required and (metrics_lines or "").strip():
+                    summary_text = _canonicalize_key_metrics_section(
+                        summary_text, metrics_lines
+                    )
+
+                # ── Structural repairs BEFORE precision expansion ─────────
+                # Quote rebalancing, key metrics canonicalization, and bridge
+                # injection all modify word count. They MUST run before the
+                # precision expansion loop so that loop can be the final
+                # content-modifying step, preventing post-fix word drift.
+                if strict_quote_contract:
+                    min_quotes_required = max(3, _summary_min_verified_quotes())
+                    max_quotes_allowed = _summary_max_verified_quotes()
+                    exec_quotes = _count_direct_quotes_in_section(
+                        summary_text, "Executive Summary"
+                    )
+                    mdna_quotes = _count_direct_quotes_in_section(
+                        summary_text, "Management Discussion & Analysis"
+                    )
+                    total_quotes = exec_quotes + mdna_quotes
+                    needs_quote_rebalance = (
+                        total_quotes < min_quotes_required
+                        or total_quotes > max_quotes_allowed
+                        or exec_quotes < 1
+                        or mdna_quotes < 1
+                    )
+                    if needs_quote_rebalance:
+                        summary_text = _rebalance_contract_quotes(
+                            summary_text,
+                            filing_language_snippets=filing_language_snippets,
+                            min_required_quotes=min_quotes_required,
+                            max_allowed_quotes=max_quotes_allowed,
+                        )
+                # Canonicalize Key Metrics after quote changes
+                if strict_contract_required and (metrics_lines or "").strip():
+                    summary_text = _canonicalize_key_metrics_section(
+                        summary_text, metrics_lines
+                    )
+
+                # Apply bridge before precision expansion so the loop accounts
+                # for the bridge's word contribution.
+                if include_health_rating:
+                    summary_text = _ensure_health_to_exec_bridge(
+                        summary_text, target_length=target_length
+                    )
+
+                # ── Precision expansion loop (LAST content modification) ──
+                # This must be the final content-modifying step before
+                # contract evaluation.  All structural repairs (quotes,
+                # bridge, key metrics) have already been applied above.
+                if target_length:
+                    _pe_target = int(target_length)
+                    _pe_tol = _effective_word_band_tolerance(target_length)
+                    _pe_lower = max(TARGET_LENGTH_MIN_WORDS, _pe_target - _pe_tol)
+                    _pe_upper = min(TARGET_LENGTH_MAX_WORDS, _pe_target + _pe_tol)
+                    _pe_number_section_cap = int(
+                        getattr(post_final_profile, "max_sections_per_repeated_number", 3)
+                    )
+                    _pe_theme_section_cap = int(
+                        getattr(post_final_profile, "max_sections_per_theme", 4)
+                    )
+                    _pe_same_opening_cap = int(
+                        getattr(post_final_profile, "max_same_opening", 2)
+                    )
+                    _pe_max_iters = 2 if one_shot_band_only_contract_retry else 5
+                    for _pe_iter in range(_pe_max_iters):
+                        _pe_split = len((summary_text or "").split())
+                        _pe_stripped = _count_words(summary_text or "")
+                        # Use the canonical stripped count as the single
+                        # source of truth (consistent with contract eval).
+                        _pe_in_band = _pe_lower <= _pe_stripped <= _pe_upper
+                        if _pe_in_band:
+                            break
+                        _pe_below = _pe_stripped < _pe_lower
+                        if _pe_below:
+                            _pe_deficit = max(
+                                _pe_lower - _pe_split, _pe_lower - _pe_stripped, 0
+                            )
+                            # Overshoot by 3-4x the deficit: the LLM consistently
+                            # delivers ~30-50% of the requested expansion.
+                            if _pe_deficit > 100:
+                                _pe_ask = _pe_deficit * 4
+                            elif _pe_deficit > 50:
+                                _pe_ask = max(200, int(_pe_deficit * 3))
+                            else:
+                                _pe_ask = max(150, _pe_deficit * 2)
+                            _pe_direction = (
+                                f"The draft has {_pe_stripped} words but MUST have between "
+                                f"{_pe_lower} and {_pe_upper} words. It is {_pe_deficit} words short.\n"
+                                f"ADD EXACTLY {_pe_ask} WORDS of substantive, filing-grounded analysis. "
+                                f"Expand the thinnest sections with deeper reasoning, business context, "
+                                f"and specific filing evidence. Do NOT add generic filler or checklists.\n"
+                                f"YOU MUST OUTPUT AT LEAST {_pe_lower} WORDS. Count carefully."
+                            )
+                            if _pe_deficit > 80:
+                                _pe_direction += (
+                                    "\nEXPAND the following sections substantially: "
+                                    "Financial Performance, Management Discussion & Analysis, Risk Factors. "
+                                    "Add filing-grounded analysis with specific numbers, percentages, and trends."
+                                )
+                            _pe_direction += _build_precision_section_balance_guidance(
+                                summary_text=summary_text or "",
+                                target_length=target_length,
+                                include_health_rating=include_health_rating,
+                                missing_requirements=missing_requirements,
+                            )
+                        else:
+                            _pe_excess = max(
+                                _pe_split - _pe_upper, _pe_stripped - _pe_upper, 0
+                            )
+                            _pe_direction = (
+                                f"The draft has {_pe_stripped} words but MUST have between "
+                                f"{_pe_lower} and {_pe_upper} words. It is {_pe_excess} words over.\n"
+                                f"REMOVE EXACTLY {_pe_excess} WORDS by condensing repetitive phrasing. "
+                                f"Do NOT remove sections or headings.\n"
+                                f"YOU MUST OUTPUT AT MOST {_pe_upper} WORDS. Count carefully."
+                            )
+                        _pe_prompt = (
+                            "You are a precision word-count editor. Your ONLY job is to adjust this "
+                            "equity-research memo to land EXACTLY within the target word-count band.\n\n"
+                            f"CURRENT: split={_pe_split}, stripped={_pe_stripped}\n"
+                            f"TARGET: {_pe_lower}–{_pe_upper} words (target={_pe_target} ±{_pe_tol})\n\n"
+                            f"{_pe_direction}\n\n"
+                            "RULES:\n"
+                            "- Preserve ALL ## section headings exactly as they are.\n"
+                            "- Preserve ALL direct quotes (text in quotation marks) verbatim.\n"
+                            "- Every section that currently has a quoted phrase MUST keep it.\n"
+                            f"- Do NOT start more than {_pe_same_opening_cap} sentences in any section with the same word (vary sentence openings).\n"
+                            f"- Do NOT repeat the same specific number or percentage in more than {_pe_number_section_cap} sections — reference by context elsewhere.\n"
+                            f"- Do NOT discuss the same financial theme (e.g. 'free cash flow', 'margin pressure') in more than {_pe_theme_section_cap} sections.\n"
+                            "- Preserve the bridge sentence at the end of Financial Health Rating that transitions to Executive Summary.\n"
+                            "- Do NOT add word-count annotations, meta-commentary, or process notes.\n"
+                            "- Do NOT add lines like 'WORD COUNT: ...' at the end.\n"
+                            "- Return ONLY the full revised memo text, nothing else.\n\n"
+                            "MEMO:\n"
+                            f"{summary_text}"
+                        )
+                        try:
+                            _pe_result = _call_gemini_client(
+                                gemini_client,
+                                _pe_prompt,
+                                allow_stream=False,
+                                progress_callback=None,
+                                timeout_seconds=float(
+                                    one_shot_retry_llm_timeout_seconds
+                                    if one_shot_retry_llm_timeout_seconds is not None
+                                    else _summary_rewrite_timeout_seconds()
+                                ),
+                            )
+                            if _pe_result and _pe_result.strip():
+                                # Strip any trailing WORD COUNT line the model may add
+                                _pe_cleaned = re.sub(
+                                    r"\n\s*WORD[\s_]*COUNT\s*[:=]\s*\d+.*$",
+                                    "",
+                                    _pe_result.strip(),
+                                    flags=re.IGNORECASE,
+                                ).strip()
+                                _pe_new_split = len(_pe_cleaned.split())
+                                _pe_new_stripped = _count_words(_pe_cleaned)
+                                _pe_old_dist = abs(_pe_stripped - _pe_target)
+                                _pe_new_dist = abs(_pe_new_stripped - _pe_target)
+                                # Structural gate: reject if required headings were lost
+                                _pe_headings_ok = True
+                                for _pe_req_h in (
+                                    "Financial Health Rating",
+                                    "Executive Summary",
+                                    "Financial Performance",
+                                    "Management Discussion & Analysis",
+                                    "Risk Factors",
+                                    "Key Metrics",
+                                    "Closing Takeaway",
+                                ):
+                                    if re.search(
+                                        r"^\s*##\s+" + re.escape(_pe_req_h),
+                                        summary_text or "",
+                                        re.IGNORECASE | re.MULTILINE,
+                                    ) and not re.search(
+                                        r"^\s*##\s+" + re.escape(_pe_req_h),
+                                        _pe_cleaned,
+                                        re.IGNORECASE | re.MULTILINE,
+                                    ):
+                                        _pe_headings_ok = False
+                                        break
+                                if _pe_new_dist < _pe_old_dist and _pe_headings_ok:
+                                    summary_text = _pe_cleaned
+                                    if generation_stats is not None:
+                                        generation_stats["precision_expansion_used"] = (
+                                            True
+                                        )
+                                        generation_stats[
+                                            "precision_expansion_iterations"
+                                        ] = _pe_iter + 1
+                                        generation_stats["precision_expansion_from"] = (
+                                            _pe_stripped
+                                        )
+                                        generation_stats["precision_expansion_to"] = (
+                                            _pe_new_stripped
+                                        )
+                                else:
+                                    # Rewrite made it worse or no progress; stop iterating
+                                    break
+                        except Exception as _pe_exc:  # noqa: BLE001
+                            logger.warning(
+                                "Precision expansion rewrite (iter=%d) failed for filing=%s: %s",
+                                _pe_iter + 1,
+                                filing_id,
+                                _pe_exc,
+                            )
+                            break
+
+                # ── Post-expansion quality guard ──────────────────────────
+                # Precision expansion may introduce quality violations.
+                # Run validators and do one targeted rewrite if needed.
+                if contract_quality_validators and not one_shot_band_only_contract_retry:
+                    _pq_issues = []
+                    for _pq_v in contract_quality_validators:
+                        _pq_result = _pq_v(summary_text or "")
+                        if _pq_result:
+                            _pq_issues.append(_pq_result)
+                    if _pq_issues and gemini_client:
+                        _pq_issue_flags = _parse_summary_contract_missing_requirements(
+                            _pq_issues
+                        )
+                        _pq_number_cap = int(
+                            getattr(post_final_profile, "max_sections_per_repeated_number", 3)
+                        )
+                        _pq_theme_cap = int(
+                            getattr(post_final_profile, "max_sections_per_theme", 4)
+                        )
+                        _pq_same_opening_cap = int(
+                            getattr(post_final_profile, "max_same_opening", 2)
+                        )
+                        _pq_numeric_caps = _numbers_discipline_caps(
+                            target_length,
+                            closing_numeric_cap_override=getattr(
+                                post_final_profile, "closing_numeric_anchor_cap", None
+                            ),
+                        )
+                        _pq_exec_numeric_cap = int(
+                            _pq_numeric_caps.get("Executive Summary", 4)
+                        )
+                        _pq_section_balance_guidance = _build_precision_section_balance_guidance(
+                            summary_text=summary_text or "",
+                            target_length=target_length,
+                            include_health_rating=include_health_rating,
+                            missing_requirements=_pq_issues,
+                        )
+                        _pq_word_delta_cap = (
+                            (
+                                60
+                                if _pq_issue_flags.get("section_balance_issue")
+                                and _is_long_form_target(target_length)
+                                else 40
+                            )
+                            if _pq_issue_flags.get("section_balance_issue")
+                            else 20
+                        )
+                        _pq_wc = _count_words(summary_text or "")
+                        # Build explicit list of required headings for the prompt
+                        _pq_required_headings = [
+                            "Financial Health Rating",
+                            "Executive Summary",
+                            "Financial Performance",
+                            "Management Discussion & Analysis",
+                            "Risk Factors",
+                            "Key Metrics",
+                            "Closing Takeaway",
+                        ]
+                        _pq_heading_list = ", ".join(
+                            f"'## {h}'" for h in _pq_required_headings
+                        )
+                        _pq_extra_guidance = ""
+                        if _pq_section_balance_guidance:
+                            _pq_extra_guidance = (
+                                "\nSECTION BALANCE TARGETING:\n"
+                                + _pq_section_balance_guidance.strip()
+                                + "\n"
+                            )
+                        _pq_numeric_guidance_lines: List[str] = []
+                        for _pq_sec in sorted(
+                            set(_pq_issue_flags.get("numbers_discipline_sections") or [])
+                        ):
+                            _pq_cap = _pq_numeric_caps.get(_pq_sec)
+                            if _pq_cap is not None:
+                                _pq_numeric_guidance_lines.append(
+                                    f"- {_pq_sec} numeric-token cap: {int(_pq_cap)}"
+                                )
+                        _pq_numeric_guidance = (
+                            ("\n" + "\n".join(_pq_numeric_guidance_lines))
+                            if _pq_numeric_guidance_lines
+                            else ""
+                        )
+                        _pq_lwr_guidance = ""
+                        if _pq_issue_flags.get("leading_word_repetition_issue"):
+                            _pq_lwr_sections = list(
+                                _pq_issue_flags.get("leading_word_repetition_sections") or []
+                            )
+                            if _pq_lwr_sections:
+                                _pq_lwr_guidance = (
+                                    "\n- Leading-word repetition fix target sections: "
+                                    + ", ".join(_pq_lwr_sections)
+                                    + f" (no more than {_pq_same_opening_cap} sentences starting with the same opening word)."
+                                )
+                            else:
+                                _pq_lwr_guidance = (
+                                    f"\n- Leading-word repetition cap: no more than {_pq_same_opening_cap} sentences per section starting with the same opening word."
+                                )
+                        _pq_prompt = (
+                            "You are a quality editor for an equity-research memo. Fix ONLY the listed quality issues "
+                            "while keeping the memo between {lower} and {upper} words (currently {wc} words).\n\n"
+                            "QUALITY ISSUES TO FIX:\n- "
+                            + "\n- ".join(_pq_issues[:5])
+                            + "\n\nEDITORIAL CAPS TO HONOR:\n"
+                            + f"- Max sections per repeated specific figure: {_pq_number_cap}\n"
+                            + f"- Max sections per repeated theme: {_pq_theme_cap}\n"
+                            + f"- Executive Summary numeric-token cap: {_pq_exec_numeric_cap}\n"
+                            + _pq_numeric_guidance
+                            + _pq_lwr_guidance
+                            + _pq_extra_guidance
+                            + "\nRULES:\n"
+                            "- Preserve ALL ## section headings EXACTLY — the memo MUST contain these headings: "
+                            + _pq_heading_list
+                            + ".\n"
+                            "- Do NOT rename, merge, or remove ANY section heading.\n"
+                            "- Preserve ALL direct quotes (text in quotation marks) verbatim — do not remove or alter them.\n"
+                            "- Preserve the bridge sentence at the end of Financial Health Rating.\n"
+                            "- Preserve the Key Metrics data table exactly as-is.\n"
+                            "- To fix leading-word repetition, rewrite ONLY the sentence openings in the affected section.\n"
+                            f"- Do NOT change the word count by more than ±{_pq_word_delta_cap} words unless strictly necessary to land in-band.\n"
+                            "- Return ONLY the full revised memo text.\n\n"
+                            "MEMO:\n" + (summary_text or "")
+                        ).format(
+                            lower=_pe_lower if target_length else max(0, _pq_wc - 20),
+                            upper=_pe_upper if target_length else _pq_wc + 20,
+                            wc=_pq_wc,
+                        )
+                        try:
+                            _pq_result_text = _call_gemini_client(
+                                gemini_client,
+                                _pq_prompt,
+                                allow_stream=False,
+                                progress_callback=None,
+                                timeout_seconds=float(
+                                    _summary_rewrite_timeout_seconds()
+                                ),
+                            )
+                            if _pq_result_text and _pq_result_text.strip():
+                                _pq_cleaned = re.sub(
+                                    r"\n\s*WORD[\s_]*COUNT\s*[:=]\s*\d+.*$",
+                                    "",
+                                    _pq_result_text.strip(),
+                                    flags=re.IGNORECASE,
+                                ).strip()
+                                _pq_new_wc = _count_words(_pq_cleaned)
+                                # Structural gate: reject if required headings are missing
+                                _pq_accept = True
+                                for _pq_req_h in _pq_required_headings:
+                                    if not re.search(
+                                        r"^\s*##\s+" + re.escape(_pq_req_h),
+                                        _pq_cleaned,
+                                        re.IGNORECASE | re.MULTILINE,
+                                    ):
+                                        _pq_accept = False
+                                        break
+                                # Also reject if quotes were destroyed
+                                if _pq_accept:
+                                    _pq_old_quotes = _count_direct_quotes_in_section(
+                                        summary_text or "", "Executive Summary"
+                                    ) + _count_direct_quotes_in_section(
+                                        summary_text or "",
+                                        "Management Discussion & Analysis",
+                                    )
+                                    _pq_new_quotes = _count_direct_quotes_in_section(
+                                        _pq_cleaned, "Executive Summary"
+                                    ) + _count_direct_quotes_in_section(
+                                        _pq_cleaned, "Management Discussion & Analysis"
+                                    )
+                                    if _pq_new_quotes < _pq_old_quotes - 1:
+                                        _pq_accept = False
+                                # Accept if word count doesn't drop below lower - 30
+                                if _pq_accept:
+                                    if target_length:
+                                        _pq_tol = _effective_word_band_tolerance(
+                                            target_length
+                                        )
+                                        _pq_lo = max(
+                                            TARGET_LENGTH_MIN_WORDS,
+                                            int(target_length) - _pq_tol,
+                                        )
+                                        if _pq_new_wc >= _pq_lo - 10:
+                                            summary_text = _pq_cleaned
+                                    else:
+                                        summary_text = _pq_cleaned
+                        except Exception:
+                            pass  # Quality guard is best-effort
+
+                # ── Final structural repair after quality guard ────────────
+                # Re-apply all deterministic structural repairs in case
+                # the quality guard or precision expansion LLM rewrites altered them.
+                if strict_contract_required:
+                    summary_text = _apply_contract_structural_repairs(
+                        summary_text,
+                        include_health_rating=include_health_rating,
+                        target_length=target_length,
+                        calculated_metrics=calculated_metrics,
+                    )
+                if strict_contract_required and (metrics_lines or "").strip():
+                    summary_text = _canonicalize_key_metrics_section(
+                        summary_text, metrics_lines
+                    )
+                if include_health_rating:
+                    summary_text = _ensure_health_to_exec_bridge(
+                        summary_text, target_length=target_length
+                    )
+                # Re-run quote rebalancing as final safety net
+                if strict_quote_contract:
+                    _fq_min = max(3, _summary_min_verified_quotes())
+                    _fq_max = _summary_max_verified_quotes()
+                    _fq_exec = _count_direct_quotes_in_section(
+                        summary_text or "", "Executive Summary"
+                    )
+                    _fq_mdna = _count_direct_quotes_in_section(
+                        summary_text or "", "Management Discussion & Analysis"
+                    )
+                    _fq_total = _fq_exec + _fq_mdna
+                    if _fq_total < _fq_min or _fq_exec < 1 or _fq_mdna < 1:
+                        summary_text = _rebalance_contract_quotes(
+                            summary_text,
+                            filing_language_snippets=filing_language_snippets,
+                            min_required_quotes=_fq_min,
+                            max_allowed_quotes=_fq_max,
+                        )
+                summary_text, _late_lwr_info = _repair_leading_word_repetition_in_summary(
+                    summary_text,
+                    max_same_opening=int(
+                        getattr(post_final_profile, "max_same_opening", 2) or 2
+                    ),
+                )
+                if _late_lwr_info.get("rewrites"):
+                    retry_iteration_event["late_lwr_rewrites"] = int(
+                        _late_lwr_info.get("rewrites", 0) or 0
+                    )
+
+                # Re-run deterministic editorial repairs after the quality guard:
+                # the LLM rewrite / precision expansion can reintroduce repetition,
+                # numeric-density drift, or low-signal parenthetical fragments.
+                _post_guard_quality_issues: List[str] = []
+                if contract_quality_validators:
+                    for _pg_v in contract_quality_validators:
+                        _pg_issue = _pg_v(summary_text or "")
+                        if _pg_issue:
+                            _post_guard_quality_issues.append(_pg_issue)
+                _post_guard_flags = _parse_summary_contract_missing_requirements(
+                    _post_guard_quality_issues
+                )
+                if _post_guard_quality_issues:
+                    (
+                        summary_text,
+                        _post_guard_editorial_info,
+                    ) = _apply_editorial_contract_repairs(
+                        summary_text,
+                        target_length=target_length,
+                        include_health_rating=include_health_rating,
+                        quality_profile=post_final_profile,
+                        missing_requirements=_post_guard_quality_issues,
+                        issue_flags=_post_guard_flags,
+                        generation_stats=generation_stats,
+                    )
+                    if _post_guard_editorial_info.get("actions"):
+                        retry_iteration_event["post_quality_editorial_repair_actions"] = list(
+                            _post_guard_editorial_info.get("actions") or []
+                        )
+                    if _post_guard_flags.get("section_balance_issue"):
+                        (
+                            summary_text,
+                            _post_guard_balance_info,
+                        ) = _rebalance_section_budgets_deterministically(
+                            summary_text,
+                            target_length=target_length,
+                            include_health_rating=include_health_rating,
+                            missing_requirements=_post_guard_quality_issues,
+                            issue_flags=_post_guard_flags,
+                            generation_stats=generation_stats,
+                            calculated_metrics=calculated_metrics,
+                            health_score_data=health_score_data,
+                            risk_factors_excerpt=risk_factors_excerpt or "",
+                        )
+                        if _post_guard_balance_info.get("actions"):
+                            retry_iteration_event[
+                                "post_quality_section_balance_repair_actions"
+                            ] = list(_post_guard_balance_info.get("actions") or [])
+                    if (
+                        _is_long_form_target(target_length)
+                        and _post_guard_flags.get("word_band_issue")
+                        and not _post_guard_flags.get("quote_issue")
+                        and not _post_guard_flags.get("key_metrics_issue")
+                    ):
+                        (
+                            summary_text,
+                            _post_guard_underflow_info,
+                        ) = _expand_underweight_narrative_sections_for_long_form_underflow(
+                            summary_text,
+                            target_length=target_length,
+                            include_health_rating=include_health_rating,
+                            issue_flags=_post_guard_flags,
+                            generation_stats=generation_stats,
+                            calculated_metrics=calculated_metrics,
+                            health_score_data=health_score_data,
+                            risk_factors_excerpt=risk_factors_excerpt or "",
+                        )
+                        if _post_guard_underflow_info.get("applied"):
+                            retry_iteration_event[
+                                "post_quality_long_form_underflow_recovery_used"
+                            ] = True
+                            retry_iteration_event[
+                                "post_quality_long_form_underflow_words_added"
+                            ] = int(
+                                _post_guard_underflow_info.get("words_added", 0) or 0
+                            )
+
+                # ── Final word-count re-enforcement after all post-processing ──
+                if target_length:
+                    _final_target = int(target_length)
+                    _final_tol = _effective_word_band_tolerance(target_length)
+                    summary_text = _ensure_final_strict_word_band(
+                        summary_text,
+                        _final_target,
+                        include_health_rating=include_health_rating,
+                        tolerance=_final_tol,
+                        generation_stats=generation_stats,
+                        allow_padding=_allow_padding_for_target(
+                            _final_target, _count_words(summary_text or "")
+                        ),
+                    )
+
+                # Final deterministic contract seal: no mutating passes should
+                # run after this and before contract evaluation.
+                summary_text = _apply_strict_contract_seal(
+                    summary_text,
+                    include_health_rating=include_health_rating,
+                    target_length=target_length,
+                    calculated_metrics=calculated_metrics,
+                    company_name=company_name,
+                    persona_requested=persona_requested,
+                    metrics_lines=metrics_lines or "",
+                    filing_language_snippets=filing_language_snippets or "",
+                    strict_quote_contract=strict_quote_contract,
+                    generation_stats=generation_stats,
+                    quality_profile=post_final_profile,
+                    final_issue_flags=_post_guard_flags,
+                )
+
+                generation_stats["pre_contract_split_word_count"] = len(
+                    (summary_text or "").split()
+                )
+                generation_stats["pre_contract_stripped_word_count"] = _count_words(
+                    summary_text or ""
+                )
+                missing_requirements, summary_meta = (
+                    _evaluate_summary_contract_requirements(
+                        summary_text=summary_text,
+                        target_length=target_length,
+                        include_health_rating=include_health_rating,
+                        quality_validators=contract_quality_validators,
+                        source_text=context_excerpt,
+                        filing_language_snippets=filing_language_snippets,
+                        enforce_quote_contract=strict_quote_contract,
+                    )
+                )
+                generation_stats["contract_missing_requirements"] = missing_requirements
+                generation_stats["contract_verified_quote_count"] = summary_meta.get(
+                    "verified_quote_count", 0
+                )
+                generation_stats["contract_final_word_count"] = summary_meta.get(
+                    "final_word_count", 0
+                )
+                retry_iteration_event["post_split_wc"] = len(
+                    (summary_text or "").split()
+                )
+                retry_iteration_event["post_stripped_wc"] = _count_words(
+                    summary_text or ""
+                )
+                retry_iteration_event["post_exec_quotes"] = (
+                    _count_direct_quotes_in_section(
+                        summary_text or "", "Executive Summary"
+                    )
+                )
+                retry_iteration_event["post_mdna_quotes"] = (
+                    _count_direct_quotes_in_section(
+                        summary_text or "", "Management Discussion & Analysis"
+                    )
+                )
+                retry_iteration_event["post_section_counts"] = (
+                    _collect_section_body_word_counts(
+                        summary_text or "", include_health_rating=include_health_rating
+                    )
+                )
+                retry_iteration_event["post_missing_requirements"] = list(
+                    (missing_requirements or [])[:12]
+                )
+                generation_stats.setdefault("contract_retry_iterations", []).append(
+                    retry_iteration_event
+                )
+                if contract_recovery_cost_diagnostic and missing_requirements:
+                    _append_contract_missing_requirement(
+                        contract_recovery_cost_diagnostic
+                    )
+            generation_stats["contract_retry_used"] = contract_retry_used
+            generation_stats["contract_recovery_generation_calls"] = int(
+                contract_recovery_generation_calls
+            )
+            if contract_recovery_cost_diagnostic and missing_requirements:
+                _append_contract_missing_requirement(contract_recovery_cost_diagnostic)
+            if (
+                missing_requirements
+                and one_shot_longform_contract_repairs
+                and last_contract_recovery_candidate
+            ):
+                summary_text = str(last_contract_recovery_candidate or "").strip()
+                missing_requirements, summary_meta = _evaluate_summary_contract_requirements(
+                    summary_text=summary_text,
+                    target_length=target_length,
+                    include_health_rating=include_health_rating,
+                    quality_validators=contract_quality_validators,
+                    source_text=context_excerpt,
+                    filing_language_snippets=filing_language_snippets,
+                    enforce_quote_contract=strict_quote_contract,
+                )
+                generation_stats["contract_missing_requirements"] = missing_requirements
+                generation_stats["contract_verified_quote_count"] = summary_meta.get(
+                    "verified_quote_count", 0
+                )
+                generation_stats["contract_final_word_count"] = summary_meta.get(
+                    "final_word_count", 0
+                )
+            if missing_requirements and strict_contract_required:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "detail": "Unable to satisfy strict summary contract after bounded retries.",
+                        "failure_code": "SUMMARY_CONTRACT_FAILED",
+                        "target_length": int(target_length or 0),
+                        "actual_word_count": int(
+                            summary_meta.get("final_word_count") or 0
+                        ),
+                        "missing_requirements": missing_requirements,
+                    },
+                )
+
+        if target_length and (summary_text or "").strip():
+            summary_text = _ensure_final_strict_word_band(
+                summary_text,
+                int(target_length),
+                include_health_rating=include_health_rating,
+                tolerance=_effective_word_band_tolerance(target_length),
+                generation_stats=generation_stats,
+                allow_padding=_allow_padding_for_target(
+                    int(target_length), _count_words(summary_text or "")
+                ),
+            )
+            if _is_short_form_sectioned_target(target_length):
+                summary_text = _apply_short_form_structural_seal(
+                    summary_text,
+                    include_health_rating=include_health_rating,
+                    metrics_lines=metrics_lines or "",
+                    calculated_metrics=calculated_metrics,
+                    company_name=company_name,
+                    risk_factors_excerpt=risk_factors_excerpt,
+                    health_score_data=health_score_data,
+                    health_rating_config=health_config,
+                    persona_name=selected_persona_name,
+                    persona_requested=persona_requested,
+                    target_length=target_length,
+                )
+            missing_requirements, summary_meta = _evaluate_summary_contract_requirements(
+                summary_text=summary_text,
+                target_length=target_length,
+                include_health_rating=include_health_rating,
+                quality_validators=contract_quality_validators,
+                source_text=context_excerpt,
+                filing_language_snippets=filing_language_snippets,
+                enforce_quote_contract=strict_quote_contract,
+            )
+            generation_stats["contract_missing_requirements"] = missing_requirements
+            generation_stats["contract_verified_quote_count"] = summary_meta.get(
+                "verified_quote_count", 0
+            )
+            generation_stats["contract_final_word_count"] = summary_meta.get(
+                "final_word_count", 0
+            )
+
+        if contract_recovery_cost_diagnostic and missing_requirements:
+            _append_contract_missing_requirement(contract_recovery_cost_diagnostic)
+
+        one_shot_fatal_requirements = _select_one_shot_contract_failure_requirements(
+            missing_requirements=missing_requirements,
+            target_length=target_length,
+        )
+        generation_stats["one_shot_contract_fatal_requirements"] = (
+            one_shot_fatal_requirements
+        )
+        strict_one_shot_failure_mode = bool(
+            one_shot_deterministic_policy
+            and (micro_plaintext_mode or strict_contract_opt_in)
+        )
+        if strict_one_shot_failure_mode and one_shot_fatal_requirements:
+            _contract_scope = _summary_contract_scope_for_target(target_length)
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "detail": "Unable to satisfy one-shot deterministic summary contract.",
+                    "failure_code": "SUMMARY_ONE_SHOT_CONTRACT_FAILED",
+                    "target_length": int(target_length or 0),
+                    "actual_word_count": int(summary_meta.get("final_word_count") or 0),
+                    "missing_requirements": one_shot_fatal_requirements,
+                    "diagnostic_missing_requirements": missing_requirements,
+                    "output_format": summary_output_format,
+                    "contract_scope": _contract_scope,
+                    "target_band": _summary_target_band_payload(target_length),
+                },
+            )
+
+        contract_warnings: List[str] = []
+        soft_target_mode = bool(
+            target_length and not strict_contract_required and not strict_one_shot_failure_mode
+        )
+        short_form_structural_fatal_requirements: List[str] = []
+        short_form_editorial_fatal_requirements: List[str] = []
+        if soft_target_mode and _is_short_form_sectioned_target(target_length):
+            short_form_structural_fatal_requirements = (
+                _select_short_form_structural_failure_requirements(
+                    summary_text=summary_text,
+                    missing_requirements=missing_requirements,
+                    include_health_rating=include_health_rating,
+                )
+            )
+            generation_stats["short_form_structural_fatal_requirements"] = (
+                short_form_structural_fatal_requirements
+            )
+            if short_form_structural_fatal_requirements:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "detail": "Unable to satisfy structural requirements for short-form summary.",
+                        "failure_code": "SUMMARY_CONTRACT_FAILED",
+                        "target_length": int(target_length or 0),
+                        "actual_word_count": int(
+                            summary_meta.get("final_word_count") or 0
+                        ),
+                        "missing_requirements": short_form_structural_fatal_requirements,
+                    },
+                )
+            if short_quality_mode:
+                short_form_editorial_fatal_requirements = (
+                    _select_short_form_editorial_failure_requirements(
+                        missing_requirements=missing_requirements,
+                    )
+                )
+                generation_stats["short_form_editorial_fatal_requirements"] = (
+                    short_form_editorial_fatal_requirements
+                )
+                if short_form_editorial_fatal_requirements:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "detail": "Unable to satisfy editorial requirements for short-form summary.",
+                            "failure_code": "SUMMARY_CONTRACT_FAILED",
+                            "target_length": int(target_length or 0),
+                            "actual_word_count": int(
+                                summary_meta.get("final_word_count") or 0
+                            ),
+                            "missing_requirements": short_form_editorial_fatal_requirements,
+                        },
+                    )
+                short_quality_floor = max(
+                    TARGET_LENGTH_MIN_WORDS,
+                    (int(target_length or 0) * 9 + 9) // 10,
+                )
+                if int(summary_meta.get("final_word_count") or 0) < short_quality_floor:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "detail": "Unable to satisfy clean short-form target without filler padding.",
+                            "failure_code": "SUMMARY_CONTRACT_FAILED",
+                            "target_length": int(target_length or 0),
+                            "actual_word_count": int(
+                                summary_meta.get("final_word_count") or 0
+                            ),
+                            "missing_requirements": list(
+                                dict.fromkeys(
+                                    list(missing_requirements or [])
+                                    + [
+                                        f"Short-form clean-output floor violation: require at least {short_quality_floor} words without filler padding, got {int(summary_meta.get('final_word_count') or 0)}."
+                                    ]
+                                )
+                            )[:12],
+                        },
+                    )
+        if soft_target_mode and missing_requirements:
+            contract_warnings = [str(item) for item in list(missing_requirements or [])[:12]]
+            fast_degraded = True
+            if not fast_degraded_reason:
+                fast_degraded_reason = "soft_target"
+            fast_warnings.append(
+                "Summary completed in soft target mode; strict contract failures were downgraded to warnings."
+            )
+            if short_quality_mode and any(
+                "word-count band violation" in str(item).lower()
+                for item in list(missing_requirements or [])
+            ):
+                fast_warnings.append(
+                    "Short-form summary returned below target to avoid filler padding."
+                )
+
+        actual_logged_cost_usd: Optional[float] = None
+        try:
+            events = load_ai_usage_events(days=2)
+            aggregated = aggregate_ai_usage_by_request_id(events)
+            for bucket in aggregated:
+                if str(bucket.get("request_id") or "") == summary_request_id:
+                    actual_logged_cost_usd = float(bucket.get("total_cost_usd") or 0.0)
+                    break
+        except Exception as usage_exc:  # noqa: BLE001
+            logger.debug(
+                "Unable to read AI usage logs for request %s: %s",
+                summary_request_id,
+                usage_exc,
+            )
+
+        budget_cap_usd = float(cost_budget.budget_cap_usd)
+        estimated_min_cost_usd = float(
+            preflight_cost_estimate.get("minimum_path_usd") or 0.0
+        )
+        estimated_bounded_cost_usd = float(
+            preflight_cost_estimate.get("bounded_total_usd") or 0.0
+        )
+        # cost_budget.spent_usd tracks accumulated charges using model-specific
+        # rates (GPT-4.1-mini: $0.40/$1.60 for longform targets).  The usage
+        # log records costs with global env var rates that may not match the
+        # runtime model.  Always prefer the runtime-tracked cost budget.
+        actual_cost_usd = float(cost_budget.spent_usd)
+        within_budget = actual_cost_usd <= (budget_cap_usd + 1e-9)
+        final_section_word_counts = _collect_section_body_word_counts(
+            summary_text or "", include_health_rating=include_health_rating
+        )
+        final_word_count = int(summary_meta.get("final_word_count") or _count_words(summary_text or ""))
+        final_word_delta = (
+            int(final_word_count) - int(target_length)
+            if target_length
+            else 0
+        )
+        continuous_v2_validation = None
+        if continuous_v2_route_mode and target_length:
+            continuous_v2_validation = validate_summary(
+                summary_text or "",
+                target_words=int(target_length),
+                section_budgets=section_budgets,
+                include_health_rating=include_health_rating,
+                risk_factors_excerpt=risk_factors_excerpt or "",
+            )
+            generation_stats["summary_continuous_v2_final_validation"] = {
+                "passed": bool(continuous_v2_validation.passed),
+                "global_failures": list(continuous_v2_validation.global_failures or []),
+                "section_failures": [
+                    {
+                        "section_name": failure.section_name,
+                        "code": failure.code,
+                        "message": failure.message,
+                        "severity": float(failure.severity or 0.0),
+                    }
+                    for failure in list(continuous_v2_validation.section_failures or [])
+                ],
+            }
+            if not continuous_v2_validation.passed:
+                detail = {
+                    "detail": "Continuous V2 summary failed section-balance validation after route-level processing.",
+                    "failure_code": "SUMMARY_SECTION_BALANCE_FAILED",
+                    "target_length": int(target_length or 0),
+                    "section_word_budgets": dict(section_budgets or {}),
+                    "section_word_counts": dict(final_section_word_counts or {}),
+                    "section_failures": [
+                        {
+                            "section_name": failure.section_name,
+                            "code": failure.code,
+                            "message": failure.message,
+                            "severity": float(failure.severity or 0.0),
+                        }
+                        for failure in list(continuous_v2_validation.section_failures or [])
+                    ],
+                    "global_failures": list(continuous_v2_validation.global_failures or []),
+                }
+                _record_summary_422_observability(
+                    filing_id=filing_id,
+                    detail=detail,
+                    summary_request_id=str(locals().get("summary_request_id") or "").strip()
+                    or None,
+                    fallback_target_length=int(target_length or 0),
+                )
+                raise HTTPException(status_code=422, detail=detail)
+        failed_sections: List[str] = []
+        canonical_titles = [
+            title
+            for title, _min_words in SUMMARY_SECTION_REQUIREMENTS
+            if include_health_rating or title != "Financial Health Rating"
+        ]
+        for requirement in list(missing_requirements or []):
+            req_text = str(requirement or "")
+            for title in canonical_titles:
+                if title in req_text and title not in failed_sections:
+                    failed_sections.append(title)
+        # Allow a 20% post-generation tolerance so slight estimation drift
+        # (e.g. actual output tokens exceeding the pre-generation estimate)
+        # does not discard an already-generated summary.
+        _post_gen_hard_cap = budget_cap_usd * 1.20
+        if not within_budget:
+            logger.warning(
+                "Post-generation budget exceeded: actual=%.6f cap=%.6f model=%s "
+                "logged_cost=%s spent_usd=%.6f",
+                actual_cost_usd,
+                budget_cap_usd,
+                active_model_name,
+                actual_logged_cost_usd,
+                cost_budget.spent_usd,
+            )
+            if (summary_text or "").strip() and actual_cost_usd <= _post_gen_hard_cap:
+                # Within tolerance — return the summary with a soft warning.
+                logger.warning(
+                    "Post-generation budget overrun within 20%% tolerance (%.1f%% over); "
+                    "returning summary.",
+                    ((actual_cost_usd / budget_cap_usd) - 1) * 100,
+                )
+                within_budget = False
+            elif fast_summary_mode and (summary_text or "").strip():
+                fast_degraded = True
+                if not fast_degraded_reason:
+                    fast_degraded_reason = "budget_cap"
+                fast_warnings.append(
+                    "Fast-mode budget cap was exceeded; returned best-effort summary without additional retries."
+                )
+                within_budget = False
+            else:
+                final_budget_detail = _decorate_budget_exceeded_detail(
+                    {
+                        "detail": "Summary generation exceeded strict per-request budget cap.",
+                        "budget_cap_usd": budget_cap_usd,
+                        "actual_cost_usd": actual_cost_usd,
+                        "estimated_min_cost_usd": estimated_min_cost_usd,
+                        "estimated_bounded_cost_usd": estimated_bounded_cost_usd,
+                    },
+                    stage="post_generation_budget_validation",
+                    target_length=int(target_length) if target_length else None,
+                    budget_adjustments_attempted=list(
+                        prompt_budget_state.get("budget_adjustments_attempted") or []
+                    ),
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail=final_budget_detail,
+                )
+
+        padding_words_added = int(generation_stats.get("padding_words_added", 0) or 0)
+        padding_sentences_added = int(
+            generation_stats.get("padding_sentences_added", 0) or 0
+        )
+        if padding_words_added > 25:
+            logger.warning(
+                "Summary deterministic padding was high: words_added=%s sentences_added=%s filing_id=%s",
+                padding_words_added,
+                padding_sentences_added,
+                filing_id,
+            )
+
+        if section_budgets:
+            section_deltas = {
+                section_name: int(final_section_word_counts.get(section_name, 0) or 0)
+                - int(section_budgets.get(section_name, 0) or 0)
+                for section_name in section_budgets.keys()
+            }
+            log_fn = logger.warning if missing_requirements else logger.info
+            log_fn(
+                "Summary section budget diagnostics: filing_id=%s target=%s deltas=%s failed_sections=%s",
+                filing_id,
+                target_length,
+                section_deltas,
+                failed_sections,
+            )
+
+        logger.info(
+            "Summary generation telemetry: model=%s estimated_generation=%.6f estimated_rewrite=%.6f estimated_total=%.6f actual_logged_cost=%s fallback_used=%s rewrite_used=%s persona_downgraded=%s generation_calls=%s rewrite_calls=%s second_quality_rewrite=%s post_final_quality_issue=%s post_final_quality_rewrite_used=%s v2_enabled=%s padding_words=%s padding_sentences=%s validators_fired=%s verified_quotes=%s final_word_count=%s contract_missing=%s",
+            active_model_name,
+            model_plan.estimated_generation_cost_usd,
+            model_plan.estimated_rewrite_cost_usd,
+            model_plan.estimated_total_cost_usd,
+            f"{actual_logged_cost_usd:.6f}"
+            if actual_logged_cost_usd is not None
+            else "n/a",
+            generation_stats.get("fallback_retry_used"),
+            generation_stats.get("rewrite_used"),
+            generation_stats.get("persona_intensity_downgraded"),
+            generation_stats.get("generation_call_count"),
+            generation_stats.get("rewrite_call_count"),
+            generation_stats.get("second_quality_rewrite_used", False),
+            generation_stats.get("post_final_quality_issue"),
+            generation_stats.get("post_final_quality_rewrite_used", False),
+            v2_enabled,
+            padding_words_added,
+            padding_sentences_added,
+            generation_stats.get("validators_fired", []),
+            generation_stats.get("contract_verified_quote_count"),
+            generation_stats.get("contract_final_word_count"),
+            generation_stats.get("contract_missing_requirements"),
+        )
 
         # Cache result
         if use_default_cache:
@@ -13366,8 +25094,200 @@ Before you output anything, verify:
             "filing_id": filing_id,
             "summary": summary_text,
             "cached": False,
+            "cache_hit": False,
+            "quality_mode": quality_mode,
+            "degraded": bool(fast_degraded),
+            "degraded_reason": (fast_degraded_reason if fast_degraded else None),
+            "warnings": list(dict.fromkeys(fast_warnings)),
+            "contract_warnings": list(dict.fromkeys(contract_warnings)),
             "company_country": company.get("country"),
+            "summary_meta": {
+                "pipeline_mode": (
+                    str(generation_stats.get("pipeline_mode"))
+                    if generation_stats.get("pipeline_mode")
+                    else (two_agent_result.pipeline_mode if two_agent_result else "two_agent")
+                ),
+                "model_used": active_model_name,
+                "agent_stage_calls": (
+                    list(two_agent_result.agent_stage_calls or [])
+                    if two_agent_result
+                    else []
+                ),
+                "agent_1_api": (
+                    str(two_agent_result.agent_1_api)
+                    if two_agent_result
+                    else "responses"
+                ),
+                "agent_2_api": (
+                    str(two_agent_result.agent_2_api)
+                    if two_agent_result
+                    else "responses"
+                ),
+                "agent_timings": (
+                    dict(two_agent_result.agent_timings or {})
+                    if two_agent_result
+                    else {}
+                ),
+                "background_used": bool(
+                    two_agent_result.background_used if two_agent_result else False
+                ),
+                "research_mode": str(
+                    prompt_budget_state.get("research_mode") or "skipped"
+                ),
+                "prompt_budget_adapted": bool(
+                    prompt_budget_state.get("prompt_budget_adapted") or False
+                ),
+                "budget_adjustments_attempted": list(
+                    prompt_budget_state.get("budget_adjustments_attempted") or []
+                ),
+                "prompt_tokens_estimated": int(
+                    prompt_budget_state.get("runtime_prompt_tokens_estimated")
+                    or prompt_budget_state.get("preflight_prompt_tokens_estimated")
+                    or 0
+                ),
+                "expected_output_tokens": int(
+                    prompt_budget_state.get("runtime_expected_output_tokens")
+                    or prompt_budget_state.get("preflight_expected_output_tokens")
+                    or 0
+                ),
+                "budget_cap_usd": budget_cap_usd,
+                "estimated_cost_usd": estimated_min_cost_usd,
+                "estimated_bounded_cost_usd": estimated_bounded_cost_usd,
+                "actual_cost_usd": actual_cost_usd,
+                "within_budget": within_budget,
+                "target_length": summary_meta.get("target_length"),
+                "final_word_count": final_word_count,
+                "final_word_delta": final_word_delta,
+                "verified_quote_count": summary_meta.get("verified_quote_count"),
+                "key_metrics_numeric_row_count": summary_meta.get(
+                    "key_metrics_numeric_row_count",
+                    preflight_key_metrics_numeric_rows,
+                ),
+                "section_word_budgets": dict(section_budgets or {}),
+                "section_word_counts": dict(final_section_word_counts or {}),
+                "section_word_ranges": {
+                    section_name: {
+                        "lower": max(
+                            1,
+                            int(words) - int(canonical_section_budget_tolerance_words(section_name, int(words))),
+                        ),
+                        "upper": int(words)
+                        + int(canonical_section_budget_tolerance_words(section_name, int(words))),
+                    }
+                    for section_name, words in dict(section_budgets or {}).items()
+                    if int(words or 0) > 0
+                },
+                "section_validation_passed": bool(
+                    continuous_v2_validation.passed
+                    if continuous_v2_validation is not None
+                    else generation_stats.get("summary_continuous_v2_metadata", {}).get(
+                        "section_validation_passed", True
+                    )
+                ),
+                "section_validation_failures": (
+                    [
+                        {
+                            "section_name": failure.section_name,
+                            "code": failure.code,
+                            "message": failure.message,
+                            "severity": float(failure.severity or 0.0),
+                        }
+                        for failure in list(
+                            (continuous_v2_validation.section_failures if continuous_v2_validation else [])
+                            or []
+                        )
+                    ]
+                    if continuous_v2_validation is not None
+                    else list(
+                        generation_stats.get("summary_continuous_v2_metadata", {}).get(
+                            "section_validation_failures", []
+                        )
+                        or []
+                    )
+                ),
+                "repair_attempts": int(
+                    generation_stats.get("summary_continuous_v2_metadata", {}).get(
+                        "repair_attempts", 0
+                    )
+                    or 0
+                ),
+                "pre_contract_split_word_count": int(
+                    generation_stats.get("pre_contract_split_word_count") or 0
+                ),
+                "pre_contract_stripped_word_count": int(
+                    generation_stats.get("pre_contract_stripped_word_count") or 0
+                ),
+                "contract_recovery_used": bool(
+                    generation_stats.get("contract_recovery_used") or False
+                ),
+                "contract_recovery_generation_calls": int(
+                    generation_stats.get("contract_recovery_generation_calls") or 0
+                ),
+                "quality_checks_passed": summary_meta.get("quality_checks_passed", []),
+                "contract_missing_requirements": missing_requirements,
+                "contract_strict_required": strict_contract_required,
+                "contract_hard_fail": bool(
+                    strict_one_shot_failure_mode and target_length
+                ),
+                "contract_mode": (
+                    "structured_section_contract"
+                    if target_length and int(target_length) >= 300 and not micro_plaintext_mode
+                    else "legacy_or_micro"
+                ),
+                "quality_mode": quality_mode,
+                "fast_summary_mode": bool(fast_summary_mode),
+                "output_format": summary_output_format,
+                "source_context_mode": source_context_mode,
+                "statement_only_source_mode": bool(statement_only_source_mode),
+                "structured_section_generation_used": bool(
+                    generation_stats.get("structured_section_generation_used") or False
+                ),
+                "generation_policy": _summary_generation_policy_name(
+                    target_length=target_length,
+                    one_shot_deterministic_policy=strict_one_shot_failure_mode,
+                    generation_stats=generation_stats,
+                ),
+                "llm_generation_calls": int(
+                    generation_stats.get("generation_call_count", 0) or 0
+                ),
+                "llm_rewrite_calls": int(
+                    generation_stats.get("rewrite_call_count", 0) or 0
+                ),
+                "retry_count": int(generation_stats.get("rewrite_call_count", 0) or 0),
+                "failed_sections": failed_sections,
+            },
         }
+
+        if statement_only_source_mode:
+            response_data["degraded"] = True
+            if not response_data.get("degraded_reason"):
+                response_data["degraded_reason"] = "statement_only_source"
+            response_data["warnings"] = list(
+                dict.fromkeys(
+                    list(response_data.get("warnings") or [])
+                    + [
+                        "Summary generated from financial statements only because no narrative filing document was available for this filing."
+                    ]
+                )
+            )
+
+        if fast_summary_mode and missing_requirements:
+            response_data["degraded"] = True
+            if not response_data.get("degraded_reason"):
+                response_data["degraded_reason"] = "soft_target"
+            merged_warnings = list(response_data.get("warnings") or [])
+            merged_warnings.append(
+                "Fast mode bypassed strict contract enforcement and returned best-effort output."
+            )
+            for item in list(missing_requirements or [])[:8]:
+                merged_warnings.append(str(item))
+            response_data["warnings"] = list(dict.fromkeys(merged_warnings))
+            merged_contract_warnings = list(response_data.get("contract_warnings") or [])
+            for item in list(missing_requirements or [])[:12]:
+                merged_contract_warnings.append(str(item))
+            response_data["contract_warnings"] = list(
+                dict.fromkeys(merged_contract_warnings)
+            )
 
         if health_score_data:
             response_data["health_score"] = health_score_data.get("overall_score")
@@ -13557,6 +25477,13 @@ Before you output anything, verify:
             # Merge chart_data into response_data instead of returning separately
             response_data["chart_data"] = chart_data
 
+        if (
+            fast_summary_mode
+            and fast_cache_key
+            and (response_data.get("summary") or "").strip()
+        ):
+            _set_fast_summary_cached_response(fast_cache_key, response_data)
+
         # Mark progress as complete
         complete_summary_progress(filing_id)
 
@@ -13564,8 +25491,184 @@ Before you output anything, verify:
 
     except HTTPException:
         raise
+    except SummarySectionBalanceError as exc:
+        detail = (
+            exc.detail
+            if isinstance(exc.detail, dict)
+            else {
+                "detail": str(exc),
+                "failure_code": "SUMMARY_SECTION_BALANCE_FAILED",
+            }
+        )
+        raw_target = detail.get("target_length")
+        parsed_target: Optional[int]
+        try:
+            parsed_target = (
+                int(raw_target) if raw_target not in (None, "", 0, "0") else None
+            )
+        except (TypeError, ValueError):
+            parsed_target = None
+        _record_summary_422_observability(
+            filing_id=filing_id,
+            detail=detail,
+            summary_request_id=str(locals().get("summary_request_id") or "").strip()
+            or None,
+            fallback_target_length=parsed_target,
+        )
+        raise HTTPException(status_code=422, detail=detail)
+    except SummaryBudgetExceededError as exc:
+        detail = (
+            exc.detail
+            if isinstance(exc.detail, dict)
+            else {
+                "detail": str(exc),
+                "failure_code": "SUMMARY_BUDGET_EXCEEDED",
+            }
+        )
+        raw_target = detail.get("target_length")
+        parsed_target: Optional[int]
+        try:
+            parsed_target = (
+                int(raw_target) if raw_target not in (None, "", 0, "0") else None
+            )
+        except (TypeError, ValueError):
+            parsed_target = None
+        detail = _decorate_budget_exceeded_detail(
+            detail,
+            stage=str(detail.get("stage") or "agent_2_summary_generation"),
+            target_length=parsed_target,
+            budget_adjustments_attempted=(
+                detail.get("budget_adjustments_attempted")
+                if isinstance(detail.get("budget_adjustments_attempted"), list)
+                else None
+            ),
+        )
+        _record_summary_422_observability(
+            filing_id=filing_id,
+            detail=detail,
+            summary_request_id=str(locals().get("summary_request_id") or "").strip()
+            or None,
+            fallback_target_length=parsed_target,
+        )
+        raise HTTPException(status_code=422, detail=detail)
+    except AITimeoutError as exc:
+        logger.warning("Summary generation timed out for filing %s: %s", filing_id, exc)
+        best_effort_response = _build_timeout_best_effort_response("timeout")
+        if best_effort_response is not None:
+            set_summary_progress(
+                filing_id,
+                status="Completed with timeout fallback.",
+                stage_percent=100,
+                error=False,
+            )
+            complete_summary_progress(filing_id)
+            return best_effort_response
+        set_summary_progress(
+            filing_id,
+            status="Summary generation timed out.",
+            stage_percent=0,
+            error=True,
+            last_failure_code="SUMMARY_TIMEOUT",
+            last_error_message=str(exc),
+            last_error_details={"detail": str(exc)},
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "AI summary generation timed out. "
+                "Please retry in a minute or request a shorter target length."
+            ),
+        )
+    except AIRateLimitError as exc:
+        logger.warning(
+            "Summary generation rate-limited for filing %s: %s", filing_id, exc
+        )
+        set_summary_progress(
+            filing_id,
+            status="AI provider is rate limited.",
+            stage_percent=0,
+            error=True,
+            last_failure_code="SUMMARY_RATE_LIMITED",
+            last_error_message=str(exc),
+            last_error_details={"detail": str(exc)},
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="AI provider is currently rate limited. Please retry in a minute.",
+        )
+    except AIAPIError as exc:
+        logger.exception(
+            "AI API failure during summary generation for filing %s", filing_id
+        )
+        set_summary_progress(
+            filing_id,
+            status="AI provider request failed.",
+            stage_percent=0,
+            error=True,
+            last_failure_code="SUMMARY_AI_API_ERROR",
+            last_error_message=str(exc),
+            last_error_details={"detail": str(exc), "status_code": exc.status_code},
+        )
+        if exc.status_code == 404:
+            detail = "Configured AI model is unavailable for this environment."
+            status_code = 502
+        elif exc.status_code == 403:
+            detail = "AI provider rejected the request."
+            status_code = 502
+        elif exc.status_code == 400:
+            detail = "AI provider rejected the summary request payload."
+            status_code = 502
+        elif exc.status_code and int(exc.status_code) >= 500:
+            detail = "AI provider encountered an internal error."
+            status_code = 503
+        else:
+            detail = "AI provider request failed during summary generation."
+            status_code = 502
+        raise HTTPException(status_code=status_code, detail=detail)
+    except TimeoutError as exc:
+        logger.warning(
+            "Summary generation timed out (runtime cap) for filing %s: %s", filing_id, exc
+        )
+        best_effort_response = _build_timeout_best_effort_response("timeout")
+        if best_effort_response is not None:
+            set_summary_progress(
+                filing_id,
+                status="Completed with timeout fallback.",
+                stage_percent=100,
+                error=False,
+            )
+            complete_summary_progress(filing_id)
+            return best_effort_response
+        set_summary_progress(
+            filing_id,
+            status="Summary generation timed out.",
+            stage_percent=0,
+            error=True,
+            last_failure_code="SUMMARY_RUNTIME_TIMEOUT",
+            last_error_message=str(exc),
+            last_error_details={"detail": str(exc)},
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                "Summary generation timed out under the 3-minute runtime cap. "
+                "Retry or request a shorter target length."
+            ),
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Error generating filing charts")
+        logger.exception("Error generating filing summary")
+        try:
+            set_summary_progress(
+                filing_id,
+                status="Summary generation failed.",
+                stage_percent=0,
+                error=True,
+                last_failure_code="SUMMARY_INTERNAL_ERROR",
+                last_error_message=str(exc),
+                last_error_details={"detail": str(exc)},
+            )
+        except Exception:  # noqa: BLE001
+            pass
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -13614,6 +25717,18 @@ def _strip_directive_lines(text: str) -> str:
         r"The best MD&A reads\b[^.\n]{0,240}(?:\.|\n|$)",
         r"The primary constraint\b[^.\n]{0,240}(?:\.|\n|$)",
         r"(?:(?:in\s+sum)\s+){5,}",
+        # Instruction-leak patterns from synthesizers and section descriptions.
+        r"Connect revenue trends to\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"Unit economics need to improve via\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"Keep this section concrete\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"Each risk should map to\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"[Rr]econciles KPI commentary\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"[Aa]s instructed\b[^.\n]{0,80}(?:\.|\n|$)",
+        r"[Pp]er the guidelines\b[^.\n]{0,80}(?:\.|\n|$)",
+        r"[Ff]inancial performance commentary not provided in the draft\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"[Cc]ommentary not provided\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"[Nn]ot provided in the draft\b[^.\n]{0,240}(?:\.|\n|$)",
+        r"[Aa]dd\s+revenue(?:/margin/cash\s*flow|,\s*margin,?\s*(?:and\s*)?cash\s*flow)\s+context\b[^.\n]{0,240}(?:\.|\n|$)",
     ]
     for pat in phrase_patterns:
         cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
@@ -13630,6 +25745,282 @@ def _strip_directive_lines(text: str) -> str:
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return cleaned.strip()
+
+
+def _rewrite_instruction_leaks_in_place(
+    text: str, calculated_metrics: Dict[str, Any], company_name: str
+) -> str:
+    """Rewrite leaked prompt-instruction language into investor-facing prose."""
+    if not text:
+        return text
+
+    leak_patterns: List[re.Pattern[str]] = [
+        re.compile(r"commentary not provided in the draft", re.IGNORECASE),
+        re.compile(r"financial performance commentary not provided", re.IGNORECASE),
+        re.compile(
+            r"financial performance commentary not provided in the draft",
+            re.IGNORECASE,
+        ),
+        re.compile(r"commentary not provided", re.IGNORECASE),
+        re.compile(r"not provided in the draft", re.IGNORECASE),
+        re.compile(r"this section should\b", re.IGNORECASE),
+        re.compile(r"keep this section concrete\b", re.IGNORECASE),
+        re.compile(r"each risk should map to\b", re.IGNORECASE),
+        re.compile(
+            r"add\s+revenue(?:/margin/cash\s*flow|,?\s*margin,?\s*(?:and\s*)?cash\s*flow)\s+context\b",
+            re.IGNORECASE,
+        ),
+        re.compile(r"as instructed\b", re.IGNORECASE),
+        re.compile(r"per the guidelines\b", re.IGNORECASE),
+        re.compile(r"the memo should\b", re.IGNORECASE),
+        re.compile(r"the analysis should\b", re.IGNORECASE),
+    ]
+    strip_spans = [
+        re.compile(r"\bthis section should\b[^.\n]{0,220}(?:\.|\n|$)", re.IGNORECASE),
+        re.compile(
+            r"\bkeep this section concrete\b[^.\n]{0,220}(?:\.|\n|$)", re.IGNORECASE
+        ),
+        re.compile(
+            r"\beach risk should map to\b[^.\n]{0,220}(?:\.|\n|$)", re.IGNORECASE
+        ),
+        re.compile(
+            r"\bfinancial performance commentary not provided in the draft\b[^.\n]{0,220}(?:\.|\n|$)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"\bcommentary not provided\b[^.\n]{0,220}(?:\.|\n|$)", re.IGNORECASE
+        ),
+        re.compile(
+            r"\bnot provided in the draft\b[^.\n]{0,220}(?:\.|\n|$)", re.IGNORECASE
+        ),
+        re.compile(
+            r"\badd\s+revenue(?:/margin/cash\s*flow|,?\s*margin,?\s*(?:and\s*)?cash\s*flow)\s+context\b[^.\n]{0,220}(?:\.|\n|$)",
+            re.IGNORECASE,
+        ),
+    ]
+
+    def _section_anchor(section: str) -> str:
+        section_key = (section or "").strip().lower()
+        revenue = calculated_metrics.get("revenue") or calculated_metrics.get(
+            "total_revenue"
+        )
+        fcf = calculated_metrics.get("free_cash_flow")
+        op_margin = calculated_metrics.get("operating_margin")
+        revenue_str = (
+            _format_metric_value_for_text("revenue", revenue)
+            if revenue is not None
+            else None
+        )
+        fcf_str = (
+            _format_metric_value_for_text("free_cash_flow", fcf)
+            if fcf is not None
+            else None
+        )
+        if section_key.startswith("financial health"):
+            return "The rating is anchored to profitability, cash-conversion durability, and liquidity resilience."
+        if section_key.startswith("executive summary"):
+            return "The thesis tension is whether operating strength remains durable as cash-conversion quality evolves."
+        if section_key.startswith("financial performance"):
+            if revenue_str and fcf_str and op_margin is not None:
+                return f"Revenue of {revenue_str}, operating margin of {op_margin:.1f}%, and free cash flow of {fcf_str} frame the operating signal in this period."
+            return "Revenue, margin structure, and cash conversion should be interpreted together to judge earnings durability."
+        if section_key.startswith("management discussion"):
+            return "Capital allocation quality is judged by whether reinvestment supports margin durability and cash generation."
+        if section_key.startswith("risk factors"):
+            short = company_name.split()[0] if company_name else "The company"
+            return f"{short}'s risk view is weighted by severity, likelihood, and the first metric likely to deteriorate."
+        if section_key.startswith("closing takeaway"):
+            return "The stance changes only when measurable upgrade and downgrade thresholds are met."
+        return ""
+
+    current_section = ""
+    rewritten_lines: List[str] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        heading_match = re.match(r"^\s*##\s*(.+?)\s*$", line)
+        if heading_match:
+            current_section = heading_match.group(1).strip()
+            rewritten_lines.append(line)
+            continue
+
+        if not line.strip():
+            rewritten_lines.append(line)
+            continue
+
+        has_leak = any(p.search(line) for p in leak_patterns)
+        if not has_leak:
+            rewritten_lines.append(line)
+            continue
+
+        candidate = line
+        for pattern in strip_spans:
+            candidate = pattern.sub("", candidate)
+        candidate = re.sub(
+            r"\b(as instructed|per the guidelines)\b",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        )
+        candidate = re.sub(r"[ \t]{2,}", " ", candidate).strip(" -–—\t")
+        candidate = re.sub(r"\s+([,.;:])", r"\1", candidate).strip()
+
+        # Preserve useful remaining prose if enough substance remains.
+        if len(candidate.split()) >= 8 and re.search(r"[A-Za-z]", candidate):
+            if candidate and candidate[-1] not in ".!?":
+                candidate += "."
+            rewritten_lines.append(candidate)
+            continue
+
+        # Otherwise replace with a compact section-aware anchor line.
+        replacement = _section_anchor(current_section)
+        if replacement:
+            rewritten_lines.append(replacement)
+        # If we still have no meaningful replacement (e.g., Key Metrics), drop the line.
+
+    rewritten = "\n".join(rewritten_lines)
+    rewritten = re.sub(r"\n{3,}", "\n\n", rewritten)
+    rewritten = re.sub(r"[ \t]{2,}", " ", rewritten)
+    return rewritten.strip()
+
+
+def _cap_closing_sentences_filings(text: str, max_sentences: int = 6) -> str:
+    """Enforce a hard sentence cap on the Closing Takeaway section.
+
+    1. Extract the Closing Takeaway body.
+    2. Deduplicate sentences with >70% content-token overlap (keep first).
+    3. Keep at most `max_sentences` prose sentences.
+    4. Preserve the section heading and any structured lines.
+    """
+    if not text:
+        return text
+
+    closing_match = re.search(
+        r"(##\s*Closing\s+Takeaway\s*)\n+([\s\S]*?)(?=\n##\s|\Z)",
+        text,
+        re.IGNORECASE,
+    )
+    if not closing_match:
+        return text
+
+    heading = closing_match.group(1).strip()
+    body = closing_match.group(2).strip()
+    if not body:
+        return text
+    if _count_words(body) >= 140:
+        return text
+
+    # Separate structured/metadata lines from prose
+    body_lines = body.splitlines()
+    prose_lines: List[str] = []
+    meta_lines: List[str] = []
+    for bl in body_lines:
+        bl_stripped = bl.strip()
+        if not bl_stripped:
+            continue
+        # Keep explicit stance/trigger/recommendation labels as metadata
+        if re.match(
+            r"^(STANCE|CONVICTION|Stance|Conviction)\s*:", bl_stripped, re.IGNORECASE
+        ):
+            meta_lines.append(bl_stripped)
+        else:
+            prose_lines.append(bl_stripped)
+
+    prose = " ".join(prose_lines)
+    if not prose:
+        return text
+
+    # Split into sentences
+    sentences = re.split(r"(?<=[.!?])\s+", prose)
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    # Simple stopword set for token extraction
+    _sw = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "if",
+        "then",
+        "so",
+        "to",
+        "of",
+        "in",
+        "on",
+        "for",
+        "with",
+        "as",
+        "at",
+        "by",
+        "from",
+        "into",
+        "that",
+        "this",
+        "it",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "will",
+        "would",
+        "can",
+        "could",
+        "should",
+        "may",
+        "might",
+        "we",
+        "i",
+        "my",
+        "our",
+        "your",
+        "not",
+        "no",
+        "its",
+    }
+
+    def _tokens(sent: str) -> set:
+        lowered = (sent or "").lower()
+        toks = re.split(r"[^a-z0-9$%]+", lowered)
+        return {t for t in toks if t and t not in _sw and len(t) >= 3}
+
+    # Deduplicate (fuzzy >70% overlap)
+    deduped: List[str] = []
+    seen_toks: List[set] = []
+    for sent in sentences:
+        toks = _tokens(sent)
+        is_dup = False
+        if len(toks) >= 3:
+            for prior in seen_toks:
+                if not prior:
+                    continue
+                overlap = toks & prior
+                smaller = min(len(toks), len(prior))
+                if smaller > 0 and len(overlap) / smaller > 0.70:
+                    is_dup = True
+                    break
+        if not is_dup:
+            deduped.append(sent)
+            seen_toks.append(toks)
+
+    # Hard cap
+    capped = deduped[:max_sentences]
+
+    # Rebuild
+    new_body_parts = [" ".join(capped)]
+    if meta_lines:
+        new_body_parts.append("")
+        new_body_parts.extend(meta_lines)
+
+    new_section = f"{heading}\n" + "\n".join(new_body_parts) + "\n"
+
+    start = closing_match.start()
+    end = closing_match.end()
+    return text[:start] + new_section + text[end:]
 
 
 def _dedupe_consecutive_sentences(text: str) -> str:
@@ -13886,7 +26277,7 @@ def _merge_staccato_paragraphs(summary_text: str) -> str:
 
             words = _count_words(paragraph)
             sentences = _sentence_count(paragraph)
-            is_staccato = sentences <= 1 and words <= 22
+            is_staccato = sentences <= 1 and words <= 35
 
             if is_staccato and not _is_structured_line(merged[-1]):
                 merged[-1] = f"{merged[-1].rstrip()} {paragraph.lstrip()}".strip()
@@ -14008,6 +26399,79 @@ def _normalize_section_headings(text: str, include_health_rating: bool) -> str:
         normalized_text = header_spacing_pattern.sub(ensure_spacing, normalized_text)
 
     return normalized_text.strip()
+
+
+def _merge_duplicate_canonical_sections(
+    text: str, *, include_health_rating: bool
+) -> str:
+    """Merge duplicate canonical markdown sections into a single section body."""
+    if not text:
+        return text
+
+    required_titles = [
+        title
+        for title, _ in SUMMARY_SECTION_REQUIREMENTS
+        if include_health_rating or title != "Financial Health Rating"
+    ]
+    canonical_set = set(required_titles)
+    heading_re = re.compile(r"^\s*##\s+(.+?)\s*$", re.MULTILINE)
+
+    pieces: List[Tuple[Optional[str], str]] = []
+    last_end = 0
+    matches = list(heading_re.finditer(text))
+    if not matches:
+        return text
+
+    preamble = text[: matches[0].start()].strip()
+    for idx, match in enumerate(matches):
+        heading = (match.group(1) or "").strip()
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        body = (text[start:end] or "").strip()
+        pieces.append((heading, body))
+        last_end = end
+
+    trailing = text[last_end:].strip() if last_end < len(text) else ""
+
+    merged_bodies: Dict[str, List[str]] = {}
+    extras: List[Tuple[str, str]] = []
+    saw_duplicate = False
+
+    for raw_heading, body in pieces:
+        canon = _standard_section_name_from_heading(f"## {raw_heading or ''}")
+        if canon in canonical_set:
+            if canon in merged_bodies:
+                saw_duplicate = True
+            merged_bodies.setdefault(canon, []).append(body)
+        else:
+            extras.append((raw_heading or "", body))
+
+    if not saw_duplicate:
+        return text.strip()
+
+    rebuilt: List[str] = []
+    if preamble:
+        rebuilt.append(preamble)
+
+    for title in required_titles:
+        chunks = [
+            chunk.strip() for chunk in merged_bodies.get(title, []) if chunk.strip()
+        ]
+        if not chunks:
+            continue
+        merged_body = "\n\n".join(chunks).strip()
+        rebuilt.append(f"## {title}\n{merged_body}".strip())
+
+    for raw_heading, body in extras:
+        heading = raw_heading.strip()
+        if not heading:
+            continue
+        rebuilt.append(f"## {heading}\n{(body or '').strip()}".strip())
+
+    if trailing:
+        rebuilt.append(trailing)
+
+    return "\n\n".join(part for part in rebuilt if part).strip()
 
 
 def _format_metric_value_for_text(key: str, value: float) -> str:
@@ -14207,12 +26671,140 @@ def _ensure_personal_verdict(
     return closing
 
 
+def _derive_closing_recommendation_signals(
+    calculated_metrics: Optional[Dict[str, Any]],
+) -> Tuple[List[str], List[str]]:
+    """Build deterministic strength/concern hints for closing verdict repair."""
+    metrics = calculated_metrics or {}
+    strengths: List[str] = []
+    concerns: List[str] = []
+
+    op_margin = metrics.get("operating_margin", 0)
+    net_margin = metrics.get("net_margin", 0)
+    fcf = metrics.get("free_cash_flow", 0)
+    revenue = metrics.get("revenue") or metrics.get("total_revenue")
+    cash = metrics.get("cash")
+    securities = metrics.get("marketable_securities") or 0
+    total_liabilities = metrics.get("total_liabilities")
+    total_assets = metrics.get("total_assets")
+    current_ratio = metrics.get("current_ratio")
+    interest_coverage = metrics.get("interest_coverage")
+
+    cash_total = None
+    if cash is not None:
+        cash_total = cash + (securities or 0)
+
+    fcf_margin_pct = None
+    if fcf and revenue:
+        try:
+            fcf_margin_pct = (fcf / revenue) * 100
+        except Exception:
+            fcf_margin_pct = None
+
+    if op_margin and op_margin > 20:
+        strengths.append("strong operating margin")
+    if net_margin and net_margin > 10:
+        strengths.append("healthy profitability")
+    if fcf and fcf > 0 and fcf_margin_pct is not None and fcf_margin_pct >= 10:
+        if fcf_margin_pct > 100:
+            concerns.append(
+                "FCF margin exceeds 100% (working-capital-driven, not sustainable)"
+            )
+        elif fcf_margin_pct > 50:
+            strengths.append("very high free cash flow conversion (likely timing-driven)")
+        else:
+            strengths.append("strong free cash flow conversion")
+    elif fcf and fcf > 0:
+        strengths.append("positive free cash flow")
+
+    if op_margin and op_margin < 5:
+        concerns.append("thin margins")
+    if net_margin and net_margin < 0:
+        concerns.append("net losses")
+    if fcf is not None and fcf <= 0:
+        concerns.append("negative free cash flow")
+    if fcf_margin_pct is not None and fcf_margin_pct < 8:
+        concerns.append("low free-cash-flow margin")
+
+    if cash_total is not None and total_liabilities is not None:
+        if cash_total > total_liabilities:
+            strengths.append("net cash balance sheet")
+        elif total_liabilities > cash_total * 2:
+            concerns.append("large liability load versus cash")
+
+    if total_liabilities and total_assets:
+        try:
+            leverage = total_liabilities / total_assets
+        except Exception:
+            leverage = None
+        if leverage is not None and leverage > 0.8:
+            concerns.append("elevated leverage")
+
+    if current_ratio is not None and current_ratio >= 1.5:
+        strengths.append("solid liquidity")
+    elif current_ratio is not None and current_ratio < 1.0:
+        concerns.append("tight liquidity")
+
+    if interest_coverage is not None and interest_coverage >= 8:
+        strengths.append("strong interest coverage")
+    elif interest_coverage is not None and interest_coverage < 2:
+        concerns.append("thin interest coverage")
+
+    return strengths, concerns
+
+
+def _repair_closing_recommendation_in_summary(
+    summary_text: str,
+    *,
+    company_name: str,
+    calculated_metrics: Optional[Dict[str, Any]],
+    persona_requested: bool,
+) -> str:
+    """Restore a missing explicit verdict after late cleanup or trimming passes."""
+    text = (summary_text or "").strip()
+    if not text:
+        return summary_text
+
+    closing_body = _extract_markdown_section_body(text, "Closing Takeaway")
+    if not closing_body:
+        return summary_text
+
+    strengths, concerns = _derive_closing_recommendation_signals(calculated_metrics)
+    if persona_requested:
+        if _contains_personal_verdict(closing_body):
+            return summary_text
+        if re.search(r"\b(buy|hold|sell)\b", closing_body, re.IGNORECASE):
+            return summary_text
+        patched = _ensure_personal_verdict(
+            closing_body,
+            company_name,
+            strengths=strengths,
+            concerns=concerns,
+        )
+    else:
+        if _contains_objective_recommendation(closing_body):
+            return summary_text
+        if re.search(r"\b(buy|hold|sell)\b", closing_body, re.IGNORECASE):
+            return summary_text
+        patched = _ensure_objective_recommendation(
+            closing_body,
+            company_name,
+            strengths=strengths,
+            concerns=concerns,
+        )
+
+    if patched == closing_body:
+        return summary_text
+    return _replace_markdown_section_body(text, "Closing Takeaway", patched)
+
+
 def _generate_fallback_closing_takeaway(
     company_name: str,
     calculated_metrics: Dict[str, Any],
     persona_name: Optional[str] = None,
     *,
     persona_requested: bool = False,
+    budget_words: Optional[int] = None,
 ) -> str:
     """Generate a substantive closing takeaway from available financial metrics.
 
@@ -14230,6 +26822,8 @@ def _generate_fallback_closing_takeaway(
     revenue = calculated_metrics.get("revenue") or calculated_metrics.get(
         "total_revenue"
     )
+    shape = get_closing_takeaway_shape(int(budget_words or 100))
+    long_form_budget = int(budget_words or 0) >= 120
 
     # Assess overall financial quality
     strengths = []
@@ -14279,6 +26873,14 @@ def _generate_fallback_closing_takeaway(
         quality = "uncertain"
         is_positive = False
         is_mixed = False
+
+    strengths_str = (
+        " and ".join(strengths[:2])
+        if strengths
+        else "limited visibility into fundamentals"
+    )
+    concerns_str = " and ".join(concerns[:2]) if concerns else "no major red flags"
+    rev_str = _format_dollar(revenue) if revenue else None
 
     # Persona-specific closing templates
     if (
@@ -14351,14 +26953,6 @@ def _generate_fallback_closing_takeaway(
         digest = hashlib.sha256(seed_material.encode("utf-8")).digest()
         rng = random.Random(int.from_bytes(digest[:8], "big"))
 
-        strengths_str = (
-            " and ".join(strengths[:2]) if strengths else "limited visibility"
-        )
-        concerns_str = (
-            " and ".join(concerns[:2]) if concerns else "no obvious red flags"
-        )
-        rev_str = _format_dollar(revenue) if revenue else None
-
         if strengths and not concerns:
             variants = [
                 [
@@ -14412,6 +27006,143 @@ def _generate_fallback_closing_takeaway(
         return _ensure_personal_verdict(closing, company_name, strengths, concerns)
 
     # Generic fallback (no persona selected) - longer and reasoned (~80-110 words)
+    if long_form_budget:
+        rev_clause = f" on {(_format_dollar(revenue) or 'the current revenue base')}" if revenue else ""
+        fcf_clause = (
+            f" with free cash flow of {_format_dollar(free_cash_flow)}"
+            if free_cash_flow is not None
+            else ""
+        )
+        balance_clause = ""
+        if cash is not None and total_debt is not None:
+            if cash > total_debt:
+                balance_clause = " and a net cash position that keeps financing risk contained"
+            else:
+                balance_clause = " and a balance sheet that still needs disciplined capital allocation"
+        elif cash is not None:
+            balance_clause = f" and {_format_dollar(cash)} of cash that supports flexibility"
+
+        if strengths and not concerns:
+            long_form_sentences = [
+                f"{company_name} still reads as a high-quality business{rev_clause}, supported by {strengths_str}{fcf_clause}{balance_clause}.",
+                "The central underwriting question is whether current operating strength can remain durable once reinvestment, competitive response, and normal capital intensity are viewed together rather than quarter by quarter.",
+                "At the moment, the margin structure and cash generation suggest the business is funding its own growth, which matters because self-funded reinvestment gives management more room to pace spending without leaning on external financing or defensive balance-sheet choices.",
+                "That does not make the thesis automatic: the market still needs evidence that revenue quality, margin resilience, and free-cash-flow conversion can stay aligned as the company absorbs the next phase of operating demands.",
+                f"A BUY recommendation is justified only because the current evidence still points to durable economics rather than short-lived earnings support.",
+                "What must stay true is that operating performance continues to convert into repeatable free cash flow over the next 2-4 quarters, so the business keeps proving that growth and reinvestment are being financed from internally generated cash rather than accounting optics.",
+                "What breaks the thesis is a period in which margins compress and cash conversion weakens at the same time over the next 2-4 quarters, because that would imply the reported earnings base is less durable than the headline results suggest.",
+                "That distinction matters for valuation support and capital allocation alike, since a self-funding business can keep compounding through volatility while a weaker cash engine forces management to trade off reinvestment, buybacks, and balance-sheet resilience."
+            ]
+        elif concerns and not strengths:
+            long_form_sentences = [
+                f"{company_name} remains constrained by {concerns_str}{rev_clause}, which makes the current earnings base harder to underwrite with confidence.",
+                "The core issue is not simply weak optics in one line item, but whether the business can translate reported performance into durable cash generation without exposing itself to tighter liquidity, weaker pricing power, or a more fragile capital structure.",
+                "In that setup, each quarter of apparent stabilization has to be tested against free-cash-flow durability and balance-sheet flexibility, because those are the variables that determine whether the company is truly improving or just buying time.",
+                f"A SELL recommendation is appropriate because the downside case still has a clearer transmission path than the upside case.",
+                "What must stay true for that negative view to soften is measurable improvement in operating margin and repeatable free-cash-flow conversion over the next 2-4 quarters, not just a single better print.",
+                "What breaks the bearish thesis is a sustained period in which the company stabilizes profitability and cash generation together over the next 2-4 quarters, proving that funding pressure and earnings-quality concerns are receding rather than compounding.",
+                "Until that evidence shows up, capital allocation remains defensive by necessity, which limits both strategic optionality and valuation support because investors have to assume more cash will be used to protect the balance sheet than to compound shareholder value."
+            ]
+        else:
+            long_form_sentences = [
+                f"{company_name} presents a mixed underwriting picture{rev_clause}: {strengths[0] if strengths else 'there are still operating positives'} offset by {concerns[0] if concerns else 'real uncertainty around durability'}.",
+                "That mixed setup means the investment case depends less on the headline result and more on whether the stronger elements of the business can keep funding the weaker ones without degrading margins, cash generation, or strategic flexibility.",
+                "The current evidence is good enough to avoid a fully bearish conclusion, but not yet strong enough to treat the business as obviously compounding through the next cycle without a further proof point on earnings quality and cash conversion.",
+                "A HOLD recommendation is the most defensible stance because the risk-reward still hinges on execution rather than on a clearly one-sided financial picture.",
+                "What must stay true is that the healthier part of the model continues to generate enough operating cash and margin support over the next 2-4 quarters to absorb reinvestment needs and keep the balance sheet from becoming the constraint.",
+                "What breaks the thesis is a period over the next 2-4 quarters in which weaker unit economics, margin slippage, or softer cash conversion start to reinforce one another, because that would turn a manageable mixed case into a structurally weaker one.",
+                "The upside path is still available if the company can show that profitability converts into durable free cash flow without relying on temporary timing benefits or unusually favorable cost conditions.",
+                "That matters for capital allocation and valuation support because a business with self-funded flexibility can justify patience, while a business that has to spend defensively usually deserves a narrower multiple and a more cautious posture.",
+                "The practical payoff from getting this call right is that stronger cash conversion would let investors underwrite both reinvestment capacity and multiple support from the same operating evidence instead of having to choose which part of the story they trust."
+            ]
+
+        lower_band_target = (
+            max(
+                180,
+                int(budget_words)
+                - int(
+                    _section_budget_tolerance_words(
+                        int(budget_words), max_tolerance=15
+                    )
+                ),
+            )
+            if budget_words
+            else 180
+        )
+        if budget_words and _count_words(" ".join(long_form_sentences)) < lower_band_target:
+            long_form_suffixes = [
+                ", which is why the current multiple still depends on durability rather than momentum alone.",
+                ", because the market usually gives less credit to growth when the cash engine behind it looks fragile.",
+                ", and that is the difference between a business that can compound through volatility and one that merely looks better for a quarter or two.",
+                ", especially when valuation already assumes management can keep reinvestment and returns in balance.",
+                ", because the long case only works when the same evidence supports both growth and funding capacity.",
+                ", rather than relying on temporary working-capital benefits or unusually favorable cost timing.",
+                ", since simultaneous pressure on those two variables usually forces both strategic and valuation resets.",
+                ", and that interaction ultimately determines how much patience investors can afford to have.",
+                ", while weaker evidence would force a narrower valuation framework and a more defensive stance.",
+            ]
+            desired_words = lower_band_target
+            running_words = 0
+            expanded_long_form_sentences: List[str] = []
+            for idx, sentence in enumerate(long_form_sentences):
+                clean_sentence = str(sentence or "").strip()
+                if not clean_sentence:
+                    continue
+                if (
+                    running_words < desired_words
+                    and idx < len(long_form_suffixes)
+                        and clean_sentence.endswith((".", "!", "?"))
+                ):
+                    clean_sentence = clean_sentence[:-1] + long_form_suffixes[idx]
+                running_words += _count_words(clean_sentence)
+                expanded_long_form_sentences.append(clean_sentence)
+            long_form_sentences = expanded_long_form_sentences
+            if _count_words(" ".join(long_form_sentences)) < desired_words:
+                extension_suffixes = [
+                    ", which would confirm that the business can still convert operating strength into funding capacity rather than using accounting optics to smooth the transition.",
+                    ", making the stance more defensible because the same evidence would support both the growth outlook and the financing profile.",
+                    ", which is the key difference between a business that deserves patience and one that simply consumes investor patience.",
+                ]
+                expanded_again: List[str] = list(long_form_sentences)
+                for idx in range(len(expanded_again) - 1, -1, -1):
+                    if _count_words(" ".join(expanded_again)) >= desired_words:
+                        break
+                    sentence = expanded_again[idx].strip()
+                    if not sentence or not sentence.endswith((".", "!", "?")):
+                        continue
+                    suffix = extension_suffixes[
+                        min(len(expanded_again) - 1 - idx, len(extension_suffixes) - 1)
+                    ]
+                    expanded_again[idx] = sentence[:-1] + suffix + "."
+                long_form_sentences = expanded_again
+
+        long_form_text = " ".join(long_form_sentences).strip()
+        if int(shape.preferred_paragraphs or 1) > 1 and len(long_form_sentences) >= 6:
+            split_idx = max(3, len(long_form_sentences) // 2)
+            long_form_text = (
+                " ".join(long_form_sentences[:split_idx]).strip()
+                + "\n\n"
+                + " ".join(long_form_sentences[split_idx:]).strip()
+            ).strip()
+        if budget_words:
+            upper_band = int(budget_words) + int(
+                _section_budget_tolerance_words(int(budget_words), max_tolerance=15)
+            )
+            long_form_words = _count_words(long_form_text)
+            if long_form_words > upper_band:
+                over_by = long_form_words - upper_band
+                if 0 < over_by <= 20:
+                    tokens = long_form_text.split()
+                    if len(tokens) > over_by + 1:
+                        long_form_text = " ".join(tokens[: len(tokens) - over_by]).strip()
+                else:
+                    long_form_text = _truncate_text_to_word_limit(
+                        long_form_text, upper_band
+                    ).strip()
+                if long_form_text and long_form_text[-1] not in ".!?":
+                    long_form_text += "."
+        return long_form_text
+
     seed_material = "|".join(
         [
             company_name or "",
@@ -14808,6 +27539,7 @@ def _ensure_required_sections(
     """
     text = summary_text
     persona_mode = bool(persona_requested) or bool(persona_name)
+    short_quality_mode = _is_short_quality_sensitive_target(target_length)
 
     def _short_company_label(name: str) -> str:
         cleaned = re.sub(r"[^A-Za-z0-9& ]+", " ", (name or "")).strip()
@@ -14848,6 +27580,19 @@ def _ensure_required_sections(
         company_tokens.discard("the")
 
         generic = {
+            "the",
+            "and",
+            "our",
+            "ours",
+            "your",
+            "their",
+            "its",
+            "this",
+            "that",
+            "these",
+            "those",
+            "here",
+            "there",
             "company",
             "companies",
             "business",
@@ -14879,10 +27624,22 @@ def _ensure_required_sections(
             "future",
             "forward",
             "looking",
+            "investment",
+            "investments",
+            "returns",
+            "return",
+            "period",
+            "periods",
             "statements",
             "item",
             "items",
             "section",
+            "report",
+            "reports",
+            "filing",
+            "filings",
+            "statement",
+            "statements",
         }
 
         deprioritized = {
@@ -15091,6 +27848,30 @@ def _ensure_required_sections(
     min_words_by_section = dict(SUMMARY_SECTION_MIN_WORDS)
     if not include_health_rating:
         min_words_by_section.pop("Financial Health Rating", None)
+    section_budgets = (
+        _calculate_section_word_budgets(
+            int(target_length), include_health_rating=include_health_rating
+        )
+        if target_length and int(target_length) > 0
+        else {}
+    )
+    risk_budget_words = int(section_budgets.get("Risk Factors", 0) or 0)
+    closing_budget_words = int(section_budgets.get("Closing Takeaway", 0) or 0)
+    risk_shape = (
+        get_risk_factors_shape(risk_budget_words) if risk_budget_words > 0 else None
+    )
+    closing_shape = (
+        get_closing_takeaway_shape(closing_budget_words)
+        if closing_budget_words > 0
+        else None
+    )
+
+    def _section_budget_min_words(title: str, fallback: int) -> int:
+        budget = int(section_budgets.get(title, 0) or 0)
+        if budget <= 0:
+            return int(fallback)
+        tol = _section_budget_tolerance_words(budget, max_tolerance=10)
+        return max(int(fallback), max(1, int(budget) - int(tol)))
 
     def _count_sentences(body: str) -> int:
         return len(re.findall(r"[.!?](?:\s|$)", body or ""))
@@ -15105,7 +27886,7 @@ def _ensure_required_sections(
             return entries
 
         pattern = re.compile(
-            r"\*\*(.+?)\*\*\s*:\s*([\s\S]*?)(?=\n\s*\*\*.+?\*\*\s*:|\Z)"
+            r"\*\*(.+?)\*\*\s*(?::|[-–—]|\.)\s*([\s\S]*?)(?=\n\s*\*\*.+?\*\*\s*(?::|[-–—]|\.)|\Z)"
         )
         for match in pattern.finditer(cleaned_body):
             name = match.group(1).strip()
@@ -15122,7 +27903,7 @@ def _ensure_required_sections(
             if not line:
                 continue
             line = re.sub(r"^[\-\*]\s*", "", line)
-            match = re.match(r"\*\*(.+?)\*\*\s*:\s*(.+)", line)
+            match = re.match(r"\*\*(.+?)\*\*\s*(?::|[-–—]|\.)\s*(.+)", line)
             if not match:
                 continue
             name = match.group(1).strip()
@@ -15188,6 +27969,10 @@ def _ensure_required_sections(
 
     def _normalize_risk_factors_section() -> None:
         nonlocal text
+        expected_risk_count = int(risk_shape.risk_count or 0) if risk_shape else 0
+        min_section_words = _section_budget_min_words(
+            "Risk Factors", int(min_words_by_section.get("Risk Factors", 20) or 20)
+        )
         pattern = re.compile(
             r"##\s*Risk Factors\s*\n+([\s\S]*?)(?=\n##\s|\Z)",
             re.IGNORECASE,
@@ -15197,7 +27982,9 @@ def _ensure_required_sections(
             return
         body = (match.group(1) or "").strip()
         if not body:
-            replacement = _synthesize_risk_factors_addendum()
+            replacement = _synthesize_risk_factors_addendum(
+                budget_words=risk_budget_words
+            )
             if replacement:
                 text = pattern.sub(
                     lambda _m: f"## Risk Factors\n{replacement}\n",
@@ -15232,11 +28019,25 @@ def _ensure_required_sections(
                 seen_desc_tokens.append(desc_tokens)
 
         # Do NOT force generic padding risks when the model already produced
-        # multiple company-specific items. Only backfill if we lack a second
-        # substantive risk entry.
-        if len(cleaned_entries) < 2:
+        # multiple company-specific items. Only backfill when we are below the
+        # expected risk count or the section still lands materially underweight.
+        if (
+            not short_quality_mode
+            and (
+                (expected_risk_count > 0 and len(cleaned_entries) < expected_risk_count)
+                or (
+                    risk_budget_words > 0
+                    and _count_words(
+                        "\n\n".join(
+                            f"**{name}**: {desc}" for name, desc in cleaned_entries
+                        )
+                    )
+                    < min_section_words
+                )
+            )
+        ):
             fallback_entries = _extract_risk_entries(
-                _synthesize_risk_factors_addendum()
+                _synthesize_risk_factors_addendum(budget_words=risk_budget_words)
             )
             for name, desc in fallback_entries:
                 name = _rewrite_generic_risk_name(name)
@@ -15257,16 +28058,25 @@ def _ensure_required_sections(
                     seen_desc_norms.add(desc_norm)
                 if desc_tokens:
                     seen_desc_tokens.append(desc_tokens)
-                if len(cleaned_entries) >= 2:
+                if expected_risk_count > 0 and len(cleaned_entries) >= expected_risk_count:
                     break
 
         if not cleaned_entries:
             return
 
-        cleaned_entries = cleaned_entries[:3]
+        if expected_risk_count > 0:
+            cleaned_entries = cleaned_entries[:expected_risk_count]
+        else:
+            cleaned_entries = cleaned_entries[:3]
         rebuilt_body = "\n\n".join(
             f"**{name}**: {desc}" for name, desc in cleaned_entries
         )
+        if risk_budget_words > 0 and _count_words(rebuilt_body) < min_section_words:
+            fallback_body = _synthesize_risk_factors_addendum(
+                budget_words=risk_budget_words
+            )
+            if fallback_body:
+                rebuilt_body = fallback_body
         text = pattern.sub(
             lambda _m: f"## Risk Factors\n{rebuilt_body}\n", text, count=1
         )
@@ -15304,6 +28114,14 @@ def _ensure_required_sections(
             calculated_metrics,
             health_score_data={"score_band": band_label} if band_label else None,
             health_rating_config=health_rating_config,
+            budget_words=int(
+                _calculate_section_word_budgets(
+                    int(target_length), include_health_rating=True
+                ).get("Financial Health Rating", 0)
+                or 0
+            )
+            if target_length
+            else None,
         )
 
         _append_section(
@@ -15356,12 +28174,11 @@ def _ensure_required_sections(
             )
 
         if not parts:
+            if short_quality_mode or not _is_long_form_target(target_length):
+                return ""
             parts.append(
-                "Financial performance commentary not provided in the draft; add revenue, margin, and cash flow context."
+                "Reported financials lack sufficient detail on revenue, margin, and cash flow to assess operating quality; the investment case depends on whether future filings clarify the earnings-to-cash bridge."
             )
-        parts.append(
-            "Connect revenue trends to margin direction and cash conversion to show sustainability."
-        )
         return " ".join(parts)
 
     def _synthesize_executive_summary_addendum() -> str:
@@ -15431,7 +28248,11 @@ def _ensure_required_sections(
             except Exception:
                 fcf_margin_pct = None
 
-        intro = "The key question is whether"
+        intro = (
+            "The key question is whether"
+            if not short_quality_mode
+            else "The core issue is whether"
+        )
 
         sentences: List[str] = []
         if rev_str and op_inc_str:
@@ -15465,6 +28286,8 @@ def _ensure_required_sections(
             )
 
         if not sentences:
+            if short_quality_mode:
+                return ""
             return "The investment case hinges on whether operating profitability and cash conversion can compound without margin fragility or balance-sheet stress."
 
         return " ".join(sentences).strip()
@@ -15532,23 +28355,47 @@ def _ensure_required_sections(
                 f"Operating cash flow {ocf_str} converts to free cash flow {fcf_str}{capex_clause}, which is the cash that can fund reinvestment, buybacks, or balance-sheet de-risking."
             )
 
-        sentences.append(
-            "Unit economics need to improve via pricing discipline and efficiency, rather than compressing under incentives, insurance, and regulatory costs."
-        )
+        if not sentences:
+            if short_quality_mode:
+                return ""
+            sentences.append(
+                "The financial performance picture depends on whether revenue growth is translating into durable margin expansion and consistent cash conversion."
+            )
 
         return " ".join([s for s in sentences if s]).strip()
 
-    def _synthesize_risk_factors_addendum() -> str:
+    def _synthesize_risk_factors_addendum(
+        *, budget_words: Optional[int] = None
+    ) -> str:
         """Add concrete risk scenarios when Risk Factors is too thin.
 
         Goal: make Risk Factors feel like *underwriting*, not boilerplate.
         We keep this metric-anchored so it reads substantive.
         """
+        budget = int(budget_words or risk_budget_words or 0)
+        shape = get_risk_factors_shape(budget or 180)
+        expected_count = int(shape.risk_count or 3)
+        per_risk_min = int(shape.per_risk_min_sentences or 2)
+        per_risk_max = int(shape.per_risk_max_sentences or 3)
+        per_risk_budget = (
+            max(18, budget // max(1, expected_count)) if budget > 0 else 110
+        )
+        long_form = per_risk_min >= 4
+        very_long_form = per_risk_budget >= 170
 
         lead = "A key risk is that"
 
         excerpt_lower = (risk_factors_excerpt or "").lower()
         reg_driver = _regulatory_driver_label(risk_factors_excerpt)
+        has_cloud_backlog = "cloud" in excerpt_lower or "backlog" in excerpt_lower
+        has_ads = any(
+            token in excerpt_lower
+            for token in ("advertis", "search", "youtube", "traffic acquisition")
+        )
+        has_ai = any(
+            token in excerpt_lower
+            for token in ("ai", "gpu", "compute", "accelerator", "inference")
+        )
 
         revenue = calculated_metrics.get("revenue")
         operating_margin = calculated_metrics.get("operating_margin")
@@ -15582,6 +28429,11 @@ def _ensure_required_sections(
             if capex is not None
             else None
         )
+        revenue_str = (
+            _format_metric_value_for_text("revenue", revenue)
+            if revenue is not None
+            else None
+        )
 
         fcf_margin_pct = None
         if fcf is not None and revenue:
@@ -15610,104 +28462,354 @@ def _ensure_required_sections(
             return None
 
         driver_hint = _business_driver_hint()
+        default_signal = (
+            "watch utilization, pricing realization, and cash conversion for evidence the risk is becoming financial rather than just operational"
+        )
+
+        def _clean_sentence(sentence: str) -> str:
+            cleaned = " ".join((sentence or "").split()).strip()
+            if cleaned and cleaned[-1] not in ".!?":
+                cleaned += "."
+            return cleaned
+
+        def _finalize_risk(name: str, sentences: List[str]) -> str:
+            cleaned_sentences = [_clean_sentence(sentence) for sentence in sentences if sentence]
+            if not cleaned_sentences:
+                return ""
+            if len(cleaned_sentences) < per_risk_min:
+                filler_pool = [
+                    "That matters because the thesis weakens quickly when a visible operating issue starts to travel into revenue quality, margins, or cash generation.",
+                    f"Early-warning signal: {default_signal}.",
+                    "If management has to protect the balance sheet before it can protect growth, the downside stops being cyclical and starts looking structural.",
+                    "That would also narrow valuation support, because investors would need to underwrite a more fragile funding profile rather than a self-financing growth engine.",
+                ]
+                for filler in filler_pool:
+                    if len(cleaned_sentences) >= per_risk_min:
+                        break
+                    cleaned_sentences.append(_clean_sentence(filler))
+            cleaned_sentences = cleaned_sentences[:per_risk_max]
+            if very_long_form:
+                desired_words = max(160, int(per_risk_budget) - 10)
+                expansion_suffixes = [
+                    ", which matters because the company ends up spending ahead of realized demand and loses visibility into when those investments actually earn back their cost",
+                    ", making it easier for what looks like an operating issue to become a revenue-quality and margin problem at the same time",
+                    ", so investors have to underwrite a longer payback period and weaker cash efficiency instead of simply slower growth",
+                    ", because these indicators usually soften before the full effect reaches recognized revenue, operating income, or free cash flow",
+                    ", increasing the odds of a multiple reset before management can prove the pressure is temporary rather than structural",
+                ]
+                expanded_sentences: List[str] = []
+                for idx, sentence in enumerate(cleaned_sentences):
+                    updated = sentence
+                    current_wc = _count_words(
+                        f"**{name}**: {' '.join(expanded_sentences + cleaned_sentences[idx:])}"
+                    )
+                    if (
+                        current_wc < desired_words
+                        and updated.endswith((".", "!", "?"))
+                    ):
+                        suffix = expansion_suffixes[min(idx, len(expansion_suffixes) - 1)]
+                        updated = updated[:-1] + suffix + "."
+                    expanded_sentences.append(updated)
+                cleaned_sentences = expanded_sentences
+            return f"**{name}**: {' '.join(cleaned_sentences)}".strip()
 
         # 0) Regulatory / enforcement when the filing flags it.
-        if reg_driver:
-            risk_name = _rewrite_generic_risk_name("Regulatory and Antitrust Scrutiny")
-            margin_clause = (
-                f" With operating margin around {operating_margin:.1f}%, even modest monetization friction can matter."
-                if operating_margin is not None
-                else ""
-            )
-            risks.append(
-                f"**{risk_name}**: {lead} the filing's emphasis on {reg_driver.lower()} exposure translates into remedies, fines, or product changes that reduce monetization efficiency."
-                f"{margin_clause} If enforcement forces changes to data use, distribution, or bundling, the impact often shows up first as slower pricing power and higher compliance cost."
-            )
+        if has_cloud_backlog:
+            cloud_name = _rewrite_generic_risk_name("Cloud Capacity and Backlog Conversion Risk")
+            cloud_sentences = [
+                f"{lead} contracted demand in cloud or backlog-like commitments converts more slowly than expected because capacity build-outs, power availability, or deployment timing fail to line up with customer consumption patterns."
+            ]
+            if revenue_str:
+                cloud_sentences.append(
+                    f"That would pressure the revenue base of {revenue_str} through weaker mix realization, while still leaving the company with the infrastructure cost needed to chase the demand opportunity."
+                )
+            else:
+                cloud_sentences.append(
+                    "That would hit revenue realization and keep cost-to-serve elevated at the same time, which is a poor combination for margin durability."
+                )
+            if long_form:
+                cloud_sentences.append(
+                    "The financial transmission path is that delayed workload onboarding or lower utilization stretches the payback period on infrastructure, so incremental growth arrives with less free-cash-flow support than the headline demand signal implies."
+                )
+                cloud_sentences.append(
+                    "Early-warning signal: watch backlog conversion, utilization, deferred-revenue recognition, and management commentary on power, data-center, or accelerator constraints for evidence that demand is outrunning delivery capacity."
+                )
+            if very_long_form:
+                cloud_sentences.append(
+                    "If that mismatch persists, investors stop underwriting backlog as near-dated revenue support and start treating the same commitments as proof of execution risk and lower capital efficiency."
+                )
+            risks.append(_finalize_risk(cloud_name, cloud_sentences))
 
-        # 1) Unit economics / cost shocks.
-        if operating_margin is not None:
-            risk_name = _rewrite_generic_risk_name("Margin Compression Risk")
+        if has_ads or has_ai or operating_margin is not None:
+            margin_name = _rewrite_generic_risk_name("Margin Compression Risk")
             driver_clause = (
-                f" This is most relevant given the business' dependence on {driver_hint}."
+                f" The pressure is most relevant in {driver_hint}."
                 if driver_hint
                 else ""
             )
-            risks.append(
-                f"**{risk_name}**: {lead} the current operating margin (~{operating_margin:.1f}%) leaves less cushion if reinvestment, incentives, insurance, or compliance costs rise faster than pricing. "
-                f"If growth slows at the same time, modest cost inflation can translate into outsized profit compression.{driver_clause}"
+            margin_intro = (
+                f"{lead} the current operating margin of {operating_margin:.1f}% leaves less cushion if AI serving costs, traffic acquisition, incentives, or compliance costs rise faster than pricing or monetization."
+                if operating_margin is not None
+                else f"{lead} reinvestment and competitive intensity rise faster than monetization, compressing the earnings base before scale offsets the cost curve."
             )
+            margin_sentences = [margin_intro + driver_clause]
+            margin_sentences.append(
+                "The transmission path runs through weaker unit economics: more compute or distribution spend per user interaction, higher cost-to-serve, and less room for revenue growth to translate into operating leverage."
+            )
+            if long_form:
+                margin_sentences.append(
+                    "That matters because the investment case depends on the stronger parts of the model funding the weaker ones; if cost intensity rises before monetization catches up, the self-funding argument weakens quickly."
+                )
+                margin_sentences.append(
+                    "Early-warning signal: watch advertiser ROI, pricing realization, traffic-acquisition trends, monetized usage, and management commentary on serving-cost intensity for evidence that the monetization curve is lagging the cost curve."
+                )
+            if very_long_form:
+                margin_sentences.append(
+                    "Once that gap opens, valuation support usually compresses faster than the income statement, because the market discounts the possibility that today's margins are being defended by timing or accounting relief rather than durable economics."
+                )
+            risks.append(_finalize_risk(margin_name, margin_sentences))
         elif net_margin is not None:
-            risk_name = _rewrite_generic_risk_name("Earnings Quality Risk")
-            risks.append(
-                f"**{risk_name}**: {lead} headline net margin ({net_margin:.1f}%) can be a noisy signal if below-the-line items fade or competitive spend re-accelerates. "
-                "If profitability is being supported by one-offs, the market can reprice quickly when operating income normalizes."
-            )
-        else:
-            risk_name = _rewrite_generic_risk_name("Competitive Spend Risk")
-            risks.append(
-                f"**{risk_name}**: {lead} competitive intensity can force higher incentive spend, compressing unit economics and delaying durable profitability. "
-                "If the company cannot hold price, the path to operating leverage becomes more fragile."
-            )
+            earnings_name = _rewrite_generic_risk_name("Earnings Quality Risk")
+            earnings_sentences = [
+                f"{lead} headline net margin of {net_margin:.1f}% overstates the underlying earnings base if below-the-line support fades or operating spend re-accelerates.",
+                "The transmission path is that investors can tolerate weaker reported growth for a while, but they rarely tolerate repeated evidence that accounting outcomes are stronger than the underlying cash economics.",
+                "Early-warning signal: watch the gap between operating and net margins, cash conversion, and non-operating support for signs that normalized profitability is weaker than the headline print suggests.",
+            ]
+            if long_form:
+                earnings_sentences.append(
+                    "If that gap stays wide, the downside reaches valuation through lower confidence in earnings durability rather than through a single quarter's EPS miss."
+                )
+            risks.append(_finalize_risk(earnings_name, earnings_sentences))
 
-        # 2) Cash conversion durability.
+        cash_name = _rewrite_generic_risk_name("Cash Conversion Reversal Risk")
         if ocf_str and fcf_str:
-            risk_name = _rewrite_generic_risk_name("Cash Conversion Reversal Risk")
             margin_clause = (
                 f" (~{fcf_margin_pct:.1f}% FCF margin)"
                 if fcf_margin_pct is not None
                 else ""
             )
-            capex_clause = ""
-            if capex_str:
-                capex_clause = f" The OCF→FCF bridge implies heavy reinvestment (capex {capex_str})."
-            elif ocf is not None and fcf is not None:
-                implied = ocf - fcf
-                implied_str = _format_metric_value_for_text(
-                    "capital_expenditures", implied
-                )
-                if implied_str:
-                    capex_clause = f" The OCF→FCF bridge implies material reinvestment (implied capex ~{implied_str})."
-            risks.append(
-                f"**{risk_name}**: With operating cash flow {ocf_str} and free cash flow {fcf_str}{margin_clause}, the risk is that cash conversion proves cyclical and normalizes lower if growth slows. "
-                f"Working-capital timing and capex cycles can make a strong quarter look repeatable when it is not.{capex_clause}"
+            capex_clause = (
+                f" with capex of {capex_str}"
+                if capex_str
+                else ""
             )
+            cash_sentences = [
+                f"With operating cash flow of {ocf_str} converting to free cash flow of {fcf_str}{margin_clause}{capex_clause}, another risk is that current cash conversion proves more cyclical than durable once working-capital timing and reinvestment normalize."
+            ]
+            cash_sentences.append(
+                "The transmission path is straightforward: if conversion weakens, management has less internally generated cash to fund capex, protect the balance sheet, and maintain shareholder returns at the same time."
+            )
+            if long_form:
+                cash_sentences.append(
+                    "That can pressure the thesis even if reported revenue still grows, because a business that needs more external funding or defensive balance-sheet choices loses the flexibility that long-duration investors are underwriting."
+                )
+                cash_sentences.append(
+                    "Early-warning signal: watch the operating-cash-flow to free-cash-flow bridge, capex intensity, working-capital swings, and management commentary on cash taxes or infrastructure spend for evidence that conversion is slipping."
+                )
+            if very_long_form:
+                cash_sentences.append(
+                    "If cash generation and reinvestment stop moving together, the market typically narrows the multiple before reported earnings fully reset because capital allocation becomes reactive instead of opportunistic."
+                )
+            risks.append(_finalize_risk(cash_name, cash_sentences))
         elif fcf_str:
-            risk_name = _rewrite_generic_risk_name("Cash Conversion Risk")
-            risks.append(
-                f"**{risk_name}**: Free cash flow {fcf_str} is a strength, but the downside case is weaker cash conversion if competition forces higher spend or payments/working-capital terms worsen. "
-                "If cash lags earnings for multiple quarters, valuation support can erode even if reported EPS holds up."
-            )
-        else:
-            risk_name = _rewrite_generic_risk_name("Cash Flow Visibility Risk")
-            risks.append(
-                f"**{risk_name}**: {lead} reported profitability may not translate into free cash flow if working capital and capex are moving against the company. "
-                "Without durable cash conversion, headline earnings become harder to underwrite."
-            )
-
-        # 3) Balance-sheet flexibility / refinancing.
-        if cash_str and liabilities_str and cash and liabilities:
-            if liabilities > cash * 2:
-                risk_name = _rewrite_generic_risk_name("Balance-Sheet Flexibility Risk")
-                reg_clause = (
-                    " If enforcement outcomes drive fines, settlements, or higher ongoing compliance spend, liquidity can tighten faster than expected."
-                    if reg_driver
-                    else ""
+            cash_sentences = [
+                f"Free cash flow of {fcf_str} is a current support, but the downside case is that weaker conversion forces the company to fund growth with less internally generated cash.",
+                "The financial transmission path runs through reduced buyback capacity, tighter reinvestment budgets, and less room to absorb operating volatility without changing the capital-allocation posture.",
+                "Early-warning signal: watch free-cash-flow conversion, capex pacing, and working-capital movements for evidence that the cash engine is weakening before revenue does.",
+            ]
+            if long_form:
+                cash_sentences.append(
+                    "That matters because a business can still look optically healthy for a period even as the quality of its funding base deteriorates."
                 )
-                risks.append(
-                    f"**{risk_name}**: {liabilities_str} of liabilities versus {cash_str} cash can constrain optionality if credit spreads widen or refinancing windows tighten. "
-                    f"In a downside scenario, management may be forced to prioritize de-risking over growth investment.{reg_clause}"
+            risks.append(_finalize_risk(cash_name, cash_sentences))
+
+        if reg_driver and len(risks) < expected_count:
+            reg_name = _rewrite_generic_risk_name("Regulatory and Antitrust Scrutiny")
+            reg_sentences = [
+                f"{lead} the filing's emphasis on {reg_driver.lower()} exposure translates into remedies, fines, or product changes that reduce monetization efficiency or raise compliance costs."
+            ]
+            if operating_margin is not None:
+                reg_sentences.append(
+                    f"With operating margin around {operating_margin:.1f}%, even modest changes to distribution, data use, or bundling can push through revenue quality and margin absorption faster than the headline numbers suggest."
                 )
             else:
-                risk_name = _rewrite_generic_risk_name("Liquidity Tightening Risk")
-                risks.append(
-                    f"**{risk_name}**: Liquidity appears workable today ({cash_str} cash against {liabilities_str} liabilities), but a sharper downturn could still tighten flexibility if funding costs rise. "
-                    "If leverage increases from here, the risk-reward can deteriorate quickly."
+                reg_sentences.append(
+                    "The transmission path is slower growth, weaker pricing power, and a higher fixed cost base, which reduces the company's ability to compound through a normal slowdown."
                 )
+            if long_form:
+                reg_sentences.append(
+                    "That is particularly relevant when the market is still valuing scale and distribution advantages, because regulatory changes can attack the mechanism that made those advantages valuable in the first place."
+                )
+                reg_sentences.append(
+                    f"Early-warning signal: watch enforcement milestones, remedy proposals, product-design changes, and commentary on compliance spend linked to {reg_driver} for evidence the risk is becoming operational."
+                )
+            risks.append(_finalize_risk(reg_name, reg_sentences))
 
-        return "\n".join([r for r in risks if r]).strip()
+        if len(risks) < expected_count and cash_str and liabilities_str:
+            funding_name = _rewrite_generic_risk_name("Balance-Sheet Flexibility Risk")
+            funding_sentences = [
+                f"Liquidity appears workable today with {cash_str} of cash against {liabilities_str} of liabilities, but the downside case is that a weaker operating period turns optional spending into defensive funding decisions."
+            ]
+            funding_sentences.append(
+                "The transmission path runs through reduced flexibility: buybacks, M&A, or growth capex have to compete with balance-sheet protection, which lowers the value of any operating recovery."
+            )
+            if long_form:
+                funding_sentences.append(
+                    "That risk matters most when growth opportunities are front-loaded, because funding constraints can force management to slow the very investments the long case depends on."
+                )
+                funding_sentences.append(
+                    "Early-warning signal: watch liquidity balances, leverage commentary, refinancing terms, and any shift in capital-allocation priorities toward preservation rather than offense."
+                )
+            risks.append(_finalize_risk(funding_name, funding_sentences))
+
+        finalized = [risk for risk in risks if risk]
+        if expected_count > 0:
+            finalized = finalized[:expected_count]
+        return "\n\n".join(finalized).strip()
 
     def _has_numeric_content(section_body: str) -> bool:
         return bool(re.search(r"\d", section_body))
+
+    section_anchor_caps: Dict[str, int] = {
+        "Executive Summary": 2,
+        "Financial Performance": 3,
+        "Management Discussion & Analysis": 3,
+        "Risk Factors": 3,
+        "Closing Takeaway": 2,
+    }
+    anchor_patterns: Dict[str, re.Pattern[str]] = {
+        "revenue": re.compile(r"\brevenue\b", re.IGNORECASE),
+        "operating_income": re.compile(
+            r"\boperating\s+income\b|\bebit\b", re.IGNORECASE
+        ),
+        "operating_margin": re.compile(r"\boperating\s+margin\b", re.IGNORECASE),
+        "net_margin": re.compile(r"\bnet\s+margin\b", re.IGNORECASE),
+        "operating_cash_flow": re.compile(
+            r"\boperating\s+cash\s+flow\b|\bocf\b", re.IGNORECASE
+        ),
+        "free_cash_flow": re.compile(r"\bfree\s+cash\s+flow\b|\bfcf\b", re.IGNORECASE),
+        "fcf_margin": re.compile(r"\bfcf\s+margin\b", re.IGNORECASE),
+        "cash": re.compile(r"\bcash(?:\s*\+\s*securities)?\b", re.IGNORECASE),
+        "liabilities": re.compile(r"\bliabilit(?:y|ies)\b", re.IGNORECASE),
+        "current_ratio": re.compile(r"\bcurrent\s+ratio\b", re.IGNORECASE),
+    }
+    mechanism_patterns: Dict[str, re.Pattern[str]] = {
+        "pricing_margin": re.compile(
+            r"\bpricing|price|margin|cost\s+discipline|opex\b", re.IGNORECASE
+        ),
+        "cash_conversion": re.compile(
+            r"\bcash\s+conversion|ocf|fcf|working[- ]capital\b", re.IGNORECASE
+        ),
+        "reinvestment": re.compile(
+            r"\breinvestment|capex|r&d|capital\s+intensity\b", re.IGNORECASE
+        ),
+        "balance_sheet": re.compile(
+            r"\bliabilit(?:y|ies)|leverage|refinancing|liquidity|funding\b",
+            re.IGNORECASE,
+        ),
+        "allocation": re.compile(
+            r"\bbuyback|dividend|m&a|capital[- ]allocation|de[- ]risk\b",
+            re.IGNORECASE,
+        ),
+        "regulatory": re.compile(
+            r"\bregulat|antitrust|enforcement|compliance|privacy\b", re.IGNORECASE
+        ),
+        "earnings_quality": re.compile(
+            r"\bone[- ]off|below[- ]the[- ]line|non[- ]operating|earnings\s+quality\b",
+            re.IGNORECASE,
+        ),
+    }
+
+    def _split_sentences(blob: str) -> List[str]:
+        blob = (blob or "").strip()
+        if not blob:
+            return []
+        return [s.strip() for s in re.split(r"(?<=[.!?])\s+", blob) if s.strip()]
+
+    def _anchor_keys(sentence: str) -> Set[str]:
+        found: Set[str] = set()
+        for anchor_name, pattern in anchor_patterns.items():
+            if pattern.search(sentence or ""):
+                found.add(anchor_name)
+        return found
+
+    def _mechanism_keys(sentence: str) -> Set[str]:
+        found: Set[str] = set()
+        for mech_name, pattern in mechanism_patterns.items():
+            if pattern.search(sentence or ""):
+                found.add(mech_name)
+        return found
+
+    def _anchor_spread_map(current_text: str) -> Dict[str, Set[str]]:
+        spread: Dict[str, Set[str]] = {}
+        narrative_sections = (
+            "Executive Summary",
+            "Financial Performance",
+            "Management Discussion & Analysis",
+            "Risk Factors",
+            "Closing Takeaway",
+        )
+        for section_title in narrative_sections:
+            body = _extract_markdown_section_body(current_text or "", section_title)
+            if not body:
+                continue
+            for sentence in _split_sentences(body):
+                for anchor in _anchor_keys(sentence):
+                    spread.setdefault(anchor, set()).add(section_title)
+        return spread
+
+    def _apply_addendum_guardrails(
+        *, section_title: str, existing_body: str, addendum: str
+    ) -> str:
+        existing_sentences = _split_sentences(existing_body or "")
+        addendum_sentences = _split_sentences(addendum or "")
+        if not addendum_sentences:
+            return ""
+
+        anchor_limit = int(section_anchor_caps.get(section_title, 3))
+        anchor_counts: Dict[str, int] = {}
+        seen_mechanisms: Set[str] = set()
+        seen_sentence_norms: Set[str] = set()
+
+        for sentence in existing_sentences:
+            norm = " ".join((sentence or "").lower().split())
+            if norm:
+                seen_sentence_norms.add(norm)
+            for anchor in _anchor_keys(sentence):
+                anchor_counts[anchor] = int(anchor_counts.get(anchor, 0)) + 1
+            seen_mechanisms.update(_mechanism_keys(sentence))
+
+        spread = _anchor_spread_map(text)
+        kept: List[str] = []
+        for sentence in addendum_sentences:
+            norm = " ".join((sentence or "").lower().split())
+            if not norm or norm in seen_sentence_norms:
+                continue
+
+            anchors = _anchor_keys(sentence)
+            mechanisms = _mechanism_keys(sentence)
+            adds_new_mechanism = bool(mechanisms - seen_mechanisms)
+
+            exceeds_section_cap = bool(anchors) and any(
+                int(anchor_counts.get(anchor, 0)) >= anchor_limit for anchor in anchors
+            )
+            exhausted_across_sections = bool(anchors) and all(
+                len(spread.get(anchor, set())) >= 3 for anchor in anchors
+            )
+
+            if (
+                exceeds_section_cap or exhausted_across_sections
+            ) and not adds_new_mechanism:
+                continue
+
+            kept.append(sentence)
+            seen_sentence_norms.add(norm)
+            for anchor in anchors:
+                anchor_counts[anchor] = int(anchor_counts.get(anchor, 0)) + 1
+            if mechanisms:
+                seen_mechanisms.update(mechanisms)
+
+        return " ".join(kept).strip()
 
     def _synthesize_mdna() -> str:
         """Fallback MD&A content: concise, concrete, and metric-anchored (no placeholders)."""
@@ -15760,40 +28862,38 @@ def _ensure_required_sections(
 
         sentences: List[str] = []
 
-        sentences.append(
-            (
-                "The management narrative is about converting scale into operating leverage while keeping growth investments disciplined."
-            )
-        )
-
+        # Paragraph 1: Capital Allocation Evidence — what management is actually doing with cash
         if operating_margin is not None and rev_str and op_inc_str:
             sentences.append(
-                f"With {rev_str} of revenue and operating income {op_inc_str}, the implied operating margin (~{operating_margin:.1f}%) puts the spotlight on pricing, incentive intensity, and cost discipline."
+                f"At {rev_str} of revenue and {op_inc_str} of operating income, the ~{operating_margin:.1f}% operating margin reflects how pricing, cost discipline, and incentive intensity are balancing against scale."
             )
         elif operating_margin is not None:
             sentences.append(
-                f"With operating margin around {operating_margin:.1f}%, the key levers are pricing discipline, incentive intensity, and operating cost control."
-            )
-
-        if ocf_str and fcf_str:
-            sentences.append(
-                f"Cash generation (operating cash flow {ocf_str} and free cash flow {fcf_str}) creates optionality, but capital allocation choices determine whether value compounds or merely cycles."
+                f"The ~{operating_margin:.1f}% operating margin frames the trade-off between reinvestment pace and near-term profitability."
             )
 
         if cash_total_str and liabilities_str:
             sentences.append(
-                f"Balance-sheet context—{cash_total_str} cash and securities versus {liabilities_str} liabilities—frames how aggressive management can be on buybacks, M&A, or de-risking."
+                f"With {cash_total_str} of cash and securities against {liabilities_str} of liabilities, management has room for buybacks, M&A, or de-risking—but the choice reveals capital-allocation priorities."
             )
 
-        sentences.append(
-            "A strong MD&A reconciles KPI commentary with cash flow and makes the next margin and risk trade-offs explicit rather than relying on adjusted optics."
-        )
+        # Paragraph 2: Earnings Quality — reconciling reported profit to cash
+        if ocf_str and fcf_str:
+            sentences.append(
+                f"Operating cash flow of {ocf_str} converting to {fcf_str} of free cash flow quantifies how much reported earnings translate into distributable capital after reinvestment."
+            )
+
+        if not sentences:
+            if short_quality_mode:
+                return ""
+            sentences.append(
+                "Without detailed operating and cash flow disclosures, management's capital allocation posture and earnings quality remain difficult to assess from this filing alone."
+            )
 
         return " ".join([s for s in sentences if s]).strip()
 
     def _synthesize_mdna_addendum() -> str:
         """Add a short, metric-anchored continuation to strengthen MD&A flow."""
-        lead = "The key check is"
 
         operating_margin = calculated_metrics.get("operating_margin")
         ocf = calculated_metrics.get("operating_cash_flow")
@@ -15829,23 +28929,21 @@ def _ensure_required_sections(
 
         sentences: List[str] = []
 
+        # Earnings-quality reconciliation: does reported margin hold up in cash terms?
         if operating_margin is not None:
             sentences.append(
-                f"{lead} operating leverage stay visible in the reported operating margin (~{operating_margin:.1f}%) without relying on one-offs or short-term timing benefits."
+                f"Operating leverage is credible only if the ~{operating_margin:.1f}% margin holds without one-offs or short-term timing benefits inflating the print."
             )
 
         if ocf_str and fcf_str:
             sentences.append(
-                f"With operating cash flow {ocf_str} and free cash flow {fcf_str}, the durability test is whether conversion holds as reinvestment and working-capital needs normalize."
+                f"The gap between {ocf_str} of operating cash flow and {fcf_str} of free cash flow measures how much reinvestment is consuming before shareholders see a dollar."
             )
 
+        # Balance-sheet context: flexibility vs. risk
         if cash_total_str and liabilities_str:
             sentences.append(
-                f"Against {liabilities_str} of liabilities, {cash_total_str} of cash and securities supports flexibility—but buybacks and M&A only compound if they do not raise refinancing risk or dilute the core margin profile."
-            )
-        else:
-            sentences.append(
-                "Capital allocation compounds best when reinvestment returns are clear and leverage stays contained."
+                f"Against {liabilities_str} of liabilities, the {cash_total_str} cash cushion determines whether management can stay offensive on capital allocation without raising refinancing risk."
             )
 
         return " ".join([s for s in sentences if s]).strip()
@@ -15853,10 +28951,29 @@ def _ensure_required_sections(
     # Add minimal Financial Performance and MD&A sections if the model omitted them
     # 0. Executive Summary (rarely missing, but catastrophic when it is)
     if not _section_present("Executive Summary"):
-        _append_section("Executive Summary", _synthesize_executive_summary_addendum())
+        exec_seed = _synthesize_executive_summary_addendum()
+        exec_addendum = _apply_addendum_guardrails(
+            section_title="Executive Summary",
+            existing_body="",
+            addendum=exec_seed,
+        )
+        exec_body = exec_addendum or exec_seed
+        if exec_body:
+            _append_section("Executive Summary", exec_body)
 
     if not _section_present("Financial Performance"):
-        _append_section("Financial Performance", _synthesize_financial_performance())
+        perf_seed = (
+            _synthesize_financial_performance_addendum()
+            or _synthesize_financial_performance()
+        )
+        perf_addendum = _apply_addendum_guardrails(
+            section_title="Financial Performance",
+            existing_body="",
+            addendum=perf_seed,
+        )
+        perf_body = perf_addendum or perf_seed
+        if perf_body:
+            _append_section("Financial Performance", perf_body)
     else:
         # If section exists but lacks numbers, append a concise metric summary
         fp_match = re.search(
@@ -15867,15 +28984,21 @@ def _ensure_required_sections(
         if fp_match:
             body = fp_match.group(1).strip()
             if not _has_numeric_content(body):
-                supplement = _synthesize_financial_performance()
-                text = text.replace(
-                    fp_match.group(0),
-                    f"## Financial Performance\n{body}\n\n{supplement}\n",
+                supplement = (
+                    _synthesize_financial_performance_addendum()
+                    or _synthesize_financial_performance()
                 )
+                if supplement:
+                    text = text.replace(
+                        fp_match.group(0),
+                        f"## Financial Performance\n{body}\n\n{supplement}\n",
+                    )
 
     # If Executive Summary / Financial Performance are present but too short, top them up.
     def _top_up_section_if_short(title: str, min_words: int, addendum: str) -> None:
         nonlocal text
+        if not addendum:
+            return
         pattern = re.compile(
             rf"##\s*{re.escape(title)}\s*\n+([\s\S]*?)(?=\n##\s|\Z)",
             re.IGNORECASE,
@@ -15892,12 +29015,6 @@ def _ensure_required_sections(
             sentence = " ".join(sentence.lower().split())
             return sentence.rstrip(".!?")
 
-        def _split_sentences(blob: str) -> List[str]:
-            blob = (blob or "").strip()
-            if not blob:
-                return []
-            return [s.strip() for s in re.split(r"(?<=[.!?])\s+", blob) if s.strip()]
-
         # Avoid introducing duplicates when the addendum overlaps with what the model
         # already wrote (a common repetition pattern users notice).
         body_norms = {_norm_sentence(s) for s in _split_sentences(body)}
@@ -15909,6 +29026,11 @@ def _ensure_required_sections(
             filtered_addendum_sentences.append(sentence)
             body_norms.add(norm)
         addendum = " ".join(filtered_addendum_sentences).strip()
+        addendum = _apply_addendum_guardrails(
+            section_title=title,
+            existing_body=body,
+            addendum=addendum,
+        )
         if not addendum:
             return
 
@@ -15925,7 +29047,15 @@ def _ensure_required_sections(
 
     # Ensure MD&A exists before we try to balance section lengths.
     if not _section_present("Management Discussion & Analysis"):
-        _append_section("Management Discussion & Analysis", _synthesize_mdna())
+        mdna_seed = _synthesize_mdna()
+        mdna_addendum = _apply_addendum_guardrails(
+            section_title="Management Discussion & Analysis",
+            existing_body="",
+            addendum=mdna_seed,
+        )
+        mdna_body = mdna_addendum or mdna_seed
+        if mdna_body:
+            _append_section("Management Discussion & Analysis", mdna_body)
     else:
         # Replace low-quality MD&A stubs the model sometimes emits.
         mdna_match = re.search(
@@ -15943,19 +29073,45 @@ def _ensure_required_sections(
                 re.IGNORECASE,
             ):
                 replacement = _synthesize_mdna()
-                text = re.sub(
-                    r"##\s*Management\s+Discussion\s*(?:&|and)\s*Analysis\s*\n+[\s\S]*?(?=\n##\s|\Z)",
-                    lambda _m: f"## Management Discussion & Analysis\n{replacement}\n",
-                    text,
-                    count=1,
-                    flags=re.IGNORECASE,
-                )
+                if replacement:
+                    text = re.sub(
+                        r"##\s*Management\s+Discussion\s*(?:&|and)\s*Analysis\s*\n+[\s\S]*?(?=\n##\s|\Z)",
+                        lambda _m: f"## Management Discussion & Analysis\n{replacement}\n",
+                        text,
+                        count=1,
+                        flags=re.IGNORECASE,
+                    )
+
+    _top_up_section_if_short(
+        "Executive Summary",
+        int(min_words_by_section.get("Executive Summary", 20) or 20),
+        _synthesize_executive_summary_addendum(),
+    )
+    _top_up_section_if_short(
+        "Financial Performance",
+        int(min_words_by_section.get("Financial Performance", 20) or 20),
+        _synthesize_financial_performance_addendum()
+        or _synthesize_financial_performance(),
+    )
+    _top_up_section_if_short(
+        "Management Discussion & Analysis",
+        int(min_words_by_section.get("Management Discussion & Analysis", 25) or 25),
+        _synthesize_mdna_addendum(),
+    )
 
     # Ensure Risk Factors exists before we try to balance section lengths.
     # If the model omitted it (often due to length pressure), synthesize a concrete,
     # underwriting-style risks paragraph rather than leaving the memo incomplete.
     if not _section_present("Risk Factors"):
-        _append_section("Risk Factors", _synthesize_risk_factors_addendum())
+        risk_seed = _synthesize_risk_factors_addendum()
+        risk_addendum = _apply_addendum_guardrails(
+            section_title="Risk Factors",
+            existing_body="",
+            addendum=risk_seed,
+        )
+        risk_body = risk_addendum or risk_seed
+        if risk_body:
+            _append_section("Risk Factors", risk_body)
 
     _normalize_risk_factors_section()
 
@@ -16003,14 +29159,20 @@ def _ensure_required_sections(
     def _min_closing_words() -> int:
         """Minimum closing length aligned to the fixed section distribution."""
         base_min = int(min_words_by_section.get("Closing Takeaway", 25))
+        if closing_budget_words > 0:
+            tol = _section_budget_tolerance_words(closing_budget_words, max_tolerance=10)
+            return max(base_min, max(1, int(closing_budget_words) - int(tol)))
+
         if not target_length or target_length <= 0:
             # No explicit target length => keep a substantive close.
             return max(base_min, 35)
 
-        budgets = _calculate_section_word_budgets(
-            target_length, include_health_rating=include_health_rating
+        budget = int(
+            _calculate_section_word_budgets(
+                target_length, include_health_rating=include_health_rating
+            ).get("Closing Takeaway", 0)
+            or 0
         )
-        budget = int(budgets.get("Closing Takeaway", 0) or 0)
         if budget <= 0:
             return base_min
 
@@ -16019,6 +29181,8 @@ def _ensure_required_sections(
         return max(base_min, floor)
 
     def _min_closing_sentences() -> int:
+        if closing_shape is not None:
+            return int(closing_shape.min_sentences)
         if not target_length or target_length <= 0:
             return 3
 
@@ -16060,75 +29224,9 @@ def _ensure_required_sections(
         existing_closing = closing_match.group(1).strip()
         existing_word_count = _count_words(existing_closing)
         existing_sentence_count = _count_sentences(existing_closing)
-
-        verdict_strengths: List[str] = []
-        verdict_concerns: List[str] = []
-        if calculated_metrics:
-            op_margin = calculated_metrics.get("operating_margin", 0)
-            net_margin = calculated_metrics.get("net_margin", 0)
-            fcf = calculated_metrics.get("free_cash_flow", 0)
-            revenue = calculated_metrics.get("revenue") or calculated_metrics.get(
-                "total_revenue"
-            )
-            cash = calculated_metrics.get("cash")
-            securities = calculated_metrics.get("marketable_securities") or 0
-            total_liabilities = calculated_metrics.get("total_liabilities")
-            total_assets = calculated_metrics.get("total_assets")
-            current_ratio = calculated_metrics.get("current_ratio")
-            interest_coverage = calculated_metrics.get("interest_coverage")
-
-            cash_total = None
-            if cash is not None:
-                cash_total = cash + (securities or 0)
-
-            fcf_margin_pct = None
-            if fcf and revenue:
-                try:
-                    fcf_margin_pct = (fcf / revenue) * 100
-                except Exception:
-                    fcf_margin_pct = None
-
-            if op_margin and op_margin > 20:
-                verdict_strengths.append("strong operating margin")
-            if net_margin and net_margin > 10:
-                verdict_strengths.append("healthy profitability")
-            if fcf and fcf > 0 and fcf_margin_pct is not None and fcf_margin_pct >= 10:
-                verdict_strengths.append("strong free cash flow conversion")
-            elif fcf and fcf > 0:
-                verdict_strengths.append("positive free cash flow")
-
-            if op_margin and op_margin < 5:
-                verdict_concerns.append("thin margins")
-            if net_margin and net_margin < 0:
-                verdict_concerns.append("net losses")
-            if fcf is not None and fcf <= 0:
-                verdict_concerns.append("negative free cash flow")
-            if fcf_margin_pct is not None and fcf_margin_pct < 8:
-                verdict_concerns.append("low free-cash-flow margin")
-
-            if cash_total is not None and total_liabilities is not None:
-                if cash_total > total_liabilities:
-                    verdict_strengths.append("net cash balance sheet")
-                elif total_liabilities > cash_total * 2:
-                    verdict_concerns.append("large liability load versus cash")
-
-            if total_liabilities and total_assets:
-                try:
-                    leverage = total_liabilities / total_assets
-                except Exception:
-                    leverage = None
-                if leverage is not None and leverage > 0.8:
-                    verdict_concerns.append("elevated leverage")
-
-            if current_ratio is not None and current_ratio >= 1.5:
-                verdict_strengths.append("solid liquidity")
-            elif current_ratio is not None and current_ratio < 1.0:
-                verdict_concerns.append("tight liquidity")
-
-            if interest_coverage is not None and interest_coverage >= 8:
-                verdict_strengths.append("strong interest coverage")
-            elif interest_coverage is not None and interest_coverage < 2:
-                verdict_concerns.append("thin interest coverage")
+        verdict_strengths, verdict_concerns = _derive_closing_recommendation_signals(
+            calculated_metrics
+        )
 
         # If persona is requested but the closing lacks an explicit personal verdict, add one.
         if persona_mode and not _contains_personal_verdict(existing_closing):
@@ -16170,9 +29268,18 @@ def _ensure_required_sections(
         existing_word_count = 0
         existing_sentence_count = 0
 
+    closing_budget_needs_rebuild = bool(
+        closing_budget_words >= 120
+        and (
+            existing_word_count < _min_closing_words()
+            or existing_sentence_count < _min_closing_sentences()
+        )
+    )
+
     needs_closing_rebuild = (
         not _section_present("Closing Takeaway")
         or not _closing_has_reasoned_takeaway(existing_closing or "")
+        or closing_budget_needs_rebuild
         or (persona_mode and not _contains_personal_verdict(existing_closing or ""))
         or (
             (not persona_mode)
@@ -16186,6 +29293,7 @@ def _ensure_required_sections(
             calculated_metrics,
             persona_name,
             persona_requested=persona_mode,
+            budget_words=closing_budget_words if closing_budget_words > 0 else None,
         )
         if existing_closing:
             # Remove the existing closing takeaway and replace it
@@ -16201,12 +29309,6 @@ def _ensure_required_sections(
     # proportional distribution (prevents hallucinated numbers / emojis).
     if metrics_lines.strip() and _section_present("Key Metrics"):
         desired_body = metrics_lines.strip()
-        if include_health_rating and health_score_data:
-            drivers_block = _build_health_driver_block(
-                calculated_metrics, health_score_data
-            )
-            if drivers_block and "Health Score Drivers" not in desired_body:
-                desired_body = f"{desired_body}\n\n{drivers_block}".strip()
 
         # Keep Key Metrics near its allocated budget for the chosen target length.
         if target_length and target_length > 0:
@@ -16242,7 +29344,14 @@ def _ensure_required_sections(
             if not budget:
                 return
             min_words = int(min_words_by_section.get(title, 25))
-            max_words = max(min_words, int(budget * 1.30))
+            # Closing Takeaway: tight strict-band tolerance; other sections: 30% headroom.
+            if title == "Closing Takeaway":
+                max_words = max(
+                    min_words,
+                    int(budget) + _effective_word_band_tolerance(target_length),
+                )
+            else:
+                max_words = max(min_words, int(budget * 1.30))
             pattern = re.compile(
                 rf"##\s*{re.escape(title)}\s*\n+([\s\S]*?)(?=\n##\s|\Z)",
                 re.IGNORECASE,
@@ -16268,6 +29377,15 @@ def _ensure_required_sections(
 
         for core_title in core_titles:
             _cap_section_to_budget(core_title)
+
+    # Cap Closing Takeaway using the canonical budget-aware section shape.
+    text = _cap_closing_sentences_filings(
+        text,
+        max_sentences=_closing_sentence_cap_for_target(
+            target_length, include_health_rating=include_health_rating
+        ),
+    )
+    text = _remove_metric_echo_loops(text)
 
     # Final repetition cleanup: this function can append addenda and padding that
     # occasionally overlaps with model output, so remove duplicates deterministically.
@@ -16345,6 +29463,10 @@ async def get_filing_summary_progress(filing_id: str):
         "percent": snapshot.percent,
         "percent_exact": snapshot.percent_exact,
         "eta_seconds": snapshot.eta_seconds,
+        "error": snapshot.error,
+        "last_failure_code": snapshot.last_failure_code,
+        "last_error_message": snapshot.last_error_message,
+        "last_error_details": snapshot.last_error_details,
     }
 
 
@@ -16365,7 +29487,9 @@ async def get_filing_spotlight_kpi(
     # resolve + download it (older filings often have no cached document yet).
     local_document = _ensure_local_document(context, settings, allow_network=False)
 
-    allow_spotlight_network = str(os.getenv("SPOTLIGHT_ALLOW_NETWORK", "1") or "").strip().lower() in (
+    allow_spotlight_network = str(
+        os.getenv("SPOTLIGHT_ALLOW_NETWORK", "1") or ""
+    ).strip().lower() in (
         "1",
         "true",
         "yes",
@@ -16373,7 +29497,9 @@ async def get_filing_spotlight_kpi(
 
     if allow_spotlight_network and (not local_document or not local_document.exists()):
         try:
-            raw_timeout = (os.getenv("SPOTLIGHT_DOCUMENT_RESOLVE_TIMEOUT_SECONDS") or "").strip() or "60"
+            raw_timeout = (
+                os.getenv("SPOTLIGHT_DOCUMENT_RESOLVE_TIMEOUT_SECONDS") or ""
+            ).strip() or "60"
             try:
                 resolve_timeout = float(raw_timeout)
             except ValueError:
@@ -16382,7 +29508,9 @@ async def get_filing_spotlight_kpi(
 
             with anyio.fail_after(resolve_timeout):
                 local_document = await anyio.to_thread.run_sync(
-                    lambda: _ensure_local_document(context, settings, allow_network=True),
+                    lambda: _ensure_local_document(
+                        context, settings, allow_network=True
+                    ),
                     cancellable=True,
                 )
         except TimeoutError:
@@ -16394,7 +29522,9 @@ async def get_filing_spotlight_kpi(
         str(filing_id),
         filing=filing,
         company=company,
-        local_document_path=local_document if (local_document and local_document.exists()) else None,
+        local_document_path=local_document
+        if (local_document and local_document.exists())
+        else None,
         settings=settings,
         context_source=str(context.get("source") or ""),
         debug=debug,
