@@ -13313,6 +13313,33 @@ def _select_short_form_editorial_failure_requirements(
     return fatal
 
 
+def _select_short_form_editorial_hard_failure_requirements(
+    *,
+    missing_requirements: Optional[List[str]],
+) -> List[str]:
+    """Escalate unresolved short-form editorial misses that break section quality."""
+    items = [str(item) for item in (missing_requirements or []) if str(item or "").strip()]
+    if not items:
+        return []
+
+    hard_fail_snippets = (
+        "section is too brief",
+        "generic filler detected",
+        "excessive generic filler",
+    )
+    hard_fail: List[str] = []
+    seen: Set[str] = set()
+    for item in items:
+        normalized = " ".join(item.split()).strip().lower()
+        if not normalized:
+            continue
+        if any(snippet in normalized for snippet in hard_fail_snippets):
+            if normalized not in seen:
+                seen.add(normalized)
+                hard_fail.append(item)
+    return hard_fail
+
+
 def _select_one_shot_contract_failure_requirements(
     *,
     missing_requirements: Optional[List[str]],
@@ -23509,7 +23536,30 @@ FLOW AND QUALITY RULES:
                     final_wc,
                     final_target,
                 )
+                if generation_stats is not None and short_quality_mode:
+                    generation_stats["short_contract_pre_final_split_words"] = int(
+                        final_split_wc
+                    )
+                    generation_stats["short_contract_pre_final_stripped_words"] = int(
+                        final_wc
+                    )
                 if final_split_wc > upper or final_wc > upper:
+                    if generation_stats is not None and short_quality_mode:
+                        overflow_excess = max(
+                            final_split_wc - upper,
+                            final_wc - upper,
+                            0,
+                        )
+                        generation_stats["short_contract_overflow_excess_pre_clamp"] = int(
+                            overflow_excess
+                        )
+                        # If the draft is still materially over the short/mid band at the
+                        # final checkpoint, treat post-hoc trimming as non-contractual.
+                        # Hard-fail later unless a bounded rewrite lands in-band.
+                        if overflow_excess > int(strict_tolerance):
+                            generation_stats["short_contract_severe_overflow_pre_clamp"] = (
+                                True
+                            )
                     summary_text = _trim_preserving_headings(summary_text, upper)
                 else:
                     underflow_gap = max(
@@ -25684,6 +25734,27 @@ FLOW AND QUALITY RULES:
                 generation_stats["short_form_editorial_fatal_requirements"] = (
                     short_form_editorial_fatal_requirements
                 )
+                short_form_editorial_hard_fail_requirements = (
+                    _select_short_form_editorial_hard_failure_requirements(
+                        missing_requirements=short_form_editorial_fatal_requirements,
+                    )
+                )
+                generation_stats["short_form_editorial_hard_fail_requirements"] = (
+                    short_form_editorial_hard_fail_requirements
+                )
+                if short_form_editorial_hard_fail_requirements:
+                    raise HTTPException(
+                        status_code=422,
+                        detail={
+                            "detail": "Unable to satisfy short-form editorial quality requirements after bounded recovery.",
+                            "failure_code": "SUMMARY_CONTRACT_FAILED",
+                            "target_length": int(target_length or 0),
+                            "actual_word_count": int(
+                                summary_meta.get("final_word_count") or 0
+                            ),
+                            "missing_requirements": short_form_editorial_hard_fail_requirements[:12],
+                        },
+                    )
                 if short_form_editorial_fatal_requirements:
                     contract_warnings.extend(short_form_editorial_fatal_requirements)
                     fast_degraded = True
@@ -25832,10 +25903,35 @@ FLOW AND QUALITY RULES:
                     lower <= final_split_word_count <= upper
                     and lower <= final_word_count <= upper
                 )
+                pre_final_split_words = int(
+                    generation_stats.get("short_contract_pre_final_split_words") or 0
+                )
+                pre_final_stripped_words = int(
+                    generation_stats.get("short_contract_pre_final_stripped_words") or 0
+                )
+                severe_pre_clamp_overflow = bool(
+                    generation_stats.get("short_contract_severe_overflow_pre_clamp")
+                    and not generation_stats.get("late_length_rescue_in_band")
+                    and (
+                        pre_final_split_words > upper
+                        or pre_final_stripped_words > upper
+                    )
+                )
+                if severe_pre_clamp_overflow:
+                    short_contract_in_band = False
                 summary_meta["short_contract_lower_bound"] = int(lower)
                 summary_meta["short_contract_upper_bound"] = int(upper)
                 summary_meta["short_contract_tolerance"] = int(tolerance)
                 summary_meta["short_contract_in_band"] = bool(short_contract_in_band)
+                summary_meta["short_contract_pre_final_split_word_count"] = int(
+                    pre_final_split_words
+                )
+                summary_meta["short_contract_pre_final_stripped_word_count"] = int(
+                    pre_final_stripped_words
+                )
+                summary_meta["short_contract_severe_overflow_pre_clamp"] = bool(
+                    severe_pre_clamp_overflow
+                )
                 summary_meta["short_underflow_rescue_used"] = bool(
                     generation_stats.get("short_underflow_rescue_used") or False
                 )
@@ -25857,9 +25953,19 @@ FLOW AND QUALITY RULES:
                 generation_stats["short_contract_tolerance"] = int(tolerance)
                 generation_stats["short_contract_in_band"] = bool(short_contract_in_band)
                 if not short_contract_in_band:
+                    violation_split_words = (
+                        pre_final_split_words
+                        if severe_pre_clamp_overflow and pre_final_split_words > 0
+                        else final_split_word_count
+                    )
+                    violation_stripped_words = (
+                        pre_final_stripped_words
+                        if severe_pre_clamp_overflow and pre_final_stripped_words > 0
+                        else final_word_count
+                    )
                     band_requirement = (
                         f"Final word-count band violation: expected {lower}-{upper}, "
-                        f"got split={final_split_word_count}, stripped={final_word_count}."
+                        f"got split={violation_split_words}, stripped={violation_stripped_words}."
                     )
                     merged_missing = list(
                         dict.fromkeys(
