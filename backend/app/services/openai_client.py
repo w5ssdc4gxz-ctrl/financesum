@@ -304,6 +304,30 @@ def _summary_research_max_words() -> int:
     )
 
 
+def _resolve_openai_setting_int(settings: Any, attr_name: str, default: int) -> int:
+    """Return a resilient integer config value for optional OpenAI settings."""
+    try:
+        raw = getattr(settings, attr_name, default)
+    except Exception:  # noqa: BLE001
+        raw = default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _resolve_openai_api_key(settings: Any) -> str:
+    """Resolve OpenAI key from settings/env for backward compatibility."""
+    configured_key = str(getattr(settings, "openai_api_key", "") or "").strip()
+    if configured_key:
+        return configured_key
+    return str(
+        os.getenv("OPENAI_API_KEY")
+        or os.getenv("OPENAI-API-KEY")
+        or ""
+    ).strip()
+
+
 def _truncate_text_to_max_words(text: str, max_words: int) -> str:
     """Deterministically cap free-form text by word count."""
     if not text:
@@ -333,7 +357,7 @@ class OpenAIClient:
     ):
         settings = get_settings()
 
-        self.api_key = settings.openai_api_key
+        self.api_key = _resolve_openai_api_key(settings)
 
         self.request_timeout = _int_env("OPENAI_REQUEST_TIMEOUT_SECONDS", default=45)
         self.request_timeout = max(8, int(self.request_timeout))
@@ -2233,9 +2257,15 @@ def get_openai_client(model_name: Optional[str] = None) -> OpenAIClient:
     settings = get_settings()
     return OpenAIClient(
         model_name=resolved_model_name,
-        max_retries=settings.openai_max_retries,
-        initial_wait=settings.openai_initial_wait,
-        max_wait=settings.openai_max_wait,
+        max_retries=_resolve_openai_setting_int(
+            settings, "openai_max_retries", DEFAULT_MAX_RETRIES
+        ),
+        initial_wait=_resolve_openai_setting_int(
+            settings, "openai_initial_wait", DEFAULT_INITIAL_WAIT
+        ),
+        max_wait=_resolve_openai_setting_int(
+            settings, "openai_max_wait", DEFAULT_MAX_WAIT
+        ),
     )
 
 
