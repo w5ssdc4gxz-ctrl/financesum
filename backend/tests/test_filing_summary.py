@@ -1423,6 +1423,82 @@ def test_ensure_required_sections_rebuilds_long_form_risk_and_closing_without_he
     assert "What breaks the thesis" in closing_body
 
 
+def test_ensure_required_sections_short_target_scales_fp_and_mdna() -> None:
+    target_length = 600
+    budgets = filings_api._calculate_section_word_budgets(
+        target_length, include_health_rating=False
+    )
+    metrics = {
+        "revenue": 6.20e9,
+        "operating_income": 1.85e9,
+        "net_income": 1.32e9,
+        "operating_margin": 29.8,
+        "net_margin": 21.3,
+        "operating_cash_flow": 2.40e9,
+        "free_cash_flow": 1.67e9,
+        "capital_expenditures": 0.73e9,
+        "cash": 9.10e9,
+        "marketable_securities": 0.0,
+        "total_liabilities": 24.8e9,
+    }
+    perf_before = _sentence_filler_body(18, prefix="pf")
+    mdna_before = _sentence_filler_body(16, prefix="md")
+    memo = (
+        "## Executive Summary\n"
+        f"{_sentence_filler_body(95, prefix='ex')}\n\n"
+        "## Financial Performance\n"
+        f"{perf_before}\n\n"
+        "## Management Discussion & Analysis\n"
+        f"{mdna_before}\n\n"
+        "## Risk Factors\n"
+        f"**Execution Risk**: {_sentence_filler_body(88, prefix='rk')}\n\n"
+        "## Key Metrics\n"
+        "DATA_GRID_START\n"
+        "Revenue | $6.20B\n"
+        "Operating Income | $1.85B\n"
+        "Operating Margin | 29.8%\n"
+        "Free Cash Flow | $1.67B\n"
+        "Current Ratio | 1.9x\n"
+        "DATA_GRID_END\n\n"
+        "## Closing Takeaway\n"
+        f"{_sentence_filler_body(70, prefix='cl')}"
+    )
+
+    repaired = filings_api._ensure_required_sections(
+        memo,
+        include_health_rating=False,
+        metrics_lines=(
+            "Revenue | $6.20B\n"
+            "Operating Income | $1.85B\n"
+            "Operating Margin | 29.8%\n"
+            "Free Cash Flow | $1.67B\n"
+            "Current Ratio | 1.9x"
+        ),
+        calculated_metrics=metrics,
+        company_name="Example Corp",
+        risk_factors_excerpt=(
+            "Management highlighted cloud-demand variability, pricing discipline, and "
+            "capital intensity as key determinants of durability."
+        ),
+        target_length=target_length,
+    )
+
+    perf_body = filings_api._extract_markdown_section_body(repaired, "Financial Performance") or ""
+    mdna_body = (
+        filings_api._extract_markdown_section_body(repaired, "Management Discussion & Analysis")
+        or ""
+    )
+    perf_after_words = filings_api._count_words(perf_body)
+    mdna_after_words = filings_api._count_words(mdna_body)
+
+    assert perf_after_words > filings_api._count_words(perf_before)
+    assert mdna_after_words > filings_api._count_words(mdna_before)
+    assert perf_after_words >= int(round(float(budgets["Financial Performance"]) * 0.80))
+    assert mdna_after_words >= int(
+        round(float(budgets["Management Discussion & Analysis"]) * 0.80)
+    )
+
+
 def test_apply_contract_structural_repairs_adds_mdna_to_risk_bridge() -> None:
     memo = (
         "## Executive Summary\n"

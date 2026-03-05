@@ -9260,6 +9260,7 @@ def _calculate_section_min_words_for_target(
     if not budgets:
         return base_mins
 
+    short_quality_target = _is_short_quality_sensitive_target(target_length)
     mins: Dict[str, int] = {}
     for section, raw_budget in budgets.items():
         budget = int(raw_budget or 0)
@@ -9278,9 +9279,18 @@ def _calculate_section_min_words_for_target(
                 ratio_min = max(min_floor, min(base_min, budget))
             else:
                 ratio_min = max(min_floor, int(budget * 0.70))
+        elif section in {"Financial Performance", "Management Discussion & Analysis"}:
+            # Short/mid requests should keep the analytical core sections close to
+            # their allocated budgets so they scale visibly with target length.
+            focus_ratio = 0.85 if short_quality_target else 0.75
+            ratio_min = max(min_floor, int(round(budget * focus_ratio)))
+        elif section == "Executive Summary":
+            ratio = 0.78 if short_quality_target else 0.70
+            ratio_min = max(min_floor, int(round(budget * ratio)))
         elif section in {"Risk Factors", "Closing Takeaway"}:
             # These are the "bookends" users remember; keep them substantive.
-            ratio_min = max(min_floor, int(budget * 0.75))
+            ratio = 0.78 if short_quality_target else 0.75
+            ratio_min = max(min_floor, int(round(budget * ratio)))
         elif section == "Financial Health Rating":
             ratio_min = max(min_floor, int(budget * 0.70))
         else:
@@ -28850,13 +28860,6 @@ def _ensure_required_sections(
         else:
             return "At Risk"
 
-    # IMPORTANT (quality over quantity):
-    # `target_length` is treated as a hard maximum, not a quota. Avoid "topping up"
-    # sections to hit proportional minimums because that pushes the system into
-    # boilerplate/padding loops at high targets.
-    min_words_by_section = dict(SUMMARY_SECTION_MIN_WORDS)
-    if not include_health_rating:
-        min_words_by_section.pop("Financial Health Rating", None)
     section_budgets = (
         _calculate_section_word_budgets(
             int(target_length), include_health_rating=include_health_rating
@@ -28864,6 +28867,30 @@ def _ensure_required_sections(
         if target_length and int(target_length) > 0
         else {}
     )
+    # IMPORTANT (quality over quantity):
+    # `target_length` is treated as a hard maximum, not a quota. For explicit
+    # short/mid targets, still enforce target-aware section floors so Financial
+    # Performance and MD&A scale with requested length.
+    min_words_by_section = dict(SUMMARY_SECTION_MIN_WORDS)
+    if short_quality_mode and target_length and int(target_length) > 0:
+        min_words_by_section = _calculate_section_min_words_for_target(
+            target_length,
+            include_health_rating=include_health_rating,
+        )
+        for focus_section in (
+            "Financial Performance",
+            "Management Discussion & Analysis",
+        ):
+            focus_budget = int(section_budgets.get(focus_section, 0) or 0)
+            if focus_budget <= 0:
+                continue
+            focus_floor = max(1, int(round(focus_budget * 0.85)))
+            min_words_by_section[focus_section] = max(
+                int(min_words_by_section.get(focus_section, 0) or 0),
+                focus_floor,
+            )
+    if not include_health_rating:
+        min_words_by_section.pop("Financial Health Rating", None)
     risk_budget_words = int(section_budgets.get("Risk Factors", 0) or 0)
     closing_budget_words = int(section_budgets.get("Closing Takeaway", 0) or 0)
     risk_shape = (
@@ -30006,8 +30033,6 @@ def _ensure_required_sections(
     # If Executive Summary / Financial Performance are present but too short, top them up.
     def _top_up_section_if_short(title: str, min_words: int, addendum: str) -> None:
         nonlocal text
-        if not addendum:
-            return
         pattern = re.compile(
             rf"##\s*{re.escape(title)}\s*\n+([\s\S]*?)(?=\n##\s|\Z)",
             re.IGNORECASE,
@@ -30016,8 +30041,23 @@ def _ensure_required_sections(
         if not m:
             return
         body = (m.group(1) or "").strip()
-        if _count_words(body) >= min_words:
+        current_words = _count_words(body)
+        if current_words >= min_words:
             return
+
+        def _append_continuation(existing_body: str, continuation: str) -> str:
+            base = (existing_body or "").strip()
+            extra = (continuation or "").strip()
+            if not extra:
+                return base
+            if not base:
+                return extra
+            if title == "Risk Factors":
+                return f"{base}\n\n{extra}".strip()
+            cleaned = base.rstrip()
+            cleaned = re.sub(r"[-\u2013\u2014]+\s*$", "", cleaned).rstrip()
+            joiner = " " if cleaned.endswith((".", "!", "?")) else ". "
+            return f"{cleaned}{joiner}{extra}".strip()
 
         def _norm_sentence(sentence: str) -> str:
             sentence = (sentence or "").replace("\u00a0", " ")
@@ -30034,25 +30074,44 @@ def _ensure_required_sections(
                 continue
             filtered_addendum_sentences.append(sentence)
             body_norms.add(norm)
-        addendum = " ".join(filtered_addendum_sentences).strip()
-        addendum = _apply_addendum_guardrails(
+        primary_addendum = " ".join(filtered_addendum_sentences).strip()
+        primary_addendum = _apply_addendum_guardrails(
             section_title=title,
             existing_body=body,
-            addendum=addendum,
+            addendum=primary_addendum,
         )
-        if not addendum:
-            return
+        if primary_addendum:
+            body = _append_continuation(body, primary_addendum)
+            current_words = _count_words(body)
 
-        # Append as a continuation to preserve flow (avoid orphan "one-liner" paragraphs).
-        if title == "Risk Factors":
-            joiner = "\n\n"
-        else:
-            cleaned = body.rstrip()
-            cleaned = re.sub(r"[-\u2013\u2014]+\s*$", "", cleaned).rstrip()
-            joiner = " " if cleaned.endswith((".", "!", "?")) else ". "
-            body = cleaned
-        new_body = f"{body}{joiner}{addendum}".strip()
-        text = pattern.sub(lambda _mm: f"## {title}\n{new_body}\n", text, count=1)
+        # Short-form hardening: if one addendum is still not enough, append a
+        # bounded number of deterministic section-specific sentences.
+        rounds = 0
+        max_rounds = 4 if short_quality_mode else 1
+        while current_words < int(min_words) and rounds < max_rounds:
+            fallback_sentence = _section_balance_top_up_sentence(
+                title,
+                attempt=rounds,
+                calculated_metrics=calculated_metrics,
+                health_score_data=health_score_data,
+                risk_factors_excerpt=risk_factors_excerpt or "",
+            )
+            fallback_sentence = _apply_addendum_guardrails(
+                section_title=title,
+                existing_body=body,
+                addendum=fallback_sentence,
+            )
+            if not fallback_sentence:
+                break
+            updated_body = _append_continuation(body, fallback_sentence)
+            updated_words = _count_words(updated_body)
+            if updated_words <= current_words:
+                break
+            body = updated_body
+            current_words = updated_words
+            rounds += 1
+
+        text = pattern.sub(lambda _mm: f"## {title}\n{body}\n", text, count=1)
 
     # Ensure MD&A exists before we try to balance section lengths.
     if not _section_present("Management Discussion & Analysis"):

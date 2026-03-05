@@ -358,14 +358,20 @@ def test_short_underflow_rescue_prioritizes_financial_performance_and_mdna(
 def test_short_mid_completeness_validator_uses_target_scaled_section_minimums(
     target: int,
 ) -> None:
+    budgets = filings_api._calculate_section_word_budgets(
+        target,
+        include_health_rating=False,
+    )
     mins = filings_api._calculate_section_min_words_for_target(
         target,
         include_health_rating=False,
     )
     fp_min = int(mins.get("Financial Performance") or 0)
     mdna_min = int(mins.get("Management Discussion & Analysis") or 0)
-    assert fp_min > 20
-    assert mdna_min > 25
+    assert fp_min >= int(round(float(budgets.get("Financial Performance") or 0) * 0.85))
+    assert mdna_min >= int(
+        round(float(budgets.get("Management Discussion & Analysis") or 0) * 0.85)
+    )
 
     too_short_fp = max(1, fp_min - 8)
     too_short_mdna = max(1, mdna_min - 8)
