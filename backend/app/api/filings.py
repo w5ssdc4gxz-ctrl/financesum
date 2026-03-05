@@ -10602,6 +10602,13 @@ def _apply_contract_structural_repairs(
         return summary_text
 
     metrics = calculated_metrics or {}
+    short_quality_mode = _is_short_quality_sensitive_target(target_length)
+    section_budgets: Dict[str, int] = {}
+    if target_length and int(target_length) > 0:
+        section_budgets = _calculate_section_word_budgets(
+            int(target_length), include_health_rating=include_health_rating
+        )
+
     min_words_by_section: Dict[str, int] = {
         "Financial Health Rating": 12,
         "Executive Summary": 20,
@@ -10611,6 +10618,24 @@ def _apply_contract_structural_repairs(
         "Key Metrics": 5,
         "Closing Takeaway": 15,
     }
+    if target_length and int(target_length) > 0:
+        min_words_by_section = _calculate_section_min_words_for_target(
+            target_length,
+            include_health_rating=include_health_rating,
+        )
+        focus_ratio = 0.85 if short_quality_mode else 0.75
+        for focus_section in (
+            "Financial Performance",
+            "Management Discussion & Analysis",
+        ):
+            focus_budget = int(section_budgets.get(focus_section, 0) or 0)
+            if focus_budget <= 0:
+                continue
+            focus_floor = max(1, int(round(focus_budget * focus_ratio)))
+            min_words_by_section[focus_section] = max(
+                int(min_words_by_section.get(focus_section, 0) or 0),
+                focus_floor,
+            )
     if not include_health_rating:
         min_words_by_section.pop("Financial Health Rating", None)
 
@@ -10839,8 +10864,25 @@ def _apply_contract_structural_repairs(
         min_words = int(min_words_by_section.get(section_title, 0) or 0)
         if section_title != "Key Metrics" and min_words > 0:
             guard = 0
-            while _count_words(body) < min_words and guard < 6:
-                body = _append_sentence(body, _top_up_sentence(section_title, attempt=guard))
+            is_focus_section = section_title in {
+                "Financial Performance",
+                "Management Discussion & Analysis",
+            }
+            if is_focus_section and target_length and int(target_length) > 0:
+                deficit_words = max(0, int(min_words) - int(_count_words(body)))
+                max_guard = max(6, min(20, max(4, (deficit_words + 19) // 20)))
+            else:
+                max_guard = 6
+            while _count_words(body) < min_words and guard < max_guard:
+                if is_focus_section:
+                    addition = _section_balance_top_up_sentence(
+                        section_title,
+                        attempt=guard,
+                        calculated_metrics=metrics,
+                    )
+                else:
+                    addition = _top_up_sentence(section_title, attempt=guard)
+                body = _append_sentence(body, addition)
                 guard += 1
             remaining = max(0, min_words - _count_words(body))
             if 0 < remaining <= 6:
@@ -14507,12 +14549,60 @@ def _section_balance_top_up_sentence(
     risk_factors_excerpt: str = "",
 ) -> str:
     metrics = calculated_metrics or {}
+    revenue = metrics.get("revenue")
+    operating_income = metrics.get("operating_income")
     operating_margin = metrics.get("operating_margin")
+    net_margin = metrics.get("net_margin")
     free_cash_flow = metrics.get("free_cash_flow")
     operating_cash_flow = metrics.get("operating_cash_flow")
+    capex = metrics.get("capital_expenditures") or metrics.get("capex")
     cash = metrics.get("cash")
+    marketable_securities = metrics.get("marketable_securities")
+    total_liabilities = metrics.get("total_liabilities")
     total_debt = metrics.get("total_debt") or metrics.get("total_liabilities")
     score_band = (health_score_data or {}).get("score_band")
+
+    rev_str = (
+        _format_metric_value_for_text("revenue", revenue)
+        if revenue is not None
+        else None
+    )
+    op_inc_str = (
+        _format_metric_value_for_text("operating_income", operating_income)
+        if operating_income is not None
+        else None
+    )
+    ocf_str = (
+        _format_metric_value_for_text("operating_cash_flow", operating_cash_flow)
+        if operating_cash_flow is not None
+        else None
+    )
+    fcf_str = (
+        _format_metric_value_for_text("free_cash_flow", free_cash_flow)
+        if free_cash_flow is not None
+        else None
+    )
+    capex_str = (
+        _format_metric_value_for_text("capital_expenditures", capex)
+        if capex is not None
+        else None
+    )
+    liabilities_str = (
+        _format_metric_value_for_text("total_liabilities", total_liabilities)
+        if total_liabilities is not None
+        else None
+    )
+    debt_str = (
+        _format_metric_value_for_text("total_debt", total_debt)
+        if total_debt is not None
+        else None
+    )
+    cash_total = cash + (marketable_securities or 0) if cash is not None else None
+    cash_total_str = (
+        _format_metric_value_for_text("cash", cash_total)
+        if cash_total is not None
+        else None
+    )
 
     if section_title == "Financial Health Rating":
         variants = [
@@ -14539,6 +14629,108 @@ def _section_balance_top_up_sentence(
             ),
         ]
         return variants[min(attempt, len(variants) - 1)]
+
+    if section_title == "Financial Performance":
+        variants = [
+            (
+                f"The run-rate setup of {rev_str} revenue and {op_inc_str} operating income shows how sensitive earnings remain to small shifts in pricing, utilization, and cost absorption."
+                if rev_str and op_inc_str
+                else "The run-rate setup shows how sensitive earnings remain to small shifts in pricing, utilization, and cost absorption."
+            ),
+            (
+                f"With operating margin at {operating_margin:.1f}% and net margin at {net_margin:.1f}%, the spread between operating and net profitability helps separate durable operating gains from below-the-line noise."
+                if operating_margin is not None and net_margin is not None
+                else "The relationship between operating and net profitability helps separate durable operating gains from below-the-line noise."
+            ),
+            (
+                f"The bridge from operating cash flow of {ocf_str} to free cash flow of {fcf_str} is central because it shows what portion of reported earnings is truly deployable."
+                if ocf_str and fcf_str
+                else "Cash-conversion quality matters because it shows what portion of reported earnings is truly deployable."
+            ),
+            (
+                f"Capex at {capex_str} is the reinvestment hurdle: if growth does not outpace that spend, apparent margin strength can fade as fixed-cost intensity rises."
+                if capex_str
+                else "Reinvestment intensity is the key hurdle: if growth does not outpace required spend, apparent margin strength can fade as fixed-cost intensity rises."
+            ),
+            "The period-over-period moves are most informative where they change unit economics, not where they only reshuffle accounting timing.",
+            "Watch whether the next period confirms improving earnings quality or reveals that this quarter's strength relied on transient mix and timing effects.",
+            "A durable upgrade requires evidence that margin retention and cash conversion can persist simultaneously, rather than one improving at the expense of the other.",
+            "If operating leverage is real, the next reporting periods should show incremental revenue translating into proportionally higher operating profit and free cash generation.",
+            "The strongest read-through comes from consistency across revenue quality, margin discipline, and funding capacity, not from a single headline beat.",
+            "This section matters most when it isolates recurring economics from temporary timing effects in working capital, expenses, or accounting mix.",
+        ]
+        idx = int(attempt)
+        if idx < len(variants):
+            return variants[idx]
+        perspective_pool = [
+            "Another lens is whether reported profitability is being supported by better operating mechanics rather than by transitory accounting effects.",
+            "A second lens is whether period-to-period volatility is narrowing in ways that signal improving earnings quality.",
+            "A third lens is whether cost absorption is improving because the core revenue engine is scaling, not because discretionary spend is being deferred.",
+            "A fourth lens is whether reinvestment spending is producing measurable efficiency gains in subsequent reporting periods.",
+        ]
+        implication_pool = [
+            "That determines whether incremental revenue can compound into durable operating profit over time.",
+            "That determines whether cash generation can keep funding growth and shareholder returns without balance-sheet strain.",
+            "That determines whether the current margin profile is likely to hold once normal spending cadence returns.",
+            "That determines whether valuation support rests on repeatable economics rather than on one-quarter timing benefits.",
+        ]
+        offset = max(0, idx - len(variants))
+        perspective = perspective_pool[offset % len(perspective_pool)]
+        implication = implication_pool[
+            (offset // max(1, len(perspective_pool))) % len(implication_pool)
+        ]
+        return f"{perspective} {implication}"
+
+    if section_title == "Management Discussion & Analysis":
+        variants = [
+            "Management's capital-allocation sequence matters because it determines whether reinvestment compounds returns or merely protects current growth optics.",
+            (
+                f"The {ocf_str} to {fcf_str} cash bridge is the operational scorecard for execution quality after reinvestment decisions."
+                if ocf_str and fcf_str
+                else "The operating-cash-to-free-cash bridge is the operational scorecard for execution quality after reinvestment decisions."
+            ),
+            (
+                f"Liquidity of {cash_total_str} against liabilities of {liabilities_str} gives flexibility, but deployment choices will reveal whether management is prioritizing resilience or near-term growth optics."
+                if cash_total_str and liabilities_str
+                else "Liquidity flexibility is useful only if deployment choices prioritize durable economics over short-term growth optics."
+            ),
+            (
+                f"Maintaining an operating margin near {operating_margin:.1f}% requires disciplined pricing and cost control as product and infrastructure complexity rises."
+                if operating_margin is not None
+                else "Maintaining operating leverage requires disciplined pricing and cost control as product and infrastructure complexity rises."
+            ),
+            (
+                f"Debt and fixed obligations around {debt_str} limit optionality if growth investments scale faster than internally generated cash."
+                if debt_str
+                else "Debt and fixed obligations limit optionality if growth investments scale faster than internally generated cash."
+            ),
+            "Execution quality should be judged by whether management tightens priorities, improves payback visibility, and keeps cash conversion from structurally diluting over time.",
+            "The key operating question is whether leadership is sequencing spend toward the highest-return initiatives or distributing capital too broadly across competing priorities.",
+            "Management credibility improves when guidance, hiring intensity, and infrastructure investment all point to the same return profile rather than mixed strategic signals.",
+            "As the model scales, discipline in cost-to-serve and monetization design becomes as important as top-line momentum for sustaining long-run value creation.",
+            "The next catalyst is evidence that strategic execution can expand durable cash capacity while preserving balance-sheet flexibility through the cycle.",
+        ]
+        idx = int(attempt)
+        if idx < len(variants):
+            return variants[idx]
+        execution_pool = [
+            "Management quality is best tested by how consistently leadership links spending to measurable return thresholds.",
+            "The strategic test is whether management can keep prioritization tight as more growth vectors compete for capital.",
+            "The operating test is whether leadership can maintain cost discipline while scaling the product and infrastructure footprint.",
+            "The capital-allocation test is whether each reinvestment decision improves long-run cash productivity rather than near-term optics.",
+        ]
+        consequence_pool = [
+            "That is what separates durable compounding from a temporary period of headline resilience.",
+            "That is what determines whether the business remains self-funding through the next cycle.",
+            "That is what keeps downside risk manageable when demand or pricing conditions soften.",
+            "That is what preserves strategic optionality without forcing defensive balance-sheet moves later.",
+        ]
+        offset = max(0, idx - len(variants))
+        execution_line = execution_pool[offset % len(execution_pool)]
+        consequence_line = consequence_pool[
+            (offset // max(1, len(execution_pool))) % len(consequence_pool)
+        ]
+        return f"{execution_line} {consequence_line}"
 
     if section_title == "Risk Factors":
         excerpt_terms = [
@@ -28978,11 +29170,12 @@ def _ensure_required_sections(
     # short/mid targets, still enforce target-aware section floors so Financial
     # Performance and MD&A scale with requested length.
     min_words_by_section = dict(SUMMARY_SECTION_MIN_WORDS)
-    if short_quality_mode and target_length and int(target_length) > 0:
+    if target_length and int(target_length) > 0:
         min_words_by_section = _calculate_section_min_words_for_target(
             target_length,
             include_health_rating=include_health_rating,
         )
+        focus_ratio = 0.85 if short_quality_mode else 0.75
         for focus_section in (
             "Financial Performance",
             "Management Discussion & Analysis",
@@ -28990,7 +29183,7 @@ def _ensure_required_sections(
             focus_budget = int(section_budgets.get(focus_section, 0) or 0)
             if focus_budget <= 0:
                 continue
-            focus_floor = max(1, int(round(focus_budget * 0.85)))
+            focus_floor = max(1, int(round(focus_budget * focus_ratio)))
             min_words_by_section[focus_section] = max(
                 int(min_words_by_section.get(focus_section, 0) or 0),
                 focus_floor,
@@ -30193,9 +30386,21 @@ def _ensure_required_sections(
         # Short-form hardening: if one addendum is still not enough, append a
         # bounded number of deterministic section-specific sentences.
         rounds = 0
-        max_rounds = 4 if short_quality_mode else 1
+        is_focus_section = title in {
+            "Financial Performance",
+            "Management Discussion & Analysis",
+        }
+        if is_focus_section and target_length and int(target_length) > 0:
+            deficit_words = max(0, int(min_words) - int(current_words))
+            rounds_for_deficit = max(2, (deficit_words + 19) // 20)
+            max_rounds = max(
+                4 if short_quality_mode else 2,
+                min(20, int(rounds_for_deficit)),
+            )
+        else:
+            max_rounds = 4 if short_quality_mode else 1
         while current_words < int(min_words) and rounds < max_rounds:
-            fallback_sentence = _section_balance_top_up_sentence(
+            fallback_seed = _section_balance_top_up_sentence(
                 title,
                 attempt=rounds,
                 calculated_metrics=calculated_metrics,
@@ -30205,8 +30410,18 @@ def _ensure_required_sections(
             fallback_sentence = _apply_addendum_guardrails(
                 section_title=title,
                 existing_body=body,
-                addendum=fallback_sentence,
+                addendum=fallback_seed,
             )
+            if (
+                not fallback_sentence
+                and is_focus_section
+                and target_length
+                and int(target_length) > 0
+            ):
+                seed_norm = _norm_sentence(fallback_seed)
+                existing_norms = {_norm_sentence(s) for s in _split_sentences(body)}
+                if seed_norm and seed_norm not in existing_norms:
+                    fallback_sentence = fallback_seed
             if not fallback_sentence:
                 break
             updated_body = _append_continuation(body, fallback_sentence)

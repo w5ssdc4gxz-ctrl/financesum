@@ -300,3 +300,65 @@ def test_short_underweight_section_guidance_prioritizes_narrative_gaps() -> None
     assert titles.index("Risk Factors") < titles.index("Executive Summary")
     assert "Management Discussion & Analysis" in guidance
     assert "Executive Summary" in guidance
+
+
+@pytest.mark.parametrize("target_length", [600, 1000, 2000, 3000])
+def test_ensure_required_sections_scales_fp_and_mdna_with_target_length(
+    target_length: int,
+) -> None:
+    base = (
+        "## Financial Health Rating\n"
+        f"{_make_body(24, token='health')}\n\n"
+        "## Executive Summary\n"
+        f"{_make_body(20, token='exec')}\n\n"
+        "## Financial Performance\n"
+        "Revenue moved.\n\n"
+        "## Management Discussion & Analysis\n"
+        "Management discussed strategy.\n\n"
+        "## Risk Factors\n"
+        f"{_make_body(26, token='risk')}\n\n"
+        "## Key Metrics\n"
+        "Revenue | $1.0B\n\n"
+        "## Closing Takeaway\n"
+        f"{_make_body(18, token='close')}\n"
+    )
+
+    metrics = {
+        "revenue": 30.57e9,
+        "operating_income": 10.34e9,
+        "net_income": 8.81e9,
+        "operating_margin": 33.8,
+        "net_margin": 28.8,
+        "operating_cash_flow": 13.52e9,
+        "free_cash_flow": 10.96e9,
+        "capital_expenditures": 2.56e9,
+        "cash": 11.21e9,
+        "marketable_securities": 0.0,
+        "total_liabilities": 168.42e9,
+        "total_debt": 79.07e9,
+    }
+
+    ensured = filings_api._ensure_required_sections(
+        base,
+        include_health_rating=True,
+        metrics_lines="Revenue | $1.0B",
+        calculated_metrics=metrics,
+        health_score_data={},
+        company_name="Microsoft Corp",
+        risk_factors_excerpt="AI serving costs and regulation may pressure margins.",
+        target_length=target_length,
+    )
+
+    counts = filings_api._collect_section_body_word_counts(
+        ensured, include_health_rating=True
+    )
+    mins = filings_api._calculate_section_min_words_for_target(
+        target_length, include_health_rating=True
+    )
+
+    assert counts["Financial Performance"] >= int(
+        mins.get("Financial Performance", 0) or 0
+    )
+    assert counts["Management Discussion & Analysis"] >= int(
+        mins.get("Management Discussion & Analysis", 0) or 0
+    )
