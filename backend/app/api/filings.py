@@ -151,6 +151,27 @@ MAX_SUMMARY_ATTEMPTS = 1
 MICRO_PLAINTEXT_SUMMARY_MAX_TARGET_WORDS = 180
 
 
+def _resolve_summary_openai_api_key(settings: Any) -> str:
+    """Resolve OpenAI API key for runtime summary generation.
+
+    This guards against stale cached settings objects by re-checking runtime env vars.
+    """
+    configured = str(getattr(settings, "openai_api_key", "") or "").strip()
+    if configured:
+        return configured
+
+    for env_name in ("OPENAI_API_KEY", "OPENAI-API-KEY"):
+        candidate = str(os.getenv(env_name, "") or "").strip()
+        if candidate:
+            try:
+                settings.openai_api_key = candidate
+            except Exception:  # noqa: BLE001
+                pass
+            return candidate
+
+    return ""
+
+
 def _extract_word_count_control(text: str) -> Tuple[str, Optional[int]]:
     """Extract an optional model-reported word count control token.
 
@@ -21235,9 +21256,19 @@ def generate_filing_summary(
     # Generate summary with GPT-5.2
     try:
         _require_summary_runtime_budget("summary_pipeline_start")
-        api_key = getattr(settings, "openai_api_key", "")
+        api_key = _resolve_summary_openai_api_key(settings)
         if not api_key or api_key.strip() == "":
-            raise HTTPException(status_code=400, detail="OPENAI_API_KEY not configured")
+            missing_key_detail = "OPENAI_API_KEY not configured"
+            set_summary_progress(
+                filing_id,
+                status="Summary provider key is not configured.",
+                stage_percent=0,
+                error=True,
+                last_failure_code="SUMMARY_OPENAI_KEY_MISSING",
+                last_error_message=missing_key_detail,
+                last_error_details={"detail": missing_key_detail},
+            )
+            raise HTTPException(status_code=400, detail=missing_key_detail)
 
         summary_request_id = uuid4().hex
 
@@ -30004,16 +30035,35 @@ async def export_filing_summary(
 @router.get("/{filing_id}/progress")
 async def get_filing_summary_progress(filing_id: str):
     """Get real-time progress of summary generation."""
-    snapshot = get_summary_progress_snapshot(filing_id)
+    try:
+        snapshot = get_summary_progress_snapshot(filing_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Unable to load summary progress snapshot for %s", filing_id)
+        return {
+            "status": str(progress_cache.get(str(filing_id), "Initializing...")),
+            "percent": 0,
+            "percent_exact": 0.0,
+            "eta_seconds": None,
+            "error": True,
+            "last_failure_code": "SUMMARY_PROGRESS_UNAVAILABLE",
+            "last_error_message": str(exc),
+            "last_error_details": {"detail": str(exc)},
+        }
+
+    status = str(
+        getattr(snapshot, "status", None) or progress_cache.get(str(filing_id), "Initializing...")
+    )
+    percent = int(getattr(snapshot, "percent", 0) or 0)
+    percent_exact = float(getattr(snapshot, "percent_exact", float(percent)) or float(percent))
     return {
-        "status": snapshot.status,
-        "percent": snapshot.percent,
-        "percent_exact": snapshot.percent_exact,
-        "eta_seconds": snapshot.eta_seconds,
-        "error": snapshot.error,
-        "last_failure_code": snapshot.last_failure_code,
-        "last_error_message": snapshot.last_error_message,
-        "last_error_details": snapshot.last_error_details,
+        "status": status,
+        "percent": percent,
+        "percent_exact": percent_exact,
+        "eta_seconds": getattr(snapshot, "eta_seconds", None),
+        "error": bool(getattr(snapshot, "error", False)),
+        "last_failure_code": getattr(snapshot, "last_failure_code", None),
+        "last_error_message": getattr(snapshot, "last_error_message", None),
+        "last_error_details": getattr(snapshot, "last_error_details", None),
     }
 
 
