@@ -245,6 +245,16 @@ def _is_short_quality_sensitive_target(target_length: Optional[int]) -> bool:
         return False
 
 
+def _is_explicit_short_mid_precision_target(
+    *,
+    target_length: Optional[int],
+    explicit_target_requested: bool,
+) -> bool:
+    if not explicit_target_requested:
+        return False
+    return _is_short_quality_sensitive_target(target_length)
+
+
 def _build_micro_plaintext_summary_prompt(
     *,
     identity_block: str,
@@ -405,6 +415,18 @@ def _effective_word_band_tolerance(target_length: Optional[int] = None) -> int:
     if target_length and _summary_continuous_v2_enabled():
         return int(total_word_tolerance_words(int(target_length)))
     return int(FINAL_STRICT_WORD_BAND_TOLERANCE)
+
+
+def _target_word_band_bounds(
+    target_length: Optional[int],
+) -> Optional[Tuple[int, int, int]]:
+    if not target_length:
+        return None
+    target = int(target_length)
+    tolerance = int(_effective_word_band_tolerance(target))
+    lower = int(max(TARGET_LENGTH_MIN_WORDS, target - tolerance))
+    upper = int(min(TARGET_LENGTH_MAX_WORDS, target + tolerance))
+    return lower, upper, tolerance
 
 
 def _float_env(name: str, default: float) -> float:
@@ -12524,9 +12546,10 @@ def _rescue_short_sectioned_underflow(
         return summary_text
 
     target = int(target_length)
-    tolerance = _effective_word_band_tolerance(target)
-    lower = max(TARGET_LENGTH_MIN_WORDS, target - tolerance)
-    upper = min(TARGET_LENGTH_MAX_WORDS, target + tolerance)
+    band = _target_word_band_bounds(target)
+    if band is None:
+        return summary_text
+    lower, upper, tolerance = band
     split_wc = len((summary_text or "").split())
     stripped_wc = _count_words(summary_text or "")
     if split_wc >= lower and stripped_wc >= lower:
@@ -12625,6 +12648,151 @@ def _rescue_short_sectioned_underflow(
         )
         generation_stats["short_underflow_rescue_targets"] = list(underweight_titles[:4])
     return summary_text
+
+
+def _recover_short_form_editorial_issues_once(
+    summary_text: str,
+    *,
+    target_length: int,
+    include_health_rating: bool,
+    missing_requirements: Optional[List[str]],
+    quality_profile: SummaryFlowQualityProfile,
+    quality_validators: Optional[List[Callable[[str], Optional[str]]]],
+    calculated_metrics: Dict[str, Any],
+    company_name: str,
+    source_text: Optional[str],
+    filing_language_snippets: str,
+    enforce_quote_contract: bool,
+    gemini_client: Optional[Any],
+    generation_stats: Optional[Dict[str, Any]] = None,
+    token_budget: Optional[TokenBudget] = None,
+    cost_budget: Optional[SummaryCostBudget] = None,
+    max_output_tokens: int = DEFAULT_OPENAI_MAX_OUTPUT_TOKENS,
+    persona_intensity: str = "strong",
+) -> Tuple[str, List[str], Dict[str, Any], bool]:
+    """Run one bounded short-form editorial recovery attempt before downgrading warnings."""
+    text = str(summary_text or "").strip()
+    if not text:
+        return summary_text, list(missing_requirements or []), {"final_word_count": 0}, False
+    if not _is_short_quality_sensitive_target(target_length):
+        rechecked_missing, rechecked_meta = _evaluate_summary_contract_requirements(
+            summary_text=text,
+            target_length=target_length,
+            include_health_rating=include_health_rating,
+            quality_validators=quality_validators,
+            source_text=source_text,
+            filing_language_snippets=filing_language_snippets,
+            enforce_quote_contract=enforce_quote_contract,
+        )
+        return text, rechecked_missing, rechecked_meta, False
+
+    attempted = False
+    rewrite_used = False
+    parsed_flags = _parse_summary_contract_missing_requirements(missing_requirements)
+
+    text, editorial_info = _apply_editorial_contract_repairs(
+        text,
+        target_length=target_length,
+        include_health_rating=include_health_rating,
+        quality_profile=quality_profile,
+        missing_requirements=list(missing_requirements or []),
+        issue_flags=parsed_flags,
+        generation_stats=generation_stats,
+    )
+    if editorial_info.get("actions"):
+        attempted = True
+
+    if parsed_flags.get("leading_word_repetition_issue"):
+        text, lwr_info = _repair_leading_word_repetition_in_summary(
+            text,
+            max_same_opening=max(1, int(getattr(quality_profile, "max_same_opening", 2) or 2)),
+            target_sections=list(parsed_flags.get("leading_word_repetition_sections") or []),
+        )
+        if lwr_info.get("changed"):
+            attempted = True
+
+    if gemini_client is not None:
+        emergency_rewrite_stats: Optional[Dict[str, Any]] = generation_stats
+        if generation_stats is not None:
+            rewrite_calls = int(generation_stats.get("rewrite_call_count", 0) or 0)
+            if rewrite_calls >= int(MAX_REWRITE_ATTEMPTS):
+                emergency_rewrite_stats = None
+        rewritten_text, _ = _rewrite_summary_to_length(
+            gemini_client,
+            text,
+            int(target_length),
+            quality_validators,
+            current_words=_count_words(text or ""),
+            token_budget=token_budget,
+            cost_budget=cost_budget,
+            max_output_tokens=max_output_tokens,
+            generation_stats=emergency_rewrite_stats,
+            persona_intensity=persona_intensity,
+            quality_issue_hint=(
+                "Short-form editorial recovery: fix repetition and style issues while preserving "
+                "headings, quotes, numeric facts, Key Metrics rows, and stance."
+            ),
+            allow_over_target_recovery=True,
+            ignore_max_rewrite_attempts=True,
+            timeout_seconds=_summary_rewrite_timeout_seconds(),
+        )
+        if rewritten_text and rewritten_text.strip():
+            text = rewritten_text
+            rewrite_used = True
+            attempted = True
+            if emergency_rewrite_stats is None and generation_stats is not None:
+                generation_stats["short_editorial_reserved_rewrite_used"] = True
+
+    if attempted:
+        text = _run_summary_cleanup_pass(
+            text,
+            include_health_rating=include_health_rating,
+            calculated_metrics=calculated_metrics,
+            company_name=company_name,
+        )
+        text = _remove_metric_echo_loops(text)
+        text = _merge_staccato_paragraphs(text)
+        text = _cap_closing_sentences_filings(
+            text,
+            max_sentences=_closing_sentence_cap_for_target(
+                target_length, include_health_rating=include_health_rating
+            ),
+        )
+        text = _merge_duplicate_canonical_sections(
+            text, include_health_rating=include_health_rating
+        )
+        text = _enforce_section_order(text, include_health_rating=include_health_rating)
+        band = _target_word_band_bounds(target_length)
+        if band is not None:
+            _lower, _upper, tolerance = band
+            text = _ensure_final_strict_word_band(
+                text,
+                int(target_length),
+                include_health_rating=include_health_rating,
+                tolerance=int(tolerance),
+                generation_stats=generation_stats,
+                allow_padding=False,
+            )
+            text = _enforce_whitespace_word_band(
+                text,
+                int(target_length),
+                tolerance=int(tolerance),
+                allow_padding=False,
+                dedupe=True,
+            )
+    rechecked_missing, rechecked_meta = _evaluate_summary_contract_requirements(
+        summary_text=text,
+        target_length=target_length,
+        include_health_rating=include_health_rating,
+        quality_validators=quality_validators,
+        source_text=source_text,
+        filing_language_snippets=filing_language_snippets,
+        enforce_quote_contract=enforce_quote_contract,
+    )
+    if generation_stats is not None:
+        generation_stats["short_form_editorial_recovery_attempted"] = bool(attempted)
+        generation_stats["short_form_editorial_recovery_rewrite_used"] = bool(rewrite_used)
+    return text, rechecked_missing, rechecked_meta, attempted
 
 
 def _parse_summary_contract_missing_requirements(
@@ -12867,15 +13035,6 @@ def _select_short_form_structural_failure_requirements(
             "closing takeaway is missing an explicit buy/hold/sell recommendation",
         )
 
-    for _snippet in (
-        "question-framing repetition:",
-        "verbatim repetition detected",
-    ):
-        for normalized, original in existing_by_norm.items():
-            if _snippet in normalized:
-                _append(original)
-                break
-
     if _summary_has_incomplete_tail(text):
         _append_matching(
             "Final summary still ends mid-thought after cleanup. Finish the closing sentence cleanly.",
@@ -12972,15 +13131,15 @@ def _summary_contract_scope_for_target(target_length: Optional[int]) -> str:
 
 
 def _summary_target_band_payload(target_length: Optional[int]) -> Optional[Dict[str, int]]:
-    if not target_length:
+    if _is_micro_plaintext_target(target_length):
         return None
-    target = int(target_length)
-    if _is_micro_plaintext_target(target):
+    band = _target_word_band_bounds(target_length)
+    if band is None:
         return None
-    tol = _effective_word_band_tolerance(target)
+    lower, upper, _tol = band
     return {
-        "lower": int(max(TARGET_LENGTH_MIN_WORDS, target - tol)),
-        "upper": int(min(TARGET_LENGTH_MAX_WORDS, target + tol)),
+        "lower": int(lower),
+        "upper": int(upper),
     }
 
 
@@ -20565,6 +20724,10 @@ def generate_filing_summary(
     one_shot_deterministic_policy = bool(
         micro_plaintext_mode or strict_contract_opt_in
     )
+    explicit_short_mid_precision_target = _is_explicit_short_mid_precision_target(
+        target_length=target_length,
+        explicit_target_requested=explicit_target_requested,
+    )
     summary_runtime_cap_seconds = max(1, int(SUMMARY_TOTAL_TIMEOUT_SECONDS))
     summary_runtime_started_at = time.monotonic()
     summary_runtime_deadline = (
@@ -20589,6 +20752,8 @@ def generate_filing_summary(
         and not one_shot_deterministic_policy
         and not long_form_target
     )
+    if explicit_short_mid_precision_target:
+        fast_summary_mode = False
     allow_fast_explicit_target_length_recovery = bool(
         fast_summary_mode
         and _allow_fast_explicit_target_length_recovery(
@@ -22070,6 +22235,9 @@ FLOW AND QUALITY RULES:
         )
         generation_stats["fast_cost_cap_usd"] = float(fast_cost_cap_usd)
         generation_stats["quality_mode"] = quality_mode
+        generation_stats["short_mid_precision_mode"] = bool(
+            explicit_short_mid_precision_target
+        )
         generation_stats["contract_recovery_used"] = False
         generation_stats["contract_recovery_generation_calls"] = 0
         generation_stats["contract_recovery_cost_guard_blocked"] = False
@@ -25001,6 +25169,97 @@ FLOW AND QUALITY RULES:
         short_form_structural_fatal_requirements: List[str] = []
         short_form_editorial_fatal_requirements: List[str] = []
         if soft_target_mode and _is_short_form_sectioned_target(target_length):
+            if short_quality_mode and not statement_only_source_mode:
+                band = _target_word_band_bounds(target_length)
+                if band is not None:
+                    lower, upper, tolerance = band
+                    initial_split_words = int(
+                        summary_meta.get("final_split_word_count")
+                        or len((summary_text or "").split())
+                    )
+                    initial_stripped_words = int(
+                        summary_meta.get("final_word_count") or _count_words(summary_text or "")
+                    )
+                    if not (
+                        lower <= initial_split_words <= upper
+                        and lower <= initial_stripped_words <= upper
+                    ):
+                        summary_text = _rescue_short_sectioned_underflow(
+                            summary_text,
+                            target_length=int(target_length),
+                            include_health_rating=include_health_rating,
+                            calculated_metrics=calculated_metrics,
+                            company_name=company_name,
+                            gemini_client=gemini_client,
+                            quality_validators=contract_quality_validators
+                            or post_final_quality_validators
+                            or quality_validators,
+                            generation_stats=generation_stats,
+                            strict_contract_required=bool(strict_contract_required),
+                            token_budget=token_budget,
+                            cost_budget=cost_budget,
+                            max_output_tokens=max_output_tokens,
+                            persona_intensity=(
+                                "subtle"
+                                if generation_stats.get("persona_intensity_downgraded")
+                                else "strong"
+                            ),
+                        )
+                        summary_text = _run_summary_cleanup_pass(
+                            summary_text,
+                            include_health_rating=include_health_rating,
+                            calculated_metrics=calculated_metrics,
+                            company_name=company_name,
+                        )
+                        summary_text = _remove_metric_echo_loops(summary_text)
+                        summary_text = _merge_staccato_paragraphs(summary_text)
+                        summary_text = _cap_closing_sentences_filings(
+                            summary_text,
+                            max_sentences=_closing_sentence_cap_for_target(
+                                target_length,
+                                include_health_rating=include_health_rating,
+                            ),
+                        )
+                        summary_text = _merge_duplicate_canonical_sections(
+                            summary_text, include_health_rating=include_health_rating
+                        )
+                        summary_text = _enforce_section_order(
+                            summary_text, include_health_rating=include_health_rating
+                        )
+                        summary_text = _ensure_final_strict_word_band(
+                            summary_text,
+                            int(target_length),
+                            include_health_rating=include_health_rating,
+                            tolerance=int(tolerance),
+                            generation_stats=generation_stats,
+                            allow_padding=False,
+                        )
+                        summary_text = _enforce_whitespace_word_band(
+                            summary_text,
+                            int(target_length),
+                            tolerance=int(tolerance),
+                            allow_padding=False,
+                            dedupe=True,
+                        )
+                        (
+                            missing_requirements,
+                            summary_meta,
+                        ) = _evaluate_summary_contract_requirements(
+                            summary_text=summary_text,
+                            target_length=target_length,
+                            include_health_rating=include_health_rating,
+                            quality_validators=contract_quality_validators,
+                            source_text=context_excerpt,
+                            filing_language_snippets=filing_language_snippets,
+                            enforce_quote_contract=strict_quote_contract,
+                        )
+                        generation_stats["contract_missing_requirements"] = missing_requirements
+                        generation_stats["contract_verified_quote_count"] = summary_meta.get(
+                            "verified_quote_count", 0
+                        )
+                        generation_stats["contract_final_word_count"] = summary_meta.get(
+                            "final_word_count", 0
+                        )
             short_form_structural_fatal_requirements = (
                 _select_short_form_structural_failure_requirements(
                     summary_text=summary_text,
@@ -25030,48 +25289,124 @@ FLOW AND QUALITY RULES:
                         missing_requirements=missing_requirements,
                     )
                 )
+                if short_form_editorial_fatal_requirements:
+                    (
+                        summary_text,
+                        missing_requirements,
+                        summary_meta,
+                        _editorial_attempted,
+                    ) = _recover_short_form_editorial_issues_once(
+                        summary_text,
+                        target_length=int(target_length),
+                        include_health_rating=include_health_rating,
+                        missing_requirements=missing_requirements,
+                        quality_profile=post_final_profile,
+                        quality_validators=contract_quality_validators,
+                        calculated_metrics=calculated_metrics,
+                        company_name=company_name,
+                        source_text=context_excerpt,
+                        filing_language_snippets=filing_language_snippets,
+                        enforce_quote_contract=strict_quote_contract,
+                        gemini_client=gemini_client,
+                        generation_stats=generation_stats,
+                        token_budget=token_budget,
+                        cost_budget=cost_budget,
+                        max_output_tokens=max_output_tokens,
+                        persona_intensity=(
+                            "subtle"
+                            if generation_stats.get("persona_intensity_downgraded")
+                            else "strong"
+                        ),
+                    )
+                    generation_stats["contract_missing_requirements"] = missing_requirements
+                    generation_stats["contract_verified_quote_count"] = summary_meta.get(
+                        "verified_quote_count", 0
+                    )
+                    generation_stats["contract_final_word_count"] = summary_meta.get(
+                        "final_word_count", 0
+                    )
+                    short_form_structural_fatal_requirements = (
+                        _select_short_form_structural_failure_requirements(
+                            summary_text=summary_text,
+                            missing_requirements=missing_requirements,
+                            include_health_rating=include_health_rating,
+                        )
+                    )
+                    if short_form_structural_fatal_requirements:
+                        raise HTTPException(
+                            status_code=422,
+                            detail={
+                                "detail": "Unable to satisfy structural requirements for short-form summary.",
+                                "failure_code": "SUMMARY_CONTRACT_FAILED",
+                                "target_length": int(target_length or 0),
+                                "actual_word_count": int(
+                                    summary_meta.get("final_word_count") or 0
+                                ),
+                                "missing_requirements": short_form_structural_fatal_requirements,
+                            },
+                        )
+                    short_form_editorial_fatal_requirements = (
+                        _select_short_form_editorial_failure_requirements(
+                            missing_requirements=missing_requirements,
+                        )
+                    )
                 generation_stats["short_form_editorial_fatal_requirements"] = (
                     short_form_editorial_fatal_requirements
                 )
                 if short_form_editorial_fatal_requirements:
-                    raise HTTPException(
-                        status_code=422,
-                        detail={
-                            "detail": "Unable to satisfy editorial requirements for short-form summary.",
-                            "failure_code": "SUMMARY_CONTRACT_FAILED",
-                            "target_length": int(target_length or 0),
-                            "actual_word_count": int(
-                                summary_meta.get("final_word_count") or 0
-                            ),
-                            "missing_requirements": short_form_editorial_fatal_requirements,
-                        },
+                    contract_warnings.extend(short_form_editorial_fatal_requirements)
+                    fast_degraded = True
+                    if not fast_degraded_reason:
+                        fast_degraded_reason = "soft_target"
+                    fast_warnings.append(
+                        "Short-form editorial issues remained after one bounded recovery pass; returned with warnings."
                     )
-                short_quality_floor = max(
-                    TARGET_LENGTH_MIN_WORDS,
-                    (int(target_length or 0) * 9 + 9) // 10,
-                )
-                if int(summary_meta.get("final_word_count") or 0) < short_quality_floor:
-                    raise HTTPException(
-                        status_code=422,
-                        detail={
-                            "detail": "Unable to satisfy clean short-form target without filler padding.",
-                            "failure_code": "SUMMARY_CONTRACT_FAILED",
-                            "target_length": int(target_length or 0),
-                            "actual_word_count": int(
-                                summary_meta.get("final_word_count") or 0
-                            ),
-                            "missing_requirements": list(
-                                dict.fromkeys(
-                                    list(missing_requirements or [])
-                                    + [
-                                        f"Short-form clean-output floor violation: require at least {short_quality_floor} words without filler padding, got {int(summary_meta.get('final_word_count') or 0)}."
-                                    ]
-                                )
-                            )[:12],
-                        },
+                band = _target_word_band_bounds(target_length)
+                if band is not None:
+                    lower, upper, tolerance = band
+                    final_split_words = int(
+                        summary_meta.get("final_split_word_count")
+                        or len((summary_text or "").split())
                     )
+                    final_stripped_words = int(
+                        summary_meta.get("final_word_count") or _count_words(summary_text or "")
+                    )
+                    if not (
+                        lower <= final_split_words <= upper
+                        and lower <= final_stripped_words <= upper
+                    ):
+                        band_requirement = (
+                            f"Final word-count band violation: expected {lower}-{upper}, "
+                            f"got split={final_split_words}, stripped={final_stripped_words}."
+                        )
+                        merged_missing = list(
+                            dict.fromkeys(
+                                list(missing_requirements or [])
+                                + [band_requirement]
+                            )
+                        )
+                        raise HTTPException(
+                            status_code=422,
+                            detail={
+                                "detail": "Unable to satisfy strict short-form word-count contract after bounded retries.",
+                                "failure_code": "SUMMARY_CONTRACT_FAILED",
+                                "target_length": int(target_length or 0),
+                                "actual_word_count": int(final_stripped_words),
+                                "target_band": {
+                                    "lower": int(lower),
+                                    "upper": int(upper),
+                                    "tolerance": int(tolerance),
+                                },
+                                "missing_requirements": merged_missing[:12],
+                            },
+                        )
         if soft_target_mode and missing_requirements:
-            contract_warnings = [str(item) for item in list(missing_requirements or [])[:12]]
+            contract_warnings = list(
+                dict.fromkeys(
+                    list(contract_warnings or [])
+                    + [str(item) for item in list(missing_requirements or [])[:12]]
+                )
+            )
             fast_degraded = True
             if not fast_degraded_reason:
                 fast_degraded_reason = "soft_target"
@@ -25082,9 +25417,7 @@ FLOW AND QUALITY RULES:
                 "word-count band violation" in str(item).lower()
                 for item in list(missing_requirements or [])
             ):
-                fast_warnings.append(
-                    "Short-form summary returned below target to avoid filler padding."
-                )
+                fast_warnings.append("Short-form summary may still miss the requested band.")
 
         actual_logged_cost_usd: Optional[float] = None
         try:
@@ -25447,6 +25780,9 @@ FLOW AND QUALITY RULES:
                 ),
                 "quality_mode": quality_mode,
                 "fast_summary_mode": bool(fast_summary_mode),
+                "short_mid_precision_mode": bool(
+                    generation_stats.get("short_mid_precision_mode") or False
+                ),
                 "output_format": summary_output_format,
                 "source_context_mode": source_context_mode,
                 "statement_only_source_mode": bool(statement_only_source_mode),

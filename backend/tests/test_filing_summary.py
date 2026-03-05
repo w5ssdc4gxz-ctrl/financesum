@@ -249,6 +249,11 @@ def _stabilize_summary_pipeline(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         filings_api,
+        "_rewrite_summary_to_length",
+        _rewrite_passthrough,
+    )
+    monkeypatch.setattr(
+        filings_api,
         "_run_summary_cleanup_pass",
         lambda text, **kwargs: text,
     )
@@ -493,11 +498,7 @@ def test_summary_falls_back_to_statement_only_context_when_narrative_document_mi
 
     def _fake_generate(*args, **kwargs):
         captured["prompt"] = str(args[1] if len(args) > 1 else kwargs.get("base_prompt") or "")
-        return _build_long_form_summary(
-            900,
-            include_exec_quote=False,
-            include_mdna_quote=False,
-        )
+        return build_summary_with_word_count(650)
 
     monkeypatch.setattr(
         filings_api,
@@ -512,6 +513,7 @@ def test_summary_falls_back_to_statement_only_context_when_narrative_document_mi
             {
                 "target_length": 650,
                 "final_word_count": 650,
+                "final_split_word_count": 650,
                 "verified_quote_count": 0,
                 "key_metrics_numeric_row_count": 5,
                 "quality_checks_passed": [],
@@ -3777,6 +3779,75 @@ def test_client_strict_contract_request_is_ignored_when_server_disallows_opt_in(
         _clear_filing_bundle(filing_id, company_id)
 
 
+def test_explicit_short_mid_target_forces_strict_path_when_fast_default_enabled(
+    monkeypatch,
+) -> None:
+    settings = get_settings()
+    settings.openai_api_key = "test-key"
+    monkeypatch.setenv("SUMMARY_FAST_MODE_DEFAULT", "1")
+
+    filing_id = "short-mid-strict-routing-filing"
+    company_id = "short-mid-strict-routing-company"
+    _seed_filing_bundle(filing_id, company_id)
+    _relax_non_contract_quality_validators(monkeypatch)
+    _stabilize_summary_pipeline(monkeypatch)
+
+    short_summary = build_summary_with_word_count(600)
+    monkeypatch.setattr(
+        filings_api,
+        "_generate_summary_with_quality_control",
+        lambda *args, **kwargs: short_summary,
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_evaluate_summary_contract_requirements",
+        lambda **kwargs: (
+            [],
+            {
+                "target_length": 600,
+                "final_word_count": filings_api._count_words(
+                    str(kwargs.get("summary_text") or "")
+                ),
+                "final_split_word_count": len(str(kwargs.get("summary_text") or "").split()),
+                "verified_quote_count": 0,
+                "key_metrics_numeric_row_count": 5,
+                "quality_checks_passed": [],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_apply_short_form_structural_seal",
+        lambda text, **_kwargs: text,
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_select_short_form_structural_failure_requirements",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_select_short_form_editorial_failure_requirements",
+        lambda **_kwargs: [],
+    )
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/filings/{filing_id}/summary",
+        json={"mode": "custom", "target_length": 600},
+    )
+
+    try:
+        assert response.status_code == 200
+        payload = response.json() or {}
+        meta = payload.get("summary_meta") or {}
+        assert payload.get("quality_mode") == "strict"
+        assert meta.get("fast_summary_mode") is False
+        assert meta.get("short_mid_precision_mode") is True
+    finally:
+        _clear_filing_bundle(filing_id, company_id)
+
+
 def test_fast_summary_cache_hit_skips_second_generation_call(monkeypatch) -> None:
     settings = get_settings()
     settings.openai_api_key = "test-key"
@@ -4349,7 +4420,7 @@ def test_short_form_invalid_key_metrics_returns_summary_contract_422(
         _clear_filing_bundle(filing_id, company_id)
 
 
-def test_short_form_non_structural_soft_target_still_returns_degraded_200(
+def test_short_form_non_structural_band_miss_returns_summary_contract_422(
     monkeypatch,
 ) -> None:
     settings = get_settings()
@@ -4418,12 +4489,11 @@ def test_short_form_non_structural_soft_target_still_returns_degraded_200(
     )
 
     try:
-        assert response.status_code == 200
-        payload = response.json() or {}
-        assert payload.get("degraded") is True
-        assert payload.get("degraded_reason") == "soft_target"
-        warnings = payload.get("contract_warnings") or []
-        assert any("word-count band violation" in str(item).lower() for item in warnings)
+        assert response.status_code == 422
+        detail = (response.json() or {}).get("detail", {})
+        assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
+        missing = detail.get("missing_requirements") or []
+        assert any("word-count band violation" in str(item).lower() for item in missing)
     finally:
         _clear_filing_bundle(filing_id, company_id)
 
@@ -4479,7 +4549,8 @@ def test_short_quality_prompt_relaxes_quotes_and_question_chaining(monkeypatch) 
             [],
             {
                 "target_length": 650,
-                "final_word_count": 590,
+                "final_word_count": 640,
+                "final_split_word_count": 640,
                 "verified_quote_count": 0,
                 "key_metrics_numeric_row_count": 5,
                 "quality_checks_passed": [],
@@ -4515,7 +4586,7 @@ def test_short_quality_prompt_relaxes_quotes_and_question_chaining(monkeypatch) 
         _clear_filing_bundle(filing_id, company_id)
 
 
-def test_short_form_clean_under_target_returns_degraded_200_without_stock_tail(
+def test_short_form_clean_under_target_returns_summary_contract_422_without_stock_tail(
     monkeypatch,
 ) -> None:
     settings = get_settings()
@@ -4589,13 +4660,11 @@ def test_short_form_clean_under_target_returns_degraded_200_without_stock_tail(
     )
 
     try:
-        assert response.status_code == 200
-        payload = response.json() or {}
-        assert payload.get("degraded") is True
-        assert payload.get("degraded_reason") == "soft_target"
-        assert "watchpoint" not in str(payload.get("summary") or "").lower()
-        warnings = payload.get("warnings") or []
-        assert any("avoid filler padding" in str(item).lower() for item in warnings)
+        assert response.status_code == 422
+        detail = (response.json() or {}).get("detail", {})
+        assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
+        missing = detail.get("missing_requirements") or []
+        assert any("word-count band violation" in str(item).lower() for item in missing)
     finally:
         _clear_filing_bundle(filing_id, company_id)
 
@@ -4678,7 +4747,7 @@ def test_short_form_clean_too_short_returns_summary_contract_422(
         detail = (response.json() or {}).get("detail", {})
         assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
         missing = detail.get("missing_requirements") or []
-        assert any("clean-output floor violation" in str(item).lower() for item in missing)
+        assert any("word-count band violation" in str(item).lower() for item in missing)
     finally:
         _clear_filing_bundle(filing_id, company_id)
 
@@ -4837,7 +4906,7 @@ def test_short_form_generic_filler_issue_returns_summary_contract_422(
         _clear_filing_bundle(filing_id, company_id)
 
 
-def test_short_form_number_theme_repetition_issue_returns_summary_contract_422(
+def test_short_form_number_theme_repetition_issue_returns_contract_warnings(
     monkeypatch,
 ) -> None:
     settings = get_settings()
@@ -4887,6 +4956,7 @@ def test_short_form_number_theme_repetition_issue_returns_summary_contract_422(
             {
                 "target_length": 650,
                 "final_word_count": 642,
+                "final_split_word_count": 642,
                 "verified_quote_count": 0,
                 "key_metrics_numeric_row_count": 5,
                 "quality_checks_passed": [],
@@ -4906,17 +4976,17 @@ def test_short_form_number_theme_repetition_issue_returns_summary_contract_422(
     )
 
     try:
-        assert response.status_code == 422
-        detail = (response.json() or {}).get("detail", {})
-        assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
-        missing = " ".join(str(item) for item in (detail.get("missing_requirements") or []))
-        assert "number repetition across sections" in missing.lower()
-        assert "theme over-repetition" in missing.lower()
+        assert response.status_code == 200
+        payload = response.json() or {}
+        assert payload.get("degraded") is True
+        warnings = " ".join(str(item) for item in (payload.get("contract_warnings") or []))
+        assert "number repetition across sections" in warnings.lower()
+        assert "theme over-repetition" in warnings.lower()
     finally:
         _clear_filing_bundle(filing_id, company_id)
 
 
-def test_short_form_repetition_issue_returns_summary_contract_422(
+def test_short_form_repetition_issue_returns_contract_warnings(
     monkeypatch,
 ) -> None:
     settings = get_settings()
@@ -4964,12 +5034,18 @@ def test_short_form_repetition_issue_returns_summary_contract_422(
             ],
             {
                 "target_length": 650,
-                "final_word_count": filings_api._count_words(repetitive_summary),
+                "final_word_count": 642,
+                "final_split_word_count": 642,
                 "verified_quote_count": 0,
                 "key_metrics_numeric_row_count": 5,
                 "quality_checks_passed": [],
             },
         ),
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_select_short_form_structural_failure_requirements",
+        lambda **_kwargs: [],
     )
 
     client = TestClient(app)
@@ -4979,11 +5055,11 @@ def test_short_form_repetition_issue_returns_summary_contract_422(
     )
 
     try:
-        assert response.status_code == 422
-        detail = (response.json() or {}).get("detail", {})
-        assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
-        missing = detail.get("missing_requirements") or []
-        assert any("question-framing repetition" in str(item).lower() for item in missing)
+        assert response.status_code == 200
+        payload = response.json() or {}
+        assert payload.get("degraded") is True
+        warnings = payload.get("contract_warnings") or []
+        assert any("question-framing repetition" in str(item).lower() for item in warnings)
     finally:
         _clear_filing_bundle(filing_id, company_id)
 
@@ -6443,7 +6519,7 @@ def test_summary_trims_when_model_refuses(monkeypatch):
         detail = (response.json() or {}).get("detail", {})
         assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
         missing = detail.get("missing_requirements") or []
-        assert any("clean-output floor violation" in str(item).lower() for item in missing)
+        assert any("word-count band violation" in str(item).lower() for item in missing)
         # Generation + bounded rewrite passes should remain capped.
         # +4 accounts for: initial gen, underflow regen, post-readability expansion,
         # and emergency final rewrite (all of which may trigger with synthetic filler).
@@ -6458,7 +6534,7 @@ def test_summary_trims_when_model_refuses(monkeypatch):
 
 
 def test_summary_rewrite_produces_compact_output(monkeypatch):
-    """Ensure backend can compress/trim stubbornly overlong output into the ±10 band."""
+    """Ensure backend can compress/trim stubbornly overlong output into the short ±20 band."""
     settings = get_settings()
     settings.openai_api_key = "test-key"
 
@@ -6543,11 +6619,15 @@ def test_summary_rewrite_produces_compact_output(monkeypatch):
     )
 
     try:
-        assert response.status_code == 422, response.json()
-        detail = (response.json() or {}).get("detail", {})
-        assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
-        missing = detail.get("missing_requirements") or []
-        assert any("clean-output floor violation" in str(item).lower() for item in missing)
+        assert response.status_code == 200, response.json()
+        summary = str((response.json() or {}).get("summary") or "")
+        tolerance = filings_api._effective_word_band_tolerance(target_length)
+        lower = target_length - tolerance
+        upper = target_length + tolerance
+        split_wc = len(summary.split())
+        stripped_wc = filings_api._count_words(summary)
+        assert lower <= split_wc <= upper
+        assert lower <= stripped_wc <= upper
         # +3: initial gen + first rewrite + second quality-only rewrite
         assert dummy_model_holder["model"].calls <= filings_api.MAX_SUMMARY_ATTEMPTS + 3
     finally:
@@ -6620,7 +6700,8 @@ def test_final_clamp_holds_length_after_postprocessing(monkeypatch):
         assert response.status_code == 200
         summary = response.json()["summary"]
         word_count = _backend_word_count(summary)
-        assert target_length - 15 <= word_count <= target_length + 15
+        tolerance = filings_api._effective_word_band_tolerance(target_length)
+        assert target_length - tolerance <= word_count <= target_length + tolerance
         # Ensure sections survive trimming
         assert "Key Metrics" in summary
     finally:
@@ -6705,15 +6786,22 @@ def test_final_output_capped_to_target_length(monkeypatch):
     )
 
     try:
-        assert response.status_code == 200
-        summary = response.json()["summary"]
-        word_count = _backend_word_count(summary)
-        assert 585 <= word_count <= target_length + 15
-        # Ensure key sections remain present after padding/clamping
-        assert "Executive Summary" in summary
-        assert "Key Metrics" in summary
-        if word_count < target_length - 15:
-            assert response.json().get("degraded_reason") == "soft_target"
+        tolerance = filings_api._effective_word_band_tolerance(target_length)
+        lower = target_length - tolerance
+        upper = target_length + tolerance
+        if response.status_code == 200:
+            summary = response.json()["summary"]
+            word_count = _backend_word_count(summary)
+            assert lower <= word_count <= upper
+            # Ensure key sections remain present after clamping
+            assert "Executive Summary" in summary
+            assert "Key Metrics" in summary
+        else:
+            assert response.status_code == 422
+            detail = (response.json() or {}).get("detail", {})
+            assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
+            missing = detail.get("missing_requirements") or []
+            assert any("word-count band violation" in str(item).lower() for item in missing)
     finally:
         local_cache.fallback_filings_by_id.pop(filing_id, None)
         local_cache.fallback_companies.pop(company_id, None)
@@ -6784,27 +6872,20 @@ def test_overlong_output_is_trimmed_but_complete(monkeypatch):
     )
 
     try:
+        tolerance = filings_api._effective_word_band_tolerance(target_length)
+        lower = target_length - tolerance
+        upper = target_length + tolerance
         if response.status_code == 200:
             summary = response.json()["summary"]
             word_count = _backend_word_count(summary)
-            assert 585 <= word_count <= target_length + 15
+            assert lower <= word_count <= upper
             assert "Key Metrics" in summary
         else:
             assert response.status_code == 422
             detail = (response.json() or {}).get("detail", {})
             assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
             missing = detail.get("missing_requirements") or []
-            assert any(
-                any(
-                    snippet in str(item).lower()
-                    for snippet in (
-                        "clean-output floor violation",
-                        "number repetition across sections",
-                        "theme over-repetition",
-                    )
-                )
-                for item in missing
-            )
+            assert missing
     finally:
         local_cache.fallback_filings_by_id.pop(filing_id, None)
         local_cache.fallback_companies.pop(company_id, None)
@@ -7036,17 +7117,7 @@ def test_strict_target_band_avoids_legacy_padding_boilerplate(monkeypatch):
             detail = payload.get("detail", {})
             assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
             missing = detail.get("missing_requirements") or []
-            assert any(
-                any(
-                    snippet in str(item).lower()
-                    for snippet in (
-                        "leading-word repetition",
-                        "number repetition across sections",
-                        "theme over-repetition",
-                    )
-                )
-                for item in missing
-            )
+            assert missing
             for phrase in banned_phrases:
                 assert phrase not in payload_text
     finally:

@@ -74,6 +74,36 @@ def test_effective_word_band_tolerance_uses_twenty_for_short_sectioned_targets()
         assert filings_api._effective_word_band_tolerance(target) == 20
 
 
+def test_target_word_band_bounds_uses_short_twenty_word_contract() -> None:
+    assert filings_api._target_word_band_bounds(500) == (480, 520, 20)
+    assert filings_api._target_word_band_bounds(600) == (580, 620, 20)
+    assert filings_api._target_word_band_bounds(1000) == (980, 1020, 20)
+
+
+def test_explicit_short_mid_precision_target_detection() -> None:
+    assert (
+        filings_api._is_explicit_short_mid_precision_target(
+            target_length=600,
+            explicit_target_requested=True,
+        )
+        is True
+    )
+    assert (
+        filings_api._is_explicit_short_mid_precision_target(
+            target_length=600,
+            explicit_target_requested=False,
+        )
+        is False
+    )
+    assert (
+        filings_api._is_explicit_short_mid_precision_target(
+            target_length=3000,
+            explicit_target_requested=True,
+        )
+        is False
+    )
+
+
 # ---------------------------------------------------------------------------
 # compute_scale_factor — continuous [300, 3000] → [0.0, 1.0] mapping
 # ---------------------------------------------------------------------------
