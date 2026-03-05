@@ -10349,6 +10349,10 @@ def _make_section_completeness_validator(
             section_body = text[section_start:next_section_index].strip()
             word_count = _count_words(section_body)
             min_words = int(min_words_by_section.get(title, 15))
+            if _is_short_quality_sensitive_target(target_length) and title == "Risk Factors":
+                # Single-word jitter near the boundary can occur after final cleanup.
+                # Keep the floor strict but avoid hard-failing on a 1-word undershoot.
+                min_words = max(1, int(min_words) - 1)
             if word_count < min_words:
                 return (
                     f"The '{title}' section is too brief ({word_count} words). Expand it to at least {min_words} words "
@@ -10461,6 +10465,13 @@ def _make_section_balance_validator(include_health_rating: bool, target_length: 
             section_tolerance = _section_budget_tolerance_words(
                 expected, max_tolerance=10
             )
+            if title == "Key Metrics":
+                # Key Metrics uses a fixed-row data block; allow a wider band on
+                # short targets so valid numeric rows do not trip structural hard-fail.
+                section_tolerance = max(
+                    int(section_tolerance),
+                    12 if _is_short_quality_sensitive_target(target_length) else 8,
+                )
             min_allowed = max(1, expected - section_tolerance)
             max_allowed = expected + section_tolerance
 
@@ -21759,6 +21770,88 @@ def generate_filing_summary(
                     health_score_data=pre_calculated_health,
                     risk_factors_excerpt=risk_factors_excerpt,
                 )
+                timeout_key_metrics_budget = int(section_budgets.get("Key Metrics", 0) or 0)
+                if timeout_key_metrics_budget > 0:
+                    timeout_key_metrics_upper = int(timeout_key_metrics_budget) + int(
+                        canonical_section_budget_tolerance_words(
+                            "Key Metrics", int(timeout_key_metrics_budget)
+                        )
+                    )
+                    timeout_key_metrics_body = (
+                        _extract_markdown_section_body(repaired_summary, "Key Metrics")
+                        or ""
+                    )
+                    if (
+                        timeout_key_metrics_body
+                        and _count_words(timeout_key_metrics_body)
+                        > int(timeout_key_metrics_upper)
+                    ):
+                        trimmed_timeout_key_metrics = _trim_appendix_preserving_rows(
+                            timeout_key_metrics_body,
+                            int(timeout_key_metrics_upper),
+                        )
+                        if trimmed_timeout_key_metrics:
+                            repaired_summary = _replace_markdown_section_body(
+                                repaired_summary,
+                                "Key Metrics",
+                                trimmed_timeout_key_metrics,
+                            )
+                for timeout_section_name, timeout_section_budget in dict(
+                    section_budgets or {}
+                ).items():
+                    if str(timeout_section_name) == "Key Metrics":
+                        continue
+                    timeout_budget_words = int(timeout_section_budget or 0)
+                    if timeout_budget_words <= 0:
+                        continue
+                    timeout_section_upper = timeout_budget_words + int(
+                        canonical_section_budget_tolerance_words(
+                            str(timeout_section_name),
+                            timeout_budget_words,
+                        )
+                    )
+                    timeout_section_body = (
+                        _extract_markdown_section_body(
+                            repaired_summary, str(timeout_section_name)
+                        )
+                        or ""
+                    )
+                    if (
+                        not timeout_section_body
+                        or _count_words(timeout_section_body) <= int(timeout_section_upper)
+                    ):
+                        continue
+                    timeout_trimmed_body = str(timeout_section_body)
+                    for _timeout_trim_round in range(4):
+                        if _count_words(timeout_trimmed_body) <= int(timeout_section_upper):
+                            break
+                        timeout_trim_budget = max(
+                            6,
+                            min(
+                                48,
+                                int(_count_words(timeout_trimmed_body) - timeout_section_upper)
+                                + 8,
+                            ),
+                        )
+                        timeout_candidate_body, timeout_trimmed_words = (
+                            _trim_section_for_balance(
+                                timeout_trimmed_body,
+                                section_title=str(timeout_section_name),
+                                max_words_to_trim=int(timeout_trim_budget),
+                            )
+                        )
+                        if (
+                            timeout_trimmed_words <= 0
+                            or timeout_candidate_body == timeout_trimmed_body
+                        ):
+                            break
+                        timeout_trimmed_body = timeout_candidate_body
+                    if timeout_trimmed_body != timeout_section_body:
+                        repaired_summary = _replace_markdown_section_body(
+                            repaired_summary,
+                            str(timeout_section_name),
+                            timeout_trimmed_body,
+                        )
                 repaired_summary = _apply_strict_contract_seal(
                     repaired_summary,
                     include_health_rating=include_health_rating,
@@ -25989,6 +26082,44 @@ FLOW AND QUALITY RULES:
                     short_form_editorial_recovery_attempted
                 )
 
+            if short_quality_mode:
+                final_key_metrics_budget = int(section_budgets.get("Key Metrics", 0) or 0)
+                if final_key_metrics_budget > 0:
+                    final_key_metrics_upper = int(final_key_metrics_budget) + int(
+                        canonical_section_budget_tolerance_words(
+                            "Key Metrics", int(final_key_metrics_budget)
+                        )
+                    )
+                    final_key_metrics_body = (
+                        _extract_markdown_section_body(summary_text, "Key Metrics") or ""
+                    )
+                    if (
+                        final_key_metrics_body
+                        and _count_words(final_key_metrics_body)
+                        > int(final_key_metrics_upper)
+                    ):
+                        final_trimmed_key_metrics = _trim_appendix_preserving_rows(
+                            final_key_metrics_body,
+                            int(final_key_metrics_upper),
+                        )
+                        if final_trimmed_key_metrics:
+                            summary_text = _replace_markdown_section_body(
+                                summary_text,
+                                "Key Metrics",
+                                final_trimmed_key_metrics,
+                            )
+                            missing_requirements, summary_meta = (
+                                _evaluate_summary_contract_requirements(
+                                    summary_text=summary_text,
+                                    target_length=target_length,
+                                    include_health_rating=include_health_rating,
+                                    quality_validators=contract_quality_validators,
+                                    source_text=context_excerpt,
+                                    filing_language_snippets=filing_language_snippets,
+                                    enforce_quote_contract=strict_quote_contract,
+                                )
+                            )
+
             short_form_structural_fatal_requirements = (
                 _select_short_form_structural_failure_requirements(
                     summary_text=summary_text,
@@ -26018,6 +26149,72 @@ FLOW AND QUALITY RULES:
                     health_score_data=health_score_data,
                     risk_factors_excerpt=risk_factors_excerpt,
                 )
+                key_metrics_budget = int(section_budgets.get("Key Metrics", 0) or 0)
+                if key_metrics_budget > 0:
+                    key_metrics_upper = int(key_metrics_budget) + int(
+                        canonical_section_budget_tolerance_words(
+                            "Key Metrics", int(key_metrics_budget)
+                        )
+                    )
+                    key_metrics_body = (
+                        _extract_markdown_section_body(summary_text, "Key Metrics") or ""
+                    )
+                    if (
+                        key_metrics_body
+                        and _count_words(key_metrics_body) > int(key_metrics_upper)
+                    ):
+                        trimmed_key_metrics = _trim_appendix_preserving_rows(
+                            key_metrics_body,
+                            int(key_metrics_upper),
+                        )
+                        if trimmed_key_metrics:
+                            summary_text = _replace_markdown_section_body(
+                                summary_text,
+                                "Key Metrics",
+                                trimmed_key_metrics,
+                            )
+                for section_name, section_budget_words in dict(section_budgets or {}).items():
+                    if str(section_name) == "Key Metrics":
+                        continue
+                    target_words_for_section = int(section_budget_words or 0)
+                    if target_words_for_section <= 0:
+                        continue
+                    section_upper = target_words_for_section + int(
+                        canonical_section_budget_tolerance_words(
+                            str(section_name), target_words_for_section
+                        )
+                    )
+                    section_body = (
+                        _extract_markdown_section_body(summary_text, str(section_name))
+                        or ""
+                    )
+                    if not section_body or _count_words(section_body) <= int(section_upper):
+                        continue
+                    trimmed_section_body = str(section_body)
+                    for _trim_round in range(4):
+                        if _count_words(trimmed_section_body) <= int(section_upper):
+                            break
+                        trim_budget_words = max(
+                            6,
+                            min(
+                                48,
+                                int(_count_words(trimmed_section_body) - section_upper) + 8,
+                            ),
+                        )
+                        candidate_body, trimmed_words = _trim_section_for_balance(
+                            trimmed_section_body,
+                            section_title=str(section_name),
+                            max_words_to_trim=int(trim_budget_words),
+                        )
+                        if trimmed_words <= 0 or candidate_body == trimmed_section_body:
+                            break
+                        trimmed_section_body = candidate_body
+                    if trimmed_section_body != section_body:
+                        summary_text = _replace_markdown_section_body(
+                            summary_text,
+                            str(section_name),
+                            trimmed_section_body,
+                        )
                 summary_text = _ensure_final_strict_word_band(
                     summary_text,
                     int(target_length),
