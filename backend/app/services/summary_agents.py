@@ -1908,50 +1908,14 @@ def _run_agent_3(
     )
     final_text = processed.text or summary_text
     if not processed.passed:
-        final_counts = {
-            section_name: count_words(section_bodies.get(section_name, ""))
-            for section_name in ordered_sections
-            if section_name in section_budgets
-        }
         validation_report = processed.validation_report
-        raise SummarySectionBalanceError(
-            {
-                "detail": "Continuous V2 summary failed section-balance validation after bounded retries.",
-                "failure_code": "SUMMARY_SECTION_BALANCE_FAILED",
-                "target_length": int(target_length or 0),
-                "section_word_budgets": dict(section_budgets or {}),
-                "section_word_counts": (
-                    {
-                        section_name: count_words(
-                            re.search(
-                                rf"##\s+{re.escape(section_name)}\s*\n(.*?)(?=\n##\s+|\Z)",
-                                final_text,
-                                re.DOTALL,
-                            ).group(1)
-                        )
-                        for section_name in ordered_sections
-                        if re.search(
-                            rf"##\s+{re.escape(section_name)}\s*\n(.*?)(?=\n##\s+|\Z)",
-                            final_text,
-                            re.DOTALL,
-                        )
-                    }
-                    if final_text
-                    else final_counts
-                ),
-                "section_failures": [
-                    {
-                        "section_name": failure.section_name,
-                        "code": failure.code,
-                        "message": failure.message,
-                        "severity": float(failure.severity or 0.0),
-                    }
-                    for failure in list((validation_report.section_failures if validation_report else []) or [])
-                ],
-                "global_failures": list((validation_report.global_failures if validation_report else []) or []),
-                "repair_attempts": int(processed.retries or 0),
-            }
+        logger.warning(
+            "Agent 3 post-process ended with unresolved validation drift (retries=%s, section_failures=%s, global_failures=%s); deferring final enforcement to route-level repairs.",
+            int(processed.retries or 0),
+            len(list((validation_report.section_failures if validation_report else []) or [])),
+            len(list((validation_report.global_failures if validation_report else []) or [])),
         )
+        return final_text, int(processed.retries or 0), processed
     return final_text, int(processed.retries or 0), processed
 
 

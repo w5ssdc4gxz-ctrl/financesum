@@ -302,7 +302,7 @@ def test_short_underweight_section_guidance_prioritizes_narrative_gaps() -> None
     assert "Executive Summary" in guidance
 
 
-@pytest.mark.parametrize("target_length", [600, 1000, 2000, 3000])
+@pytest.mark.parametrize("target_length", [500, 600, 1000, 2000, 3000])
 def test_ensure_required_sections_scales_fp_and_mdna_with_target_length(
     target_length: int,
 ) -> None:
@@ -361,4 +361,86 @@ def test_ensure_required_sections_scales_fp_and_mdna_with_target_length(
     )
     assert counts["Management Discussion & Analysis"] >= int(
         mins.get("Management Discussion & Analysis", 0) or 0
+    )
+
+
+def test_ensure_required_sections_normalizes_risk_schema_for_short_targets() -> None:
+    target_length = 600
+    base = (
+        "## Financial Health Rating\n"
+        f"{_make_body(18, token='health')}\n\n"
+        "## Executive Summary\n"
+        f"{_make_body(18, token='exec')}\n\n"
+        "## Financial Performance\n"
+        "Revenue changed.\n\n"
+        "## Management Discussion & Analysis\n"
+        "Management discussed execution.\n\n"
+        "## Risk Factors\n"
+        "**Competition Risk**: Pricing pressure may affect demand and costs.\n\n"
+        "**Regulatory Risk**: Compliance changes could increase operating expense.\n\n"
+        "## Key Metrics\n"
+        "Revenue | $1.0B\n\n"
+        "## Closing Takeaway\n"
+        f"{_make_body(16, token='close')}\n"
+    )
+
+    metrics = {
+        "revenue": 30.57e9,
+        "operating_income": 10.34e9,
+        "net_income": 8.81e9,
+        "operating_margin": 33.8,
+        "net_margin": 28.8,
+        "operating_cash_flow": 13.52e9,
+        "free_cash_flow": 10.96e9,
+        "capital_expenditures": 2.56e9,
+        "cash": 11.21e9,
+        "marketable_securities": 0.0,
+        "total_liabilities": 168.42e9,
+        "total_debt": 79.07e9,
+    }
+
+    ensured = filings_api._ensure_required_sections(
+        base,
+        include_health_rating=True,
+        metrics_lines="Revenue | $1.0B",
+        calculated_metrics=metrics,
+        health_score_data={},
+        company_name="Microsoft Corp",
+        risk_factors_excerpt="AI infrastructure demand, enterprise renewals, and regulatory changes can affect margins.",
+        target_length=target_length,
+    )
+
+    risk_body = _get_section_body(ensured, "Risk Factors")
+    entries = list(
+        re.finditer(
+            r"\*\*(?P<name>[^*:\n]{2,120}?):?\*\*\s*:?\s*(?P<body>.+?)(?=(?:\n\s*\*\*[^*]+?\*\*\s*:?)|\Z)",
+            risk_body,
+            flags=re.DOTALL,
+        )
+    )
+    budgets = filings_api._calculate_section_word_budgets(
+        target_length, include_health_rating=True
+    )
+    shape = filings_api.get_risk_factors_shape(int(budgets.get("Risk Factors") or 0))
+    assert len(entries) == int(shape.risk_count)
+
+    generic_name_re = re.compile(
+        r"\b(macro(?:economic)?|competition|competitive pressure|regulatory risk|margin compression|liquidity risk|cash flow risk)\b",
+        re.IGNORECASE,
+    )
+    for entry in entries:
+        name = (entry.group("name") or "").strip()
+        assert not generic_name_re.search(name)
+
+    validation = filings_api.validate_summary(
+        ensured,
+        target_words=target_length,
+        section_budgets=budgets,
+        include_health_rating=True,
+        risk_factors_excerpt=(
+            "AI infrastructure demand, enterprise renewals, and regulatory changes can affect margins."
+        ),
+    )
+    assert not any(
+        failure.code == "risk_schema" for failure in validation.section_failures
     )

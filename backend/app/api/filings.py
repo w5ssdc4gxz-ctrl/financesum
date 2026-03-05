@@ -21192,6 +21192,12 @@ def generate_filing_summary(
         explicit_target_requested=explicit_target_requested,
     )
     summary_runtime_cap_seconds = max(1, int(SUMMARY_TOTAL_TIMEOUT_SECONDS))
+    if explicit_target_requested and short_quality_mode and target_length:
+        short_timeout_floor = _int_env("SUMMARY_SHORT_TARGET_TIMEOUT_SECONDS", 300)
+        summary_runtime_cap_seconds = max(
+            int(summary_runtime_cap_seconds),
+            max(60, min(900, int(short_timeout_floor))),
+        )
     summary_runtime_started_at = time.monotonic()
     summary_runtime_deadline = (
         summary_runtime_started_at + float(summary_runtime_cap_seconds)
@@ -21563,6 +21569,14 @@ def generate_filing_summary(
     actual_cost_usd = 0.0
     within_budget = True
     two_agent_result: Optional[TwoAgentSummaryPipelineResult] = None
+    calculated_metrics: Dict[str, Any] = {}
+    pre_calculated_health: Optional[Dict[str, Any]] = None
+    metrics_lines: str = ""
+    risk_factors_excerpt: str = ""
+    health_config: Optional[Dict[str, Any]] = None
+    selected_persona_name: Optional[str] = None
+    persona_requested = False
+    filing_language_snippets: str = ""
 
     def _build_timeout_best_effort_response(reason: str) -> Optional[JSONResponse]:
         draft_summary = str(summary_text or "").strip()
@@ -21686,6 +21700,155 @@ def generate_filing_summary(
                     ),
                 },
             }
+
+        timeout_fallback_validation_failures: List[str] = []
+        if (
+            target_length
+            and explicit_target_requested
+            and short_quality_mode
+            and str(payload.get("summary") or "").strip()
+        ):
+            repaired_summary = str(payload.get("summary") or "").strip()
+            try:
+                repaired_summary = _fix_inline_section_headers(repaired_summary)
+                repaired_summary = _normalize_section_headings(
+                    repaired_summary, include_health_rating=include_health_rating
+                )
+                repaired_summary = _merge_duplicate_canonical_sections(
+                    repaired_summary, include_health_rating=include_health_rating
+                )
+                repaired_summary = _enforce_section_order(
+                    repaired_summary, include_health_rating=include_health_rating
+                )
+                repaired_summary = _ensure_required_sections(
+                    repaired_summary,
+                    include_health_rating=include_health_rating,
+                    metrics_lines=metrics_lines,
+                    calculated_metrics=calculated_metrics,
+                    health_score_data=pre_calculated_health,
+                    company_name=company_name,
+                    risk_factors_excerpt=risk_factors_excerpt,
+                    health_rating_config=health_config,
+                    persona_name=selected_persona_name,
+                    persona_requested=persona_requested,
+                    target_length=target_length,
+                )
+                repaired_summary = _apply_contract_structural_repairs(
+                    repaired_summary,
+                    include_health_rating=include_health_rating,
+                    target_length=target_length,
+                    calculated_metrics=calculated_metrics,
+                )
+                timeout_issue_flags = _parse_summary_contract_missing_requirements(
+                    list(
+                        (payload.get("summary_meta") or {}).get(
+                            "contract_missing_requirements"
+                        )
+                        or missing_requirements
+                        or []
+                    )
+                )
+                repaired_summary, _ = _rebalance_section_budgets_deterministically(
+                    repaired_summary,
+                    target_length=target_length,
+                    include_health_rating=include_health_rating,
+                    section_balance_contract_required=True,
+                    issue_flags=timeout_issue_flags,
+                    generation_stats=generation_stats,
+                    calculated_metrics=calculated_metrics,
+                    health_score_data=pre_calculated_health,
+                    risk_factors_excerpt=risk_factors_excerpt,
+                )
+                repaired_summary = _apply_strict_contract_seal(
+                    repaired_summary,
+                    include_health_rating=include_health_rating,
+                    target_length=target_length,
+                    calculated_metrics=calculated_metrics,
+                    metrics_lines=metrics_lines,
+                    filing_language_snippets=filing_language_snippets,
+                    strict_quote_contract=False,
+                    company_name=company_name,
+                    persona_requested=persona_requested,
+                    generation_stats=generation_stats,
+                )
+                repaired_summary = _ensure_final_strict_word_band(
+                    repaired_summary,
+                    target_words=int(target_length),
+                    tolerance=_effective_word_band_tolerance(target_length),
+                    allow_pad=False,
+                )
+                repaired_summary = _enforce_whitespace_word_band(
+                    repaired_summary,
+                    target_words=int(target_length),
+                    tolerance=_effective_word_band_tolerance(target_length),
+                )
+            except Exception as timeout_repair_exc:  # noqa: BLE001
+                logger.debug(
+                    "Timeout fallback deterministic repair failed for %s: %s",
+                    filing_id,
+                    timeout_repair_exc,
+                )
+
+            timeout_validation = validate_summary(
+                repaired_summary or "",
+                target_words=int(target_length),
+                section_budgets=section_budgets,
+                include_health_rating=include_health_rating,
+                risk_factors_excerpt=risk_factors_excerpt,
+            )
+            if not timeout_validation.passed:
+                timeout_fallback_validation_failures = list(
+                    timeout_validation.global_failures
+                ) + [
+                    failure.message for failure in timeout_validation.section_failures
+                ]
+            else:
+                payload["summary"] = repaired_summary
+                timeout_counts = _collect_section_body_word_counts(
+                    repaired_summary,
+                    include_health_rating=include_health_rating,
+                )
+                timeout_final_wc = int(_count_words(repaired_summary))
+                timeout_meta = dict(payload.get("summary_meta") or {})
+                timeout_meta["target_length"] = int(target_length)
+                timeout_meta["final_word_count"] = int(timeout_final_wc)
+                timeout_meta["final_word_delta"] = int(
+                    timeout_final_wc - int(target_length)
+                )
+                timeout_meta["section_word_budgets"] = dict(section_budgets or {})
+                timeout_meta["section_word_counts"] = dict(timeout_counts or {})
+                timeout_meta["section_word_ranges"] = {
+                    section_name: {
+                        "lower": max(
+                            1,
+                            int(words)
+                            - int(
+                                canonical_section_budget_tolerance_words(
+                                    section_name, int(words)
+                                )
+                            ),
+                        ),
+                        "upper": int(words)
+                        + int(
+                            canonical_section_budget_tolerance_words(
+                                section_name, int(words)
+                            )
+                        ),
+                    }
+                    for section_name, words in dict(section_budgets or {}).items()
+                    if int(words or 0) > 0
+                }
+                timeout_meta["contract_missing_requirements"] = []
+                timeout_meta["timeout_fallback_contract_verified"] = True
+                payload["summary_meta"] = timeout_meta
+                generation_stats["timeout_fallback_contract_verified"] = True
+
+        if timeout_fallback_validation_failures:
+            generation_stats["timeout_fallback_contract_failed"] = True
+            generation_stats["timeout_fallback_contract_missing_requirements"] = list(
+                timeout_fallback_validation_failures
+            )
+            return None
 
         payload["degraded"] = True
         payload["degraded_reason"] = str(reason or "timeout")
@@ -25834,6 +25997,59 @@ FLOW AND QUALITY RULES:
                     enforce_section_balance=bool(section_balance_contract_required),
                 )
             )
+            if short_form_structural_fatal_requirements and short_quality_mode:
+                rescue_flags = _parse_summary_contract_missing_requirements(
+                    short_form_structural_fatal_requirements
+                )
+                summary_text = _repair_closing_recommendation_in_summary(
+                    summary_text,
+                    company_name=company_name,
+                    calculated_metrics=calculated_metrics,
+                    persona_requested=persona_requested,
+                )
+                summary_text, _ = _rebalance_section_budgets_deterministically(
+                    summary_text,
+                    target_length=target_length,
+                    include_health_rating=include_health_rating,
+                    section_balance_contract_required=True,
+                    issue_flags=rescue_flags,
+                    generation_stats=generation_stats,
+                    calculated_metrics=calculated_metrics,
+                    health_score_data=health_score_data,
+                    risk_factors_excerpt=risk_factors_excerpt,
+                )
+                summary_text = _ensure_final_strict_word_band(
+                    summary_text,
+                    int(target_length),
+                    include_health_rating=include_health_rating,
+                    tolerance=_effective_word_band_tolerance(target_length),
+                    generation_stats=generation_stats,
+                    allow_padding=False,
+                )
+                summary_text = _enforce_whitespace_word_band(
+                    summary_text,
+                    int(target_length),
+                    tolerance=_effective_word_band_tolerance(target_length),
+                    allow_padding=False,
+                    dedupe=True,
+                )
+                missing_requirements, summary_meta = _evaluate_summary_contract_requirements(
+                    summary_text=summary_text,
+                    target_length=target_length,
+                    include_health_rating=include_health_rating,
+                    quality_validators=contract_quality_validators,
+                    source_text=context_excerpt,
+                    filing_language_snippets=filing_language_snippets,
+                    enforce_quote_contract=strict_quote_contract,
+                )
+                short_form_structural_fatal_requirements = (
+                    _select_short_form_structural_failure_requirements(
+                        summary_text=summary_text,
+                        missing_requirements=missing_requirements,
+                        include_health_rating=include_health_rating,
+                        enforce_section_balance=bool(section_balance_contract_required),
+                    )
+                )
             generation_stats["short_form_structural_fatal_requirements"] = (
                 short_form_structural_fatal_requirements
             )
@@ -26215,31 +26431,185 @@ FLOW AND QUALITY RULES:
                 ],
             }
             if not continuous_v2_validation.passed:
-                detail = {
-                    "detail": "Continuous V2 summary failed section-balance validation after route-level processing.",
-                    "failure_code": "SUMMARY_SECTION_BALANCE_FAILED",
-                    "target_length": int(target_length or 0),
-                    "section_word_budgets": dict(section_budgets or {}),
-                    "section_word_counts": dict(final_section_word_counts or {}),
-                    "section_failures": [
-                        {
-                            "section_name": failure.section_name,
-                            "code": failure.code,
-                            "message": failure.message,
-                            "severity": float(failure.severity or 0.0),
-                        }
-                        for failure in list(continuous_v2_validation.section_failures or [])
-                    ],
-                    "global_failures": list(continuous_v2_validation.global_failures or []),
-                }
-                _record_summary_422_observability(
-                    filing_id=filing_id,
-                    detail=detail,
-                    summary_request_id=str(locals().get("summary_request_id") or "").strip()
-                    or None,
-                    fallback_target_length=int(target_length or 0),
+                cv2_missing_requirements = list(
+                    continuous_v2_validation.global_failures or []
+                ) + [
+                    failure.message
+                    for failure in list(continuous_v2_validation.section_failures or [])
+                ]
+                cv2_issue_flags = _parse_summary_contract_missing_requirements(
+                    cv2_missing_requirements
                 )
-                raise HTTPException(status_code=422, detail=detail)
+                cv2_under_titles: List[str] = []
+                cv2_over_titles: List[str] = []
+                for failure in list(continuous_v2_validation.section_failures or []):
+                    section_name = str(failure.section_name or "").strip()
+                    if not section_name or section_name == "Key Metrics":
+                        continue
+                    if failure.code == "section_budget_under":
+                        if section_name not in cv2_under_titles:
+                            cv2_under_titles.append(section_name)
+                    elif failure.code == "section_budget_over":
+                        if section_name not in cv2_over_titles:
+                            cv2_over_titles.append(section_name)
+                if cv2_under_titles or cv2_over_titles:
+                    cv2_issue_flags["section_balance_issue"] = True
+                    if cv2_under_titles:
+                        cv2_issue_flags["section_balance_underweight_titles"] = (
+                            cv2_under_titles
+                        )
+                    if cv2_over_titles:
+                        cv2_issue_flags["section_balance_overweight_titles"] = (
+                            cv2_over_titles
+                        )
+
+                repaired_summary_text = str(summary_text or "").strip()
+                if repaired_summary_text:
+                    repaired_summary_text = _fix_inline_section_headers(
+                        repaired_summary_text
+                    )
+                    repaired_summary_text = _normalize_section_headings(
+                        repaired_summary_text, include_health_rating
+                    )
+                    repaired_summary_text = _merge_duplicate_canonical_sections(
+                        repaired_summary_text,
+                        include_health_rating=include_health_rating,
+                    )
+                    repaired_summary_text = _enforce_section_order(
+                        repaired_summary_text, include_health_rating=include_health_rating
+                    )
+                    repaired_summary_text = _ensure_required_sections(
+                        repaired_summary_text,
+                        include_health_rating=include_health_rating,
+                        metrics_lines=metrics_lines,
+                        calculated_metrics=calculated_metrics,
+                        health_score_data=pre_calculated_health,
+                        company_name=company_name,
+                        risk_factors_excerpt=risk_factors_excerpt,
+                        health_rating_config=health_config,
+                        persona_name=selected_persona_name,
+                        persona_requested=persona_requested,
+                        target_length=target_length,
+                    )
+                    repaired_summary_text = _apply_contract_structural_repairs(
+                        repaired_summary_text,
+                        include_health_rating=include_health_rating,
+                        target_length=target_length,
+                        calculated_metrics=calculated_metrics,
+                    )
+                    (
+                        repaired_summary_text,
+                        cv2_balance_info,
+                    ) = _rebalance_section_budgets_deterministically(
+                        repaired_summary_text,
+                        target_length=target_length,
+                        include_health_rating=include_health_rating,
+                        section_balance_contract_required=True,
+                        missing_requirements=cv2_missing_requirements,
+                        issue_flags=cv2_issue_flags,
+                        generation_stats=generation_stats,
+                        calculated_metrics=calculated_metrics,
+                        health_score_data=pre_calculated_health,
+                        risk_factors_excerpt=risk_factors_excerpt or "",
+                    )
+                    repaired_summary_text = _apply_strict_contract_seal(
+                        repaired_summary_text,
+                        include_health_rating=include_health_rating,
+                        target_length=target_length,
+                        calculated_metrics=calculated_metrics,
+                        metrics_lines=metrics_lines or "",
+                        filing_language_snippets=filing_language_snippets or "",
+                        strict_quote_contract=strict_quote_contract,
+                        company_name=company_name,
+                        persona_requested=persona_requested,
+                        generation_stats=generation_stats,
+                        quality_profile=post_final_profile,
+                        final_issue_flags=cv2_issue_flags,
+                    )
+                    final_tol = _effective_word_band_tolerance(target_length)
+                    repaired_summary_text = _ensure_final_strict_word_band(
+                        repaired_summary_text,
+                        int(target_length),
+                        include_health_rating=include_health_rating,
+                        tolerance=int(final_tol),
+                        generation_stats=generation_stats,
+                        allow_padding=_allow_padding_for_target(
+                            int(target_length), _count_words(repaired_summary_text or "")
+                        ),
+                    )
+                    repaired_summary_text = _enforce_whitespace_word_band(
+                        repaired_summary_text,
+                        int(target_length),
+                        tolerance=int(final_tol),
+                        allow_padding=_allow_padding_for_target(
+                            int(target_length), _count_words(repaired_summary_text or "")
+                        ),
+                        dedupe=True,
+                    )
+
+                    repaired_validation = validate_summary(
+                        repaired_summary_text or "",
+                        target_words=int(target_length),
+                        section_budgets=section_budgets,
+                        include_health_rating=include_health_rating,
+                        risk_factors_excerpt=risk_factors_excerpt or "",
+                    )
+                    generation_stats["summary_continuous_v2_final_repair_attempted"] = True
+                    generation_stats["summary_continuous_v2_final_repair_applied"] = bool(
+                        cv2_balance_info.get("applied") or repaired_validation.passed
+                    )
+                    generation_stats["summary_continuous_v2_final_repair_validation"] = {
+                        "passed": bool(repaired_validation.passed),
+                        "global_failures": list(repaired_validation.global_failures or []),
+                        "section_failures": [
+                            {
+                                "section_name": failure.section_name,
+                                "code": failure.code,
+                                "message": failure.message,
+                                "severity": float(failure.severity or 0.0),
+                            }
+                            for failure in list(repaired_validation.section_failures or [])
+                        ],
+                    }
+                    if repaired_validation.passed:
+                        summary_text = repaired_summary_text
+                        continuous_v2_validation = repaired_validation
+                        final_section_word_counts = _collect_section_body_word_counts(
+                            summary_text or "",
+                            include_health_rating=include_health_rating,
+                        )
+
+                if not continuous_v2_validation.passed:
+                    detail = {
+                        "detail": "Continuous V2 summary failed section-balance validation after route-level processing.",
+                        "failure_code": "SUMMARY_SECTION_BALANCE_FAILED",
+                        "target_length": int(target_length or 0),
+                        "section_word_budgets": dict(section_budgets or {}),
+                        "section_word_counts": dict(
+                            _collect_section_body_word_counts(
+                                summary_text or "",
+                                include_health_rating=include_health_rating,
+                            )
+                        ),
+                        "section_failures": [
+                            {
+                                "section_name": failure.section_name,
+                                "code": failure.code,
+                                "message": failure.message,
+                                "severity": float(failure.severity or 0.0),
+                            }
+                            for failure in list(continuous_v2_validation.section_failures or [])
+                        ],
+                        "global_failures": list(continuous_v2_validation.global_failures or []),
+                    }
+                    _record_summary_422_observability(
+                        filing_id=filing_id,
+                        detail=detail,
+                        summary_request_id=str(locals().get("summary_request_id") or "").strip()
+                        or None,
+                        fallback_target_length=int(target_length or 0),
+                    )
+                    raise HTTPException(status_code=422, detail=detail)
         failed_sections: List[str] = []
         canonical_titles = [
             title
@@ -26880,6 +27250,28 @@ FLOW AND QUALITY RULES:
             )
             complete_summary_progress(filing_id)
             return best_effort_response
+        if target_length and explicit_target_requested and short_quality_mode:
+            detail = {
+                "detail": (
+                    "Unable to satisfy the explicit short-target summary contract before timeout."
+                ),
+                "failure_code": "SUMMARY_CONTRACT_TIMEOUT",
+                "target_length": int(target_length),
+                "missing_requirements": list(
+                    generation_stats.get(
+                        "timeout_fallback_contract_missing_requirements"
+                    )
+                    or []
+                ),
+            }
+            _record_summary_422_observability(
+                filing_id=filing_id,
+                detail=detail,
+                summary_request_id=str(locals().get("summary_request_id") or "").strip()
+                or None,
+                fallback_target_length=int(target_length),
+            )
+            raise HTTPException(status_code=422, detail=detail)
         set_summary_progress(
             filing_id,
             status="Summary generation timed out.",
@@ -26956,6 +27348,28 @@ FLOW AND QUALITY RULES:
             )
             complete_summary_progress(filing_id)
             return best_effort_response
+        if target_length and explicit_target_requested and short_quality_mode:
+            detail = {
+                "detail": (
+                    "Unable to satisfy the explicit short-target summary contract before timeout."
+                ),
+                "failure_code": "SUMMARY_CONTRACT_TIMEOUT",
+                "target_length": int(target_length),
+                "missing_requirements": list(
+                    generation_stats.get(
+                        "timeout_fallback_contract_missing_requirements"
+                    )
+                    or []
+                ),
+            }
+            _record_summary_422_observability(
+                filing_id=filing_id,
+                detail=detail,
+                summary_request_id=str(locals().get("summary_request_id") or "").strip()
+                or None,
+                fallback_target_length=int(target_length),
+            )
+            raise HTTPException(status_code=422, detail=detail)
         set_summary_progress(
             filing_id,
             status="Summary generation timed out.",
@@ -29105,6 +29519,19 @@ def _ensure_required_sections(
             return _themed("Earnings Quality / Normalization Risk")
         if norm in {"competitive spend risk"}:
             return _themed("Pricing / Competitive Spend Risk")
+        if norm in {
+            "competition risk",
+            "competitive pressure risk",
+            "competitive risk",
+        }:
+            return _themed("Pricing / Competitive Position Risk")
+        if norm in {"cash flow risk"}:
+            return _themed("Cash Conversion / Capex Risk")
+        if norm in {"liquidity risk"}:
+            return _themed("Liquidity / Funding Risk")
+        if norm in {"regulatory risk", "compliance risk"}:
+            driver = reg_driver or "Regulatory"
+            return f"{driver} / {theme} Compliance Risk".strip(" /")
         if norm in {"regulatory and antitrust scrutiny"} or (
             ("regulatory" in norm or "regulation" in norm)
             and "antitrust" in norm
@@ -29302,6 +29729,76 @@ def _ensure_required_sections(
                 return True
         return False
 
+    risk_mechanism_re = re.compile(
+        r"\b(because|driven by|if|unless|pressure|cost|pricing|demand|churn|renewal|utilization|capex|compliance|execution)\b",
+        re.IGNORECASE,
+    )
+    risk_transmission_re = re.compile(
+        r"\b(revenue|margin|cash flow|free cash flow|liquidity|balance sheet|debt|capex|opex|pricing|volume|mix)\b",
+        re.IGNORECASE,
+    )
+    risk_early_warning_re = re.compile(
+        r"\b(early[- ]warning|signal|trigger|watch|indicator|renewal|bookings|backlog|churn|pipeline|utilization|defaults?|delinquency|pricing)\b",
+        re.IGNORECASE,
+    )
+
+    def _enforce_risk_schema_phrasing(desc: str, *, risk_name: str = "") -> str:
+        text_desc = " ".join((desc or "").split()).strip()
+        if not text_desc:
+            return text_desc
+        if not text_desc.endswith((".", "!", "?")):
+            text_desc += "."
+
+        has_mechanism = bool(risk_mechanism_re.search(text_desc))
+        has_transmission = bool(risk_transmission_re.search(text_desc))
+        has_early_warning = bool(risk_early_warning_re.search(text_desc))
+        if not (has_mechanism and has_transmission and has_early_warning):
+            risk_label = str(risk_name or "this risk").strip()
+            text_desc = (
+                f"{text_desc} "
+                f"For {risk_label}, the mechanism is that pricing, demand, or cost-to-serve pressure can flow into revenue mix, operating margin, and free-cash-flow conversion; "
+                "an early-warning signal is weakening bookings, renewals, utilization, or cash-conversion trends."
+            ).strip()
+
+        min_sentences = int(risk_shape.per_risk_min_sentences or 2) if risk_shape else 2
+        max_sentences = int(risk_shape.per_risk_max_sentences or 3) if risk_shape else 3
+        sentences = _split_sentences(text_desc)
+        while len(sentences) < min_sentences:
+            sentences.append(
+                "Management should monitor those indicators and adjust execution before pressure is fully visible in reported earnings."
+            )
+        if len(sentences) > max_sentences:
+            early_idx = next(
+                (
+                    idx
+                    for idx, sentence in enumerate(sentences)
+                    if risk_early_warning_re.search(sentence)
+                ),
+                None,
+            )
+            trimmed: List[str] = []
+            if sentences:
+                trimmed.append(sentences[0])
+            if early_idx is not None and early_idx != 0 and len(trimmed) < max_sentences:
+                trimmed.append(sentences[early_idx])
+            for sentence in sentences[1:]:
+                if len(trimmed) >= max_sentences:
+                    break
+                if sentence in trimmed:
+                    continue
+                trimmed.append(sentence)
+            sentences = trimmed[:max_sentences]
+
+        rebuilt = " ".join(sentences).strip()
+        if _count_words(rebuilt) < 18:
+            rebuilt = rebuilt.rstrip(".!?")
+            rebuilt += (
+                " while preserving liquidity flexibility and downside protection."
+            )
+        if rebuilt and not rebuilt.endswith((".", "!", "?")):
+            rebuilt += "."
+        return rebuilt
+
     def _normalize_risk_factors_section() -> None:
         nonlocal text
         expected_risk_count = int(risk_shape.risk_count or 0) if risk_shape else 0
@@ -29335,15 +29832,15 @@ def _ensure_required_sections(
         seen_desc_tokens: List[Set[str]] = []
         for name, desc in entries:
             name = _rewrite_generic_risk_name(name)
+            raw_desc = " ".join((desc or "").split()).strip()
             name_norm = _normalize_risk_name(name)
-            desc_norm = " ".join(re.sub(r"[^a-z0-9]+", " ", desc.lower()).split())
-            desc_tokens = _risk_desc_tokens(desc)
+            desc_norm = " ".join(re.sub(r"[^a-z0-9]+", " ", raw_desc.lower()).split())
+            desc_tokens = _risk_desc_tokens(raw_desc)
             if not name_norm or name_norm in seen_names:
                 continue
             if desc_norm and desc_norm in seen_desc_norms:
                 continue
-            if desc_tokens and _is_desc_duplicate(desc_tokens, seen_desc_tokens):
-                continue
+            desc = _enforce_risk_schema_phrasing(raw_desc, risk_name=name)
             if _count_words(desc) < 18:
                 continue
             cleaned_entries.append((name, desc))
@@ -29357,18 +29854,15 @@ def _ensure_required_sections(
         # multiple company-specific items. Only backfill when we are below the
         # expected risk count or the section still lands materially underweight.
         if (
-            not short_quality_mode
-            and (
-                (expected_risk_count > 0 and len(cleaned_entries) < expected_risk_count)
-                or (
-                    risk_budget_words > 0
-                    and _count_words(
-                        "\n\n".join(
-                            f"**{name}**: {desc}" for name, desc in cleaned_entries
-                        )
+            (expected_risk_count > 0 and len(cleaned_entries) < expected_risk_count)
+            or (
+                risk_budget_words > 0
+                and _count_words(
+                    "\n\n".join(
+                        f"**{name}**: {desc}" for name, desc in cleaned_entries
                     )
-                    < min_section_words
                 )
+                < min_section_words
             )
         ):
             fallback_entries = _extract_risk_entries(
@@ -29376,15 +29870,15 @@ def _ensure_required_sections(
             )
             for name, desc in fallback_entries:
                 name = _rewrite_generic_risk_name(name)
+                raw_desc = " ".join((desc or "").split()).strip()
                 name_norm = _normalize_risk_name(name)
-                desc_norm = " ".join(re.sub(r"[^a-z0-9]+", " ", desc.lower()).split())
-                desc_tokens = _risk_desc_tokens(desc)
+                desc_norm = " ".join(re.sub(r"[^a-z0-9]+", " ", raw_desc.lower()).split())
+                desc_tokens = _risk_desc_tokens(raw_desc)
                 if not name_norm or name_norm in seen_names:
                     continue
                 if desc_norm and desc_norm in seen_desc_norms:
                     continue
-                if desc_tokens and _is_desc_duplicate(desc_tokens, seen_desc_tokens):
-                    continue
+                desc = _enforce_risk_schema_phrasing(raw_desc, risk_name=name)
                 if _count_words(desc) < 18:
                     continue
                 cleaned_entries.append((name, desc))
@@ -29411,7 +29905,48 @@ def _ensure_required_sections(
                 budget_words=risk_budget_words
             )
             if fallback_body:
-                rebuilt_body = fallback_body
+                normalized_fallback_entries: List[Tuple[str, str]] = []
+                fallback_seen_names: Set[str] = set()
+                for fallback_name, fallback_desc in _extract_risk_entries(fallback_body):
+                    fixed_name = _rewrite_generic_risk_name(fallback_name)
+                    fixed_desc = _enforce_risk_schema_phrasing(
+                        fallback_desc, risk_name=fixed_name
+                    )
+                    fixed_norm = _normalize_risk_name(fixed_name)
+                    if not fixed_norm or fixed_norm in fallback_seen_names:
+                        continue
+                    fallback_seen_names.add(fixed_norm)
+                    normalized_fallback_entries.append((fixed_name, fixed_desc))
+                    if expected_risk_count > 0 and len(normalized_fallback_entries) >= expected_risk_count:
+                        break
+                if normalized_fallback_entries:
+                    rebuilt_body = "\n\n".join(
+                        f"**{name}**: {desc}"
+                        for name, desc in normalized_fallback_entries
+                    )
+                else:
+                    rebuilt_body = fallback_body
+        if risk_budget_words > 0 and _count_words(rebuilt_body) < min_section_words:
+            risk_pad_guard = 0
+            while (
+                _count_words(rebuilt_body) < min_section_words
+                and risk_pad_guard < 8
+            ):
+                addition = _section_balance_top_up_sentence(
+                    "Risk Factors",
+                    attempt=risk_pad_guard,
+                    calculated_metrics=calculated_metrics,
+                    health_score_data=health_score_data,
+                    risk_factors_excerpt=risk_factors_excerpt or "",
+                )
+                if not addition:
+                    break
+                rebuilt_body = _append_section_balance_sentence(
+                    rebuilt_body,
+                    section_title="Risk Factors",
+                    sentence=addition,
+                )
+                risk_pad_guard += 1
         text = pattern.sub(
             lambda _m: f"## Risk Factors\n{rebuilt_body}\n", text, count=1
         )
@@ -30780,6 +31315,10 @@ def _ensure_required_sections(
     # occasionally overlaps with model output, so remove duplicates deterministically.
     text = _dedupe_consecutive_sentences(text)
     text = _deduplicate_sentences(text)
+    # Re-normalize Risk Factors after sentence-level dedupe so structured entries
+    # retain parser-friendly boundaries and schema-required phrasing.
+    if target_length and int(target_length) > 0:
+        _normalize_risk_factors_section()
 
     return text
 

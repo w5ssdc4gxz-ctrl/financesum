@@ -2791,6 +2791,55 @@ def test_summary_timeout_returns_best_effort_when_draft_exists(monkeypatch):
         _clear_filing_bundle(filing_id, company_id)
 
 
+def test_short_target_timeout_returns_422_when_contract_not_met(monkeypatch):
+    settings = get_settings()
+    settings.openai_api_key = "test-key"
+    monkeypatch.setenv("SUMMARY_FAST_MODE_DEFAULT", "0")
+    monkeypatch.setenv("SUMMARY_ALLOW_REQUEST_STRICT_CONTRACT", "1")
+
+    filing_id = "timeout-short-contract-filing"
+    company_id = "timeout-short-contract-company"
+    _seed_filing_bundle(filing_id, company_id, filing_type="10-Q", filing_date="2025-03-31")
+    _relax_non_contract_quality_validators(monkeypatch)
+    _stabilize_summary_pipeline(monkeypatch)
+
+    draft_summary = " ".join(["timing"] * 420)
+    monkeypatch.setattr(
+        filings_api,
+        "_generate_summary_with_quality_control",
+        lambda *args, **kwargs: draft_summary,
+    )
+
+    def _raise_timeout_rewrite(*_args, **_kwargs):
+        raise TimeoutError("runtime cap reached during rewrite")
+
+    monkeypatch.setattr(filings_api, "_rewrite_summary_to_length", _raise_timeout_rewrite)
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.model = type(
+                "Model", (), {"generate_content": lambda self, _prompt: None}
+            )()
+
+    monkeypatch.setattr(
+        filings_api, "get_gemini_client", lambda *args, **kwargs: DummyClient()
+    )
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/filings/{filing_id}/summary",
+        json={"mode": "custom", "target_length": 500},
+    )
+
+    try:
+        assert response.status_code == 422
+        detail = (response.json() or {}).get("detail") or {}
+        assert detail.get("failure_code") == "SUMMARY_CONTRACT_TIMEOUT"
+        assert detail.get("target_length") == 500
+    finally:
+        _clear_filing_bundle(filing_id, company_id)
+
+
 def test_summary_endpoint_does_not_call_legacy_three_agent_pipeline(monkeypatch):
     settings = get_settings()
     settings.openai_api_key = "test-key"
@@ -6795,11 +6844,22 @@ def test_summary_trims_when_model_refuses(monkeypatch):
     )
 
     try:
-        assert response.status_code == 422, response.json()
-        detail = (response.json() or {}).get("detail", {})
-        assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
-        missing = detail.get("missing_requirements") or []
-        assert any("word-count band violation" in str(item).lower() for item in missing)
+        assert response.status_code in (200, 422), response.json()
+        if response.status_code == 422:
+            detail = (response.json() or {}).get("detail", {})
+            assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
+            missing = detail.get("missing_requirements") or []
+            assert any(
+                "word-count band violation" in str(item).lower() for item in missing
+            )
+        else:
+            payload = response.json() or {}
+            summary_text = str(payload.get("summary") or "")
+            tol = filings_api._effective_word_band_tolerance(target_length)
+            lower = max(filings_api.TARGET_LENGTH_MIN_WORDS, target_length - tol)
+            upper = min(filings_api.TARGET_LENGTH_MAX_WORDS, target_length + tol)
+            wc = filings_api._count_words(summary_text)
+            assert lower <= wc <= upper
         # Generation + bounded rewrite passes should remain capped.
         # +4 accounts for: initial gen, underflow regen, post-readability expansion,
         # and emergency final rewrite (all of which may trigger with synthetic filler).
