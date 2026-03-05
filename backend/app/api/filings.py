@@ -21519,7 +21519,9 @@ def generate_filing_summary(
             if preferences and preferences.investor_focus
             else None
         )
-        persona_id_from_request = (preferences.persona_id or "").strip().lower()
+        persona_id_from_request = (
+            str(getattr(preferences, "persona_id", "") or "").strip().lower()
+        )
         selected_persona_name = _persona_name_from_id(persona_id_from_request)
         if not selected_persona_name:
             selected_persona_name = _extract_persona_name(investor_focus)
@@ -21571,10 +21573,12 @@ def generate_filing_summary(
         if target_length and target_length > 0:
             # Use section_weight_overrides from the frontend when provided.
             user_weight_overrides = (
-                preferences.section_weight_overrides
-                if preferences and preferences.section_weight_overrides
+                getattr(preferences, "section_weight_overrides", None)
+                if preferences
                 else None
             )
+            if not isinstance(user_weight_overrides, dict) or not user_weight_overrides:
+                user_weight_overrides = None
             section_budgets = _calculate_section_word_budgets(
                 int(target_length),
                 include_health_rating=include_health_rating,
