@@ -1696,8 +1696,10 @@ def test_rebalance_section_budgets_handles_overweight_only_long_form_health_case
     assert stats.get("section_balance_overweight_trim_applied") is True
 
 
-def test_rebalance_short_contract_reallocates_dense_donors_to_fp_and_mdna() -> None:
-    target_length = 1000
+@pytest.mark.parametrize("target_length", [1000, 1225, 1400])
+def test_rebalance_short_mid_precision_contract_reallocates_dense_donors_to_fp_and_mdna(
+    target_length: int,
+) -> None:
     budgets = filings_api._calculate_section_word_budgets(
         target_length, include_health_rating=True
     )
@@ -1734,6 +1736,9 @@ def test_rebalance_short_contract_reallocates_dense_donors_to_fp_and_mdna() -> N
     counts_before = filings_api._collect_section_body_word_counts(
         memo, include_health_rating=True
     )
+    lower_total, upper_total, _total_tol = filings_api._target_word_band_bounds(
+        target_length
+    )
     missing_requirements: list[str] = []
     for title in (
         "Executive Summary",
@@ -1749,12 +1754,12 @@ def test_rebalance_short_contract_reallocates_dense_donors_to_fp_and_mdna() -> N
         if wc < lower:
             missing_requirements.append(
                 f"Section balance issue: '{title}' is underweight ({wc} words; target ~{expected}±{tol}). "
-                "Expand it and shorten other sections proportionally so the memo stays within 980-1020 words."
+                f"Expand it and shorten other sections proportionally so the memo stays within {lower_total}-{upper_total} words."
             )
         elif wc > upper:
             missing_requirements.append(
                 f"Section balance issue: '{title}' is overweight ({wc} words; target ~{expected}±{tol}). "
-                "Tighten it and reallocate words to the shorter sections (especially Risk Factors), while staying within 980-1020 words."
+                f"Tighten it and reallocate words to the shorter sections (especially Risk Factors), while staying within {lower_total}-{upper_total} words."
             )
 
     repaired, info = filings_api._rebalance_section_budgets_deterministically(
@@ -3799,6 +3804,282 @@ def test_mid_form_large_underflow_attempts_final_rewrite_and_returns_in_band(
         local_cache.fallback_filing_summaries.pop(filing_id, None)
 
 
+def test_mid_precision_underflow_rewrite_or_rescue_returns_in_band(monkeypatch) -> None:
+    settings = get_settings()
+    settings.openai_api_key = "test-key"
+
+    filing_id = "mid-precision-underflow-filing"
+    company_id = "mid-precision-underflow-company"
+    local_cache.fallback_filings_by_id[filing_id] = {
+        "id": filing_id,
+        "company_id": company_id,
+        "filing_type": "10-Q",
+        "filing_date": "2024-06-30",
+    }
+    local_cache.fallback_companies[company_id] = {
+        "id": company_id,
+        "ticker": "MIDP",
+        "name": "Mid Precision Corp",
+    }
+    local_cache.fallback_financial_statements[filing_id] = {
+        "filing_id": filing_id,
+        "period_start": "2024-04-01",
+        "period_end": "2024-06-30",
+        "statements": _build_test_statements("2024-06-30", 1225),
+    }
+
+    _relax_non_contract_quality_validators(monkeypatch)
+    _stabilize_summary_pipeline(monkeypatch)
+
+    initial_summary = build_summary_with_word_count(1130)
+    compliant_summary = build_summary_with_word_count(1225)
+    rewrite_hints: list[str] = []
+
+    monkeypatch.setattr(
+        filings_api,
+        "_generate_summary_with_quality_control",
+        lambda *args, **kwargs: initial_summary,
+    )
+
+    def _rewrite_to_target(
+        _client,
+        summary_text,
+        target_length,
+        _quality_validators,
+        current_words=None,
+        **kwargs,
+    ):
+        hint = str(kwargs.get("quality_issue_hint") or "")
+        rewrite_hints.append(hint)
+        if (
+            "Final strict-band underflow" in hint
+            or "Short-form underflow rescue" in hint
+        ):
+            return compliant_summary, (target_length, 10)
+        return summary_text, (current_words or _backend_word_count(summary_text), 10)
+
+    monkeypatch.setattr(filings_api, "_rewrite_summary_to_length", _rewrite_to_target)
+    monkeypatch.setattr(
+        filings_api,
+        "_apply_short_form_structural_seal",
+        lambda text, **_kwargs: text,
+    )
+
+    def _evaluate_contract(**kwargs):
+        summary_text = str(kwargs.get("summary_text") or "")
+        target = int(kwargs.get("target_length") or 0)
+        final_split_wc = len((summary_text or "").split())
+        final_wc = _backend_word_count(summary_text)
+        lower, upper, _tol = filings_api._target_word_band_bounds(target)
+        missing = []
+        if target and not (
+            lower <= final_split_wc <= upper and lower <= final_wc <= upper
+        ):
+            missing.append(
+                f"Final word-count band violation: expected {lower}-{upper}, got split={final_split_wc}, stripped={final_wc}."
+            )
+        return (
+            missing,
+            {
+                "target_length": target,
+                "final_word_count": final_wc,
+                "final_split_word_count": final_split_wc,
+                "verified_quote_count": 0,
+                "key_metrics_numeric_row_count": 5,
+                "quality_checks_passed": [],
+            },
+        )
+
+    monkeypatch.setattr(
+        filings_api, "_evaluate_summary_contract_requirements", _evaluate_contract
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_select_short_form_structural_failure_requirements",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_select_short_form_editorial_failure_requirements",
+        lambda **_kwargs: [],
+    )
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/filings/{filing_id}/summary",
+        json={"mode": "custom", "target_length": 1225},
+    )
+
+    try:
+        assert response.status_code == 200
+        payload = response.json() or {}
+        summary = str(payload.get("summary") or "")
+        summary_meta = payload.get("summary_meta") or {}
+        lower, upper, _tol = filings_api._target_word_band_bounds(1225)
+        final_split_words = int(
+            summary_meta.get("final_split_word_count")
+            or len((summary or "").split())
+        )
+        final_stripped_words = int(
+            summary_meta.get("final_word_count")
+            or _backend_word_count(summary)
+        )
+        assert lower <= final_split_words <= upper
+        assert lower <= final_stripped_words <= upper
+        assert summary_meta.get("short_contract_tolerance") == 20
+        assert summary_meta.get("short_contract_in_band") is True
+        assert payload.get("degraded") is not True
+        assert any(
+            "Final strict-band underflow" in hint
+            or "Short-form underflow rescue" in hint
+            for hint in rewrite_hints
+        ) or bool(
+            summary_meta.get("short_underflow_rescue_used")
+            or summary_meta.get("section_balance_repair_applied")
+        )
+    finally:
+        local_cache.fallback_filings_by_id.pop(filing_id, None)
+        local_cache.fallback_companies.pop(company_id, None)
+        local_cache.fallback_financial_statements.pop(filing_id, None)
+        local_cache.fallback_filing_summaries.pop(filing_id, None)
+
+
+def test_mid_precision_structural_seal_rebands_before_contract_evaluation(
+    monkeypatch,
+) -> None:
+    settings = get_settings()
+    settings.openai_api_key = "test-key"
+
+    filing_id = "mid-precision-structural-seal-filing"
+    company_id = "mid-precision-structural-seal-company"
+    local_cache.fallback_filings_by_id[filing_id] = {
+        "id": filing_id,
+        "company_id": company_id,
+        "filing_type": "10-Q",
+        "filing_date": "2024-06-30",
+    }
+    local_cache.fallback_companies[company_id] = {
+        "id": company_id,
+        "ticker": "SEAL",
+        "name": "Seal Drift Corp",
+    }
+    local_cache.fallback_financial_statements[filing_id] = {
+        "filing_id": filing_id,
+        "period_start": "2024-04-01",
+        "period_end": "2024-06-30",
+        "statements": _build_test_statements("2024-06-30", 1225),
+    }
+
+    _relax_non_contract_quality_validators(monkeypatch)
+    _stabilize_summary_pipeline(monkeypatch)
+
+    initial_summary = re.sub(
+        r"\nWORD COUNT:\s*\d+\s*$",
+        "",
+        build_summary_with_word_count(1225),
+    ).strip()
+    structurally_trimmed_summary = re.sub(
+        r"\nWORD COUNT:\s*\d+\s*$",
+        "",
+        build_summary_with_word_count(1180),
+    ).strip()
+    seal_calls = {"count": 0}
+
+    monkeypatch.setattr(
+        filings_api,
+        "_generate_summary_with_quality_control",
+        lambda *args, **kwargs: initial_summary,
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_rewrite_summary_to_length",
+        lambda _client, summary_text, _target_length, _quality_validators, current_words=None, **_kwargs: (
+            summary_text,
+            (current_words or _backend_word_count(summary_text), 10),
+        ),
+    )
+
+    def _late_trimming_structural_seal(_text, **_kwargs):
+        seal_calls["count"] += 1
+        return structurally_trimmed_summary
+
+    monkeypatch.setattr(
+        filings_api,
+        "_apply_short_form_structural_seal",
+        _late_trimming_structural_seal,
+    )
+
+    def _evaluate_contract(**kwargs):
+        summary_text = str(kwargs.get("summary_text") or "")
+        target = int(kwargs.get("target_length") or 0)
+        final_split_wc = len((summary_text or "").split())
+        final_wc = _backend_word_count(summary_text)
+        lower, upper, _tol = filings_api._target_word_band_bounds(target)
+        missing = []
+        if target and not (
+            lower <= final_split_wc <= upper and lower <= final_wc <= upper
+        ):
+            missing.append(
+                f"Final word-count band violation: expected {lower}-{upper}, got split={final_split_wc}, stripped={final_wc}."
+            )
+        return (
+            missing,
+            {
+                "target_length": target,
+                "final_word_count": final_wc,
+                "final_split_word_count": final_split_wc,
+                "verified_quote_count": 0,
+                "key_metrics_numeric_row_count": 5,
+                "quality_checks_passed": [],
+            },
+        )
+
+    monkeypatch.setattr(
+        filings_api, "_evaluate_summary_contract_requirements", _evaluate_contract
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_select_short_form_structural_failure_requirements",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_select_short_form_editorial_failure_requirements",
+        lambda **_kwargs: [],
+    )
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/filings/{filing_id}/summary",
+        json={"mode": "custom", "target_length": 1225},
+    )
+
+    try:
+        assert response.status_code == 200
+        payload = response.json() or {}
+        summary = str(payload.get("summary") or "")
+        summary_meta = payload.get("summary_meta") or {}
+        lower, upper, _tol = filings_api._target_word_band_bounds(1225)
+        final_split_words = int(
+            summary_meta.get("final_split_word_count")
+            or len((summary or "").split())
+        )
+        final_stripped_words = int(
+            summary_meta.get("final_word_count")
+            or _backend_word_count(summary)
+        )
+        assert seal_calls["count"] >= 1
+        assert lower <= final_split_words <= upper
+        assert lower <= final_stripped_words <= upper
+        assert summary_meta.get("short_contract_tolerance") == 20
+        assert summary_meta.get("short_contract_in_band") is True
+    finally:
+        local_cache.fallback_filings_by_id.pop(filing_id, None)
+        local_cache.fallback_companies.pop(company_id, None)
+        local_cache.fallback_financial_statements.pop(filing_id, None)
+        local_cache.fallback_filing_summaries.pop(filing_id, None)
+
+
 def test_long_form_underflow_returns_contract_failure_422(monkeypatch) -> None:
     settings = get_settings()
     settings.openai_api_key = "test-key"
@@ -5246,6 +5527,83 @@ def test_short_quality_boundary_1200_brief_section_returns_summary_contract_422(
     response = client.post(
         f"/api/v1/filings/{filing_id}/summary",
         json={"mode": "custom", "target_length": 1200},
+    )
+
+    try:
+        assert response.status_code == 422
+        detail = (response.json() or {}).get("detail", {})
+        assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
+        missing = detail.get("missing_requirements") or []
+        assert any("section is too brief" in str(item).lower() for item in missing)
+    finally:
+        _clear_filing_bundle(filing_id, company_id)
+
+
+def test_mid_precision_boundary_1225_brief_section_returns_summary_contract_422(
+    monkeypatch,
+) -> None:
+    settings = get_settings()
+    settings.openai_api_key = "test-key"
+
+    filing_id = "mid-precision-boundary-1225-brief-section-filing"
+    company_id = "mid-precision-boundary-1225-brief-section-company"
+    _seed_filing_bundle(filing_id, company_id)
+    _relax_non_contract_quality_validators(monkeypatch)
+    _stabilize_summary_pipeline(monkeypatch)
+
+    intact_summary = (
+        "## Financial Health Rating\n"
+        "The balance sheet remains stable and provides operating flexibility.\n\n"
+        "## Executive Summary\n"
+        "Profitability improved, but the quarter still depends on repeatable cash conversion.\n\n"
+        "## Financial Performance\n"
+        "Revenue moved higher.\n\n"
+        "## Management Discussion & Analysis\n"
+        "Management is balancing reinvestment with margin discipline, which matters for durability through the next few periods.\n\n"
+        "## Risk Factors\n"
+        "**Demand Risk**: A softer demand environment could pressure both pricing and cash generation.\n\n"
+        "## Key Metrics\n"
+        "DATA_GRID_START\n"
+        "Revenue | $2.50B\n"
+        "Operating Income | $0.70B\n"
+        "Operating Margin | 28.0%\n"
+        "Free Cash Flow | $0.65B\n"
+        "Current Ratio | 2.3x\n"
+        "DATA_GRID_END\n\n"
+        "## Closing Takeaway\n"
+        "I rate Example Corp a HOLD because margins improved while cash conversion still needs to prove durability."
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_generate_summary_with_quality_control",
+        lambda *args, **kwargs: intact_summary,
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_evaluate_summary_contract_requirements",
+        lambda **_kwargs: (
+            [
+                "The 'Financial Performance' section is too brief (17 words). Expand it to at least 20 words and ensure it concludes on a full sentence."
+            ],
+            {
+                "target_length": 1225,
+                "final_word_count": 1212,
+                "verified_quote_count": 0,
+                "key_metrics_numeric_row_count": 5,
+                "quality_checks_passed": [],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_select_short_form_structural_failure_requirements",
+        lambda **_kwargs: [],
+    )
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/filings/{filing_id}/summary",
+        json={"mode": "custom", "target_length": 1225},
     )
 
     try:

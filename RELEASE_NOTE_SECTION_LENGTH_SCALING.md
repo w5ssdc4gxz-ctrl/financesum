@@ -145,3 +145,30 @@
 ### Validation
 - `cd backend && pytest -q` -> `946 passed`.
 - `cd frontend && npm run build` -> success (warnings only).
+
+## Update: 1201-1499 Precision Contract Coverage (2026-03-05)
+
+### Root Cause
+- The strongest short-target contract logic still stopped at `<=1200`, even though the sectioned short/mid range runs up to `1499`.
+- Requests like `1225` therefore missed the stronger underflow rescue, target-aware section floors, and short-contract observability path, which left `Financial Performance` and `MD&A` underweight and allowed materially short outputs unless a later rewrite happened to recover them.
+- A late `_apply_short_form_structural_seal(...)` pass could also trim the memo after an earlier in-band pass with no guaranteed re-band before final contract evaluation.
+
+### Policy and Code Changes
+- Expanded precision-contract handling in `backend/app/api/filings.py` from `<=1200` to the full sectioned short/mid range `300-1499` where it matters for the length contract:
+  - short/mid target band now uses `±20` across the full range,
+  - target-aware section minimums now scale `Financial Performance`, `MD&A`, Risk Factors, Closing Takeaway, and Health Rating for `1201-1499`,
+  - section-balance enforcement and short underflow rescue now run for explicit `1225`/`1300`/`1400` style requests instead of falling through to the weaker middle path,
+  - timeout and final response observability now report short-contract metadata for `1201-1499`,
+  - a final strict re-band now runs immediately after `_apply_short_form_structural_seal(...)` before contract evaluation.
+
+### Expected Behavior
+- Explicit short/mid sectioned targets from `300` through `1499` now behave as one precision-contract class.
+- A `1225` request should either return inside `1205-1245` or fail with `422`; it should not silently return something materially short such as `1130`.
+- `Financial Performance` and `MD&A` should visibly scale up with `1225` and `1400` requests instead of behaving like the lower short-target path.
+
+### Validation
+- Added/updated regression coverage in `backend/tests/test_filing_summary.py` for:
+  - dense-donor section rebalance at `1000`, `1225`, and `1400`,
+  - successful `1225` underflow recovery into the `1205-1245` band,
+  - late structural-seal trimming that is re-banded before contract evaluation,
+  - explicit `1225` brief-section hard-fail returning `422`.

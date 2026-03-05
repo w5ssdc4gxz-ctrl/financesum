@@ -257,8 +257,13 @@ def _is_short_form_sectioned_target(target_length: Optional[int]) -> bool:
     )
 
 
+def _is_short_mid_precision_target(target_length: Optional[int]) -> bool:
+    """Return True for the full sectioned short/mid precision range [300, 1500)."""
+    return _is_short_form_sectioned_target(target_length)
+
+
 def _is_short_quality_sensitive_target(target_length: Optional[int]) -> bool:
-    if not _is_short_form_sectioned_target(target_length):
+    if not _is_short_mid_precision_target(target_length):
         return False
     try:
         return int(target_length or 0) <= 1200
@@ -273,7 +278,7 @@ def _is_explicit_short_mid_precision_target(
 ) -> bool:
     if not explicit_target_requested:
         return False
-    return _is_short_quality_sensitive_target(target_length)
+    return _is_short_mid_precision_target(target_length)
 
 
 def _requires_section_balance_contract(
@@ -452,7 +457,7 @@ SHORT_SECTIONED_WORD_BAND_TOLERANCE = 20
 
 def _effective_word_band_tolerance(target_length: Optional[int] = None) -> int:
     """Return the active memo word-band tolerance."""
-    if _is_short_quality_sensitive_target(target_length):
+    if _is_short_mid_precision_target(target_length):
         return int(SHORT_SECTIONED_WORD_BAND_TOLERANCE)
     if target_length and _summary_continuous_v2_enabled():
         return int(total_word_tolerance_words(int(target_length)))
@@ -3342,7 +3347,13 @@ def _enforce_whitespace_word_band(
         # For markdown sectioned memos, prefer section-aware padding so we avoid
         # appending generic one-liner loops to the tail of the final section.
         if re.search(r"^\s*##\s+", hardened, re.MULTILINE):
-            padded = _distribute_padding_across_sections(hardened, deficit)
+            padded = _distribute_padding_across_sections(
+                hardened,
+                deficit,
+                allow_sectioned_precision_padding=_is_short_mid_precision_target(
+                    target_length
+                ),
+            )
             if padded != hardened:
                 hardened = padded
                 continue
@@ -3420,7 +3431,13 @@ def _ensure_final_strict_word_band(
             )
         else:
             before_distribute = enforced
-            enforced = _distribute_padding_across_sections(enforced, deficit)
+            enforced = _distribute_padding_across_sections(
+                enforced,
+                deficit,
+                allow_sectioned_precision_padding=_is_short_mid_precision_target(
+                    target_length
+                ),
+            )
             _record_padding_telemetry(
                 generation_stats, before_text=before_distribute, after_text=enforced
             )
@@ -6463,7 +6480,12 @@ def _generate_padding_sentences(
     return sentences
 
 
-def _distribute_padding_across_sections(summary_text: str, required_words: int) -> str:
+def _distribute_padding_across_sections(
+    summary_text: str,
+    required_words: int,
+    *,
+    allow_sectioned_precision_padding: bool = False,
+) -> str:
     """Add a tiny amount of deterministic padding only for compact sectioned memos.
 
     For the real short-form product range (300+ words), filler-free behavior remains
@@ -6475,7 +6497,10 @@ def _distribute_padding_across_sections(summary_text: str, required_words: int) 
         return summary_text
 
     current_words = _count_words(summary_text or "")
-    if current_words >= int(SHORT_FORM_SECTIONED_TARGET_MIN_WORDS):
+    if (
+        current_words >= int(SHORT_FORM_SECTIONED_TARGET_MIN_WORDS)
+        and not allow_sectioned_precision_padding
+    ):
         return summary_text
     if int(required_words) > 40:
         return summary_text
@@ -9260,7 +9285,7 @@ def _calculate_section_min_words_for_target(
     if not budgets:
         return base_mins
 
-    short_quality_target = _is_short_quality_sensitive_target(target_length)
+    short_mid_precision_target = _is_short_mid_precision_target(target_length)
     mins: Dict[str, int] = {}
     for section, raw_budget in budgets.items():
         budget = int(raw_budget or 0)
@@ -9282,14 +9307,14 @@ def _calculate_section_min_words_for_target(
         elif section in {"Financial Performance", "Management Discussion & Analysis"}:
             # Short/mid requests should keep the analytical core sections close to
             # their allocated budgets so they scale visibly with target length.
-            focus_ratio = 0.85 if short_quality_target else 0.75
+            focus_ratio = 0.85 if short_mid_precision_target else 0.75
             ratio_min = max(min_floor, int(round(budget * focus_ratio)))
         elif section == "Executive Summary":
-            ratio = 0.78 if short_quality_target else 0.70
+            ratio = 0.78 if short_mid_precision_target else 0.70
             ratio_min = max(min_floor, int(round(budget * ratio)))
         elif section in {"Risk Factors", "Closing Takeaway"}:
             # These are the "bookends" users remember; keep them substantive.
-            ratio = 0.78 if short_quality_target else 0.75
+            ratio = 0.78 if short_mid_precision_target else 0.75
             ratio_min = max(min_floor, int(round(budget * ratio)))
         elif section == "Financial Health Rating":
             ratio_min = max(min_floor, int(budget * 0.70))
@@ -10320,7 +10345,7 @@ def _make_section_completeness_validator(
         "Key Metrics": 5,
         "Closing Takeaway": 15,
     }
-    if _is_short_quality_sensitive_target(target_length):
+    if _is_short_mid_precision_target(target_length):
         # For explicit short/mid precision requests, fixed low floors allow FP/MD&A
         # to collapse while still passing completeness checks. Use target-aware floors.
         min_words_by_section = _calculate_section_min_words_for_target(
@@ -10349,7 +10374,7 @@ def _make_section_completeness_validator(
             section_body = text[section_start:next_section_index].strip()
             word_count = _count_words(section_body)
             min_words = int(min_words_by_section.get(title, 15))
-            if _is_short_quality_sensitive_target(target_length) and title == "Risk Factors":
+            if _is_short_mid_precision_target(target_length) and title == "Risk Factors":
                 # Final cleanup can clip a few words from Risk Factors on short targets.
                 # Keep the floor strict while avoiding avoidable hard fails on small drift.
                 min_words = max(1, int(min_words) - 4)
@@ -10470,7 +10495,7 @@ def _make_section_balance_validator(include_health_rating: bool, target_length: 
                 # short targets so valid numeric rows do not trip structural hard-fail.
                 section_tolerance = max(
                     int(section_tolerance),
-                    12 if _is_short_quality_sensitive_target(target_length) else 8,
+                    12 if _is_short_mid_precision_target(target_length) else 8,
                 )
             min_allowed = max(1, expected - section_tolerance)
             max_allowed = expected + section_tolerance
@@ -12661,7 +12686,7 @@ def _rescue_short_sectioned_underflow(
     persona_intensity: str = "strong",
 ) -> str:
     """Run one short-form, section-aware rewrite when cleanup leaves the memo under target."""
-    if not summary_text or not _is_short_quality_sensitive_target(target_length):
+    if not summary_text or not _is_short_mid_precision_target(target_length):
         return summary_text
     if gemini_client is None:
         return summary_text
@@ -12929,7 +12954,7 @@ def _recover_short_form_editorial_issues_once(
     text = str(summary_text or "").strip()
     if not text:
         return summary_text, list(missing_requirements or []), {"final_word_count": 0}, False
-    if not _is_short_quality_sensitive_target(target_length):
+    if not _is_short_mid_precision_target(target_length):
         rechecked_missing, rechecked_meta = _evaluate_summary_contract_requirements(
             summary_text=text,
             target_length=target_length,
@@ -14897,7 +14922,7 @@ def _rebalance_section_budgets_deterministically(
 
     target = int(target_length)
     long_form = _is_long_form_target(target)
-    short_quality_mode = _is_short_quality_sensitive_target(target)
+    short_mid_precision_mode = _is_short_mid_precision_target(target)
     _section_wc = lambda value: len(re.findall(r"\b\w+\b", value or ""))
     budgets = _calculate_section_word_budgets(target, include_health_rating=include_health_rating)
     if not budgets:
@@ -15098,7 +15123,7 @@ def _rebalance_section_budgets_deterministically(
 
     # On clean-first short targets, only allow bounded underweight expansion when the
     # explicit short/mid section-balance contract is active.
-    if short_quality_mode and not section_balance_contract_required:
+    if short_mid_precision_mode and not section_balance_contract_required:
         if (not long_form) and _count_words(text) < lower_total and info["words_trimmed"] > 0:
             return summary_text, {
                 "changed": False,
@@ -21210,6 +21235,7 @@ def generate_filing_summary(
     preferences = preferences or FilingSummaryPreferences()
     explicit_target_requested = preferences.target_length is not None
     target_length = _clamp_target_length(preferences.target_length)
+    short_mid_precision_mode = _is_short_mid_precision_target(target_length)
     short_quality_mode = _is_short_quality_sensitive_target(target_length)
     summary_output_format = _summary_output_format_for_target(target_length)
     micro_plaintext_mode = summary_output_format == "plain_text_micro"
@@ -21226,7 +21252,7 @@ def generate_filing_summary(
         explicit_target_requested=explicit_target_requested,
     )
     summary_runtime_cap_seconds = max(1, int(SUMMARY_TOTAL_TIMEOUT_SECONDS))
-    if explicit_target_requested and short_quality_mode and target_length:
+    if explicit_target_requested and short_mid_precision_mode and target_length:
         short_timeout_floor = _int_env("SUMMARY_SHORT_TARGET_TIMEOUT_SECONDS", 300)
         summary_runtime_cap_seconds = max(
             int(summary_runtime_cap_seconds),
@@ -21257,7 +21283,7 @@ def generate_filing_summary(
     )
     if explicit_short_mid_precision_target:
         fast_summary_mode = False
-    if target_length and _is_short_quality_sensitive_target(target_length):
+    if explicit_target_requested and short_mid_precision_mode and target_length:
         # Explicit short/mid targets always run strict routing so fast-mode
         # best-effort output cannot bypass hard word-band enforcement.
         fast_summary_mode = False
@@ -21739,7 +21765,7 @@ def generate_filing_summary(
         if (
             target_length
             and explicit_target_requested
-            and short_quality_mode
+            and short_mid_precision_mode
             and str(payload.get("summary") or "").strip()
         ):
             repaired_summary = str(payload.get("summary") or "").strip()
@@ -23958,7 +23984,7 @@ FLOW AND QUALITY RULES:
 
         if (
             target_length
-            and short_quality_mode
+            and short_mid_precision_mode
             and not fast_summary_mode
             and not one_shot_deterministic_policy
             and not continuous_v2_route_mode
@@ -24007,7 +24033,7 @@ FLOW AND QUALITY RULES:
                     final_wc,
                     final_target,
                 )
-                if generation_stats is not None and short_quality_mode:
+                if generation_stats is not None and short_mid_precision_mode:
                     generation_stats["short_contract_pre_final_split_words"] = int(
                         final_split_wc
                     )
@@ -24015,7 +24041,7 @@ FLOW AND QUALITY RULES:
                         final_wc
                     )
                 if final_split_wc > upper or final_wc > upper:
-                    if generation_stats is not None and short_quality_mode:
+                    if generation_stats is not None and short_mid_precision_mode:
                         overflow_excess = max(
                             final_split_wc - upper,
                             final_wc - upper,
@@ -24344,6 +24370,47 @@ FLOW AND QUALITY RULES:
                 persona_name=selected_persona_name,
                 persona_requested=persona_requested,
                 target_length=target_length,
+            )
+            summary_text = _enforce_strict_target_band(
+                summary_text,
+                int(target_length),
+                calculated_metrics=calculated_metrics,
+                company_name=company_name,
+                include_health_rating=include_health_rating,
+                generation_stats=generation_stats,
+                allow_padding_rescue=_allow_padding_for_target(
+                    int(target_length), _count_words(summary_text or "")
+                ),
+                prefer_narrative_padding=True,
+                gemini_client=gemini_client,
+                quality_validators=quality_validators,
+                token_budget=token_budget,
+                cost_budget=cost_budget,
+                max_output_tokens=max_output_tokens,
+                persona_intensity=(
+                    "subtle"
+                    if generation_stats.get("persona_intensity_downgraded")
+                    else "strong"
+                ),
+            )
+            summary_text = _ensure_final_strict_word_band(
+                summary_text,
+                int(target_length),
+                include_health_rating=include_health_rating,
+                tolerance=_effective_word_band_tolerance(target_length),
+                generation_stats=generation_stats,
+                allow_padding=_allow_padding_for_target(
+                    int(target_length), _count_words(summary_text or "")
+                ),
+            )
+            summary_text = _enforce_whitespace_word_band(
+                summary_text,
+                int(target_length),
+                tolerance=_effective_word_band_tolerance(target_length),
+                allow_padding=_allow_padding_for_target(
+                    int(target_length), _count_words(summary_text or "")
+                ),
+                dedupe=True,
             )
         contract_quality_validators = (
             post_final_quality_validators
@@ -25912,6 +25979,47 @@ FLOW AND QUALITY RULES:
                     persona_requested=persona_requested,
                     target_length=target_length,
                 )
+                summary_text = _enforce_strict_target_band(
+                    summary_text,
+                    int(target_length),
+                    calculated_metrics=calculated_metrics,
+                    company_name=company_name,
+                    include_health_rating=include_health_rating,
+                    generation_stats=generation_stats,
+                    allow_padding_rescue=_allow_padding_for_target(
+                        int(target_length), _count_words(summary_text or "")
+                    ),
+                    prefer_narrative_padding=True,
+                    gemini_client=gemini_client,
+                    quality_validators=contract_quality_validators,
+                    token_budget=token_budget,
+                    cost_budget=cost_budget,
+                    max_output_tokens=max_output_tokens,
+                    persona_intensity=(
+                        "subtle"
+                        if generation_stats.get("persona_intensity_downgraded")
+                        else "strong"
+                    ),
+                )
+                summary_text = _ensure_final_strict_word_band(
+                    summary_text,
+                    int(target_length),
+                    include_health_rating=include_health_rating,
+                    tolerance=_effective_word_band_tolerance(target_length),
+                    generation_stats=generation_stats,
+                    allow_padding=_allow_padding_for_target(
+                        int(target_length), _count_words(summary_text or "")
+                    ),
+                )
+                summary_text = _enforce_whitespace_word_band(
+                    summary_text,
+                    int(target_length),
+                    tolerance=_effective_word_band_tolerance(target_length),
+                    allow_padding=_allow_padding_for_target(
+                        int(target_length), _count_words(summary_text or "")
+                    ),
+                    dedupe=True,
+                )
             missing_requirements, summary_meta = _evaluate_summary_contract_requirements(
                 summary_text=summary_text,
                 target_length=target_length,
@@ -25967,7 +26075,7 @@ FLOW AND QUALITY RULES:
         short_form_structural_fatal_requirements: List[str] = []
         short_form_editorial_fatal_requirements: List[str] = []
         if soft_target_mode and _is_short_form_sectioned_target(target_length):
-            if short_quality_mode:
+            if short_mid_precision_mode:
                 band = _target_word_band_bounds(target_length)
                 if band is not None:
                     lower, upper, tolerance = band
@@ -26060,7 +26168,7 @@ FLOW AND QUALITY RULES:
                         )
             short_form_editorial_recovery_attempted = False
             if (
-                short_quality_mode
+                short_mid_precision_mode
                 and bool(section_balance_contract_required)
                 and _parse_summary_contract_missing_requirements(
                     missing_requirements
@@ -26105,7 +26213,7 @@ FLOW AND QUALITY RULES:
                     short_form_editorial_recovery_attempted
                 )
 
-            if short_quality_mode:
+            if short_mid_precision_mode:
                 final_key_metrics_budget = int(section_budgets.get("Key Metrics", 0) or 0)
                 if final_key_metrics_budget > 0:
                     final_key_metrics_upper = int(final_key_metrics_budget) + int(
@@ -26151,7 +26259,7 @@ FLOW AND QUALITY RULES:
                     enforce_section_balance=bool(section_balance_contract_required),
                 )
             )
-            if short_form_structural_fatal_requirements and short_quality_mode:
+            if short_form_structural_fatal_requirements and short_mid_precision_mode:
                 rescue_flags = _parse_summary_contract_missing_requirements(
                     short_form_structural_fatal_requirements
                 )
@@ -26286,7 +26394,7 @@ FLOW AND QUALITY RULES:
                         "missing_requirements": short_form_structural_fatal_requirements,
                     },
                 )
-            if short_quality_mode:
+            if short_mid_precision_mode:
                 short_form_editorial_fatal_requirements = (
                     _select_short_form_editorial_failure_requirements(
                         missing_requirements=missing_requirements,
@@ -26471,7 +26579,7 @@ FLOW AND QUALITY RULES:
             fast_warnings.append(
                 "Summary completed in soft target mode; strict contract failures were downgraded to warnings."
             )
-            if short_quality_mode and any(
+            if short_mid_precision_mode and any(
                 "word-count band violation" in str(item).lower()
                 for item in list(missing_requirements or [])
             ):
@@ -26518,7 +26626,7 @@ FLOW AND QUALITY RULES:
         summary_meta["final_word_count"] = int(final_word_count)
         short_contract_band: Optional[Dict[str, int]] = None
         short_contract_in_band: Optional[bool] = None
-        if target_length and _is_short_quality_sensitive_target(target_length):
+        if target_length and _is_short_mid_precision_target(target_length):
             band = _target_word_band_bounds(target_length)
             if band is not None:
                 lower, upper, tolerance = band
@@ -27470,7 +27578,7 @@ FLOW AND QUALITY RULES:
             )
             complete_summary_progress(filing_id)
             return best_effort_response
-        if target_length and explicit_target_requested and short_quality_mode:
+        if target_length and explicit_target_requested and short_mid_precision_mode:
             detail = {
                 "detail": (
                     "Unable to satisfy the explicit short-target summary contract before timeout."
@@ -27568,7 +27676,7 @@ FLOW AND QUALITY RULES:
             )
             complete_summary_progress(filing_id)
             return best_effort_response
-        if target_length and explicit_target_requested and short_quality_mode:
+        if target_length and explicit_target_requested and short_mid_precision_mode:
             detail = {
                 "detail": (
                     "Unable to satisfy the explicit short-target summary contract before timeout."
@@ -29490,6 +29598,7 @@ def _ensure_required_sections(
     """
     text = summary_text
     persona_mode = bool(persona_requested) or bool(persona_name)
+    short_mid_precision_mode = _is_short_mid_precision_target(target_length)
     short_quality_mode = _is_short_quality_sensitive_target(target_length)
 
     def _short_company_label(name: str) -> str:
@@ -29822,7 +29931,7 @@ def _ensure_required_sections(
             target_length,
             include_health_rating=include_health_rating,
         )
-        focus_ratio = 0.85 if short_quality_mode else 0.75
+        focus_ratio = 0.85 if short_mid_precision_mode else 0.75
         for focus_section in (
             "Financial Performance",
             "Management Discussion & Analysis",
@@ -31149,11 +31258,11 @@ def _ensure_required_sections(
             deficit_words = max(0, int(min_words) - int(current_words))
             rounds_for_deficit = max(2, (deficit_words + 19) // 20)
             max_rounds = max(
-                4 if short_quality_mode else 2,
+                4 if short_mid_precision_mode else 2,
                 min(20, int(rounds_for_deficit)),
             )
         else:
-            max_rounds = 4 if short_quality_mode else 1
+            max_rounds = 4 if short_mid_precision_mode else 1
         while current_words < int(min_words) and rounds < max_rounds:
             fallback_seed = _section_balance_top_up_sentence(
                 title,
