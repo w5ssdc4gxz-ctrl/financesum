@@ -12546,7 +12546,14 @@ def _short_underweight_section_guidance(
         ]
 
     underweight_rows: List[Tuple[int, int, int, str]] = []
-    priority = {title: idx for idx, title in enumerate(narrative_titles)}
+    priority = {
+        "Financial Performance": 0,
+        "Management Discussion & Analysis": 1,
+        "Risk Factors": 2,
+        "Executive Summary": 3,
+        "Financial Health Rating": 4,
+        "Closing Takeaway": 5,
+    }
     for title in narrative_titles:
         budget = int(budgets.get(title, 0) or 0)
         observed = int(counts.get(title, 0) or 0)
@@ -12561,7 +12568,7 @@ def _short_underweight_section_guidance(
         return [], ""
 
     underweight_rows.sort(
-        key=lambda item: (-int(item[0]), int(priority.get(item[3], 999)))
+        key=lambda item: (int(priority.get(item[3], 999)), -int(item[0]))
     )
     ordered_titles = [title for _deficit, _observed, _budget, title in underweight_rows]
     guidance_lines = [
@@ -12623,6 +12630,56 @@ def _rescue_short_sectioned_underflow(
     if guidance_block:
         quality_hint += f"\nSection budget gaps:\n{guidance_block}"
 
+    if generation_stats is not None:
+        generation_stats["short_underflow_rescue_used"] = True
+        generation_stats["short_underflow_rescue_initial_split_words"] = int(split_wc)
+        generation_stats["short_underflow_rescue_initial_stripped_words"] = int(
+            stripped_wc
+        )
+        generation_stats["short_underflow_rescue_targets"] = list(
+            underweight_titles[:4]
+        )
+
+    pre_rebalance_flags: Dict[str, Any] = {
+        "section_balance_issue": True,
+        "section_balance_underweight_titles": list(underweight_titles[:4]),
+    }
+    summary_text, pre_rebalance_info = _rebalance_section_budgets_deterministically(
+        summary_text,
+        target_length=target,
+        include_health_rating=include_health_rating,
+        section_balance_contract_required=True,
+        issue_flags=pre_rebalance_flags,
+        generation_stats=generation_stats,
+        calculated_metrics=calculated_metrics,
+    )
+    if generation_stats is not None:
+        generation_stats["short_underflow_rescue_pre_rebalance_applied"] = bool(
+            pre_rebalance_info.get("applied")
+        )
+        generation_stats["short_underflow_rescue_pre_rebalance_words_added"] = int(
+            pre_rebalance_info.get("words_added", 0) or 0
+        )
+        generation_stats["short_underflow_rescue_pre_rebalance_words_trimmed"] = int(
+            pre_rebalance_info.get("words_trimmed", 0) or 0
+        )
+        generation_stats["short_underflow_rescue_pre_rebalance_expanded_sections"] = list(
+            pre_rebalance_info.get("expanded_sections") or []
+        )
+
+    split_wc = len((summary_text or "").split())
+    stripped_wc = _count_words(summary_text or "")
+    if split_wc >= lower and stripped_wc >= lower:
+        if generation_stats is not None:
+            generation_stats["short_underflow_rescue_in_band"] = bool(
+                lower <= split_wc <= upper and lower <= stripped_wc <= upper
+            )
+            generation_stats["short_underflow_rescue_final_split_words"] = int(split_wc)
+            generation_stats["short_underflow_rescue_final_stripped_words"] = int(
+                stripped_wc
+            )
+        return summary_text
+
     emergency_rewrite_stats: Optional[Dict[str, Any]] = generation_stats
     if generation_stats is not None:
         rewrite_calls = int(generation_stats.get("rewrite_call_count", 0) or 0)
@@ -12675,6 +12732,24 @@ def _rescue_short_sectioned_underflow(
     summary_text = _merge_duplicate_canonical_sections(
         summary_text, include_health_rating=include_health_rating
     )
+    post_underweight_titles, _ = _short_underweight_section_guidance(
+        summary_text,
+        target_length=target,
+        include_health_rating=include_health_rating,
+    )
+    post_rebalance_flags: Dict[str, Any] = {
+        "section_balance_issue": True,
+        "section_balance_underweight_titles": list(post_underweight_titles[:4]),
+    }
+    summary_text, post_rebalance_info = _rebalance_section_budgets_deterministically(
+        summary_text,
+        target_length=target,
+        include_health_rating=include_health_rating,
+        section_balance_contract_required=True,
+        issue_flags=post_rebalance_flags,
+        generation_stats=generation_stats,
+        calculated_metrics=calculated_metrics,
+    )
     summary_text = _ensure_final_strict_word_band(
         summary_text,
         target,
@@ -12693,11 +12768,77 @@ def _rescue_short_sectioned_underflow(
 
     final_split_wc = len((summary_text or "").split())
     final_stripped_wc = _count_words(summary_text or "")
+    if final_split_wc < lower or final_stripped_wc < lower:
+        # Final deterministic drift correction: append one balanced sentence
+        # to the highest-priority narrative section until both counters clear.
+        preferred_titles = [
+            "Financial Performance",
+            "Management Discussion & Analysis",
+            "Risk Factors",
+            "Executive Summary",
+            "Closing Takeaway",
+        ]
+        for section_title in preferred_titles:
+            if final_split_wc >= lower and final_stripped_wc >= lower:
+                break
+            section_body = _extract_markdown_section_body(summary_text, section_title)
+            if not section_body:
+                continue
+            addition = _section_balance_top_up_sentence(
+                section_title,
+                attempt=0,
+                calculated_metrics=calculated_metrics,
+                health_score_data=None,
+                risk_factors_excerpt="",
+            )
+            updated_body = _append_section_balance_sentence(
+                section_body,
+                section_title=section_title,
+                sentence=addition,
+            )
+            if updated_body == section_body:
+                continue
+            summary_text = _replace_markdown_section_body(
+                summary_text,
+                section_title,
+                updated_body,
+            )
+            summary_text = _enforce_whitespace_word_band(
+                summary_text,
+                target,
+                tolerance=tolerance,
+                allow_padding=False,
+                dedupe=True,
+            )
+            final_split_wc = len((summary_text or "").split())
+            final_stripped_wc = _count_words(summary_text or "")
     if generation_stats is not None:
+        generation_stats["short_underflow_rescue_post_rebalance_applied"] = bool(
+            post_rebalance_info.get("applied")
+        )
+        generation_stats["short_underflow_rescue_post_rebalance_words_added"] = int(
+            post_rebalance_info.get("words_added", 0) or 0
+        )
+        generation_stats["short_underflow_rescue_post_rebalance_words_trimmed"] = int(
+            post_rebalance_info.get("words_trimmed", 0) or 0
+        )
+        generation_stats["short_underflow_rescue_post_rebalance_expanded_sections"] = list(
+            post_rebalance_info.get("expanded_sections") or []
+        )
+        generation_stats["short_underflow_rescue_expanded_sections"] = list(
+            dict.fromkeys(
+                list(pre_rebalance_info.get("expanded_sections") or [])
+                + list(post_rebalance_info.get("expanded_sections") or [])
+            )
+        )
         generation_stats["short_underflow_rescue_in_band"] = bool(
             lower <= final_split_wc <= upper and lower <= final_stripped_wc <= upper
         )
         generation_stats["short_underflow_rescue_targets"] = list(underweight_titles[:4])
+        generation_stats["short_underflow_rescue_final_split_words"] = int(final_split_wc)
+        generation_stats["short_underflow_rescue_final_stripped_words"] = int(
+            final_stripped_wc
+        )
     return summary_text
 
 
@@ -14505,6 +14646,7 @@ def _rebalance_section_budgets_deterministically(
         "words_added": 0,
         "words_trimmed": 0,
         "inferred_underweight_targets": [],
+        "expanded_sections": [],
     }
     if not text or not target_length:
         return summary_text, info
@@ -14585,18 +14727,30 @@ def _rebalance_section_budgets_deterministically(
         "Financial Health Rating": 4,
         "Closing Takeaway": 5,
     }
+    short_form_recipient_priority = {
+        "Financial Performance": 0,
+        "Management Discussion & Analysis": 1,
+        "Risk Factors": 2,
+        "Executive Summary": 3,
+        "Financial Health Rating": 4,
+        "Closing Takeaway": 5,
+    }
+    def _underweight_sort_key(item: Tuple[int, str]) -> Tuple[int, int]:
+        deficit, title = item
+        if long_form:
+            return (-int(deficit), int(long_form_recipient_priority.get(title, 99)))
+        return (
+            int(short_form_recipient_priority.get(title, 99)),
+            -int(deficit),
+        )
+
     under_titles = _dedupe_titles(
         parsed_under_titles
         + [
             title
             for _deficit, title in sorted(
                 inferred_under,
-                key=lambda item: (
-                    -int(item[0]),
-                    int(long_form_recipient_priority.get(item[1], 99))
-                    if long_form
-                    else _summary_repetition_section_priority(item[1]),
-                ),
+                key=_underweight_sort_key,
             )
         ]
     )
@@ -14681,12 +14835,7 @@ def _rebalance_section_budgets_deterministically(
             title
             for _deficit, title in sorted(
                 post_trim_inferred_under,
-                key=lambda item: (
-                    -int(item[0]),
-                    int(long_form_recipient_priority.get(item[1], 99))
-                    if long_form
-                    else _summary_repetition_section_priority(item[1]),
-                ),
+                key=_underweight_sort_key,
             )
         ]
         under_titles = _dedupe_titles(list(under_titles) + post_trim_titles)
@@ -14808,6 +14957,7 @@ def _rebalance_section_budgets_deterministically(
         }
 
     if info["applied"]:
+        info["expanded_sections"] = list(dict.fromkeys(expanded_titles))
         if expanded_titles:
             info["actions"].append("section_balance_expand_underweight")
         if info["words_trimmed"] > 0:
@@ -20838,6 +20988,10 @@ def generate_filing_summary(
     )
     if explicit_short_mid_precision_target:
         fast_summary_mode = False
+    if target_length and _is_short_quality_sensitive_target(target_length):
+        # Explicit short/mid targets always run strict routing so fast-mode
+        # best-effort output cannot bypass hard word-band enforcement.
+        fast_summary_mode = False
     allow_fast_explicit_target_length_recovery = bool(
         fast_summary_mode
         and _allow_fast_explicit_target_length_recovery(
@@ -25282,7 +25436,7 @@ FLOW AND QUALITY RULES:
         short_form_structural_fatal_requirements: List[str] = []
         short_form_editorial_fatal_requirements: List[str] = []
         if soft_target_mode and _is_short_form_sectioned_target(target_length):
-            if short_quality_mode and not statement_only_source_mode:
+            if short_quality_mode:
                 band = _target_word_band_bounds(target_length)
                 if band is not None:
                     lower, upper, tolerance = band
@@ -25538,6 +25692,34 @@ FLOW AND QUALITY RULES:
                     final_stripped_words = int(
                         summary_meta.get("final_word_count") or _count_words(summary_text or "")
                     )
+                    summary_meta["final_split_word_count"] = int(final_split_words)
+                    summary_meta["final_word_count"] = int(final_stripped_words)
+                    summary_meta["short_contract_lower_bound"] = int(lower)
+                    summary_meta["short_contract_upper_bound"] = int(upper)
+                    summary_meta["short_contract_tolerance"] = int(tolerance)
+                    summary_meta["short_underflow_rescue_used"] = bool(
+                        generation_stats.get("short_underflow_rescue_used") or False
+                    )
+                    summary_meta["short_underflow_rescue_expanded_sections"] = list(
+                        generation_stats.get("short_underflow_rescue_expanded_sections")
+                        or []
+                    )
+                    summary_meta["short_underflow_rescue_targets"] = list(
+                        generation_stats.get("short_underflow_rescue_targets") or []
+                    )
+                    generation_stats["short_contract_final_split_words"] = int(
+                        final_split_words
+                    )
+                    generation_stats["short_contract_final_stripped_words"] = int(
+                        final_stripped_words
+                    )
+                    generation_stats["short_contract_lower_bound"] = int(lower)
+                    generation_stats["short_contract_upper_bound"] = int(upper)
+                    generation_stats["short_contract_tolerance"] = int(tolerance)
+                    generation_stats["short_contract_in_band"] = bool(
+                        lower <= final_split_words <= upper
+                        and lower <= final_stripped_words <= upper
+                    )
                     if not (
                         lower <= final_split_words <= upper
                         and lower <= final_stripped_words <= upper
@@ -25617,7 +25799,86 @@ FLOW AND QUALITY RULES:
         final_section_word_counts = _collect_section_body_word_counts(
             summary_text or "", include_health_rating=include_health_rating
         )
-        final_word_count = int(summary_meta.get("final_word_count") or _count_words(summary_text or ""))
+        final_split_word_count = int(
+            summary_meta.get("final_split_word_count") or len((summary_text or "").split())
+        )
+        final_word_count = int(
+            summary_meta.get("final_word_count") or _count_words(summary_text or "")
+        )
+        summary_meta["final_split_word_count"] = int(final_split_word_count)
+        summary_meta["final_word_count"] = int(final_word_count)
+        short_contract_band: Optional[Dict[str, int]] = None
+        short_contract_in_band: Optional[bool] = None
+        if target_length and _is_short_quality_sensitive_target(target_length):
+            band = _target_word_band_bounds(target_length)
+            if band is not None:
+                lower, upper, tolerance = band
+                short_contract_band = {
+                    "lower": int(lower),
+                    "upper": int(upper),
+                    "tolerance": int(tolerance),
+                }
+                short_contract_in_band = bool(
+                    lower <= final_split_word_count <= upper
+                    and lower <= final_word_count <= upper
+                )
+                summary_meta["short_contract_lower_bound"] = int(lower)
+                summary_meta["short_contract_upper_bound"] = int(upper)
+                summary_meta["short_contract_tolerance"] = int(tolerance)
+                summary_meta["short_contract_in_band"] = bool(short_contract_in_band)
+                summary_meta["short_underflow_rescue_used"] = bool(
+                    generation_stats.get("short_underflow_rescue_used") or False
+                )
+                summary_meta["short_underflow_rescue_expanded_sections"] = list(
+                    generation_stats.get("short_underflow_rescue_expanded_sections")
+                    or []
+                )
+                summary_meta["short_underflow_rescue_targets"] = list(
+                    generation_stats.get("short_underflow_rescue_targets") or []
+                )
+                generation_stats["short_contract_final_split_words"] = int(
+                    final_split_word_count
+                )
+                generation_stats["short_contract_final_stripped_words"] = int(
+                    final_word_count
+                )
+                generation_stats["short_contract_lower_bound"] = int(lower)
+                generation_stats["short_contract_upper_bound"] = int(upper)
+                generation_stats["short_contract_tolerance"] = int(tolerance)
+                generation_stats["short_contract_in_band"] = bool(short_contract_in_band)
+                if not short_contract_in_band:
+                    band_requirement = (
+                        f"Final word-count band violation: expected {lower}-{upper}, "
+                        f"got split={final_split_word_count}, stripped={final_word_count}."
+                    )
+                    merged_missing = list(
+                        dict.fromkeys(
+                            list(missing_requirements or [])
+                            + [band_requirement]
+                        )
+                    )
+                    detail = {
+                        "detail": (
+                            "Unable to satisfy strict short-form word-count contract after bounded retries."
+                        ),
+                        "failure_code": "SUMMARY_CONTRACT_FAILED",
+                        "target_length": int(target_length or 0),
+                        "actual_word_count": int(final_word_count),
+                        "target_band": {
+                            "lower": int(lower),
+                            "upper": int(upper),
+                            "tolerance": int(tolerance),
+                        },
+                        "missing_requirements": merged_missing[:12],
+                    }
+                    _record_summary_422_observability(
+                        filing_id=filing_id,
+                        detail=detail,
+                        summary_request_id=str(locals().get("summary_request_id") or "").strip()
+                        or None,
+                        fallback_target_length=int(target_length or 0),
+                    )
+                    raise HTTPException(status_code=422, detail=detail)
         final_word_delta = (
             int(final_word_count) - int(target_length)
             if target_length
@@ -25868,6 +26129,7 @@ FLOW AND QUALITY RULES:
                 "within_budget": within_budget,
                 "target_length": summary_meta.get("target_length"),
                 "final_word_count": final_word_count,
+                "final_split_word_count": int(final_split_word_count),
                 "final_word_delta": final_word_delta,
                 "verified_quote_count": summary_meta.get("verified_quote_count"),
                 "key_metrics_numeric_row_count": summary_meta.get(
@@ -25939,6 +26201,39 @@ FLOW AND QUALITY RULES:
                 "contract_strict_required": strict_contract_required,
                 "contract_hard_fail": bool(
                     strict_one_shot_failure_mode and target_length
+                ),
+                "short_contract_lower_bound": (
+                    int(short_contract_band["lower"])
+                    if isinstance(short_contract_band, dict)
+                    and short_contract_band.get("lower") is not None
+                    else None
+                ),
+                "short_contract_upper_bound": (
+                    int(short_contract_band["upper"])
+                    if isinstance(short_contract_band, dict)
+                    and short_contract_band.get("upper") is not None
+                    else None
+                ),
+                "short_contract_tolerance": (
+                    int(short_contract_band["tolerance"])
+                    if isinstance(short_contract_band, dict)
+                    and short_contract_band.get("tolerance") is not None
+                    else None
+                ),
+                "short_contract_in_band": (
+                    bool(short_contract_in_band)
+                    if short_contract_in_band is not None
+                    else None
+                ),
+                "short_underflow_rescue_used": bool(
+                    generation_stats.get("short_underflow_rescue_used") or False
+                ),
+                "short_underflow_rescue_targets": list(
+                    generation_stats.get("short_underflow_rescue_targets") or []
+                ),
+                "short_underflow_rescue_expanded_sections": list(
+                    generation_stats.get("short_underflow_rescue_expanded_sections")
+                    or []
                 ),
                 "contract_mode": (
                     "structured_section_contract"

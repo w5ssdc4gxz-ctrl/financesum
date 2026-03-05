@@ -252,6 +252,108 @@ def test_short_underflow_rescue_rewrites_into_twenty_word_band(
     assert "Key Metrics:" not in captured["hint"]
 
 
+def test_short_underflow_rescue_prioritizes_financial_performance_and_mdna(
+    monkeypatch,
+) -> None:
+    target = 1000
+    budgets = filings_api._calculate_section_word_budgets(
+        target, include_health_rating=True
+    )
+    assert budgets
+
+    section_order = [
+        "Financial Health Rating",
+        "Executive Summary",
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Risk Factors",
+        "Key Metrics",
+        "Closing Takeaway",
+    ]
+    parts: list[str] = []
+    for title in section_order:
+        if title == "Key Metrics":
+            body = (
+                "DATA_GRID_START\n"
+                "Revenue | $1.0B\n"
+                "Operating Margin | 10.0%\n"
+                "Free Cash Flow | $250M\n"
+                "Current Ratio | 2.0x\n"
+                "DATA_GRID_END"
+            )
+        else:
+            expected = int(budgets.get(title, 0) or 0)
+            if title == "Closing Takeaway":
+                body_words = max(10, expected - 70)
+            elif title in {
+                "Financial Performance",
+                "Management Discussion & Analysis",
+                "Risk Factors",
+                "Executive Summary",
+            }:
+                body_words = max(10, expected - 12)
+            else:
+                body_words = max(10, expected)
+            body = _make_body(body_words, title.split()[0].lower())
+        parts.append(f"## {title}\n{body}".strip())
+
+    draft = "\n\n".join(parts).strip()
+    captured: dict[str, str] = {}
+    generation_stats: dict[str, object] = {}
+
+    def _fake_rewrite_summary_to_length(*args, **kwargs):
+        current_text = str(
+            kwargs.get("summary_text")
+            if kwargs.get("summary_text") is not None
+            else (args[1] if len(args) > 1 else "")
+        )
+        captured["hint"] = str(kwargs.get("quality_issue_hint") or "")
+        return current_text, (filings_api._count_words(current_text), 20)
+
+    monkeypatch.setattr(
+        filings_api,
+        "_rewrite_summary_to_length",
+        _fake_rewrite_summary_to_length,
+    )
+    monkeypatch.setattr(filings_api, "_run_summary_cleanup_pass", lambda text, **_: text)
+    monkeypatch.setattr(filings_api, "_remove_metric_echo_loops", lambda text: text)
+    monkeypatch.setattr(filings_api, "_merge_staccato_paragraphs", lambda text: text)
+    monkeypatch.setattr(
+        filings_api,
+        "_cap_closing_sentences_filings",
+        lambda text, **_: text,
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_merge_duplicate_canonical_sections",
+        lambda text, **_: text,
+    )
+
+    _ = filings_api._rescue_short_sectioned_underflow(
+        draft,
+        target_length=target,
+        include_health_rating=True,
+        calculated_metrics={},
+        company_name="ExampleCo",
+        gemini_client=object(),
+        quality_validators=None,
+        generation_stats=generation_stats,
+        strict_contract_required=False,
+    )
+
+    targets = list(generation_stats.get("short_underflow_rescue_targets") or [])
+    assert targets[:3] == [
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Risk Factors",
+    ]
+    hint = captured.get("hint") or ""
+    assert "Financial Performance, Management Discussion & Analysis, Risk Factors" in hint
+    expanded = list(generation_stats.get("short_underflow_rescue_expanded_sections") or [])
+    assert "Financial Performance" in expanded
+    assert "Management Discussion & Analysis" in expanded
+
+
 @pytest.mark.parametrize("target", [500, 1000])
 def test_short_mid_completeness_validator_uses_target_scaled_section_minimums(
     target: int,

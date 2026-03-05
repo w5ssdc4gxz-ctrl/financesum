@@ -294,10 +294,9 @@ def test_short_underweight_section_guidance_prioritizes_narrative_gaps() -> None
 
     assert titles
     assert "Key Metrics" not in titles
-    assert titles[:3] == [
-        "Management Discussion & Analysis",
-        "Executive Summary",
-        "Closing Takeaway",
-    ]
+    assert titles[0] == "Management Discussion & Analysis"
+    assert "Risk Factors" in titles[:3]
+    assert "Executive Summary" in titles[:4]
+    assert titles.index("Risk Factors") < titles.index("Executive Summary")
     assert "Management Discussion & Analysis" in guidance
     assert "Executive Summary" in guidance

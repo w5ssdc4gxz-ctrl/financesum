@@ -3795,20 +3795,21 @@ def test_client_strict_contract_request_is_ignored_when_server_disallows_opt_in(
         _clear_filing_bundle(filing_id, company_id)
 
 
+@pytest.mark.parametrize("target_length", [600, 1000])
 def test_explicit_short_mid_target_forces_strict_path_when_fast_default_enabled(
-    monkeypatch,
+    monkeypatch, target_length: int
 ) -> None:
     settings = get_settings()
     settings.openai_api_key = "test-key"
     monkeypatch.setenv("SUMMARY_FAST_MODE_DEFAULT", "1")
 
-    filing_id = "short-mid-strict-routing-filing"
-    company_id = "short-mid-strict-routing-company"
+    filing_id = f"short-mid-strict-routing-filing-{target_length}"
+    company_id = f"short-mid-strict-routing-company-{target_length}"
     _seed_filing_bundle(filing_id, company_id)
     _relax_non_contract_quality_validators(monkeypatch)
     _stabilize_summary_pipeline(monkeypatch)
 
-    short_summary = build_summary_with_word_count(600)
+    short_summary = build_summary_with_word_count(target_length)
     monkeypatch.setattr(
         filings_api,
         "_generate_summary_with_quality_control",
@@ -3819,11 +3820,11 @@ def test_explicit_short_mid_target_forces_strict_path_when_fast_default_enabled(
         "_evaluate_summary_contract_requirements",
         lambda **kwargs: (
             [],
-            {
-                "target_length": 600,
-                "final_word_count": filings_api._count_words(
-                    str(kwargs.get("summary_text") or "")
-                ),
+                {
+                    "target_length": target_length,
+                    "final_word_count": filings_api._count_words(
+                        str(kwargs.get("summary_text") or "")
+                    ),
                 "final_split_word_count": len(str(kwargs.get("summary_text") or "").split()),
                 "verified_quote_count": 0,
                 "key_metrics_numeric_row_count": 5,
@@ -3850,7 +3851,7 @@ def test_explicit_short_mid_target_forces_strict_path_when_fast_default_enabled(
     client = TestClient(app)
     response = client.post(
         f"/api/v1/filings/{filing_id}/summary",
-        json={"mode": "custom", "target_length": 600},
+        json={"mode": "custom", "target_length": target_length},
     )
 
     try:
@@ -3860,6 +3861,93 @@ def test_explicit_short_mid_target_forces_strict_path_when_fast_default_enabled(
         assert payload.get("quality_mode") == "strict"
         assert meta.get("fast_summary_mode") is False
         assert meta.get("short_mid_precision_mode") is True
+    finally:
+        _clear_filing_bundle(filing_id, company_id)
+
+
+def test_short_mid_target_1000_underflow_noop_recovery_returns_contract_422(
+    monkeypatch,
+) -> None:
+    settings = get_settings()
+    settings.openai_api_key = "test-key"
+    monkeypatch.setenv("SUMMARY_FAST_MODE_DEFAULT", "0")
+
+    filing_id = "short-mid-1000-underflow-noop-filing"
+    company_id = "short-mid-1000-underflow-noop-company"
+    _seed_filing_bundle(filing_id, company_id)
+    _relax_non_contract_quality_validators(monkeypatch)
+    _stabilize_summary_pipeline(monkeypatch)
+
+    target_length = 1000
+    underflow_summary = build_summary_with_word_count(800)
+
+    monkeypatch.setattr(
+        filings_api,
+        "_generate_summary_with_quality_control",
+        lambda *args, **kwargs: underflow_summary,
+    )
+    monkeypatch.setattr(filings_api, "_rewrite_summary_to_length", _rewrite_passthrough)
+    monkeypatch.setattr(
+        filings_api,
+        "_rebalance_section_budgets_deterministically",
+        lambda summary_text, **_kwargs: (
+            summary_text,
+            {
+                "changed": False,
+                "applied": False,
+                "actions": [],
+                "words_added": 0,
+                "words_trimmed": 0,
+                "inferred_underweight_targets": [],
+                "expanded_sections": [],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_apply_short_form_structural_seal",
+        lambda text, **_kwargs: text,
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_select_short_form_structural_failure_requirements",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_select_short_form_editorial_failure_requirements",
+        lambda **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_evaluate_summary_contract_requirements",
+        lambda **kwargs: (
+            [],
+            {
+                "target_length": target_length,
+                "final_word_count": filings_api._count_words(
+                    str(kwargs.get("summary_text") or "")
+                ),
+                "final_split_word_count": len(str(kwargs.get("summary_text") or "").split()),
+                "verified_quote_count": 0,
+                "key_metrics_numeric_row_count": 5,
+                "quality_checks_passed": [],
+            },
+        ),
+    )
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/filings/{filing_id}/summary",
+        json={"mode": "custom", "target_length": target_length},
+    )
+
+    try:
+        assert response.status_code == 422
+        detail = (response.json() or {}).get("detail", {})
+        assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
+        missing = detail.get("missing_requirements") or []
+        assert any("word-count band violation" in str(item).lower() for item in missing)
     finally:
         _clear_filing_bundle(filing_id, company_id)
 
