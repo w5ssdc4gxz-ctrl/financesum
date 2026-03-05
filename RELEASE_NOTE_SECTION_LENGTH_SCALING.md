@@ -120,3 +120,28 @@
 ### Validation
 - `pytest backend/tests/test_filing_summary.py -k "timeout"` -> `4 passed`.
 - `pytest backend/tests/test_enforce_section_budget_distribution.py backend/tests/test_filing_summary.py -q` -> `124 passed`.
+
+## Update: Short-Target FP/MD&A Reallocation Reliability (2026-03-05)
+
+### Root Cause
+- In short explicit-target repairs, donor trimming could fail on dense single-block sections (no removable trailing sentence), leaving insufficient room to expand both `Financial Performance` and `MD&A`.
+- The short-contract expansion loop also used a fixed low cap, so the first underweight section could consume available room while the second remained underweight.
+
+### Policy and Code Changes
+- Updated `_rebalance_section_budgets_deterministically(...)` in `backend/app/api/filings.py`:
+  - increased donor trim capacity for explicit short-contract repairs,
+  - added fallback donor trimming via `_truncate_text_to_word_limit(...)` when sentence-level trim yields zero progress,
+  - made short-contract expansion loops deficit-aware (dynamic loop cap) instead of fixed 4 rounds.
+- Added regression coverage in `backend/tests/test_filing_summary.py`:
+  - `test_rebalance_short_contract_reallocates_dense_donors_to_fp_and_mdna`.
+- Updated an existing mid-form underflow test assertion to accept either:
+  - rewrite-hint based recovery, or
+  - deterministic short underflow/section-balance recovery metadata.
+
+### Expected Behavior
+- For explicit short/mid targets, both `Financial Performance` and `MD&A` are substantially less likely to remain underweight after deterministic repair.
+- Rebalance logic is more robust when overweight donor sections are dense prose blocks.
+
+### Validation
+- `cd backend && pytest -q` -> `946 passed`.
+- `cd frontend && npm run build` -> success (warnings only).

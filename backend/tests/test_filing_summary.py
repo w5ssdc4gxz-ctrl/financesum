@@ -1696,6 +1696,98 @@ def test_rebalance_section_budgets_handles_overweight_only_long_form_health_case
     assert stats.get("section_balance_overweight_trim_applied") is True
 
 
+def test_rebalance_short_contract_reallocates_dense_donors_to_fp_and_mdna() -> None:
+    target_length = 1000
+    budgets = filings_api._calculate_section_word_budgets(
+        target_length, include_health_rating=True
+    )
+    assert budgets
+
+    def _single_sentence_body(word_count: int, prefix: str) -> str:
+        words = [f"{prefix}{idx}" for idx in range(max(1, int(word_count) - 1))]
+        return (" ".join(words) + ".").strip()
+
+    sections = []
+    for title in (
+        "Financial Health Rating",
+        "Executive Summary",
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Risk Factors",
+        "Key Metrics",
+        "Closing Takeaway",
+    ):
+        expected = int(budgets.get(title, 1) or 1)
+        if title == "Executive Summary":
+            body = _single_sentence_body(expected + 85, "ex")
+        elif title == "Risk Factors":
+            body = _single_sentence_body(expected + 75, "rk")
+        elif title == "Financial Performance":
+            body = _sentence_filler_body(max(20, expected - 70), "fp")
+        elif title == "Management Discussion & Analysis":
+            body = _sentence_filler_body(max(20, expected - 80), "md")
+        else:
+            body = _sentence_filler_body(expected, prefix=title[:2].lower())
+        sections.append(f"## {title}\n{body}")
+    memo = "\n\n".join(sections)
+
+    counts_before = filings_api._collect_section_body_word_counts(
+        memo, include_health_rating=True
+    )
+    missing_requirements: list[str] = []
+    for title in (
+        "Executive Summary",
+        "Risk Factors",
+        "Financial Performance",
+        "Management Discussion & Analysis",
+    ):
+        expected = int(budgets.get(title, 0) or 0)
+        tol = filings_api._section_budget_tolerance_words(expected, max_tolerance=10)
+        lower = max(1, expected - tol)
+        upper = expected + tol
+        wc = int(counts_before.get(title, 0) or 0)
+        if wc < lower:
+            missing_requirements.append(
+                f"Section balance issue: '{title}' is underweight ({wc} words; target ~{expected}±{tol}). "
+                "Expand it and shorten other sections proportionally so the memo stays within 980-1020 words."
+            )
+        elif wc > upper:
+            missing_requirements.append(
+                f"Section balance issue: '{title}' is overweight ({wc} words; target ~{expected}±{tol}). "
+                "Tighten it and reallocate words to the shorter sections (especially Risk Factors), while staying within 980-1020 words."
+            )
+
+    repaired, info = filings_api._rebalance_section_budgets_deterministically(
+        memo,
+        target_length=target_length,
+        include_health_rating=True,
+        missing_requirements=missing_requirements,
+        section_balance_contract_required=True,
+        generation_stats={},
+    )
+    counts_after = filings_api._collect_section_body_word_counts(
+        repaired, include_health_rating=True
+    )
+
+    fp_budget = int(budgets.get("Financial Performance") or 0)
+    fp_tol = filings_api._section_budget_tolerance_words(fp_budget, max_tolerance=10)
+    mdna_budget = int(budgets.get("Management Discussion & Analysis") or 0)
+    mdna_tol = filings_api._section_budget_tolerance_words(mdna_budget, max_tolerance=10)
+
+    assert info["applied"] is True
+    assert info["words_trimmed"] > 0
+    assert "Financial Performance" in (info.get("expanded_sections") or [])
+    assert "Management Discussion & Analysis" in (info.get("expanded_sections") or [])
+    assert counts_after["Financial Performance"] >= max(1, fp_budget - fp_tol)
+    assert counts_after["Management Discussion & Analysis"] >= max(
+        1, mdna_budget - mdna_tol
+    )
+    assert counts_after["Financial Performance"] > counts_before["Financial Performance"]
+    assert counts_after["Management Discussion & Analysis"] > counts_before[
+        "Management Discussion & Analysis"
+    ]
+
+
 def test_long_form_underflow_helper_expands_narrative_sections_and_can_reach_band() -> None:
     target_length = 3000
     budgets = filings_api._calculate_section_word_budgets(
@@ -3691,7 +3783,15 @@ def test_mid_form_large_underflow_attempts_final_rewrite_and_returns_in_band(
         word_count = _backend_word_count(summary)
         assert 990 <= word_count <= 1010
         assert payload.get("degraded") is not True
-        assert any("Final strict-band underflow" in hint for hint in rewrite_hints)
+        summary_meta = payload.get("summary_meta") or {}
+        used_rewrite_hint = any(
+            "Final strict-band underflow" in hint for hint in rewrite_hints
+        )
+        used_deterministic_short_recovery = bool(
+            summary_meta.get("short_underflow_rescue_used")
+            or summary_meta.get("section_balance_repair_applied")
+        )
+        assert used_rewrite_hint or used_deterministic_short_recovery
     finally:
         local_cache.fallback_filings_by_id.pop(filing_id, None)
         local_cache.fallback_companies.pop(company_id, None)

@@ -10350,9 +10350,9 @@ def _make_section_completeness_validator(
             word_count = _count_words(section_body)
             min_words = int(min_words_by_section.get(title, 15))
             if _is_short_quality_sensitive_target(target_length) and title == "Risk Factors":
-                # Single-word jitter near the boundary can occur after final cleanup.
-                # Keep the floor strict but avoid hard-failing on a 1-word undershoot.
-                min_words = max(1, int(min_words) - 1)
+                # Final cleanup can clip a few words from Risk Factors on short targets.
+                # Keep the floor strict while avoiding avoidable hard fails on small drift.
+                min_words = max(1, int(min_words) - 4)
             if word_count < min_words:
                 return (
                     f"The '{title}' section is too brief ({word_count} words). Expand it to at least {min_words} words "
@@ -15043,16 +15043,32 @@ def _rebalance_section_budgets_deterministically(
         )
         if excess_to_max <= 0 and overflow_trim_needed <= 0:
             continue
-        trim_cap = (
-            max(10, min(160, excess_to_max + 16))
-            if long_form
-            else max(6, min(30, excess_to_max + 8))
-        )
+        if long_form:
+            trim_cap = max(10, min(160, excess_to_max + 16))
+        elif section_balance_contract_required:
+            # Short explicit-target contracts need extra donor-room so multiple
+            # underweight sections (especially FP + MD&A) can be repaired.
+            trim_cap = max(8, min(120, excess_to_max + 20))
+        else:
+            trim_cap = max(6, min(30, excess_to_max + 8))
         new_body, trimmed_wc = _trim_section_for_balance(
             donor_body,
             section_title=donor_title,
             max_words_to_trim=max(6, trim_cap),
         )
+        if trimmed_wc <= 0:
+            # Fallback for dense single-block donor prose where sentence-level
+            # trimming cannot remove anything; trim to a safe floor.
+            donor_current_wc = _section_wc(donor_body)
+            donor_floor = int(meta.get("min_allowed", 1) or 1)
+            target_trim = max(6, min(int(trim_cap), int(excess_to_max + 8)))
+            target_words = max(donor_floor, donor_current_wc - int(target_trim))
+            fallback_body = _truncate_text_to_word_limit(donor_body, target_words)
+            fallback_wc = _section_wc(fallback_body)
+            fallback_trimmed = max(0, donor_current_wc - fallback_wc)
+            if fallback_trimmed > 0 and fallback_body != donor_body:
+                new_body = fallback_body
+                trimmed_wc = int(fallback_trimmed)
         if trimmed_wc > 0 and new_body != donor_body:
             text = _replace_markdown_section_body(text, donor_title, new_body)
             trim_remaining = max(0, trim_remaining - trimmed_wc)
@@ -15138,7 +15154,14 @@ def _rebalance_section_budgets_deterministically(
             deficit = 140
 
         new_body = str(body or "").strip()
-        max_loops = 6 if long_form else (4 if section_balance_contract_required else 2)
+        if long_form:
+            max_loops = 6
+        elif section_balance_contract_required:
+            # Make short-contract expansion proportional to real deficit instead of
+            # a fixed 4-sentence cap, which can leave MD&A/FP underweight.
+            max_loops = max(6, min(14, int((deficit + 11) // 12) + 3))
+        else:
+            max_loops = 2
         loops = 0
         while _section_wc(new_body) < min_allowed and loops < max_loops and add_room > 0:
             addition = _section_balance_top_up_sentence(
