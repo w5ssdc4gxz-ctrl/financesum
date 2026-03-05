@@ -37,142 +37,128 @@ def _make_body(words: int, *, token: str) -> str:
     return " ".join(parts).strip()
 
 
-@pytest.mark.parametrize("target_length", [300, 550, 1000])
-def test_enforce_section_budget_distribution_matches_budgets(
+@pytest.mark.parametrize("target_length", [500, 600, 1000])
+def test_short_mid_section_balance_repair_expands_underweight_narrative_sections(
     target_length: int,
 ) -> None:
-    """With padding templates disabled, _enforce_section_budget_distribution can
-    only trim overweight sections.  Underweight sections stay underweight, so the
-    overall word count may be well below target_length.  This test verifies that:
-      1. Overweight sections are trimmed to at most budget + tolerance.
-      2. The overall word count does not exceed target + tolerance.
-      3. Key Metrics stays under the hard cap for long-form memos.
-    """
     budgets = filings_api._calculate_section_word_budgets(
         target_length, include_health_rating=True
     )
+    assert budgets
 
-    # Deliberately imbalanced input to ensure we exercise trimming.
+    fp_budget = int(budgets.get("Financial Performance") or 0)
+    mdna_budget = int(budgets.get("Management Discussion & Analysis") or 0)
+    exec_budget = int(budgets.get("Executive Summary") or 0)
+    health_budget = int(budgets.get("Financial Health Rating") or 0)
+    risk_budget = int(budgets.get("Risk Factors") or 0)
+    close_budget = int(budgets.get("Closing Takeaway") or 0)
+    key_metrics_budget = int(budgets.get("Key Metrics") or 0)
+
     base = (
         "## Financial Health Rating\n"
-        f"{_make_body(200, token='health')}\n\n"
+        f"{_make_body(max(health_budget + 40, 80), token='health')}\n\n"
         "## Executive Summary\n"
-        f"{_make_body(200, token='exec')}\n\n"
+        f"{_make_body(max(exec_budget + 80, 120), token='exec')}\n\n"
         "## Financial Performance\n"
-        f"{_make_body(20, token='perf')}\n\n"
+        f"{_make_body(max(12, fp_budget // 4), token='perf')}\n\n"
         "## Management Discussion & Analysis\n"
-        f"{_make_body(20, token='mdna')}\n\n"
+        f"{_make_body(max(14, mdna_budget // 4), token='mdna')}\n\n"
         "## Risk Factors\n"
-        f"{_make_body(20, token='risk')}\n\n"
+        f"{_make_body(max(risk_budget, 60), token='risk')}\n\n"
         "## Key Metrics\n"
-        "→ Revenue: $1.0B\n"
-        "→ Operating Margin: 10%\n\n"
+        f"{_make_body(max(key_metrics_budget, 18), token='metric')}\n\n"
         "## Closing Takeaway\n"
-        f"{_make_body(15, token='close')}"
+        f"{_make_body(max(close_budget, 40), token='close')}"
     )
 
-    section_tolerance = (
-        40
-        if target_length >= filings_api.KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS
-        else 15
+    validator = filings_api._make_section_balance_validator(
+        include_health_rating=True,
+        target_length=target_length,
     )
-    enforced = filings_api._enforce_section_budget_distribution(
+    issue = validator(base)
+    assert issue is not None
+
+    before_counts = filings_api._collect_section_body_word_counts(
+        base, include_health_rating=True
+    )
+    repaired, info = filings_api._rebalance_section_budgets_deterministically(
         base,
         target_length=target_length,
         include_health_rating=True,
-        section_tolerance=section_tolerance,
+        section_balance_contract_required=True,
+        missing_requirements=[str(issue)],
+        generation_stats={},
+    )
+    after_counts = filings_api._collect_section_body_word_counts(
+        repaired, include_health_rating=True
     )
 
-    # Overall: output must not exceed target + tolerance (trimming works).
-    # It may be well below target since padding is disabled and underweight
-    # sections cannot be expanded.
-    overall_tol = max(15, target_length // 8)
-    assert len(enforced.split()) <= target_length + overall_tol
-    assert filings_api._count_words(enforced) <= target_length + overall_tol
-
-    # Per-section: overweight sections must be trimmed. Underweight sections
-    # are left as-is (no padding), so we only check the upper bound.
-    for section, budget in budgets.items():
-        body = _get_section_body(enforced, section)
-        wc = filings_api._count_words(body)
-        tol = filings_api._section_budget_tolerance_words(
-            budget, max_tolerance=section_tolerance
-        )
-        section_tol = max(tol, overall_tol)
-        if (
-            target_length >= filings_api.KEY_METRICS_FIXED_BUDGET_THRESHOLD_WORDS
-            and section == "Key Metrics"
-        ):
-            assert wc <= filings_api.KEY_METRICS_MAX_WORDS
-        else:
-            # Upper bound only — underweight sections can't be padded.
-            assert wc <= budget + section_tol
+    assert info.get("applied") is True
+    assert after_counts["Financial Performance"] > before_counts["Financial Performance"]
+    assert (
+        after_counts["Management Discussion & Analysis"]
+        > before_counts["Management Discussion & Analysis"]
+    )
+    assert after_counts["Key Metrics"] == before_counts["Key Metrics"]
+    post_issue = validator(repaired) or ""
+    assert "Financial Performance" not in post_issue
+    assert "Management Discussion & Analysis" not in post_issue
 
 
-def test_enforce_section_budget_distribution_regression_realistic_memo() -> None:
-    """With padding templates disabled, the budget enforcer can only trim
-    overweight sections.  Verify trimming works and overall count doesn't
-    exceed the target, but accept that the total may be below target since
-    underweight sections cannot be expanded.
-    """
-    target_length = 650
+def test_short_mid_section_balance_repair_keeps_sections_inside_budget_bands() -> None:
+    target_length = 600
     budgets = filings_api._calculate_section_word_budgets(
         target_length, include_health_rating=True
     )
+    assert budgets
 
-    # Realistic memo structure: long Financial Performance/MD&A, short Risk/Closing,
-    # plus punctuation-heavy Key Metrics (pipes, list bullets) that can inflate
-    # whitespace token counts.
-    draft = """## Financial Health Rating
-Uber Technologies Inc receives a Financial Health Rating of 68/100 - Watch because operating margin of 10.6% supports the earnings base, free cash flow of $2.25B funds reinvestment, and $29.92B liabilities against $6.38B cash frames the margin for error.
+    draft = (
+        "## Financial Health Rating\n"
+        f"{_make_body(120, token='health')}\n\n"
+        "## Executive Summary\n"
+        f"{_make_body(150, token='exec')}\n\n"
+        "## Financial Performance\n"
+        f"{_make_body(18, token='perf')}\n\n"
+        "## Management Discussion & Analysis\n"
+        f"{_make_body(18, token='mdna')}\n\n"
+        "## Risk Factors\n"
+        f"{_make_body(90, token='risk')}\n\n"
+        "## Key Metrics\n"
+        f"{_make_body(int(budgets.get('Key Metrics') or 20), token='metric')}\n\n"
+        "## Closing Takeaway\n"
+        f"{_make_body(40, token='close')}"
+    )
 
-The score weights profitability and margin quality most heavily because it best captures durability in this setup. Operating margin of 10.6% and net margin of 15.4% describe the profitability profile.
+    balance_validator = filings_api._make_section_balance_validator(
+        include_health_rating=True, target_length=target_length
+    )
+    issue = balance_validator(draft)
+    assert issue is not None
 
-## Executive Summary
-My conviction on Uber Technologies Inc is currently Neutral with a Medium conviction. This company matters right now because it continues to consolidate its leadership in the global mobility and delivery sectors, demonstrating an ability to generate significant free cash flow.
-
-## Financial Performance
-Uber reported total revenue of $11.53 billion for Q1 2025, a substantial figure that underscores its market presence. Operating income stood at $1.23 billion, yielding an operating margin of 10.67%, which is a healthy improvement, suggesting better cost control or pricing power. The net income of $1.78 billion, translating to a net margin of 15.44%, notably exceeds the operating income due to a significant negative tax provision. This negative provision boosts reported earnings but warrants scrutiny for its recurring nature, as true earnings quality comes from operational performance.
-
-## Management Discussion & Analysis
-From my perspective, management appears to be prioritizing profitability and cash generation, aligning with the positive operating margin trajectory and strong free cash flow conversion observed this quarter. The relatively low capital expenditures of $74 million suggest that the core platform is not overly capital-intensive, allowing a substantial portion of operating cash flow to convert into free cash flow. This capital efficiency is something I always look for, as it directly impacts return on capital. Management's strategic focus likely includes disciplined geographic expansion, leveraging network effects in existing markets, and optimizing rider/driver matching algorithms to enhance efficiency and reduce costs.
-
-## Risk Factors
-**Regulatory Headwinds Risk**: Uber operates in a highly regulated environment, and any shift in the regulatory landscape could materially impact its business model and profitability.
-
-## Key Metrics
-→ Revenue: $11.53B | Operating Income: $1.23B | Net Income: $1.78B
-→ Capital Expenditures: $74.00M | Total Assets: $52.82B
-
-Health Score Drivers:
-Profitability: operating margin 10.6%, net margin 15.4%.
-Cash conversion: operating cash flow $2.32B, FCF $2.25B, FCF margin 19.5%.
-Balance sheet: cash and securities of $6.38B, liabilities of $29.92B, leverage 0.6x assets, interest coverage 11.7x.
-Liquidity: current ratio 1.0x.
-
-## Closing Takeaway
-Uber Technologies Inc is either good or cheap, but not clearly both."""
-
-    enforced = filings_api._enforce_section_budget_distribution(
+    repaired, info = filings_api._rebalance_section_budgets_deterministically(
         draft,
         target_length=target_length,
         include_health_rating=True,
-        section_tolerance=10,
+        section_balance_contract_required=True,
+        missing_requirements=[str(issue)],
+        generation_stats={},
     )
+    assert info.get("applied") is True
 
-    # Overall: must not exceed target + tolerance.  May be below target
-    # since padding is disabled and underweight sections stay underweight.
-    overall_tol = max(10, target_length // 10)
-    assert filings_api._count_words(enforced) <= target_length + overall_tol
-
-    # Per-section: overweight sections trimmed; underweight sections left as-is.
-    for section, budget in budgets.items():
-        body = _get_section_body(enforced, section)
-        wc = filings_api._count_words(body)
-        tol = filings_api._section_budget_tolerance_words(budget, max_tolerance=10)
-        section_tol = max(tol, overall_tol)
-        # Upper bound only — padding is disabled so underweight sections can't grow.
-        assert wc <= budget + section_tol
+    before_counts = filings_api._collect_section_body_word_counts(
+        draft, include_health_rating=True
+    )
+    counts = filings_api._collect_section_body_word_counts(
+        repaired, include_health_rating=True
+    )
+    assert counts["Financial Performance"] > before_counts["Financial Performance"]
+    assert (
+        counts["Management Discussion & Analysis"]
+        > before_counts["Management Discussion & Analysis"]
+    )
+    post_issue = balance_validator(repaired) or ""
+    assert "Financial Performance" not in post_issue
+    assert "Management Discussion & Analysis" not in post_issue
 
 
 def test_key_metrics_block_removes_health_score_drivers_and_caps_rows() -> None:

@@ -250,3 +250,42 @@ def test_short_underflow_rescue_rewrites_into_twenty_word_band(
     assert "Executive Summary" in captured["hint"]
     assert "Management Discussion & Analysis" in captured["hint"]
     assert "Key Metrics:" not in captured["hint"]
+
+
+@pytest.mark.parametrize("target", [500, 1000])
+def test_short_mid_completeness_validator_uses_target_scaled_section_minimums(
+    target: int,
+) -> None:
+    mins = filings_api._calculate_section_min_words_for_target(
+        target,
+        include_health_rating=False,
+    )
+    fp_min = int(mins.get("Financial Performance") or 0)
+    mdna_min = int(mins.get("Management Discussion & Analysis") or 0)
+    assert fp_min > 20
+    assert mdna_min > 25
+
+    too_short_fp = max(1, fp_min - 8)
+    too_short_mdna = max(1, mdna_min - 8)
+    summary = (
+        "## Executive Summary\n"
+        f"{_make_body(int(mins.get('Executive Summary') or 30), 'exec')}\n\n"
+        "## Financial Performance\n"
+        f"{_make_body(too_short_fp, 'perf')}\n\n"
+        "## Management Discussion & Analysis\n"
+        f"{_make_body(too_short_mdna, 'mdna')}\n\n"
+        "## Risk Factors\n"
+        f"{_make_body(int(mins.get('Risk Factors') or 30), 'risk')}\n\n"
+        "## Key Metrics\n"
+        f"{_make_body(int(mins.get('Key Metrics') or 8), 'metric')}\n\n"
+        "## Closing Takeaway\n"
+        f"{_make_body(int(mins.get('Closing Takeaway') or 24), 'close')}"
+    )
+    validator = filings_api._make_section_completeness_validator(
+        include_health_rating=False,
+        target_length=target,
+    )
+    issue = validator(summary)
+    assert issue is not None
+    assert "section is too brief" in issue.lower()
+    assert str(fp_min) in issue or str(mdna_min) in issue

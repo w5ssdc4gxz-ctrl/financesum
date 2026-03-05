@@ -104,6 +104,41 @@ def test_explicit_short_mid_precision_target_detection() -> None:
     )
 
 
+def test_requires_section_balance_contract_for_explicit_short_mid_targets() -> None:
+    assert (
+        filings_api._requires_section_balance_contract(
+            target_length=600,
+            explicit_target_requested=True,
+            v2_enabled=False,
+        )
+        is True
+    )
+    assert (
+        filings_api._requires_section_balance_contract(
+            target_length=600,
+            explicit_target_requested=False,
+            v2_enabled=False,
+        )
+        is False
+    )
+    assert (
+        filings_api._requires_section_balance_contract(
+            target_length=3000,
+            explicit_target_requested=True,
+            v2_enabled=False,
+        )
+        is False
+    )
+    assert (
+        filings_api._requires_section_balance_contract(
+            target_length=3000,
+            explicit_target_requested=False,
+            v2_enabled=True,
+        )
+        is True
+    )
+
+
 # ---------------------------------------------------------------------------
 # compute_scale_factor — continuous [300, 3000] → [0.0, 1.0] mapping
 # ---------------------------------------------------------------------------

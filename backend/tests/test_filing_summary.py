@@ -26,6 +26,22 @@ def _default_narrative_document(monkeypatch, tmp_path):
     monkeypatch.setenv("SUMMARY_ALLOW_REQUEST_STRICT_CONTRACT", "1")
     monkeypatch.setenv("SUMMARY_CONTINUOUS_V2_AUTO_LONGFORM", "0")
     monkeypatch.setenv("OPENAI_COST_PER_SUMMARY_USD", "10")
+    monkeypatch.setattr(
+        filings_api,
+        "get_summary_usage_status",
+        lambda _user_id: SimpleNamespace(
+            plan="pro",
+            limit=100,
+            used=0,
+            remaining=100,
+            period_start=None,
+            period_end=None,
+            subscription_status="active",
+            cancel_at_period_end=False,
+            is_pro=True,
+            billing_unavailable=False,
+        ),
+    )
     text = (
         'Management said "we remain focused on execution discipline and durable cash conversion." '
         "The filing also notes that pricing and reinvestment decisions will be balanced against margin durability."
@@ -4494,6 +4510,88 @@ def test_short_form_non_structural_band_miss_returns_summary_contract_422(
         assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
         missing = detail.get("missing_requirements") or []
         assert any("word-count band violation" in str(item).lower() for item in missing)
+    finally:
+        _clear_filing_bundle(filing_id, company_id)
+
+
+def test_short_form_unresolved_section_balance_returns_summary_contract_422(
+    monkeypatch,
+) -> None:
+    settings = get_settings()
+    settings.openai_api_key = "test-key"
+
+    filing_id = "shortform-section-balance-failure-filing"
+    company_id = "shortform-section-balance-failure-company"
+    _seed_filing_bundle(filing_id, company_id)
+    _relax_non_contract_quality_validators(monkeypatch)
+    _stabilize_summary_pipeline(monkeypatch)
+
+    intact_summary = (
+        "## Financial Health Rating\n"
+        "The balance sheet remains stable and provides operating flexibility.\n\n"
+        "## Executive Summary\n"
+        "Profitability improved, but the quarter still depends on repeatable cash conversion.\n\n"
+        "## Financial Performance\n"
+        "Revenue, operating income, and free cash flow all moved in the right direction against the prior quarter.\n\n"
+        "## Management Discussion & Analysis\n"
+        "Management is balancing reinvestment with margin discipline, which matters for durability through the next few periods.\n\n"
+        "## Risk Factors\n"
+        "**Demand Risk**: A softer demand environment could pressure both pricing and cash generation.\n\n"
+        "## Key Metrics\n"
+        "DATA_GRID_START\n"
+        "Revenue | $2.50B\n"
+        "Operating Income | $0.70B\n"
+        "Operating Margin | 28.0%\n"
+        "Free Cash Flow | $0.65B\n"
+        "Current Ratio | 2.3x\n"
+        "DATA_GRID_END\n\n"
+        "## Closing Takeaway\n"
+        "Hold if operating margin stays above 25% over the next four quarters, and move to Sell if free cash flow falls below $0.30B over the next year."
+    )
+    balance_issue = (
+        "Section balance issue: 'Financial Performance' is underweight (32 words; target ~96±8). "
+        "Expand it and shorten other sections proportionally so the memo stays within 630-670 words."
+    )
+    base_meta = {
+        "target_length": 650,
+        "final_word_count": 642,
+        "final_split_word_count": 642,
+        "verified_quote_count": 0,
+        "key_metrics_numeric_row_count": 5,
+        "quality_checks_passed": [],
+    }
+    monkeypatch.setattr(
+        filings_api,
+        "_generate_summary_with_quality_control",
+        lambda *args, **kwargs: intact_summary,
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_evaluate_summary_contract_requirements",
+        lambda **_kwargs: ([balance_issue], dict(base_meta)),
+    )
+
+    def _unresolved_recovery(summary_text, *args, **kwargs):
+        return summary_text, [balance_issue], dict(base_meta), True
+
+    monkeypatch.setattr(
+        filings_api,
+        "_recover_short_form_editorial_issues_once",
+        _unresolved_recovery,
+    )
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/filings/{filing_id}/summary",
+        json={"mode": "custom", "target_length": 650},
+    )
+
+    try:
+        assert response.status_code == 422
+        detail = (response.json() or {}).get("detail", {})
+        assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
+        missing = detail.get("missing_requirements") or []
+        assert any("section balance issue" in str(item).lower() for item in missing)
     finally:
         _clear_filing_bundle(filing_id, company_id)
 

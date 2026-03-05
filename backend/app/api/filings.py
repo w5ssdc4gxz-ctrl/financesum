@@ -276,6 +276,27 @@ def _is_explicit_short_mid_precision_target(
     return _is_short_quality_sensitive_target(target_length)
 
 
+def _requires_section_balance_contract(
+    *,
+    target_length: Optional[int],
+    explicit_target_requested: bool,
+    v2_enabled: bool,
+) -> bool:
+    """Determine when section-balance validation is mandatory.
+
+    Keep existing v2/long-form behavior unchanged, and additionally require
+    section-balance checks for explicit short/mid precision requests.
+    """
+    if not target_length or _is_micro_plaintext_target(target_length):
+        return False
+    if v2_enabled:
+        return True
+    return _is_explicit_short_mid_precision_target(
+        target_length=target_length,
+        explicit_target_requested=explicit_target_requested,
+    )
+
+
 def _build_micro_plaintext_summary_prompt(
     *,
     identity_block: str,
@@ -10280,9 +10301,6 @@ def _make_section_completeness_validator(
 
     ordered_titles = [title for title, _ in required_titles]
 
-    # Keep section "minimums" light and non-scaling:
-    # - This validator exists to prevent empty/missing sections, not to force padding.
-    # - Scaling mins with high target lengths incentivizes repetition and filler.
     min_words_by_section: Dict[str, int] = {
         "Financial Health Rating": 12,
         "Executive Summary": 20,
@@ -10292,6 +10310,13 @@ def _make_section_completeness_validator(
         "Key Metrics": 5,
         "Closing Takeaway": 15,
     }
+    if _is_short_quality_sensitive_target(target_length):
+        # For explicit short/mid precision requests, fixed low floors allow FP/MD&A
+        # to collapse while still passing completeness checks. Use target-aware floors.
+        min_words_by_section = _calculate_section_min_words_for_target(
+            target_length,
+            include_health_rating=include_health_rating,
+        )
 
     def _validator(text: str) -> Optional[str]:
         lower_text = text.lower()
@@ -12230,6 +12255,7 @@ def _build_post_final_quality_validators(
     v2_enabled: bool,
     persona_requested: bool,
     company_name: str,
+    explicit_target_requested: bool = False,
     source_text: Optional[str] = None,
     require_quotes: bool = False,
 ) -> List[Callable[[str], Optional[str]]]:
@@ -12271,7 +12297,11 @@ def _build_post_final_quality_validators(
                 max_allowed_quotes=_summary_max_verified_quotes(),
             )
         )
-    if v2_enabled and target_length:
+    if _requires_section_balance_contract(
+        target_length=target_length,
+        explicit_target_requested=explicit_target_requested,
+        v2_enabled=v2_enabled,
+    ):
         validators.append(
             _make_section_balance_validator(
                 include_health_rating=include_health_rating,
@@ -12733,6 +12763,23 @@ def _recover_short_form_editorial_issues_once(
             attempted = True
 
     if gemini_client is not None:
+        rewrite_hint = (
+            "Short-form editorial recovery: fix repetition and style issues while preserving "
+            "headings, quotes, numeric facts, Key Metrics rows, and stance."
+        )
+        if parsed_flags.get("section_balance_issue"):
+            balance_guidance = _build_precision_section_balance_guidance(
+                summary_text=text,
+                target_length=target_length,
+                include_health_rating=include_health_rating,
+                missing_requirements=list(missing_requirements or []),
+            )
+            if balance_guidance:
+                rewrite_hint += (
+                    "\nRebalance section budgets by expanding underweight narrative sections first "
+                    "and tightening overweight sections proportionally.\n"
+                    + balance_guidance
+                )
         emergency_rewrite_stats: Optional[Dict[str, Any]] = generation_stats
         if generation_stats is not None:
             rewrite_calls = int(generation_stats.get("rewrite_call_count", 0) or 0)
@@ -12749,10 +12796,7 @@ def _recover_short_form_editorial_issues_once(
             max_output_tokens=max_output_tokens,
             generation_stats=emergency_rewrite_stats,
             persona_intensity=persona_intensity,
-            quality_issue_hint=(
-                "Short-form editorial recovery: fix repetition and style issues while preserving "
-                "headings, quotes, numeric facts, Key Metrics rows, and stance."
-            ),
+            quality_issue_hint=rewrite_hint,
             allow_over_target_recovery=True,
             ignore_max_rewrite_attempts=True,
             timeout_seconds=_summary_rewrite_timeout_seconds(),
@@ -12959,6 +13003,7 @@ def _select_short_form_structural_failure_requirements(
     summary_text: str,
     missing_requirements: Optional[List[str]],
     include_health_rating: bool,
+    enforce_section_balance: bool = False,
 ) -> List[str]:
     """Select structural failures that must remain fatal for short sectioned memos."""
     text = str(summary_text or "").strip()
@@ -13062,6 +13107,21 @@ def _select_short_form_structural_failure_requirements(
             "the 'closing takeaway' section is too brief",
             "final summary still ends mid-thought",
         )
+
+    if enforce_section_balance:
+        appended = False
+        for item in items:
+            normalized = " ".join(str(item).split()).strip().lower()
+            if "section balance issue:" not in normalized:
+                continue
+            _append(item)
+            appended = True
+        if not appended:
+            parsed_flags = _parse_summary_contract_missing_requirements(items)
+            if parsed_flags.get("section_balance_issue"):
+                _append(
+                    "Section balance issue remains unresolved after bounded recovery; narrative sections must align with target-aware budgets."
+                )
 
     return fatal
 
@@ -14429,6 +14489,7 @@ def _rebalance_section_budgets_deterministically(
     *,
     target_length: Optional[int],
     include_health_rating: bool,
+    section_balance_contract_required: bool = False,
     missing_requirements: Optional[List[str]] = None,
     issue_flags: Optional[Dict[str, Any]] = None,
     generation_stats: Optional[Dict[str, Any]] = None,
@@ -14630,9 +14691,9 @@ def _rebalance_section_budgets_deterministically(
         ]
         under_titles = _dedupe_titles(list(under_titles) + post_trim_titles)
 
-    # On clean-first short targets, never synthesize generic top-up prose just to
-    # satisfy a section-balance warning. Let targeted section repair or a 422 handle it.
-    if short_quality_mode:
+    # On clean-first short targets, only allow bounded underweight expansion when the
+    # explicit short/mid section-balance contract is active.
+    if short_quality_mode and not section_balance_contract_required:
         if (not long_form) and _count_words(text) < lower_total and info["words_trimmed"] > 0:
             return summary_text, {
                 "changed": False,
@@ -14680,13 +14741,15 @@ def _rebalance_section_budgets_deterministically(
         deficit = max(0, min_allowed - observed)
         if deficit <= 0:
             continue
-        if not long_form and deficit > 20:
+        if not long_form and deficit > 20 and not section_balance_contract_required:
             continue
+        if not long_form and section_balance_contract_required and deficit > 120:
+            deficit = 120
         if long_form and deficit > 140:
             deficit = 140
 
         new_body = str(body or "").strip()
-        max_loops = 6 if long_form else 2
+        max_loops = 6 if long_form else (4 if section_balance_contract_required else 2)
         loops = 0
         while _section_wc(new_body) < min_allowed and loops < max_loops and add_room > 0:
             addition = _section_balance_top_up_sentence(
@@ -22285,6 +22348,14 @@ FLOW AND QUALITY RULES:
             and not fast_summary_mode
             and not one_shot_deterministic_policy
         )
+        section_balance_contract_required = _requires_section_balance_contract(
+            target_length=target_length,
+            explicit_target_requested=explicit_target_requested,
+            v2_enabled=v2_enabled,
+        )
+        generation_stats["section_balance_contract_required"] = bool(
+            section_balance_contract_required
+        )
         continuous_v2_enabled = bool(
             _summary_continuous_v2_requested_for_target(target_length)
             and not fast_summary_mode
@@ -22373,7 +22444,7 @@ FLOW AND QUALITY RULES:
                 )
             )
             quality_validators.append(_make_stance_consistency_validator())
-            if v2_enabled and target_length:
+            if section_balance_contract_required:
                 quality_validators.append(
                     _make_section_balance_validator(
                         include_health_rating=include_health_rating,
@@ -23056,6 +23127,7 @@ FLOW AND QUALITY RULES:
                 target_length=target_length,
                 profile=post_final_profile,
                 v2_enabled=v2_enabled,
+                explicit_target_requested=explicit_target_requested,
                 persona_requested=persona_requested,
                 company_name=company_name,
                 source_text=context_excerpt,
@@ -23919,6 +23991,9 @@ FLOW AND QUALITY RULES:
                         summary_text,
                         target_length=target_length,
                         include_health_rating=include_health_rating,
+                        section_balance_contract_required=bool(
+                            section_balance_contract_required
+                        ),
                         issue_flags=retry_issue_flags,
                         generation_stats=generation_stats,
                         calculated_metrics=calculated_metrics,
@@ -24955,6 +25030,9 @@ FLOW AND QUALITY RULES:
                             summary_text,
                             target_length=target_length,
                             include_health_rating=include_health_rating,
+                            section_balance_contract_required=bool(
+                                section_balance_contract_required
+                            ),
                             missing_requirements=_post_guard_quality_issues,
                             issue_flags=_post_guard_flags,
                             generation_stats=generation_stats,
@@ -25295,11 +25373,59 @@ FLOW AND QUALITY RULES:
                         generation_stats["contract_final_word_count"] = summary_meta.get(
                             "final_word_count", 0
                         )
+            short_form_editorial_recovery_attempted = False
+            if (
+                short_quality_mode
+                and bool(section_balance_contract_required)
+                and _parse_summary_contract_missing_requirements(
+                    missing_requirements
+                ).get("section_balance_issue")
+            ):
+                (
+                    summary_text,
+                    missing_requirements,
+                    summary_meta,
+                    short_form_editorial_recovery_attempted,
+                ) = _recover_short_form_editorial_issues_once(
+                    summary_text,
+                    target_length=int(target_length),
+                    include_health_rating=include_health_rating,
+                    missing_requirements=missing_requirements,
+                    quality_profile=post_final_profile,
+                    quality_validators=contract_quality_validators,
+                    calculated_metrics=calculated_metrics,
+                    company_name=company_name,
+                    source_text=context_excerpt,
+                    filing_language_snippets=filing_language_snippets,
+                    enforce_quote_contract=strict_quote_contract,
+                    gemini_client=gemini_client,
+                    generation_stats=generation_stats,
+                    token_budget=token_budget,
+                    cost_budget=cost_budget,
+                    max_output_tokens=max_output_tokens,
+                    persona_intensity=(
+                        "subtle"
+                        if generation_stats.get("persona_intensity_downgraded")
+                        else "strong"
+                    ),
+                )
+                generation_stats["contract_missing_requirements"] = missing_requirements
+                generation_stats["contract_verified_quote_count"] = summary_meta.get(
+                    "verified_quote_count", 0
+                )
+                generation_stats["contract_final_word_count"] = summary_meta.get(
+                    "final_word_count", 0
+                )
+                generation_stats["short_form_section_balance_recovery_attempted"] = bool(
+                    short_form_editorial_recovery_attempted
+                )
+
             short_form_structural_fatal_requirements = (
                 _select_short_form_structural_failure_requirements(
                     summary_text=summary_text,
                     missing_requirements=missing_requirements,
                     include_health_rating=include_health_rating,
+                    enforce_section_balance=bool(section_balance_contract_required),
                 )
             )
             generation_stats["short_form_structural_fatal_requirements"] = (
@@ -25324,7 +25450,10 @@ FLOW AND QUALITY RULES:
                         missing_requirements=missing_requirements,
                     )
                 )
-                if short_form_editorial_fatal_requirements:
+                if (
+                    short_form_editorial_fatal_requirements
+                    and not short_form_editorial_recovery_attempted
+                ):
                     (
                         summary_text,
                         missing_requirements,
@@ -25365,6 +25494,9 @@ FLOW AND QUALITY RULES:
                             summary_text=summary_text,
                             missing_requirements=missing_requirements,
                             include_health_rating=include_health_rating,
+                            enforce_section_balance=bool(
+                                section_balance_contract_required
+                            ),
                         )
                     )
                     if short_form_structural_fatal_requirements:
