@@ -167,6 +167,55 @@ def build_summary_with_word_count(word_count: int) -> str:
     return f"{text}\nWORD COUNT: {actual}"
 
 
+def _build_balanced_sectioned_summary(
+    target_length: int,
+    *,
+    include_health_rating: bool = False,
+    body_word_overrides: dict[str, int] | None = None,
+) -> str:
+    section_budgets = filings_api._calculate_section_word_budgets(
+        target_length, include_health_rating=include_health_rating
+    )
+    if body_word_overrides:
+        for section_name, override in body_word_overrides.items():
+            if section_name in section_budgets:
+                section_budgets[section_name] = int(max(1, override))
+
+    ordered_sections: list[tuple[str, str]] = []
+    if include_health_rating:
+        ordered_sections.append(
+            (
+                "Financial Health Rating",
+                _section_body(
+                    "Financial Health Rating",
+                    f"- Target {int(section_budgets['Financial Health Rating'])} body words.",
+                ),
+            )
+        )
+
+    for section_name in (
+        "Executive Summary",
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Risk Factors",
+        "Key Metrics",
+        "Closing Takeaway",
+    ):
+        budget_words = int(section_budgets[section_name])
+        if section_name == "Key Metrics":
+            body = _metrics_lines_for_budget(budget_words)
+        else:
+            body = _section_body(
+                section_name,
+                f"- Target {budget_words} body words.",
+            )
+        ordered_sections.append((section_name, body))
+
+    return "\n\n".join(
+        f"## {section_name}\n{body}" for section_name, body in ordered_sections
+    )
+
+
 def _build_test_statements(period_end: str, revenue: float) -> dict:
     rev = float(revenue)
     operating_income = rev * 0.30
@@ -2933,6 +2982,127 @@ def test_short_target_timeout_returns_422_when_contract_not_met(monkeypatch):
         detail = (response.json() or {}).get("detail") or {}
         assert detail.get("failure_code") == "SUMMARY_CONTRACT_TIMEOUT"
         assert detail.get("target_length") == 500
+    finally:
+        _clear_filing_bundle(filing_id, company_id)
+
+
+def test_mid_precision_timeout_fallback_recovers_with_precision_reband(
+    monkeypatch,
+) -> None:
+    settings = get_settings()
+    settings.openai_api_key = "test-key"
+    monkeypatch.setenv("SUMMARY_FAST_MODE_DEFAULT", "0")
+    monkeypatch.setenv("SUMMARY_ALLOW_REQUEST_STRICT_CONTRACT", "1")
+
+    filing_id = "timeout-mid-precision-filing"
+    company_id = "timeout-mid-precision-company"
+    _seed_filing_bundle(
+        filing_id, company_id, filing_type="10-Q", filing_date="2025-03-31"
+    )
+    _relax_non_contract_quality_validators(monkeypatch)
+
+    underflow_summary = _build_balanced_sectioned_summary(
+        1225,
+        include_health_rating=False,
+        body_word_overrides={
+            "Executive Summary": 196,
+            "Closing Takeaway": 155,
+        },
+    )
+    compliant_summary = _build_balanced_sectioned_summary(
+        1225, include_health_rating=False
+    )
+    lower, upper, _tol = filings_api._target_word_band_bounds(1225)
+    assert filings_api._count_words(underflow_summary) < lower
+    assert lower <= filings_api._count_words(compliant_summary) <= upper
+
+    timeout_state = {
+        "raised": False,
+        "reband_calls": 0,
+        "reband_allow_padding": None,
+        "whitespace_calls": 0,
+        "whitespace_allow_padding": None,
+    }
+
+    monkeypatch.setattr(
+        filings_api,
+        "_generate_summary_with_quality_control",
+        lambda *args, **kwargs: underflow_summary,
+    )
+
+    def _raise_timeout_rewrite(*_args, **_kwargs):
+        timeout_state["raised"] = True
+        raise TimeoutError("runtime cap reached during rewrite")
+
+    monkeypatch.setattr(filings_api, "_rewrite_summary_to_length", _raise_timeout_rewrite)
+
+    def _timeout_reband(
+        text,
+        target_length,
+        *,
+        include_health_rating,
+        tolerance=filings_api.FINAL_STRICT_WORD_BAND_TOLERANCE,
+        generation_stats=None,
+        allow_padding=True,
+    ):
+        if timeout_state["raised"]:
+            timeout_state["reband_calls"] += 1
+            timeout_state["reband_allow_padding"] = allow_padding
+            return compliant_summary
+        return text
+
+    def _timeout_whitespace(
+        text,
+        target_length,
+        tolerance=filings_api.FINAL_STRICT_WORD_BAND_TOLERANCE,
+        *,
+        allow_padding=False,
+        dedupe=True,
+    ):
+        if timeout_state["raised"]:
+            timeout_state["whitespace_calls"] += 1
+            timeout_state["whitespace_allow_padding"] = allow_padding
+            return compliant_summary
+        return text
+
+    monkeypatch.setattr(filings_api, "_ensure_final_strict_word_band", _timeout_reband)
+    monkeypatch.setattr(
+        filings_api, "_enforce_whitespace_word_band", _timeout_whitespace
+    )
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.model = type(
+                "Model", (), {"generate_content": lambda self, _prompt: None}
+            )()
+
+    monkeypatch.setattr(
+        filings_api, "get_gemini_client", lambda *args, **kwargs: DummyClient()
+    )
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/filings/{filing_id}/summary",
+        json={
+            "mode": "custom",
+            "target_length": 1225,
+            "health_rating": {"enabled": False},
+        },
+    )
+
+    try:
+        assert response.status_code == 200
+        payload = response.json() or {}
+        summary = str(payload.get("summary") or "")
+        meta = payload.get("summary_meta") or {}
+        final_wc = int(meta.get("final_word_count") or filings_api._count_words(summary))
+        assert payload.get("degraded") is True
+        assert meta.get("timeout_fallback_contract_verified") is True
+        assert lower <= final_wc <= upper
+        assert timeout_state["reband_calls"] >= 1
+        assert timeout_state["whitespace_calls"] >= 1
+        assert timeout_state["reband_allow_padding"] is True
+        assert timeout_state["whitespace_allow_padding"] is True
     finally:
         _clear_filing_bundle(filing_id, company_id)
 

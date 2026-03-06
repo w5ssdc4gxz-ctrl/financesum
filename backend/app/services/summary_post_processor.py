@@ -12,6 +12,8 @@ from app.services.summary_budget_controller import (
     describe_sentence_range,
     get_risk_factors_shape,
     risk_budget_target_count,
+    SHORT_FORM_SECTIONED_TARGET_MAX_WORDS,
+    SHORT_FORM_SECTIONED_TARGET_MIN_WORDS,
     section_budget_tolerance_words,
     total_word_tolerance_words,
 )
@@ -51,6 +53,7 @@ _DANGLING_PATTERNS = (
     r"\bwhere\s*$",
     r"\bif\s*$",
 )
+SHORT_SECTIONED_WORD_BAND_TOLERANCE = 20
 
 
 @dataclass(frozen=True)
@@ -240,10 +243,21 @@ def validate_summary(
     section_budgets: Dict[str, int],
     include_health_rating: bool = True,
     risk_factors_excerpt: str = "",
+    total_tolerance_words: Optional[int] = None,
 ) -> SummaryValidationReport:
     working_text = str(text or "").strip()
     total_words = count_words(working_text)
-    tolerance_words = total_word_tolerance_words(target_words)
+    target = int(target_words or 0)
+    if total_tolerance_words is not None:
+        tolerance_words = max(0, int(total_tolerance_words))
+    elif (
+        int(SHORT_FORM_SECTIONED_TARGET_MIN_WORDS)
+        <= target
+        < int(SHORT_FORM_SECTIONED_TARGET_MAX_WORDS)
+    ):
+        tolerance_words = int(SHORT_SECTIONED_WORD_BAND_TOLERANCE)
+    else:
+        tolerance_words = total_word_tolerance_words(target_words)
     lower = max(1, int(target_words) - int(tolerance_words))
     upper = int(target_words) + int(tolerance_words)
 

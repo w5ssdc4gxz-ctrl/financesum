@@ -13112,6 +13112,10 @@ def _parse_summary_contract_missing_requirements(
         "numbers_discipline_issue": False,
         "numbers_discipline_sections": [],
         "closing_parenthetical_issue": False,
+        "duplicate_sentence_issue": False,
+        "near_duplicate_paragraph_issue": False,
+        "section_repetition_issue": False,
+        "risk_schema_issue": False,
         "editorial_quality_issue": False,
         "needs_editorial_deterministic_repair": False,
         "needs_deterministic_repair": False,
@@ -13196,6 +13200,20 @@ def _parse_summary_contract_missing_requirements(
                         flags["numbers_discipline_sections"].append(section_title)
         if "closing takeaway" in normalized and "parenthetical" in normalized:
             flags["closing_parenthetical_issue"] = True
+        if "duplicate sentences detected" in normalized:
+            flags["duplicate_sentence_issue"] = True
+        if "near-duplicate paragraphs detected" in normalized:
+            flags["near_duplicate_paragraph_issue"] = True
+        if "contains repeated analytical content" in normalized:
+            flags["section_repetition_issue"] = True
+        if (
+            "risk factors has" in normalized
+            and "structured risk(s);" in normalized
+            and "expected exactly" in normalized
+        ):
+            flags["risk_schema_issue"] = True
+        if "risk factors contain duplicate risk names" in normalized:
+            flags["risk_schema_issue"] = True
     flags["quote_issue"] = bool(
         flags["quote_distribution_issue"]
         or flags["quote_grounding_issue"]
@@ -13208,6 +13226,9 @@ def _parse_summary_contract_missing_requirements(
         or flags["leading_word_repetition_issue"]
         or flags["numbers_discipline_issue"]
         or flags["closing_parenthetical_issue"]
+        or flags["duplicate_sentence_issue"]
+        or flags["near_duplicate_paragraph_issue"]
+        or flags["section_repetition_issue"]
         or flags["section_balance_issue"]
     )
     flags["needs_editorial_deterministic_repair"] = bool(
@@ -13217,12 +13238,16 @@ def _parse_summary_contract_missing_requirements(
         or flags["leading_word_repetition_issue"]
         or flags["numbers_discipline_issue"]
         or flags["closing_parenthetical_issue"]
+        or flags["duplicate_sentence_issue"]
+        or flags["near_duplicate_paragraph_issue"]
+        or flags["section_repetition_issue"]
     )
     flags["needs_deterministic_repair"] = bool(
         flags["quote_distribution_issue"]
         or flags["bridge_issue"]
         or flags["closing_trigger_issue"]
         or flags["key_metrics_issue"]
+        or flags["risk_schema_issue"]
     )
     return flags
 
@@ -14448,6 +14473,21 @@ def _apply_editorial_contract_repairs(
                 lwr_info.get("sections") or []
             )
             info["actions"].append("leading_word_repetition_fix")
+
+    if (
+        flags.get("duplicate_sentence_issue")
+        or flags.get("near_duplicate_paragraph_issue")
+        or flags.get("section_repetition_issue")
+    ):
+        cleaned = _dedupe_consecutive_sentences(text)
+        cleaned = _deduplicate_sentences(cleaned)
+        cleaned = _merge_duplicate_canonical_sections(
+            cleaned, include_health_rating=include_health_rating
+        )
+        if cleaned != text:
+            text = cleaned
+            info["changed"] = True
+            info["actions"].append("repetition_cleanup")
 
     if flags.get("numbers_discipline_issue"):
         flagged_sections = set(flags.get("numbers_discipline_sections") or [])
@@ -21913,16 +21953,24 @@ def generate_filing_summary(
                     persona_requested=persona_requested,
                     generation_stats=generation_stats,
                 )
+                timeout_allow_padding = _allow_padding_for_target(
+                    int(target_length),
+                    _count_words(repaired_summary or ""),
+                )
                 repaired_summary = _ensure_final_strict_word_band(
                     repaired_summary,
-                    target_words=int(target_length),
+                    int(target_length),
+                    include_health_rating=include_health_rating,
                     tolerance=_effective_word_band_tolerance(target_length),
-                    allow_pad=False,
+                    generation_stats=generation_stats,
+                    allow_padding=timeout_allow_padding,
                 )
                 repaired_summary = _enforce_whitespace_word_band(
                     repaired_summary,
-                    target_words=int(target_length),
+                    int(target_length),
                     tolerance=_effective_word_band_tolerance(target_length),
+                    allow_padding=timeout_allow_padding,
+                    dedupe=True,
                 )
             except Exception as timeout_repair_exc:  # noqa: BLE001
                 logger.debug(
@@ -21939,11 +21987,115 @@ def generate_filing_summary(
                 risk_factors_excerpt=risk_factors_excerpt,
             )
             if not timeout_validation.passed:
-                timeout_fallback_validation_failures = list(
-                    timeout_validation.global_failures
+                timeout_validation_failures = list(
+                    timeout_validation.global_failures or []
                 ) + [
                     failure.message for failure in timeout_validation.section_failures
                 ]
+                timeout_issue_flags = _parse_summary_contract_missing_requirements(
+                    timeout_validation_failures
+                )
+                timeout_recovered_summary = str(repaired_summary or "").strip()
+                timeout_quality_profile = SummaryFlowQualityProfile()
+                try:
+                    timeout_recovered_summary, _timeout_editorial_info = (
+                        _apply_editorial_contract_repairs(
+                            timeout_recovered_summary,
+                            target_length=target_length,
+                            include_health_rating=include_health_rating,
+                            quality_profile=timeout_quality_profile,
+                            missing_requirements=timeout_validation_failures,
+                            issue_flags=timeout_issue_flags,
+                            generation_stats=generation_stats,
+                        )
+                    )
+                    timeout_recovered_summary = _run_summary_cleanup_pass(
+                        timeout_recovered_summary,
+                        include_health_rating=include_health_rating,
+                        calculated_metrics=calculated_metrics,
+                        company_name=company_name,
+                    )
+                    timeout_recovered_summary = _remove_metric_echo_loops(
+                        timeout_recovered_summary
+                    )
+                    timeout_recovered_summary = _merge_staccato_paragraphs(
+                        timeout_recovered_summary
+                    )
+                    timeout_recovered_summary = _merge_duplicate_canonical_sections(
+                        timeout_recovered_summary,
+                        include_health_rating=include_health_rating,
+                    )
+                    timeout_recovered_summary, _timeout_rebalance_info = (
+                        _rebalance_section_budgets_deterministically(
+                            timeout_recovered_summary,
+                            target_length=target_length,
+                            include_health_rating=include_health_rating,
+                            section_balance_contract_required=True,
+                            missing_requirements=timeout_validation_failures,
+                            issue_flags=timeout_issue_flags,
+                            generation_stats=generation_stats,
+                            calculated_metrics=calculated_metrics,
+                            health_score_data=pre_calculated_health,
+                            risk_factors_excerpt=risk_factors_excerpt,
+                        )
+                    )
+                    timeout_recovered_summary = _apply_strict_contract_seal(
+                        timeout_recovered_summary,
+                        include_health_rating=include_health_rating,
+                        target_length=target_length,
+                        calculated_metrics=calculated_metrics,
+                        metrics_lines=metrics_lines,
+                        filing_language_snippets=filing_language_snippets,
+                        strict_quote_contract=False,
+                        company_name=company_name,
+                        persona_requested=persona_requested,
+                        generation_stats=generation_stats,
+                        quality_profile=timeout_quality_profile,
+                        final_issue_flags=timeout_issue_flags,
+                    )
+                    timeout_allow_padding = _allow_padding_for_target(
+                        int(target_length),
+                        _count_words(timeout_recovered_summary or ""),
+                    )
+                    timeout_recovered_summary = _ensure_final_strict_word_band(
+                        timeout_recovered_summary,
+                        int(target_length),
+                        include_health_rating=include_health_rating,
+                        tolerance=_effective_word_band_tolerance(target_length),
+                        generation_stats=generation_stats,
+                        allow_padding=timeout_allow_padding,
+                    )
+                    timeout_recovered_summary = _enforce_whitespace_word_band(
+                        timeout_recovered_summary,
+                        int(target_length),
+                        tolerance=_effective_word_band_tolerance(target_length),
+                        allow_padding=timeout_allow_padding,
+                        dedupe=True,
+                    )
+                    timeout_validation = validate_summary(
+                        timeout_recovered_summary or "",
+                        target_words=int(target_length),
+                        section_budgets=section_budgets,
+                        include_health_rating=include_health_rating,
+                        risk_factors_excerpt=risk_factors_excerpt,
+                    )
+                    if timeout_validation.passed:
+                        repaired_summary = timeout_recovered_summary
+                    elif generation_stats is not None:
+                        generation_stats["timeout_fallback_second_pass_failed"] = True
+                except Exception as timeout_second_pass_exc:  # noqa: BLE001
+                    logger.debug(
+                        "Timeout fallback second deterministic pass failed for %s: %s",
+                        filing_id,
+                        timeout_second_pass_exc,
+                    )
+                if not timeout_validation.passed:
+                    timeout_fallback_validation_failures = list(
+                        timeout_validation.global_failures or []
+                    ) + [
+                        failure.message
+                        for failure in timeout_validation.section_failures
+                    ]
             else:
                 payload["summary"] = repaired_summary
                 timeout_counts = _collect_section_body_word_counts(

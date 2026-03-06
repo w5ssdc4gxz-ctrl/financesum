@@ -172,3 +172,29 @@
   - successful `1225` underflow recovery into the `1205-1245` band,
   - late structural-seal trimming that is re-banded before contract evaluation,
   - explicit `1225` brief-section hard-fail returning `422`.
+
+## Update: Timeout Fallback Precision-Band Parity (2026-03-06)
+
+### Root Cause
+- The timeout fallback validator still used percentage-based total-word tolerance, so `1225` requests were being judged against `>=1188` instead of the precision short/mid contract `>=1205`.
+- The same timeout fallback repair block was also calling `_ensure_final_strict_word_band(...)` and `_enforce_whitespace_word_band(...)` with stale keyword names, causing the last-mile repair step to fail silently inside a broad `try/except`.
+- That left repairable timeout drafts failing with stale band math and without the final deterministic re-band/padding pass.
+
+### Policy and Code Changes
+- Updated `backend/app/services/summary_post_processor.py` so `validate_summary(...)` uses the same `±20` total-word band for sectioned short/mid targets `300-1499`.
+- Fixed the timeout fallback repair calls in `backend/app/api/filings.py` to use the live final-band function signatures and to allow bounded deterministic padding when the draft is still under the explicit target band.
+- Added a second deterministic timeout fallback pass for explicit short/mid targets:
+  - editorial repetition cleanup,
+  - cleanup/rebalance rerun,
+  - strict seal rerun,
+  - final strict re-band and whitespace-band enforcement,
+  - then re-validation before returning `422`.
+
+### Expected Behavior
+- A `1225` timeout fallback is now validated against `1205-1245`, not `1188-1262`.
+- Repairable timeout drafts should recover through the same precision-band logic the normal route uses instead of failing on stale fallback behavior.
+- If the draft still cannot satisfy the explicit contract after the bounded deterministic fallback passes, the API will still return `422`.
+
+### Validation
+- Added regression coverage in `backend/tests/test_filing_summary.py` for `1225` timeout fallback recovery using the precision re-band path.
+- Added regression coverage in `backend/tests/test_summary_post_processor.py` proving `validate_summary(...)` uses `1205-1245` for a `1225` target.

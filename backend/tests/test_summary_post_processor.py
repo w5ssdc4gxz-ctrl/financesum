@@ -6,7 +6,9 @@ from app.services.summary_post_processor import (
     validate_summary,
     post_process_summary,
 )
+from app.services.summary_budget_controller import calculate_section_word_budgets
 from app.services.word_surgery import count_words
+from scripts.smoke_summary_continuous_v2 import _metrics_lines_for_budget, _section_body
 
 
 def _build_memo(sections: dict[str, str]) -> str:
@@ -373,6 +375,38 @@ def test_validate_summary_uses_wider_tolerance_for_high_budget_long_form_section
         and failure.code == "section_budget_under"
         for failure in report.section_failures
     )
+
+
+def test_validate_summary_uses_short_mid_precision_band_for_1225_target() -> None:
+    target_words = 1225
+    budgets = calculate_section_word_budgets(
+        target_words, include_health_rating=False
+    )
+    memo = "\n\n".join(
+        [
+            f"## Executive Summary\n{_section_body('Executive Summary', f'- Target {int(budgets['Executive Summary'])} body words.')}",
+            f"## Financial Performance\n{_section_body('Financial Performance', f'- Target {int(budgets['Financial Performance'])} body words.')}",
+            f"## Management Discussion & Analysis\n{_section_body('Management Discussion & Analysis', f'- Target {int(budgets['Management Discussion & Analysis'])} body words.')}",
+            f"## Risk Factors\n{_section_body('Risk Factors', f'- Target {int(budgets['Risk Factors'])} body words.')}",
+            f"## Key Metrics\n{_metrics_lines_for_budget(int(budgets['Key Metrics']))}",
+            f"## Closing Takeaway\n{_section_body('Closing Takeaway', f'- Target {int(budgets['Closing Takeaway'])} body words.')}",
+        ]
+    )
+
+    report = validate_summary(
+        memo,
+        target_words=target_words,
+        section_budgets=budgets,
+        include_health_rating=False,
+        risk_factors_excerpt=(
+            "renewals pipeline monetization capex pricing enterprise demand "
+            "channel partner execution friction backlog conversion"
+        ),
+    )
+
+    assert report.lower_bound == 1205
+    assert report.upper_bound == 1245
+    assert report.passed
 
 
 def test_post_process_summary_uses_global_under_retry_when_only_long_form_gap_remains() -> None:
