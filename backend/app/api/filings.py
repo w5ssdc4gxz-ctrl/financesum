@@ -14599,6 +14599,10 @@ def _is_closing_trigger_sentence_for_balance_trim(sentence: str) -> bool:
     if not sentence:
         return False
     lowered = sentence.lower()
+    if lowered.startswith("what must stay true") or lowered.startswith(
+        "what breaks the thesis"
+    ):
+        return True
     if not re.search(r"\b(if|unless|would|trigger|flip|change)\b", lowered):
         return False
     if not re.search(
@@ -22039,6 +22043,19 @@ def generate_filing_summary(
                             risk_factors_excerpt=risk_factors_excerpt,
                         )
                     )
+                    timeout_recovered_summary = _ensure_required_sections(
+                        timeout_recovered_summary,
+                        include_health_rating=include_health_rating,
+                        metrics_lines=metrics_lines,
+                        calculated_metrics=calculated_metrics,
+                        health_score_data=pre_calculated_health,
+                        company_name=company_name,
+                        risk_factors_excerpt=risk_factors_excerpt,
+                        health_rating_config=health_config,
+                        persona_name=selected_persona_name,
+                        persona_requested=persona_requested,
+                        target_length=target_length,
+                    )
                     timeout_recovered_summary = _apply_strict_contract_seal(
                         timeout_recovered_summary,
                         include_health_rating=include_health_rating,
@@ -29093,6 +29110,112 @@ def _generate_fallback_closing_takeaway(
     concerns_str = " and ".join(concerns[:2]) if concerns else "no major red flags"
     rev_str = _format_dollar(revenue) if revenue else None
 
+    def _fit_closing_to_budget(closing_text: str) -> str:
+        fitted = str(closing_text or "").strip()
+        if not fitted:
+            return fitted
+        if budget_words:
+            if int(budget_words) >= 120:
+                if "What must stay true" not in fitted:
+                    fitted = _append_section_balance_sentence(
+                        fitted,
+                        section_title="Closing Takeaway",
+                        sentence=_section_balance_top_up_sentence(
+                            "Closing Takeaway",
+                            attempt=1,
+                            calculated_metrics=calculated_metrics,
+                        ),
+                    )
+                if "What breaks the thesis" not in fitted:
+                    fitted = _append_section_balance_sentence(
+                        fitted,
+                        section_title="Closing Takeaway",
+                        sentence=_section_balance_top_up_sentence(
+                            "Closing Takeaway",
+                            attempt=2,
+                            calculated_metrics=calculated_metrics,
+                        ),
+                    )
+                fitted, _ = _cap_closing_takeaway_sentences_preserve_triggers(
+                    fitted,
+                    budget_words=int(budget_words),
+                )
+            tol = int(
+                _section_budget_tolerance_words(int(budget_words), max_tolerance=15)
+            )
+            lower_band = max(1, int(budget_words) - int(tol))
+            upper_band = int(budget_words) + int(tol)
+            top_up_attempt = 0
+            while _count_words(fitted) < lower_band and top_up_attempt < 8:
+                addition = _section_balance_top_up_sentence(
+                    "Closing Takeaway",
+                    attempt=top_up_attempt,
+                    calculated_metrics=calculated_metrics,
+                )
+                if not addition:
+                    break
+                next_fitted = _append_section_balance_sentence(
+                    fitted,
+                    section_title="Closing Takeaway",
+                    sentence=addition,
+                )
+                if next_fitted == fitted:
+                    break
+                fitted = next_fitted
+                top_up_attempt += 1
+            if int(budget_words) >= 120:
+                fitted, _ = _cap_closing_takeaway_sentences_preserve_triggers(
+                    fitted,
+                    budget_words=int(budget_words),
+                )
+                if _count_words(fitted) < lower_band:
+                    closing_sentences = [
+                        s.strip()
+                        for s in re.split(r"(?<=[.!?])\s+", fitted)
+                        if s.strip()
+                    ]
+                    expandable_indexes = [
+                        idx
+                        for idx, sentence in enumerate(closing_sentences)
+                        if not str(sentence or "").lower().startswith("what must stay true")
+                        and not str(sentence or "").lower().startswith(
+                            "what breaks the thesis"
+                        )
+                    ]
+                    extension_clauses = [
+                        ", which keeps valuation support tied to cash durability rather than optimism alone",
+                        ", and that is why the funding profile matters as much as the headline margin profile",
+                        ", because investors need the same evidence to support both reinvestment capacity and downside protection",
+                        ", while weaker evidence would force a narrower multiple and a more defensive posture",
+                    ]
+                    extension_idx = 0
+                    target_indexes = expandable_indexes or [0]
+                    for sentence_idx in target_indexes:
+                        if _count_words(" ".join(closing_sentences)) >= lower_band:
+                            break
+                        if extension_idx >= len(extension_clauses):
+                            break
+                        sentence = str(closing_sentences[sentence_idx] or "").strip()
+                        if not sentence or not sentence.endswith((".", "!", "?")):
+                            continue
+                        closing_sentences[sentence_idx] = (
+                            sentence[:-1] + extension_clauses[extension_idx] + "."
+                        )
+                        extension_idx += 1
+                    fitted = " ".join(closing_sentences).strip()
+            if _count_words(fitted) > upper_band:
+                over_by = _count_words(fitted) - upper_band
+                if 0 < over_by <= 20:
+                    tokens = fitted.split()
+                    if len(tokens) > over_by + 1:
+                        fitted = " ".join(tokens[: len(tokens) - over_by]).strip()
+                else:
+                    fitted = _truncate_text_to_word_limit(fitted, upper_band).strip()
+        fitted = _normalize_closing_prose_spacing(fitted)
+        if fitted and fitted[-1] not in ".!?":
+            fitted += "."
+        return fitted
+
     # Persona-specific closing templates
     if (
         persona_requested
@@ -29144,7 +29267,9 @@ def _generate_fallback_closing_takeaway(
         trigger_sentence = rng.choice(trigger_variants)
 
         closing = f"{closing} {trigger_sentence}".strip()
-        return _ensure_personal_verdict(closing, company_name, strengths, concerns)
+        return _fit_closing_to_budget(
+            _ensure_personal_verdict(closing, company_name, strengths, concerns)
+        )
 
     # Generic persona (custom prompt): first-person, no famous investor mimicry.
     if persona_requested:
@@ -29214,7 +29339,9 @@ def _generate_fallback_closing_takeaway(
             sentences = rng.choice(variants)
 
         closing = " ".join(sentences).strip()
-        return _ensure_personal_verdict(closing, company_name, strengths, concerns)
+        return _fit_closing_to_budget(
+            _ensure_personal_verdict(closing, company_name, strengths, concerns)
+        )
 
     # Generic fallback (no persona selected) - longer and reasoned (~80-110 words)
     if long_form_budget:
@@ -29352,7 +29479,7 @@ def _generate_fallback_closing_takeaway(
                     ).strip()
                 if long_form_text and long_form_text[-1] not in ".!?":
                     long_form_text += "."
-        return long_form_text
+        return _fit_closing_to_budget(long_form_text)
 
     seed_material = "|".join(
         [
@@ -29447,7 +29574,7 @@ def _generate_fallback_closing_takeaway(
         ]
         sentences = rng.choice(variants)
 
-    return " ".join(sentences).strip()
+    return _fit_closing_to_budget(" ".join(sentences).strip())
 
 
 def _generate_persona_flavored_closing(
@@ -30129,7 +30256,7 @@ def _ensure_required_sections(
             return entries
 
         pattern = re.compile(
-            r"\*\*(.+?)\*\*\s*(?::|[-–—]|\.)\s*([\s\S]*?)(?=\n\s*\*\*.+?\*\*\s*(?::|[-–—]|\.)|\Z)"
+            r"\*\*(.+?)\*\*\s*(?::|[-–—]|\.)\s*([\s\S]*?)(?=(?:\n\s*)?\*\*.+?\*\*\s*(?::|[-–—]|\.)|\Z)"
         )
         for match in pattern.finditer(cleaned_body):
             name = match.group(1).strip()
@@ -30198,6 +30325,91 @@ def _ensure_required_sections(
         tokens = [t for t in cleaned.split() if t not in stopwords and len(t) > 2]
         return set(tokens)
 
+    risk_excerpt_terms = {
+        token
+        for token in re.findall(r"[a-z]{5,}", (risk_factors_excerpt or "").lower())
+        if token
+        not in {
+            "could",
+            "these",
+            "those",
+            "which",
+            "there",
+            "their",
+            "about",
+            "under",
+            "after",
+            "before",
+            "being",
+            "become",
+            "changes",
+            "affect",
+        }
+    }
+
+    def _risk_excerpt_bridge_sentence() -> str:
+        excerpt_lower = (risk_factors_excerpt or "").lower()
+        themes: List[str] = []
+        if "ai" in excerpt_lower and (
+            "infrastructure" in excerpt_lower or "demand" in excerpt_lower
+        ):
+            themes.append("AI infrastructure demand")
+        elif "infrastructure" in excerpt_lower and "demand" in excerpt_lower:
+            themes.append("infrastructure demand")
+        elif "demand" in excerpt_lower:
+            themes.append("customer demand")
+        if "enterprise" in excerpt_lower and "renewal" in excerpt_lower:
+            themes.append("enterprise renewals")
+        elif "renewal" in excerpt_lower:
+            themes.append("renewal trends")
+        if "regulatory" in excerpt_lower or "compliance" in excerpt_lower:
+            themes.append("regulatory changes")
+        if not themes and risk_excerpt_terms:
+            themes = list(dict.fromkeys(list(risk_excerpt_terms)[:3]))
+        themes = list(dict.fromkeys(t for t in themes if t))
+        if not themes:
+            return ""
+        if len(themes) == 1:
+            theme_text = themes[0]
+        elif len(themes) == 2:
+            theme_text = f"{themes[0]} and {themes[1]}"
+        else:
+            theme_text = f"{themes[0]}, {themes[1]}, and {themes[2]}"
+        return (
+            f"If {theme_text} weakens, the first damage usually shows up in bookings, renewal rates, margins, or cash conversion."
+        )
+
+    def _risk_early_warning_sentence() -> str:
+        excerpt_lower = (risk_factors_excerpt or "").lower()
+        if "enterprise" in excerpt_lower and "renewal" in excerpt_lower:
+            return (
+                "Early-warning signal: watch enterprise renewals, bookings, pricing, and cash conversion for deterioration."
+            )
+        if (
+            "cloud" in excerpt_lower
+            or "ai" in excerpt_lower
+            or "infrastructure" in excerpt_lower
+        ):
+            return (
+                "Early-warning signal: watch utilization, deployment timing, backlog conversion, and pricing."
+            )
+        if "regulatory" in excerpt_lower or "compliance" in excerpt_lower:
+            return (
+                "Early-warning signal: watch enforcement milestones, remedy proposals, pricing flexibility, and compliance spend."
+            )
+        return (
+            "Early-warning signal: watch bookings, renewals, utilization, pricing, and cash conversion."
+        )
+
+    def _risk_append_sentence(body: str, sentence: str) -> str:
+        base = " ".join((body or "").split()).strip()
+        addition = " ".join((sentence or "").split()).strip()
+        if not addition:
+            return base
+        if base and base[-1] not in ".!?":
+            base += "."
+        return f"{base} {addition}".strip() if base else addition
+
     def _is_desc_duplicate(tokens: Set[str], seen_tokens: List[Set[str]]) -> bool:
         if not tokens:
             return False
@@ -30233,13 +30445,23 @@ def _ensure_required_sections(
         has_mechanism = bool(risk_mechanism_re.search(text_desc))
         has_transmission = bool(risk_transmission_re.search(text_desc))
         has_early_warning = bool(risk_early_warning_re.search(text_desc))
-        if not (has_mechanism and has_transmission and has_early_warning):
-            risk_label = str(risk_name or "this risk").strip()
-            text_desc = (
-                f"{text_desc} "
-                f"For {risk_label}, the mechanism is that pricing, demand, or cost-to-serve pressure can flow into revenue mix, operating margin, and free-cash-flow conversion; "
-                "an early-warning signal is weakening bookings, renewals, utilization, or cash-conversion trends."
-            ).strip()
+        risk_label = str(risk_name or "this risk").strip()
+        if not (has_mechanism and has_transmission):
+            text_desc = _risk_append_sentence(
+                text_desc,
+                (
+                    f"For {risk_label}, the mechanism is that pricing, demand, or cost-to-serve pressure can "
+                    "flow into revenue mix, operating margin, and free-cash-flow conversion."
+                ),
+            )
+        if risk_excerpt_terms:
+            body_tokens = set(re.findall(r"[a-z]{5,}", text_desc.lower()))
+            if not (body_tokens & risk_excerpt_terms):
+                excerpt_bridge = _risk_excerpt_bridge_sentence()
+                if excerpt_bridge:
+                    text_desc = _risk_append_sentence(text_desc, excerpt_bridge)
+        if not has_early_warning:
+            text_desc = _risk_append_sentence(text_desc, _risk_early_warning_sentence())
 
         min_sentences = int(risk_shape.per_risk_min_sentences or 2) if risk_shape else 2
         max_sentences = int(risk_shape.per_risk_max_sentences or 3) if risk_shape else 3
@@ -30257,11 +30479,28 @@ def _ensure_required_sections(
                 ),
                 None,
             )
+            excerpt_idx = next(
+                (
+                    idx
+                    for idx, sentence in enumerate(sentences)
+                    if risk_excerpt_terms
+                    and (set(re.findall(r"[a-z]{5,}", sentence.lower())) & risk_excerpt_terms)
+                ),
+                None,
+            )
             trimmed: List[str] = []
             if sentences:
                 trimmed.append(sentences[0])
-            if early_idx is not None and early_idx != 0 and len(trimmed) < max_sentences:
-                trimmed.append(sentences[early_idx])
+            for preferred_idx in (excerpt_idx, early_idx):
+                if (
+                    preferred_idx is None
+                    or preferred_idx == 0
+                    or len(trimmed) >= max_sentences
+                ):
+                    continue
+                preferred_sentence = sentences[preferred_idx]
+                if preferred_sentence not in trimmed:
+                    trimmed.append(preferred_sentence)
             for sentence in sentences[1:]:
                 if len(trimmed) >= max_sentences:
                     break
@@ -30331,6 +30570,30 @@ def _ensure_required_sections(
             if desc_tokens:
                 seen_desc_tokens.append(desc_tokens)
 
+        if not cleaned_entries:
+            fallback_seed = _synthesize_risk_factors_addendum(
+                budget_words=risk_budget_words
+            )
+            fallback_entries = _extract_risk_entries(fallback_seed)
+            for name, desc in fallback_entries:
+                name = _rewrite_generic_risk_name(name)
+                raw_desc = " ".join((desc or "").split()).strip()
+                name_norm = _normalize_risk_name(name)
+                desc_norm = " ".join(re.sub(r"[^a-z0-9]+", " ", raw_desc.lower()).split())
+                if not name_norm or name_norm in seen_names:
+                    continue
+                if desc_norm and desc_norm in seen_desc_norms:
+                    continue
+                desc = _enforce_risk_schema_phrasing(raw_desc, risk_name=name)
+                if _count_words(desc) < 18:
+                    continue
+                cleaned_entries.append((name, desc))
+                seen_names.add(name_norm)
+                if desc_norm:
+                    seen_desc_norms.add(desc_norm)
+                if expected_risk_count > 0 and len(cleaned_entries) >= expected_risk_count:
+                    break
+
         # Do NOT force generic padding risks when the model already produced
         # multiple company-specific items. Only backfill when we are below the
         # expected risk count or the section still lands materially underweight.
@@ -30381,6 +30644,40 @@ def _ensure_required_sections(
         rebuilt_body = "\n\n".join(
             f"**{name}**: {desc}" for name, desc in cleaned_entries
         )
+        max_section_words = (
+            int(risk_budget_words)
+            + int(_section_budget_tolerance_words(int(risk_budget_words), max_tolerance=10))
+            if risk_budget_words > 0
+            else 0
+        )
+        if max_section_words > 0 and _count_words(rebuilt_body) > max_section_words:
+            budget_capped_body = _synthesize_risk_factors_addendum(
+                budget_words=max_section_words
+            )
+            if budget_capped_body:
+                normalized_budget_entries: List[Tuple[str, str]] = []
+                budget_seen_names: Set[str] = set()
+                for capped_name, capped_desc in _extract_risk_entries(budget_capped_body):
+                    fixed_name = _rewrite_generic_risk_name(capped_name)
+                    fixed_desc = _enforce_risk_schema_phrasing(
+                        capped_desc, risk_name=fixed_name
+                    )
+                    fixed_norm = _normalize_risk_name(fixed_name)
+                    if not fixed_norm or fixed_norm in budget_seen_names:
+                        continue
+                    budget_seen_names.add(fixed_norm)
+                    normalized_budget_entries.append((fixed_name, fixed_desc))
+                    if expected_risk_count > 0 and len(normalized_budget_entries) >= expected_risk_count:
+                        break
+                if normalized_budget_entries:
+                    budget_capped_body = "\n\n".join(
+                        f"**{name}**: {desc}"
+                        for name, desc in normalized_budget_entries
+                    )
+                if budget_capped_body and _count_words(budget_capped_body) < _count_words(
+                    rebuilt_body
+                ):
+                    rebuilt_body = budget_capped_body
         if risk_budget_words > 0 and _count_words(rebuilt_body) < min_section_words:
             fallback_body = _synthesize_risk_factors_addendum(
                 budget_words=risk_budget_words
@@ -30428,6 +30725,13 @@ def _ensure_required_sections(
                     sentence=addition,
                 )
                 risk_pad_guard += 1
+        if max_section_words > 0 and _count_words(rebuilt_body) > max_section_words:
+            excess_words = _count_words(rebuilt_body) - max_section_words
+            trimmed_body, removed_words = _micro_trim_filler_words(
+                rebuilt_body, excess_words
+            )
+            if removed_words > 0:
+                rebuilt_body = trimmed_body
         text = pattern.sub(
             lambda _m: f"## Risk Factors\n{rebuilt_body}\n", text, count=1
         )

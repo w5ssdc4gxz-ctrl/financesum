@@ -1399,6 +1399,31 @@ def test_generate_fallback_closing_takeaway_very_long_budget_can_land_near_band(
     assert "What breaks the thesis" in closing
 
 
+def test_generate_fallback_closing_takeaway_mid_precision_budget_hits_section_floor() -> None:
+    metrics = {
+        "operating_margin": 33.8,
+        "net_margin": 28.8,
+        "revenue": 30.57e9,
+        "free_cash_flow": 10.96e9,
+        "cash": 11.21e9,
+        "total_debt": 79.07e9,
+    }
+
+    budget_words = 144
+    closing = filings_api._generate_fallback_closing_takeaway(
+        "Microsoft Corp",
+        metrics,
+        budget_words=budget_words,
+    )
+    tol = filings_api._section_budget_tolerance_words(budget_words, max_tolerance=15)
+    word_count = filings_api._count_words(closing)
+
+    assert budget_words - tol <= word_count <= budget_words + tol
+    assert len(re.findall(r"\bBUY\b|\bHOLD\b|\bSELL\b", closing)) == 1
+    assert "What must stay true" in closing
+    assert "What breaks the thesis" in closing
+
+
 def test_ensure_required_sections_rebuilds_long_form_risk_and_closing_without_health() -> None:
     target_length = 3000
     budgets = filings_api._calculate_section_word_budgets(
@@ -1450,6 +1475,85 @@ def test_ensure_required_sections_rebuilds_long_form_risk_and_closing_without_he
             "cloud, and developer products. Search and YouTube monetization remain the primary funding engines for "
             "the broader investment cycle. Risk factors emphasize that backlog conversion, advertiser ROI, traffic "
             "acquisition dynamics, and capex utilization determine whether elevated investment produces durable returns."
+        ),
+        target_length=target_length,
+    )
+
+    risk_body = filings_api._extract_markdown_section_body(repaired, "Risk Factors") or ""
+    closing_body = (
+        filings_api._extract_markdown_section_body(repaired, "Closing Takeaway") or ""
+    )
+    risk_tol = filings_api._section_budget_tolerance_words(
+        budgets["Risk Factors"], max_tolerance=15
+    )
+    closing_tol = filings_api._section_budget_tolerance_words(
+        budgets["Closing Takeaway"], max_tolerance=15
+    )
+
+    assert len(re.findall(r"\*\*[^*:\n]{2,120}\*\*:", risk_body)) == 3
+    assert budgets["Risk Factors"] - risk_tol <= filings_api._count_words(risk_body) <= budgets["Risk Factors"] + risk_tol
+    assert budgets["Closing Takeaway"] - closing_tol <= filings_api._count_words(closing_body) <= budgets["Closing Takeaway"] + closing_tol
+    assert "What must stay true" in closing_body
+    assert "What breaks the thesis" in closing_body
+
+
+def test_ensure_required_sections_rebuilds_mid_precision_plain_risk_block_and_short_close() -> None:
+    target_length = 1225
+    budgets = filings_api._calculate_section_word_budgets(
+        target_length, include_health_rating=True
+    )
+    metrics = {
+        "revenue": 30.57e9,
+        "operating_income": 10.34e9,
+        "net_income": 8.81e9,
+        "operating_margin": 33.8,
+        "net_margin": 28.8,
+        "operating_cash_flow": 13.52e9,
+        "free_cash_flow": 10.96e9,
+        "capital_expenditures": 2.56e9,
+        "cash": 11.21e9,
+        "total_debt": 79.07e9,
+        "total_liabilities": 168.42e9,
+        "current_ratio": 3.0,
+    }
+    memo = (
+        "## Financial Health Rating\n"
+        f"{_sentence_filler_body(190, prefix='fh')}\n\n"
+        "## Executive Summary\n"
+        f"{_sentence_filler_body(165, prefix='ex')}\n\n"
+        "## Financial Performance\n"
+        f"{_sentence_filler_body(197, prefix='fp')}\n\n"
+        "## Management Discussion & Analysis\n"
+        f"{_sentence_filler_body(197, prefix='md')}\n\n"
+        "## Risk Factors\n"
+        "The main downside is that rising infrastructure intensity and weaker backlog conversion could pressure margins, cash flow, and liquidity flexibility before management can fully reset the cost base.\n\n"
+        "## Key Metrics\n"
+        "DATA_GRID_START\n"
+        "Revenue | $30.57B\n"
+        "Operating Income | $10.34B\n"
+        "Operating Margin | 33.8%\n"
+        "Free Cash Flow | $10.96B\n"
+        "Current Ratio | 3.0x\n"
+        "DATA_GRID_END\n\n"
+        "## Closing Takeaway\n"
+        "Microsoft still looks durable, but I would wait for clearer proof that cash conversion holds. HOLD."
+    )
+
+    repaired = filings_api._ensure_required_sections(
+        memo,
+        include_health_rating=True,
+        metrics_lines=(
+            "Revenue | $30.57B\n"
+            "Operating Income | $10.34B\n"
+            "Operating Margin | 33.8%\n"
+            "Free Cash Flow | $10.96B\n"
+            "Current Ratio | 3.0x"
+        ),
+        calculated_metrics=metrics,
+        company_name="Microsoft Corp",
+        risk_factors_excerpt=(
+            "cloud backlog conversion, enterprise renewals, capex intensity, pricing durability, "
+            "AI infrastructure, operating leverage, liquidity flexibility"
         ),
         target_length=target_length,
     )
