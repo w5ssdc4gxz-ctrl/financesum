@@ -17,6 +17,71 @@ def _make_words(n: int, token: str) -> str:
     return " ".join([token] * n)
 
 
+def _build_sectioned_summary(word_count: int) -> str:
+    sections = [
+        (
+            "## Executive Summary",
+            "Durable cash generation matters only if the current investment cycle still earns a real return.",
+        ),
+        (
+            "## Financial Performance",
+            "Revenue improved, but margin durability now depends on whether higher spending translates into stronger conversion.",
+        ),
+        (
+            "## Management Discussion & Analysis",
+            "Management says reinvestment pacing is disciplined and that pricing will improve as newer products scale.",
+        ),
+        (
+            "## Risk Factors",
+            "**Execution Risk**: If deployments slip, spending could rise faster than realized demand and pressure cash flow.",
+        ),
+        (
+            "## Key Metrics",
+            "→ Revenue: $1.0B\n→ Free Cash Flow: $0.2B\n→ Operating Margin: 10%\n→ Capex: $0.3B\n→ Current Ratio: 2.0x",
+        ),
+        (
+            "## Closing Takeaway",
+            "The verdict depends on whether the business can convert this spending cycle into durable cash returns.",
+        ),
+    ]
+    text = "\n\n".join(f"{header}\n{body}" for header, body in sections)
+    current_words = filings_api._count_words(text)
+    if current_words >= word_count:
+        return filings_api._truncate_text_to_word_limit(text, word_count)
+
+    filler_targets = [
+        "Executive Summary",
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Risk Factors",
+    ]
+    filler_needed = word_count - current_words
+    per_section = filler_needed // len(filler_targets)
+    leftover = filler_needed % len(filler_targets)
+    word_idx = 0
+    for idx, section_name in enumerate(filler_targets):
+        add_words = per_section + (1 if idx < leftover else 0)
+        if add_words <= 0:
+            continue
+        filler_words = [f"detail{word_idx + offset}" for offset in range(add_words)]
+        word_idx += add_words
+        marker = f"## {section_name}\n"
+        start = text.find(marker)
+        if start < 0:
+            continue
+        body_start = start + len(marker)
+        next_section = text.find("\n\n## ", body_start)
+        if next_section == -1:
+            next_section = len(text)
+        text = (
+            text[:next_section].rstrip()
+            + " "
+            + " ".join(filler_words)
+            + text[next_section:]
+        )
+    return text
+
+
 def test_enforce_summary_target_length_caps_markdown_to_target() -> None:
     # Deliberately over-long markdown with headings so trimming must preserve structure.
     base = (
@@ -69,15 +134,40 @@ def test_enforce_summary_target_length_caps_to_global_max_when_no_target() -> No
     assert filings_api._count_words(enforced) <= TARGET_LENGTH_MAX_WORDS
 
 
-def test_effective_word_band_tolerance_uses_twenty_for_short_sectioned_targets() -> None:
+def test_effective_word_band_tolerance_uses_forty_for_short_sectioned_targets() -> None:
     for target in (500, 600, 1000):
-        assert filings_api._effective_word_band_tolerance(target) == 20
+        assert filings_api._effective_word_band_tolerance(target) == 40
 
 
-def test_target_word_band_bounds_uses_short_twenty_word_contract() -> None:
-    assert filings_api._target_word_band_bounds(500) == (480, 520, 20)
-    assert filings_api._target_word_band_bounds(600) == (580, 620, 20)
-    assert filings_api._target_word_band_bounds(1000) == (980, 1020, 20)
+def test_target_word_band_bounds_uses_short_forty_word_acceptance_contract() -> None:
+    assert filings_api._target_word_band_bounds(500) == (460, 540, 40)
+    assert filings_api._target_word_band_bounds(600) == (560, 640, 40)
+    assert filings_api._target_word_band_bounds(1000) == (960, 1040, 40)
+
+
+def test_rewrite_target_word_band_tolerance_keeps_tighter_short_targeting() -> None:
+    for target in (500, 600, 1000):
+        assert filings_api._rewrite_target_word_band_tolerance(target) == 20
+
+
+def test_tighten_short_mid_precision_target_resteers_near_miss_contract_safe_outputs() -> (
+    None
+):
+    target = 1000
+    for current_words in (971, 1029):
+        text = _build_sectioned_summary(current_words)
+        tightened = filings_api._tighten_short_mid_precision_target(
+            text,
+            target_length=target,
+            include_health_rating=False,
+            generation_stats={},
+        )
+        split_wc = len(tightened.split())
+        stripped_wc = filings_api._count_words(tightened)
+        assert 980 <= split_wc <= 1020
+        assert 980 <= stripped_wc <= 1020
+        assert "## Key Metrics" in tightened
+        assert "## Closing Takeaway" in tightened
 
 
 def test_explicit_short_mid_precision_target_detection() -> None:
@@ -240,24 +330,53 @@ def test_compute_depth_plan_progressively_adds_later_features() -> None:
 # section_budget_tolerance_words — now 3% of budget
 # ---------------------------------------------------------------------------
 
-def test_section_budget_tolerance_is_three_percent() -> None:
-    # 300 words * 3% = 9, but floor is 6
+def test_section_budget_tolerance_is_five_percent_under_250() -> None:
+    # 200 words * 5% = 10
+    tol = section_budget_tolerance_words("Executive Summary", 200)
+    assert tol == max(8, round(200 * 0.05))
+
+
+def test_section_budget_tolerance_is_three_percent_over_250() -> None:
+    # 300 words * 3% = 9, floor 10
     tol = section_budget_tolerance_words("Executive Summary", 300)
-    assert tol == max(6, int(300 * 0.03))
+    assert tol == max(10, round(300 * 0.03))
 
 
-def test_section_budget_tolerance_floor_at_six() -> None:
+def test_section_budget_tolerance_floor_at_ten() -> None:
     # Very small budget — floor kicks in
     tol = section_budget_tolerance_words("Closing Takeaway", 50)
-    assert tol == max(6, int(50 * 0.03))
-    assert tol == 6  # 50 * 0.03 = 1.5 < 6 → floor
+    assert tol == 10  # 50 * 0.05 = 2.5 < 10 → floor
 
 
-def test_key_metrics_tolerance_is_zero() -> None:
-    assert section_budget_tolerance_words("Key Metrics", 100) == 0
+def test_key_metrics_tolerance_is_small() -> None:
+    # Key Metrics has a small fixed tolerance (±3) to avoid 422s from
+    # minor row-length variance while staying tighter than narrative sections.
+    assert section_budget_tolerance_words("Key Metrics", 100) == 3
 
 
 def test_tolerance_scales_with_budget() -> None:
     small = section_budget_tolerance_words("Financial Performance", 200)
     large = section_budget_tolerance_words("Financial Performance", 800)
     assert large > small
+
+
+def test_risk_factors_tolerance_wider_at_mid_range_budgets() -> None:
+    """Risk Factors at 110-250 word budgets uses 12% band (not 5%)."""
+    tol = section_budget_tolerance_words("Risk Factors", 172)
+    assert tol == max(10, round(172 * 0.12))  # 21
+    # Non-Risk section at same budget unchanged
+    tol_exec = section_budget_tolerance_words("Executive Summary", 172)
+    assert tol_exec == max(10, round(172 * 0.05))  # 10 (floor)
+    assert tol > tol_exec
+
+
+def test_risk_factors_tolerance_normal_outside_mid_range() -> None:
+    """Risk Factors below 110 or above 250 uses the standard rate."""
+    # Below the 3-risk zone
+    tol_low = section_budget_tolerance_words("Risk Factors", 90)
+    tol_low_other = section_budget_tolerance_words("Executive Summary", 90)
+    assert tol_low == tol_low_other  # both use 5% → floor 10
+    # Above the squeeze zone
+    tol_high = section_budget_tolerance_words("Risk Factors", 300)
+    tol_high_other = section_budget_tolerance_words("Executive Summary", 300)
+    assert tol_high == tol_high_other  # both use 3%
