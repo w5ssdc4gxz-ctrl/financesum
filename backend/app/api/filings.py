@@ -14516,7 +14516,7 @@ def _make_closing_structure_validator() -> Callable[[str], Optional[str]]:
         trigger_sentences: List[Tuple[int, str]] = []
         for idx, sentence in enumerate(sentences):
             lowered = sentence.lower()
-            if not re.search(r"\b(if|unless|would|trigger|flip|change)\b", lowered):
+            if not re.search(r"\b(if|unless|would|should|when|once|provided|assuming|while|trigger|flip|change)\b", lowered):
                 continue
             if not measurable_re.search(sentence):
                 continue
@@ -16888,6 +16888,7 @@ def _select_one_shot_contract_failure_requirements(
         return items
 
     fatal: List[str] = []
+    _short_mid = _is_short_mid_precision_target(target_length)
     for item in items:
         normalized = " ".join(item.split()).strip().lower()
         if "word-count band violation" in normalized:
@@ -16897,6 +16898,11 @@ def _select_one_shot_contract_failure_requirements(
             _is_risk_specificity_requirement(normalized)
             or "risk factors lack filing grounding" in normalized
         ):
+            # At short-mid targets (300-1499), per-risk filing grounding
+            # failures are demoted — thin filings may not have quotable
+            # risk language and the LLM cannot cite what does not exist.
+            if _short_mid and "missing a direct filing quote" in normalized:
+                continue
             fatal.append(item)
             continue
         if "missing the heading '## " in normalized:
