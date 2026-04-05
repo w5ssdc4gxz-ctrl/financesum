@@ -27,7 +27,12 @@ from app.services.local_cache import (
 from app.services.summary_activity import record_summary_generated_event
 from app.services.ratio_calculator import calculate_ratios
 from app.services.sample_data import sample_filings_by_ticker
-from app.services.gemini_client import get_gemini_client
+from app.services.openai_client import (
+    TLDR_EXACT_WORD_TARGET,
+    count_tldr_contract_words,
+    get_openai_client,
+    validate_tldr_contract,
+)
 from app.services.persona_engine import get_persona_engine
 from app.services.summary_length import (
     clamp_summary_target_length,
@@ -547,26 +552,61 @@ def _generate_fallback_summary(
     health_score: Optional[float],
     narrative: str,
 ) -> Dict[str, str]:
-    """Generate a basic summary when Gemini is unavailable."""
-    def _clamp_to_max_words(text: str, max_words: int = 10) -> str:
-        text = (text or "").strip()
-        if not text:
-            return text
-        tokens = text.split()
-        if len(tokens) <= max_words:
-            return text
-        trimmed = " ".join(tokens[:max_words]).strip()
-        if trimmed and trimmed[-1] not in ".!?":
-            trimmed += "."
-        return trimmed
+    """Generate a basic summary when OpenAI is unavailable."""
 
-    score_text = f" with a health score of {health_score:.1f}/100" if health_score else ""
-    
+    def _is_number(value: Any) -> bool:
+        return isinstance(value, (int, float))
+
+    def _select_fallback_tldr() -> str:
+        operating_margin = ratios.get("operating_margin")
+        fcf_margin = ratios.get("fcf_margin")
+        debt_to_equity = ratios.get("debt_to_equity")
+        current_ratio = ratios.get("current_ratio")
+
+        if (
+            _is_number(health_score)
+            and float(health_score) >= 75
+            and _is_number(operating_margin)
+            and float(operating_margin) > 0.12
+            and (
+                (_is_number(fcf_margin) and float(fcf_margin) > 0.08)
+                or (_is_number(current_ratio) and float(current_ratio) >= 1.2)
+            )
+        ):
+            return "Constructive stance: healthy margins and liquidity support disciplined compounding potential."
+
+        if (
+            (_is_number(health_score) and float(health_score) <= 45)
+            or (_is_number(debt_to_equity) and float(debt_to_equity) >= 2.0)
+            or (_is_number(current_ratio) and float(current_ratio) < 1.0)
+        ):
+            return "Cautious view: leverage and weaker cash conversion elevate downside risk."
+
+        if _is_number(operating_margin) and float(operating_margin) > 0:
+            return "Hold bias: margins hold, but execution consistency still needs proof."
+
+        return "Neutral stance: fundamentals remain mixed, pending clearer profitability confirmation ahead."
+
+    fallback_tldr = _select_fallback_tldr()
+    tldr_report = validate_tldr_contract(
+        fallback_tldr, target_words=TLDR_EXACT_WORD_TARGET
+    )
+    if tldr_report.get("reasons"):
+        fallback_tldr = (
+            "Neutral stance: fundamentals remain mixed, pending clearer profitability confirmation ahead."
+        )
+        tldr_report = validate_tldr_contract(
+            fallback_tldr, target_words=TLDR_EXACT_WORD_TARGET
+        )
+    validated_tldr = str(tldr_report.get("normalized") or fallback_tldr).strip()
+    if count_tldr_contract_words(validated_tldr) != TLDR_EXACT_WORD_TARGET:
+        validated_tldr = "Neutral stance: fundamentals remain mixed, pending clearer profitability confirmation ahead."
+
     return {
-        "tldr": _clamp_to_max_words(f"{company_name}{score_text}. Strong margins, solid cash generation."),
+        "tldr": validated_tldr,
         "thesis": narrative,
-        "risks": "Set GEMINI_API_KEY in .env to generate AI-powered risk analysis, thesis, and investor persona views.",
-        "catalysts": "AI-generated catalysts require Gemini API key configuration.",
+        "risks": "Set OPENAI_API_KEY in .env to generate AI-powered risk analysis, thesis, and investor persona views.",
+        "catalysts": "AI-generated catalysts require OPENAI_API_KEY configuration.",
         "kpis": "Revenue growth, operating margin, net margin, free cash flow margin, debt to equity.",
     }
 
@@ -587,13 +627,13 @@ def _generate_ai_sections(
     try:
         from app.config import get_settings
         settings = get_settings()
-        if not settings.gemini_api_key or settings.gemini_api_key.strip() == "":
-            print("GEMINI_API_KEY not configured; using basic summary")
+        if not (getattr(settings, "openai_api_key", "") or "").strip():
+            print("AI API key not configured; using basic summary")
             ai_summary = _generate_fallback_summary(company_name, ratios, health_score, narrative)
         else:
-            gemini_client = get_gemini_client()
-            gemini_client.set_usage_context(usage_context)
-            ai_summary = gemini_client.generate_company_summary(
+            ai_client = get_openai_client()
+            ai_client.set_usage_context(usage_context)
+            ai_summary = ai_client.generate_company_summary(
                 company_name=company_name,
                 financial_data={"filings": filing_ids},
                 ratios=ratios,
@@ -602,9 +642,11 @@ def _generate_ai_sections(
                 risk_factors_text=None,
                 target_length=target_length,
             )
+            if hasattr(ai_client, "normalize_summary_sections"):
+                ai_summary = ai_client.normalize_summary_sections(ai_summary)
     except Exception as exc:
         import traceback
-        print(f"Gemini summary error: {exc}")
+        print(f"AI summary error: {exc}")
         traceback.print_exc()
         ai_summary = _generate_fallback_summary(company_name, ratios, health_score, narrative)
 

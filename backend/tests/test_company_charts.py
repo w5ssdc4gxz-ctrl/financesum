@@ -39,7 +39,7 @@ def test_segment_sanitizer_rejects_garbage_labels():
 
 @pytest.mark.anyio
 async def test_service_regex_fallback_extracts_kpi_when_no_gemini(tmp_path, monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("OPENAI_API_KEY", "")
     monkeypatch.setenv("SPOTLIGHT_CACHE_TTL_SECONDS", "0")
     get_settings.cache_clear()
 
@@ -75,7 +75,7 @@ async def test_service_regex_fallback_extracts_kpi_when_no_gemini(tmp_path, monk
 
 @pytest.mark.anyio
 async def test_service_no_kpi_when_only_generic_financials(tmp_path, monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("OPENAI_API_KEY", "")
     get_settings.cache_clear()
 
     doc_path = tmp_path / "filing.txt"

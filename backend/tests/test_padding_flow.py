@@ -16,7 +16,9 @@ def _get_section_body(text: str, title: str) -> str:
 
 
 def test_padding_templates_avoid_legacy_micro_slogans() -> None:
-    padded = " ".join(filings_api._generate_padding_sentences(80))
+    padded = " ".join(
+        filings_api._generate_padding_sentences(80, section="Financial Performance")
+    )
     banned = [
         "Earnings quality is the key question.",
         "Durability matters more than optics.",
@@ -35,6 +37,10 @@ def test_padding_templates_avoid_legacy_micro_slogans() -> None:
 
 
 def test_padding_is_spread_across_shortest_sections() -> None:
+    """Padding system is disabled — _distribute_padding_across_sections is a no-op.
+
+    Verify that no sections grow (padding templates are intentionally killed).
+    """
     base = (
         "## Financial Health Rating\n"
         "ExampleCo receives a Financial Health Rating of 72/100 - Healthy because operating margin strength and cash conversion outweigh leverage.\n\n"
@@ -55,25 +61,5 @@ def test_padding_is_spread_across_shortest_sections() -> None:
 
     padded = filings_api._distribute_padding_across_sections(base, required_words=60)
 
-    # Padding should be spread across multiple *underweight* sections, not dumped
-    # entirely into Financial Performance / MD&A (which makes the memo feel lopsided).
-    assert _get_section_body(padded, "Financial Health Rating") == _get_section_body(
-        base, "Financial Health Rating"
-    )
-    assert _get_section_body(padded, "Key Metrics") == _get_section_body(base, "Key Metrics")
-
-    base_exec = _get_section_body(base, "Executive Summary")
-    padded_exec = _get_section_body(padded, "Executive Summary")
-    assert len(padded_exec.split()) > len(base_exec.split())
-
-    base_risk = _get_section_body(base, "Risk Factors")
-    padded_risk = _get_section_body(padded, "Risk Factors")
-    assert len(padded_risk.split()) > len(base_risk.split())
-
-    base_mdna = _get_section_body(base, "Management Discussion & Analysis")
-    padded_mdna = _get_section_body(padded, "Management Discussion & Analysis")
-    assert len(padded_mdna.split()) > len(base_mdna.split())
-
-    base_fp = _get_section_body(base, "Financial Performance")
-    padded_fp = _get_section_body(padded, "Financial Performance")
-    assert len(padded_fp.split()) > len(base_fp.split())
+    # Padding is disabled: output should be identical to input.
+    assert padded == base

@@ -56,8 +56,8 @@ def enforce_summary_target_length(
         return filings_api._enforce_whitespace_word_band(  # type: ignore[attr-defined]
             cleaned,
             cap,
-            tolerance=0,
-            allow_padding=False,
+            tolerance=tolerance,
+            allow_padding=True,
             dedupe=True,
         )
     except Exception:

@@ -330,13 +330,8 @@ def get_depth_profile(scale_factor: float) -> dict:
 
 
 def risk_budget_target_count(risk_budget_words: int) -> int:
-    """Return the required number of structured risks for the given budget.
-
-    Premium analyst-note summaries should stay concentrated on the top 1-2
-    thesis-breaking risks rather than expanding into a third, lower-signal item
-    when the budget grows.
-    """
-    return 2 if int(risk_budget_words or 0) > 0 else 0
+    """Return the required number of structured risks for the given budget."""
+    return 2 if int(risk_budget_words or 0) <= int(RISK_FACTORS_TWO_RISK_MAX_BUDGET) else 3
 
 
 def _apply_integer_drift(
@@ -546,17 +541,17 @@ def section_budget_tolerance_words(section_name: str, budget_words: int) -> int:
     at mid-range targets (1000-1500 total words).  Larger sections keep the
     tighter 3% band.  Key Metrics remains exact because it is validator-driven.
 
-    Risk Factors at mid-range budgets (110-250) uses a 12% band because the
-    per-risk word allocation is tight and LLMs frequently undershoot when
-    filing evidence is thin.
+    Risk Factors at mid-range budgets (110-250) uses an 8% band because the
+    per-risk word allocation is tight when 3 risks are required and LLMs
+    frequently undershoot.
     """
     budget_words = max(0, int(budget_words or 0))
     if section_name == _KEY_METRICS_SECTION:
         return 3
     if budget_words <= 0:
         return NARRATIVE_SECTION_TOLERANCE_FLOOR
-    # Risk Factors in the squeeze zone: use 12% to absorb variance from thin filings.
+    # Risk Factors in the 3-risk squeeze zone: use 8% to absorb variance.
     if section_name == _RISK_FACTORS_SECTION and 110 <= budget_words <= 250:
-        return max(NARRATIVE_SECTION_TOLERANCE_FLOOR, int(round(budget_words * 0.12)))
+        return max(NARRATIVE_SECTION_TOLERANCE_FLOOR, int(round(budget_words * 0.08)))
     rate = 0.05 if budget_words <= 250 else 0.03
     return max(NARRATIVE_SECTION_TOLERANCE_FLOOR, int(round(budget_words * rate)))

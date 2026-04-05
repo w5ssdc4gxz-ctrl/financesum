@@ -28,7 +28,7 @@ from app.services.analysis_fallback import (
     run_analysis as fallback_run_analysis,
 )
 from app.services.local_cache import fallback_analysis_by_id, fallback_analyses
-from app.utils.supabase_errors import is_supabase_table_missing_error
+from app.utils.supabase_errors import is_supabase_table_missing_error, coerce_supabase_rows
 
 router = APIRouter()
 
@@ -261,8 +261,9 @@ async def list_company_analyses(
             .range(offset, offset + limit - 1)
             .execute()
         )
-        
-        return [Analysis(**analysis) for analysis in response.data]
+
+        rows = coerce_supabase_rows(response)
+        return [Analysis(**analysis) for analysis in rows]
     
     except Exception as e:
         if is_supabase_table_missing_error(e):

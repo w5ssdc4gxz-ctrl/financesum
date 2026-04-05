@@ -7,7 +7,13 @@ import pytest
 from app.services.repetition_guard import (
     RepetitionReport,
     check_repetition,
+    detect_analyst_fog,
+    detect_boilerplate_quotes,
+    detect_cross_section_dollar_figures,
     detect_duplicate_sentences,
+    detect_filler_phrases,
+    find_garbled_sentences,
+    detect_incoherent_endings,
     detect_repeated_ngrams,
     detect_repeated_trailing_phrases,
     detect_similar_paragraphs,
@@ -268,3 +274,330 @@ class TestStripRepeatedSentences:
 
     def test_empty_returns_empty(self) -> None:
         assert strip_repeated_sentences("") == ""
+
+
+# ---------------------------------------------------------------------------
+# detect_cross_section_dollar_figures
+# ---------------------------------------------------------------------------
+
+class TestDetectCrossSectionDollarFigures:
+    def test_flags_figure_in_three_plus_sections(self) -> None:
+        text = (
+            "## Financial Health Rating\n"
+            "Automotive regulatory credits contributed $397 million in the quarter.\n\n"
+            "## Executive Summary\n"
+            "Credits were $397 million, supporting profitability.\n\n"
+            "## Financial Performance\n"
+            "The $397 million credit revenue propped up margins.\n\n"
+            "## Closing Takeaway\n"
+            "Cash flow improved independently of credits."
+        )
+        findings = detect_cross_section_dollar_figures(text)
+        assert len(findings) >= 1
+        assert any("397" in f.figure for f in findings)
+        assert any(f.count >= 3 for f in findings)
+
+    def test_no_flag_for_figure_in_two_sections(self) -> None:
+        text = (
+            "## Financial Health Rating\n"
+            "Cash was $19.38 billion.\n\n"
+            "## Executive Summary\n"
+            "The $19.38 billion cash position provides runway.\n\n"
+            "## Financial Performance\n"
+            "Revenue grew 22% year over year."
+        )
+        findings = detect_cross_section_dollar_figures(text)
+        assert len(findings) == 0
+
+    def test_ignores_key_metrics_section(self) -> None:
+        text = (
+            "## Financial Health Rating\n"
+            "Revenue was $10.74 billion.\n\n"
+            "## Executive Summary\n"
+            "The $10.74 billion topline grew.\n\n"
+            "## Key Metrics\n"
+            "Revenue: $10.74 billion\nOCF: $3.02 billion"
+        )
+        # Key Metrics doesn't count toward the threshold
+        findings = detect_cross_section_dollar_figures(text)
+        assert len(findings) == 0
+
+    def test_empty_text(self) -> None:
+        assert detect_cross_section_dollar_figures("") == []
+
+    def test_regression_tesla_example(self) -> None:
+        """Regression: Tesla summary had $397M, $4.218B, $969M each in 3+ sections."""
+        text = (
+            "## Financial Health Rating\n"
+            "Credits contributed $397 million and inventory rose to $4.218 billion. "
+            "Tesla expects to recognize $969 million of deferred revenue.\n\n"
+            "## Executive Summary\n"
+            "Credits still contributed $397 million. Inventory climbed to $4.218 billion. "
+            "Deferred revenue of $969 million supports near-term visibility.\n\n"
+            "## Financial Performance\n"
+            "Automotive regulatory credits were $397 million. Inventory was $4.218 billion. "
+            "The $969 million deferred revenue matters.\n\n"
+            "## Management Discussion & Analysis\n"
+            "Tesla expects $969 million of deferred revenue in the next 12 months."
+        )
+        findings = detect_cross_section_dollar_figures(text)
+        figures = {f.figure for f in findings}
+        # All three figures should be flagged
+        assert any("397" in fig for fig in figures)
+        assert any("4.218" in fig or "4,218" in fig for fig in figures)
+        assert any("969" in fig for fig in figures)
+
+
+# ---------------------------------------------------------------------------
+# detect_incoherent_endings
+# ---------------------------------------------------------------------------
+
+class TestDetectIncoherentEndings:
+    def test_flags_fragment_ending(self) -> None:
+        text = (
+            "## Financial Performance\n"
+            "Revenue grew strongly. Margins held. inventory confirms. The better."
+        )
+        findings = detect_incoherent_endings(text)
+        assert len(findings) >= 1
+        assert any("Financial Performance" in f for f in findings)
+
+    def test_flags_filler_ending(self) -> None:
+        text = (
+            "## Closing Takeaway\n"
+            "The company performed well. Still matters."
+        )
+        findings = detect_incoherent_endings(text)
+        assert len(findings) >= 1
+
+    def test_flags_two_word_fragment(self) -> None:
+        text = (
+            "## Closing Takeaway\n"
+            "Revenue grew strongly. Confirmed."
+        )
+        findings = detect_incoherent_endings(text)
+        assert len(findings) >= 1
+
+    def test_no_flag_for_clean_ending(self) -> None:
+        text = (
+            "## Executive Summary\n"
+            "Revenue grew 22% year over year driven by cloud adoption. "
+            "Management expects continued momentum through the next quarter."
+        )
+        findings = detect_incoherent_endings(text)
+        assert len(findings) == 0
+
+    def test_ignores_key_metrics(self) -> None:
+        text = (
+            "## Key Metrics\n"
+            "Revenue: $10.74B"
+        )
+        findings = detect_incoherent_endings(text)
+        assert len(findings) == 0
+
+    def test_empty_text(self) -> None:
+        assert detect_incoherent_endings("") == []
+
+
+# ---------------------------------------------------------------------------
+# detect_filler_phrases (new patterns)
+# ---------------------------------------------------------------------------
+
+class TestDetectFillerPhrasesNewPatterns:
+    def test_detects_still_anchors_pattern(self) -> None:
+        text = "Tesla still anchors how much balance-sheet pressure this company can absorb."
+        found = detect_filler_phrases(text)
+        assert any("still anchors how much" in f for f in found)
+
+    def test_detects_cleanest_thread_pattern(self) -> None:
+        text = "That leaves Tesla as the cleanest thread tying the story together."
+        found = detect_filler_phrases(text)
+        assert any("cleanest thread tying the story together" in f for f in found)
+
+    def test_detects_proof_point_pattern(self) -> None:
+        text = "Tesla remains the company-specific proof point behind the thesis."
+        found = detect_filler_phrases(text)
+        assert any("company-specific proof point behind the thesis" in f for f in found)
+
+    def test_detects_key_issue_for_section(self) -> None:
+        text = "This is important, which is the key issue for the Executive Summary."
+        found = detect_filler_phrases(text)
+        assert any("key issue for the" in f.lower() for f in found)
+
+    def test_detects_inventory_confirms(self) -> None:
+        text = "Inventory confirms. The better."
+        found = detect_filler_phrases(text)
+        assert any("inventory confirms" in f.lower() for f in found) or \
+               any("the better" in f.lower() for f in found)
+
+    def test_detects_management_sequence_and_rating_depends_patterns(self) -> None:
+        text = (
+            "The rating still depends on whether Microsoft keeps supporting financial resilience. "
+            "Execution credibility now depends on how leadership sequences Investments."
+        )
+        found = detect_filler_phrases(text)
+        assert any("rating still depends on whether" in f.lower() for f in found)
+        assert any("leadership sequences investments" in f.lower() for f in found)
+        assert len(find_garbled_sentences(text)) == 2
+
+
+# ---------------------------------------------------------------------------
+# check_repetition integration with new detections
+# ---------------------------------------------------------------------------
+
+class TestCheckRepetitionNewViolations:
+    def test_cross_section_dollars_in_report(self) -> None:
+        text = (
+            "## Financial Health Rating\n"
+            "Credits contributed $397 million.\n\n"
+            "## Executive Summary\n"
+            "Credits were $397 million.\n\n"
+            "## Financial Performance\n"
+            "The $397 million credit revenue.\n\n"
+            "## Closing Takeaway\n"
+            "Cash improved."
+        )
+        report = check_repetition(text)
+        assert report.has_violations
+        assert "cross_section_dollar_figures" in report.violation_types
+        assert report.cross_section_dollar_figures
+
+    def test_incoherent_endings_in_report(self) -> None:
+        text = (
+            "## Financial Performance\n"
+            "Revenue grew. Margins held. inventory confirms. The better."
+        )
+        report = check_repetition(text)
+        assert report.has_violations
+        assert "incoherent_endings" in report.violation_types
+
+    def test_lower_ngram_floor_catches_five_word_repeats(self) -> None:
+        text = (
+            "automotive regulatory credits contributed significantly to margins. "
+            "Other factors mattered too. "
+            "automotive regulatory credits contributed significantly to profits."
+        )
+        report = check_repetition(text)
+        assert report.has_violations
+        assert "repeated_ngrams" in report.violation_types
+
+
+# ---------------------------------------------------------------------------
+# detect_analyst_fog
+# ---------------------------------------------------------------------------
+
+class TestDetectAnalystFog:
+    def test_detects_underwriting_thread(self) -> None:
+        text = "The underwriting thread still depends on cloud demand."
+        found = detect_analyst_fog(text)
+        assert any("underwriting thread" in f for f in found)
+
+    def test_detects_capital_absorption(self) -> None:
+        text = "Capital absorption is rising faster than revenue growth."
+        found = detect_analyst_fog(text)
+        assert any("capital absorption" in f for f in found)
+
+    def test_detects_forward_visibility(self) -> None:
+        text = "Forward visibility constraints limit the investment case."
+        found = detect_analyst_fog(text)
+        assert any("forward visibility" in f for f in found)
+
+    def test_no_false_positive_on_clean_text(self) -> None:
+        text = "Revenue grew 15% because cloud demand was strong."
+        found = detect_analyst_fog(text)
+        assert found == []
+
+    def test_detects_prompt_instruction_leaks(self) -> None:
+        text = "The golden thread of this analysis is margin compression."
+        found = detect_analyst_fog(text)
+        assert any("golden thread" in f for f in found)
+
+    def test_empty_text(self) -> None:
+        assert detect_analyst_fog("") == []
+
+    def test_case_insensitive(self) -> None:
+        text = "The UNDERWRITING THREAD depends on demand."
+        found = detect_analyst_fog(text)
+        assert any("underwriting thread" in f for f in found)
+
+
+# ---------------------------------------------------------------------------
+# detect_boilerplate_quotes
+# ---------------------------------------------------------------------------
+
+class TestDetectBoilerplateQuotes:
+    def test_detects_investment_classification_quote(self) -> None:
+        text = (
+            'Management noted that "investments with maturities beyond one year '
+            'may be classified as short-term based on their highly liquid nature."'
+        )
+        found = detect_boilerplate_quotes(text)
+        assert len(found) >= 1
+
+    def test_detects_forward_looking_disclaimer(self) -> None:
+        text = (
+            'The filing states that "forward-looking statements involve '
+            'risks and uncertainties that could cause results to differ."'
+        )
+        found = detect_boilerplate_quotes(text)
+        assert len(found) >= 1
+
+    def test_ignores_high_signal_quote(self) -> None:
+        text = (
+            'Management noted that "we expect AI infrastructure spending to '
+            'accelerate through the second half of the fiscal year."'
+        )
+        found = detect_boilerplate_quotes(text)
+        assert found == []
+
+    def test_detects_gaap_boilerplate(self) -> None:
+        text = (
+            'The company states "in accordance with generally accepted '
+            'accounting principles these values are recorded at fair market value."'
+        )
+        found = detect_boilerplate_quotes(text)
+        assert len(found) >= 1
+
+    def test_empty_text(self) -> None:
+        assert detect_boilerplate_quotes("") == []
+
+
+# ---------------------------------------------------------------------------
+# check_repetition integration — analyst fog and boilerplate quotes
+# ---------------------------------------------------------------------------
+
+class TestCheckRepetitionAnalystFogIntegration:
+    def test_analyst_fog_in_report(self) -> None:
+        text = (
+            "## Executive Summary\n"
+            "The underwriting thread depends on cloud demand. "
+            "Capital absorption is rising faster than revenue.\n\n"
+            "## Closing Takeaway\n"
+            "Forward visibility constraints limit the case."
+        )
+        report = check_repetition(text)
+        assert report.has_violations
+        assert "analyst_fog" in report.violation_types
+        assert report.analyst_fog_phrases
+
+    def test_boilerplate_quotes_in_report(self) -> None:
+        text = (
+            "## Executive Summary\n"
+            'Management noted "investments with maturities beyond one year '
+            'may be classified as short-term based on their highly liquid nature '
+            'and because such securities represent the investment of cash."'
+        )
+        report = check_repetition(text)
+        assert report.has_violations
+        assert "boilerplate_quotes" in report.violation_types
+        assert report.boilerplate_quotes
+
+    def test_clean_text_no_fog_or_boilerplate(self) -> None:
+        text = (
+            "## Executive Summary\n"
+            "Revenue grew 15% because cloud demand was strong. "
+            "The company is investing in AI infrastructure."
+        )
+        report = check_repetition(text)
+        assert "analyst_fog" not in report.violation_types
+        assert "boilerplate_quotes" not in report.violation_types

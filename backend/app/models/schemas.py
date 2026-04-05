@@ -8,6 +8,18 @@ from pydantic import BaseModel, Field, field_validator
 from uuid import UUID
 
 
+VALID_SECTION_INSTRUCTION_KEYS = frozenset(
+    {
+        "Financial Health Rating",
+        "Executive Summary",
+        "Financial Performance",
+        "Management Discussion & Analysis",
+        "Risk Factors",
+        "Closing Takeaway",
+    }
+)
+
+
 # Company schemas
 class CompanyBase(BaseModel):
     ticker: str
@@ -211,7 +223,11 @@ class HealthRatingPreferences(BaseModel):
 
 class FilingSummaryPreferences(BaseModel):
     mode: Literal["default", "custom"] = "default"
+    # Opt-in strict contract mode. Default path is fast/best-effort to reduce
+    # latency/cost and avoid repeated contract-retry loops.
+    strict_contract: bool = Field(default=False)
     investor_focus: Optional[str] = Field(default=None, max_length=5000)
+    persona_id: Optional[str] = Field(default=None, max_length=100)
     focus_areas: List[str] = Field(default_factory=list)
     tone: Optional[str] = Field(default=None, max_length=50)
     detail_level: Optional[str] = Field(default=None, max_length=50)
@@ -219,7 +235,46 @@ class FilingSummaryPreferences(BaseModel):
     # Word budget cap (kept in sync with backend/app/api/filings.py TARGET_LENGTH_MAX_WORDS).
     target_length: Optional[int] = Field(default=None, ge=1, le=3000)
     complexity: Literal["simple", "intermediate", "expert"] = "intermediate"
+    # Optional per-section weight overrides computed by the frontend from focus
+    # areas.  Keys must match SECTION_PROPORTIONAL_WEIGHTS (e.g. "Risk Factors").
+    # Values are integer percentages that should sum to 100.  When None/empty the
+    # backend falls back to the default fixed distribution.
+    section_weight_overrides: Optional[Dict[str, int]] = Field(default=None)
+    # When True the summary should open with a "Key Takeaways" block (3-5 bullets)
+    # whose word count is drawn from the overall target_length budget.
+    include_key_takeaways: bool = Field(default=False)
+    # Per-section custom instructions keyed by canonical section name.
+    # Allowed keys: Financial Health Rating, Executive Summary,
+    # Financial Performance, Management Discussion & Analysis,
+    # Risk Factors, Closing Takeaway.  Values max 1000 chars each.
+    section_instructions: Optional[Dict[str, str]] = Field(default=None)
     health_rating: Optional[HealthRatingPreferences] = None
+
+    @field_validator("section_instructions", mode="before")
+    @classmethod
+    def validate_section_instructions(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise ValueError("section_instructions must be a dictionary")
+        invalid_keys = sorted(
+            str(key) for key in value.keys() if key not in VALID_SECTION_INSTRUCTION_KEYS
+        )
+        if invalid_keys:
+            raise ValueError(
+                "section_instructions contains invalid keys: "
+                + ", ".join(invalid_keys)
+            )
+        cleaned: Dict[str, str] = {}
+        for key, val in value.items():
+            text = str(val).strip() if val else ""
+            if text:
+                if len(text) > 1000:
+                    raise ValueError(
+                        f"section_instructions['{key}'] exceeds 1000 characters"
+                    )
+                cleaned[key] = text
+        return cleaned or None
 
     @field_validator("target_length", mode="before")
     @classmethod

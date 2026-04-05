@@ -35,9 +35,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Retry configuration constants
 # ---------------------------------------------------------------------------
-DEFAULT_MAX_RETRIES = 2
-DEFAULT_INITIAL_WAIT = 1  # seconds
-DEFAULT_MAX_WAIT = 15
+DEFAULT_MAX_RETRIES = 5
+DEFAULT_INITIAL_WAIT = 3  # seconds
+DEFAULT_MAX_WAIT = 30
 DEFAULT_EXPONENTIAL_MULTIPLIER = 2
 
 # ---------------------------------------------------------------------------
@@ -59,8 +59,8 @@ PERSONA_DEFAULT_LENGTHS = {
 # ---------------------------------------------------------------------------
 # OpenAI model names
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL = "gpt-5.2"
-DEFAULT_PERSONA_MODEL = "gpt-5.2"
+DEFAULT_MODEL = "gpt-5.4-mini"
+DEFAULT_PERSONA_MODEL = "gpt-5.4-mini"
 
 # OpenAI API base URL
 OPENAI_API_BASE = "https://api.openai.com/v1"
@@ -608,6 +608,17 @@ class OpenAIClient:
                 if response.status_code == 429:
                     retry_after = response.headers.get("Retry-After")
                     retry_seconds = int(retry_after) if retry_after and str(retry_after).isdigit() else None
+                    # Check if this is a quota exhaustion vs rate limit
+                    body_text = (response.text or "").lower()
+                    if "insufficient_quota" in body_text:
+                        raise AIAPIError(
+                            "OpenAI quota exhausted. Please add credits at platform.openai.com/account/billing.",
+                            status_code=429,
+                            response_body=(response.text or "")[:2000],
+                        )
+                    # For actual rate limits, default to 10s wait if no header
+                    if retry_seconds is None:
+                        retry_seconds = 10
                     raise AIRateLimitError("OpenAI API rate limit exceeded.", retry_after=retry_seconds)
 
                 if response.status_code >= 400:
@@ -688,6 +699,15 @@ class OpenAIClient:
                         if retry_after and str(retry_after).isdigit()
                         else None
                     )
+                    body_text = (response.text or "").lower()
+                    if "insufficient_quota" in body_text:
+                        raise AIAPIError(
+                            "OpenAI quota exhausted. Please add credits at platform.openai.com/account/billing.",
+                            status_code=429,
+                            response_body=(response.text or "")[:2000],
+                        )
+                    if retry_seconds is None:
+                        retry_seconds = 10
                     raise AIRateLimitError(
                         "OpenAI API rate limit exceeded.", retry_after=retry_seconds
                     )

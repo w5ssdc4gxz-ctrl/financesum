@@ -54,6 +54,13 @@ DEFAULT_CORS_ORIGINS = [
     "https://www.financesums.com",
     "https://financesums-frontend-1093972319438.europe-west1.run.app",
 ]
+DEFAULT_CORS_ORIGIN_REGEX = (
+    r"^https://("
+    r"(?:[a-z0-9-]+\.)*financesums\.com"
+    r"|(?:[a-z0-9-]+---)?financesums-frontend-[a-z0-9-]+\.a\.run\.app"
+    r"|financesums-frontend-\d+\.[a-z0-9-]+\.run\.app"
+    r")$"
+)
 
 
 class Settings(BaseSettings):
@@ -62,6 +69,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=[str(path.resolve()) for path in ENV_FILES],
         case_sensitive=False,
+        extra="ignore",
     )
     
     # Supabase configuration
@@ -69,28 +77,34 @@ class Settings(BaseSettings):
     supabase_anon_key: str = os.getenv("SUPABASE_ANON_KEY", "")
     supabase_service_role_key: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     
-    # Gemini AI configuration
-    gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
+    # OpenAI GPT-5.2 configuration (primary AI provider)
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
 
-    # Gemini retry configuration
-    gemini_max_retries: int = Field(
+    # OpenAI retry configuration
+    openai_max_retries: int = Field(
         default=2,
         ge=1,
         le=10,
-        description="Maximum retry attempts for rate-limited Gemini requests"
+        description="Maximum retry attempts for rate-limited OpenAI requests"
     )
-    gemini_initial_wait: int = Field(
+    openai_initial_wait: int = Field(
         default=1,
         ge=1,
         le=10,
         description="Initial wait time in seconds before first retry"
     )
-    gemini_max_wait: int = Field(
+    openai_max_wait: int = Field(
         default=60,
         ge=10,
         le=300,
         description="Maximum wait time in seconds between retries"
     )
+
+    # Deprecated Gemini config placeholders retained only for non-summary legacy paths.
+    gemini_api_key: str = os.getenv("GEMINI_API_KEY", "")
+    gemini_max_retries: int = Field(default=2, ge=1, le=10)
+    gemini_initial_wait: int = Field(default=1, ge=1, le=10)
+    gemini_max_wait: int = Field(default=60, ge=10, le=300)
 
     # Redis configuration (defaults to localhost)
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -105,7 +119,7 @@ class Settings(BaseSettings):
 
     # CORS configuration
     cors_origins: List[str] = Field(default_factory=lambda: DEFAULT_CORS_ORIGINS.copy())
-    cors_origin_regex: str | None = Field(default=None)
+    cors_origin_regex: str | None = Field(default=DEFAULT_CORS_ORIGIN_REGEX)
     cors_allow_all: bool = Field(default=False)
     
     # EODHD API configuration (Required for financial data)
@@ -153,10 +167,19 @@ def get_settings() -> Settings:
     """Get cached settings instance."""
     settings = Settings()
 
-    if not settings.gemini_api_key:
-        secret = _fetch_secret_from_supabase(settings, "GEMINI_API_KEY")
-        if secret:
-            settings.gemini_api_key = secret
+    # OpenAI API key resolution (highest to lowest priority):
+    # 1) OPENAI_API_KEY env var (already loaded by Settings())
+    # 2) OPENAI-API-KEY env alias (legacy env naming convention)
+    #
+    # Intentionally DO NOT load OPENAI keys from Supabase app_config.
+    # OpenAI credentials must be provided via environment variables.
+    if not settings.openai_api_key:
+        legacy_env = (os.getenv("OPENAI-API-KEY") or "").strip()
+        if legacy_env:
+            settings.openai_api_key = legacy_env
+
+    # Intentionally do not auto-load GEMINI_API_KEY from Supabase.
+    # Production summary pipeline is OpenAI-only.
 
     if not settings.stripe_secret_key:
         secret = _fetch_secret_from_supabase(settings, "STRIPE_SECRET_KEY")

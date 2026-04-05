@@ -1,7 +1,0 @@
-UNEXPECTED ERROR: name 'section_budget_tolerance' is not defined
-Type: <class 'NameError'>
-Traceback (most recent call last):
-  File "/Users/alexandersibast/Documents/Financesum/backend/app/api/filings.py", line 10451, in generate_filing_summary
-    budget_tolerance=section_budget_tolerance,
-                     ^^^^^^^^^^^^^^^^^^^^^^^^
-NameError: name 'section_budget_tolerance' is not defined. Did you mean: '_section_budget_tolerance_words'?

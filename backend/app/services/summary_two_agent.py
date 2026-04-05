@@ -16,7 +16,7 @@ from app.services.web_research import get_company_research_dossier
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SUMMARY_MODEL_NAME = "gpt-5.2"
+DEFAULT_SUMMARY_MODEL_NAME = "gpt-5.4-mini"
 DEFAULT_AGENT1_TIMEOUT_SECONDS = 25.0
 DEFAULT_AGENT2_TIMEOUT_SECONDS = 120.0
 DEFAULT_AGENT2_MIN_RESERVED_SECONDS = 20.0

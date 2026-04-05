@@ -1,5 +1,9 @@
 """Helpers for handling Supabase errors gracefully."""
 
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
 
 def is_supabase_table_missing_error(error: Exception) -> bool:
     """
@@ -41,3 +45,33 @@ def is_supabase_table_missing_error(error: Exception) -> bool:
         or "network is unreachable" in lowered
         or "connection error" in lowered
     )
+
+
+def coerce_supabase_rows(response: Any) -> List[Dict[str, Any]]:
+    """Return a list of rows from a Supabase response, raising on error payloads.
+
+    Supabase client helpers typically return objects with a `.data` attribute. In
+    misconfigured environments (invalid API key, network issues), some clients return
+    a dict error payload in `.data` instead of raising. Treat those as fallback-worthy
+    by raising with the message so callers can reuse `is_supabase_table_missing_error`.
+    """
+    data = getattr(response, "data", None)
+    if data is None:
+        return []
+
+    if isinstance(data, dict):
+        message = data.get("message") or data.get("error") or data.get("msg")
+        if isinstance(message, str) and message.strip():
+            raise RuntimeError(message.strip())
+        raise RuntimeError("Supabase returned an error payload")
+
+    if not isinstance(data, list):
+        raise RuntimeError("Supabase returned a non-list payload")
+
+    rows: List[Dict[str, Any]] = []
+    for item in data:
+        if isinstance(item, dict):
+            rows.append(item)
+        else:
+            raise RuntimeError("Supabase returned a non-row item")
+    return rows

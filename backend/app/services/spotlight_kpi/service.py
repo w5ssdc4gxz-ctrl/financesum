@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 import anyio
 
 from app.models.database import get_supabase_client
-from app.services.gemini_client import get_gemini_client
+from app.services.openai_client import get_openai_client
 from app.services.edgar_fetcher import download_filing
 from app.services.local_cache import (
     fallback_filings,
@@ -26,6 +26,9 @@ from .ranker import pick_best_spotlight_kpi
 from .regex_fallback import extract_kpis_with_regex
 from .text_pipeline import extract_company_specific_spotlight_kpi_from_text
 from .types import SpotlightKpiCandidate
+
+# Backward-compat alias for legacy tests/mocks.
+get_gemini_client = get_openai_client
 
 
 _DISALLOWED_SPOTLIGHT_KPI_PATTERNS: Tuple[re.Pattern[str], ...] = (
@@ -1065,7 +1068,8 @@ async def build_spotlight_payload_for_filing(
 
     gemini_client = None
     try:
-        if getattr(settings, "gemini_api_key", None) and str(settings.gemini_api_key).strip():
+        api_key = getattr(settings, "openai_api_key", None)
+        if api_key and str(api_key).strip():
             gemini_client = get_gemini_client()
     except Exception:  # noqa: BLE001
         gemini_client = None
@@ -1503,7 +1507,7 @@ async def build_spotlight_payload_for_filing(
         if not has_local:
             spotlight_reason = "no_local_document"
         elif not gemini_client:
-            spotlight_reason = "gemini_not_configured"
+            spotlight_reason = "openai_not_configured"
         elif pipeline_file_bytes:
             spotlight_reason = str((pipeline_dbg or {}).get("reason") or "").strip() or "file_pipeline_no_kpi"
         elif (document_text or "").strip():

@@ -140,10 +140,7 @@ from app.services.risk_evidence import (
     looks_like_risk_sentence,
     score_risk_evidence_candidate,
 )
-from app.services.repetition_guard import (
-    detect_boilerplate_quotes,
-    find_garbled_sentences,
-)
+from app.services.repetition_guard import find_garbled_sentences
 from app.services.health_scorer import calculate_health_score
 from app.services.sample_data import sample_filings_by_ticker
 from app.utils.supabase_errors import is_supabase_table_missing_error
@@ -159,15 +156,6 @@ from app.services.summary_post_processor import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-_EXPLICIT_STANCE_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z-])(buy|hold|sell)(?![A-Za-z-])",
-    re.IGNORECASE,
-)
-_EXPLICIT_STANCE_OR_NEUTRAL_TOKEN_RE = re.compile(
-    r"(?<![A-Za-z-])(buy|hold|sell|neutral)(?![A-Za-z-])",
-    re.IGNORECASE,
-)
 
 # Backward-compat module alias for older tests/mocks.
 
@@ -575,27 +563,6 @@ def _effective_word_band_tolerance(target_length: Optional[int] = None) -> int:
     return int(FINAL_STRICT_WORD_BAND_TOLERANCE)
 
 
-def _adaptive_key_metrics_min_rows(
-    calculated_metrics: Optional[Dict[str, Any]] = None,
-) -> int:
-    """Return the minimum required Key Metrics numeric rows based on data availability.
-
-    Returns 0 when no usable numeric metrics exist (nothing to require),
-    3 for sparse filings (1-4 usable values), and 5 when the filing
-    exposes at least five usable numeric metrics.
-    """
-    if calculated_metrics is None:
-        return 0
-    usable = sum(
-        1
-        for v in calculated_metrics.values()
-        if v is not None and str(v).strip() not in ("", "N/A", "n/a")
-    )
-    if usable == 0:
-        return 0
-    return 3 if usable < 5 else 5
-
-
 def _rewrite_target_word_band_tolerance(target_length: Optional[int] = None) -> int:
     """Return the tighter steering tolerance used for rewrite prompts."""
     if _is_short_mid_precision_target(target_length):
@@ -789,85 +756,27 @@ def _summary_max_verified_quotes() -> int:
 def _summary_quote_policy_for_target_length(
     target_length: Optional[int],
 ) -> Dict[str, int]:
-    """Return budget-aware quote guidance for sectioned summaries."""
+    """Return budget-aware quote requirements for sectioned summaries."""
     target = int(target_length or 0)
     if target <= 0:
         return {
-            "min_quotes": 0,
-            "max_quotes": min(3, _summary_max_verified_quotes()),
-            "exec_min": 0,
-            "mdna_min": 0,
+            "min_quotes": max(3, _summary_min_verified_quotes()),
+            "max_quotes": max(5, _summary_max_verified_quotes()),
+            "exec_min": 1,
+            "mdna_min": 1,
         }
     if _is_micro_plaintext_target(target):
         return {"min_quotes": 0, "max_quotes": 0, "exec_min": 0, "mdna_min": 0}
     if target < 400:
-        return {"min_quotes": 0, "max_quotes": 1, "exec_min": 0, "mdna_min": 0}
+        return {"min_quotes": 1, "max_quotes": 1, "exec_min": 1, "mdna_min": 0}
     if target < 1200:
-        return {"min_quotes": 0, "max_quotes": 2, "exec_min": 0, "mdna_min": 0}
+        return {"min_quotes": 2, "max_quotes": 3, "exec_min": 1, "mdna_min": 1}
     return {
-        "min_quotes": 0,
-        "max_quotes": min(3, _summary_max_verified_quotes()),
-        "exec_min": 0,
-        "mdna_min": 0,
+        "min_quotes": max(3, _summary_min_verified_quotes()),
+        "max_quotes": max(5, _summary_max_verified_quotes()),
+        "exec_min": 1,
+        "mdna_min": 1,
     }
-
-
-def _normalize_quote_candidate_text(value: str) -> str:
-    return " ".join(str(value or "").split()).strip().strip('"“”').strip()
-
-
-def _is_low_signal_quote_candidate(candidate: str) -> bool:
-    cleaned = _normalize_quote_candidate_text(candidate)
-    if not cleaned:
-        return True
-    if detect_boilerplate_quotes(f'"{cleaned}"'):
-        return True
-
-    meta_re = re.compile(
-        r"\b("
-        r"should\s+frame|should\s+start|should\s+open|should\s+focus|"
-        r"golden\s+thread|aha\s+insight|executive summary|financial performance|"
-        r"management discussion|closing takeaway|key metrics|risk factors"
-        r")\b",
-        re.IGNORECASE,
-    )
-    boilerplate_re = re.compile(
-        r"\b("
-        r"disclosure requirements?|income taxes?|tax disclosure|accounting standards?|"
-        r"fair value|carrying value|deferred tax|effective tax rate|internal control|"
-        r"quantitative and qualitative disclosures|market risk|finsa|swiss financial market|"
-        r"share[- ]based compensation|stock[- ]based compensation|lease liabilities?|"
-        r"goodwill impairment|derivative instruments?|adoption of asu"
-        r")\b",
-        re.IGNORECASE,
-    )
-    if meta_re.search(cleaned) or boilerplate_re.search(cleaned):
-        return True
-    return False
-
-
-def _is_high_signal_management_quote_candidate(candidate: str) -> bool:
-    cleaned = _normalize_quote_candidate_text(candidate)
-    if not cleaned or _is_low_signal_quote_candidate(cleaned):
-        return False
-    words = cleaned.split()
-    if len(words) < 6 or len(words) > 28:
-        return False
-
-    signal_re = re.compile(
-        r"\b("
-        r"expect|expects|plan|plans|planning|continue|continues|remain|remains|"
-        r"focus|focused|priority|priorities|strategy|strategic|invest|investment|"
-        r"reinvestment|pricing|demand|margin|margins|cash flow|free cash flow|"
-        r"capacity|capex|utilization|deployment|backlog|bookings|pipeline|launch|"
-        r"customer|renewal|retention|mix|monetization|take rate|ads?|advertising|"
-        r"cloud|shipment|shipments|rollout|discipline|profitability|antitrust|"
-        r"bundling|export controls?|privacy|remedy|approval|reimbursement|"
-        r"concentration|supplier|supply|power availability"
-        r")\b",
-        re.IGNORECASE,
-    )
-    return bool(signal_re.search(cleaned))
 
 
 def _summary_pro_min_target_words() -> int:
@@ -3186,85 +3095,6 @@ def _micro_trim_filler_words(text: str, max_remove: int) -> Tuple[str, int]:
     return "\n".join(out_lines), removed
 
 
-def _compact_markdown_split_tokens(text: str) -> str:
-    """Reduce whitespace-token drift from markdown separators without changing content."""
-    if not text:
-        return text
-
-    out_lines: List[str] = []
-    changed = False
-    for raw in text.splitlines():
-        line = raw.rstrip()
-        if re.match(r"^\s*[-*•]\s*$", line) or re.match(r"^\s*→\s*$", line):
-            changed = True
-            continue
-        stripped = re.sub(r"^(\s*)[-*•]\s+", r"\1", line)
-        if stripped != line:
-            changed = True
-        stripped2 = re.sub(r"^(\s*)→\s+", r"\1→", stripped)
-        if stripped2 != stripped:
-            changed = True
-        stripped = stripped2
-        if "|" in stripped and stripped.upper() not in {
-            "DATA_GRID_START",
-            "DATA_GRID_END",
-        }:
-            parts = [part.strip() for part in stripped.split("|", 1)]
-            if len(parts) == 2 and parts[0] and parts[1]:
-                normalized_pipe = f"{parts[0]}| {parts[1]}"
-                if normalized_pipe != stripped:
-                    changed = True
-                stripped = normalized_pipe
-        merged = re.sub(r"\s+/\s+", "/", stripped)
-        if merged != stripped:
-            changed = True
-        stripped = merged
-        out_lines.append(stripped)
-
-    if not changed:
-        return text
-    return "\n".join(out_lines).strip()
-
-
-def _tighten_split_only_word_band_overflow(
-    text: str,
-    *,
-    target_length: int,
-    tolerance: int = FINAL_STRICT_WORD_BAND_TOLERANCE,
-) -> str:
-    """Trim split-only overflow while keeping stripped count inside the target band."""
-    if not text:
-        return text
-
-    lower = max(TARGET_LENGTH_MIN_WORDS, int(target_length) - int(tolerance))
-    upper = min(TARGET_LENGTH_MAX_WORDS, int(target_length) + int(tolerance))
-    tightened = str(text or "").strip()
-
-    for _ in range(4):
-        split_count = len(tightened.split())
-        stripped_count = _count_words(tightened)
-        if split_count <= upper or stripped_count < lower or stripped_count > upper:
-            break
-
-        compacted = _compact_markdown_split_tokens(tightened)
-        if compacted != tightened and len(compacted.split()) < split_count:
-            tightened = compacted
-            continue
-
-        removable_budget = max(0, stripped_count - lower)
-        excess = max(0, split_count - upper)
-        if removable_budget <= 0 or excess <= 0:
-            break
-        trimmed, removed = _micro_trim_filler_words(
-            tightened, min(int(excess), int(removable_budget))
-        )
-        if removed <= 0 or trimmed == tightened:
-            break
-        tightened = trimmed
-
-    return tightened
-
-
 def _section_exact_fit_micro_pad_sentence(
     section_title: str,
     *,
@@ -4252,8 +4082,6 @@ def _run_summary_cleanup_pass(
         calculated_metrics=calculated_metrics,
         company_name=company_name,
     )
-    out = _strip_low_signal_management_quotes(out)
-    out = _tighten_executive_summary_opening(out)
     out = _remove_metric_echo_loops(out)
     out = _cleanup_sentence_artifacts(out)
     out = _validate_complete_sentences(out)
@@ -4637,11 +4465,6 @@ def _remove_filler_phrases(text: str) -> str:
         r"\bThe quality signal weakens if\b[^.\n]{0,240}(?:\.|\n|$)",
         r"\bCurrent posture remains intact if\b[^.\n]{0,240}(?:\.|\n|$)",
         r"\bThis setup is easier to defend while\b[^.\n]{0,240}(?:\.|\n|$)",
-        r"\b(?:the memo|the analysis|this section|the executive summary|the financial performance section|the management discussion(?:\s*&\s*analysis)?|the closing takeaway)\s+should\s+(?:frame|start|open|lead|focus|surface|end|include)\b[^.\n]{0,240}(?:\.|\n|$)",
-        r"\bshould\s+frame\s+[A-Z][A-Za-z0-9&.,'’ -]{0,80}\s+as\b[^.\n]{0,180}(?:\.|\n|$)",
-        r"\b(?:golden\s+thread|aha\s+insight)\b[^.\n]{0,180}(?:\.|\n|$)",
-        r"\bthat gives the future earnings mix more visibility\b[^.\n]{0,160}(?:\.|\n|$)",
-        r"\bmore visibility into the future earnings mix\b[^.\n]{0,160}(?:\.|\n|$)",
         r"\bIn sum\b[^.\n]{0,240}(?:\.|\n|$)",
         r"\((?:key swing factor|primary swing factor|near term factors|in practical terms|fundamental catalyst|structural driver|operating backdrop|valuation context|execution priority|capital intensity backdrop|on a forward basis|relative to the cycle|across the enterprise|from a risk standpoint|on a relative basis|under current conditions|given the trajectory|within this framework)\)",
         r"(?:\s*\((?:[^)\n]{1,40})\)){4,}\s*$",
@@ -4688,140 +4511,6 @@ def _remove_filler_phrases(text: str) -> str:
     )
 
     return result
-
-
-def _strip_low_signal_management_quotes(summary_text: str) -> str:
-    text = str(summary_text or "").strip()
-    if not text:
-        return summary_text
-
-    quote_re = re.compile(r'[“"]([^“”"\n]{8,260})[”"]')
-    attribution_re = re.compile(
-        r"^(?:as\s+the\s+filing\s+notes,\s*)?"
-        r"(?:management|leadership|executives?|ceo|cfo|the company)\s+"
-        r"(?:said|noted|added|highlighted|emphasized|indicated|stated|described)\b",
-        re.IGNORECASE,
-    )
-
-    for section_title in (
-        "Executive Summary",
-        "Financial Performance",
-        "Management Discussion & Analysis",
-        "Risk Factors",
-        "Closing Takeaway",
-    ):
-        body = _extract_markdown_section_body(text, section_title)
-        if not body:
-            continue
-
-        sentences = _split_sentences(body)
-        if not sentences:
-            continue
-
-        changed = False
-        kept: List[str] = []
-        for sentence in sentences:
-            quotes = [
-                _normalize_quote_candidate_text(match.group(1))
-                for match in quote_re.finditer(sentence)
-                if _normalize_quote_candidate_text(match.group(1))
-            ]
-            if not quotes:
-                kept.append(sentence)
-                continue
-            if any(_is_high_signal_management_quote_candidate(quote) for quote in quotes):
-                kept.append(sentence)
-                continue
-
-            changed = True
-            stripped = sentence.strip()
-            if attribution_re.search(stripped):
-                tail = quote_re.sub("", stripped, count=1)
-                tail = re.sub(
-                    r"^(?:as\s+the\s+filing\s+notes,\s*)?"
-                    r"(?:management|leadership|executives?|ceo|cfo|the company)\s+"
-                    r"(?:said|noted|added|highlighted|emphasized|indicated|stated|described)\s*,?\s*",
-                    "",
-                    tail,
-                    flags=re.IGNORECASE,
-                )
-                tail = _cleanup_sentence_artifacts(tail.strip(" ,;:-"))
-                if tail and len(tail.split()) >= 6:
-                    if tail[-1] not in ".!?":
-                        tail += "."
-                    kept.append(tail)
-                continue
-
-            repaired = quote_re.sub("", stripped)
-            repaired = re.sub(r"\s*,\s*which\b.*$", "", repaired, flags=re.IGNORECASE)
-            repaired = re.sub(r"\s+([,.;:])", r"\1", repaired)
-            repaired = repaired.strip(" ,;:-")
-            repaired = _cleanup_sentence_artifacts(repaired)
-            if repaired and len(repaired.split()) >= 6:
-                if repaired[-1] not in ".!?":
-                    repaired += "."
-                kept.append(repaired)
-
-        if not changed:
-            continue
-        rebuilt = " ".join(kept).strip()
-        rebuilt = _cleanup_sentence_artifacts(rebuilt)
-        text = _replace_markdown_section_body(text, section_title, rebuilt)
-
-    return text
-
-
-def _tighten_executive_summary_opening(summary_text: str) -> str:
-    text = str(summary_text or "").strip()
-    if not text:
-        return summary_text
-
-    body = _extract_markdown_section_body(text, "Executive Summary")
-    if not body:
-        return summary_text
-
-    sentences = _split_sentences(body)
-    if len(sentences) <= 1:
-        return summary_text
-
-    quote_re = re.compile(r'[“"]([^“”"\n]{8,260})[”"]')
-    weak_open_re = re.compile(
-        r"^(?:as\s+the\s+filing\s+notes,\s*)?"
-        r"(?:management|leadership|executives?|ceo|cfo|the company)\s+"
-        r"(?:said|noted|added|highlighted|emphasized|indicated|stated|described)\b",
-        re.IGNORECASE,
-    )
-    meta_re = re.compile(
-        r"\b(should\s+frame|should\s+start|should\s+open|golden\s+thread|aha\s+insight)\b",
-        re.IGNORECASE,
-    )
-
-    changed = False
-    while len(sentences) > 1:
-        first = sentences[0].strip()
-        quotes = [
-            _normalize_quote_candidate_text(match.group(1))
-            for match in quote_re.finditer(first)
-            if _normalize_quote_candidate_text(match.group(1))
-        ]
-        if meta_re.search(first):
-            sentences.pop(0)
-            changed = True
-            continue
-        if quotes and weak_open_re.search(first) and not any(
-            _is_high_signal_management_quote_candidate(quote) for quote in quotes
-        ):
-            sentences.pop(0)
-            changed = True
-            continue
-        break
-
-    if not changed:
-        return summary_text
-
-    rebuilt = " ".join(sentences).strip()
-    rebuilt = _cleanup_sentence_artifacts(rebuilt)
-    return _replace_markdown_section_body(text, "Executive Summary", rebuilt)
 
 
 _GENERIC_HEURISTIC_SENTENCES = [
@@ -5456,8 +5145,6 @@ def _cleanup_sentence_artifacts(text: str) -> str:
 
         # Clean up punctuation collisions created by fragment removal (e.g., ",.").
         stripped = re.sub(r"[,:;]\.$", ".", stripped)
-        stripped = re.sub(r"\.:\s*$", ".", stripped)
-        stripped = re.sub(r":\.(?=\s|$)", ".", stripped)
 
         # Remove guidance verbs from bullet/list items while preserving the substance.
         stripped = bullet_imperative.sub(r"\1", stripped)
@@ -6507,7 +6194,6 @@ def _summary_has_incomplete_tail(text: str) -> bool:
         if line.strip()
         and not line.strip().startswith("#")
         and line.strip().upper() not in {"DATA_GRID_START", "DATA_GRID_END"}
-        and not re.fullmatch(r"WORD COUNT:\s*\d+\s*", line.strip(), re.IGNORECASE)
     ]
     if not substantive_lines:
         return False
@@ -8771,22 +8457,15 @@ def _rewrite_summary_to_length(
     if (original_key_metrics or "").strip():
         _original_issue, original_rows = _validate_key_metrics_numeric_block(
             str(original_key_metrics or ""),
-            min_rows=0,
+            min_rows=5,
             require_markers=False,
         )
         _rewritten_issue, rewritten_rows = _validate_key_metrics_numeric_block(
             str(rewritten_key_metrics or ""),
-            min_rows=0,
+            min_rows=5,
             require_markers=False,
         )
-        preserved_min_rows = (
-            5
-            if int(original_rows or 0) >= 5
-            else int(original_rows or 0)
-            if int(original_rows or 0) >= 3
-            else 0
-        )
-        if preserved_min_rows and int(rewritten_rows or 0) < preserved_min_rows:
+        if int(original_rows or 0) >= 5 and int(rewritten_rows or 0) < 5:
             logger.info(
                 "Rejecting rewrite because it degraded Key Metrics rows from %s to %s.",
                 int(original_rows or 0),
@@ -10171,9 +9850,7 @@ def _calculate_section_min_words_for_target(
             ratio_min = max(min_floor, int(budget * ratio))
         elif section in {"Risk Factors", "Closing Takeaway"}:
             # These are the "bookends" users remember; keep them substantive.
-            # At short-mid targets thin filings may not support 78% of budget,
-            # so use 0.68 to avoid unsatisfiable completeness floors.
-            ratio = 0.68 if short_mid_precision_target else 0.75
+            ratio = 0.78 if short_mid_precision_target else 0.75
             ratio_min = max(min_floor, int(budget * ratio))
         elif section == "Financial Health Rating":
             ratio_min = max(min_floor, int(budget * 0.70))
@@ -11626,8 +11303,7 @@ def _ensure_health_to_exec_bridge(
         r"thesis",
         r"sets? up",
         r"frames the thesis",
-        r"balance sheet is not the debate",
-        r"real question is whether",
+        r"next thing investors need to underwrite",
     )
     if any(re.search(hint, health_body, re.IGNORECASE) for hint in transition_hints):
         return summary_text
@@ -11639,11 +11315,11 @@ def _ensure_health_to_exec_bridge(
     ]
     if strong_anchors:
         bridge = (
-            f"The balance sheet is not the debate; the real question is whether {strong_anchors[0]} can carry the operating case from here."
+            f"That leaves {strong_anchors[0]} as the next thing investors need to underwrite."
         )
     else:
         bridge = (
-            "The balance sheet is not the debate; the real question is whether operating momentum can earn the next leg of investment."
+            "That leaves the operating proof, not the balance-sheet baseline, as the next thing investors need to underwrite."
         )
     if target_length:
         try:
@@ -11838,17 +11514,6 @@ def _apply_contract_structural_repairs(
             min_words_by_section[focus_section] = max(
                 int(min_words_by_section.get(focus_section, 0) or 0),
                 focus_floor,
-            )
-        closing_budget = int(section_budgets.get("Closing Takeaway", 0) or 0)
-        if closing_budget > 0:
-            closing_tol = _section_budget_tolerance_words(
-                closing_budget,
-                max_tolerance=10,
-                section_name="Closing Takeaway",
-            )
-            min_words_by_section["Closing Takeaway"] = max(
-                int(min_words_by_section.get("Closing Takeaway", 0) or 0),
-                max(1, closing_budget - int(closing_tol)),
             )
     if not include_health_rating:
         min_words_by_section.pop("Financial Health Rating", None)
@@ -12145,16 +11810,6 @@ def _apply_contract_structural_repairs(
                         body_context=body,
                         full_context=text,
                     )
-                if section_title == "Closing Takeaway" and (
-                    not addition
-                    or _section_body_contains_equivalent_sentence(body, addition)
-                ):
-                    addition = _next_unique_section_balance_top_up_sentence(
-                        body,
-                        section_title="Closing Takeaway",
-                        attempt=sentence_guard,
-                        calculated_metrics=metrics,
-                    )
                 if not addition:
                     break
                 body = _append_sentence(body, addition)
@@ -12185,16 +11840,6 @@ def _apply_contract_structural_repairs(
                         attempt=guard,
                         body_context=body,
                         full_context=text,
-                    )
-                if section_title == "Closing Takeaway" and (
-                    not addition
-                    or _section_body_contains_equivalent_sentence(body, addition)
-                ):
-                    addition = _next_unique_section_balance_top_up_sentence(
-                        body,
-                        section_title="Closing Takeaway",
-                        attempt=guard,
-                        calculated_metrics=metrics,
                     )
                 if not addition:
                     break
@@ -12257,7 +11902,7 @@ def _extract_quotes_from_filing_snippets(snippets: str) -> List[str]:
     seen: Set[str] = set()
     for match in re.finditer(r"[“\"]([^“”\"\n]{8,260})[”\"]", snippets or ""):
         candidate = " ".join((match.group(1) or "").split()).strip()
-        if not candidate or not _is_high_signal_management_quote_candidate(candidate):
+        if not candidate:
             continue
         norm = re.sub(r"\s+", " ", candidate.lower()).strip()
         if norm in seen:
@@ -12315,17 +11960,24 @@ def _rebalance_contract_quotes(
     max_quotes = max(1, int(max_allowed_quotes or 0))
     target_quotes = max(0, min(max_quotes, int(min_required_quotes or 0)))
     if target_quotes <= 0:
-        if (exec_quotes_existing or mdna_quotes_existing) and snippet_quotes:
-            target_quotes = min(
-                max_quotes,
-                max(1, min(len(snippet_quotes), len(exec_quotes_existing) + len(mdna_quotes_existing))),
-            )
-        else:
-            return summary_text
+        return summary_text
     if len(quote_pool) < target_quotes:
         # Fallback: extract short sentence fragments from filing snippets
         # that contain management language patterns
-        fallback_quotes = _management_snippet_candidates(filing_language_snippets)
+        management_patterns = [
+            r"(?:we|the company|management)\s+(?:believe|expect|anticipate|continue|remain|plan|intend)[^.]{10,120}\.",
+            r"(?:our|the)\s+(?:strategy|focus|priority|goal|objective)[^.]{10,120}\.",
+        ]
+        fallback_quotes = []
+        for pattern in management_patterns:
+            for match in re.finditer(
+                pattern, filing_language_snippets or "", re.IGNORECASE
+            ):
+                candidate = match.group(0).strip().rstrip(".")
+                if 10 <= len(candidate.split()) <= 30:
+                    fallback_quotes.append(candidate)
+            if len(quote_pool) + len(fallback_quotes) >= target_quotes:
+                break
         quote_pool = _dedupe(quote_pool + fallback_quotes)
         if len(quote_pool) < target_quotes:
             return summary_text  # Still insufficient — genuine data gap
@@ -12333,61 +11985,28 @@ def _rebalance_contract_quotes(
     selected = quote_pool[:target_quotes]
     exec_assigned: List[str] = []
     mdna_assigned: List[str] = []
-    optional_quote_mode = int(min_required_quotes or 0) <= 0
-    exec_had_quote = bool(exec_quotes_existing)
-    mdna_had_quote = bool(mdna_quotes_existing)
 
-    if optional_quote_mode:
-        unassigned: List[str] = []
-        for quote in selected:
-            if quote in exec_quotes_existing and quote not in exec_assigned:
-                exec_assigned.append(quote)
-                continue
-            if quote in mdna_quotes_existing and quote not in mdna_assigned:
-                mdna_assigned.append(quote)
-                continue
-            unassigned.append(quote)
+    preferred_exec = next((q for q in selected if q in exec_quotes_existing), None)
+    exec_assigned.append(preferred_exec or selected[0])
 
-        if unassigned and not exec_assigned and not mdna_assigned:
-            first_quote = unassigned.pop(0)
-            if mdna_had_quote and not exec_had_quote:
-                mdna_assigned.append(first_quote)
-            elif exec_had_quote and not mdna_had_quote:
-                exec_assigned.append(first_quote)
-            else:
-                exec_assigned.append(first_quote)
-
-        for quote in unassigned:
-            if mdna_had_quote or mdna_assigned:
-                mdna_assigned.append(quote)
-            elif exec_had_quote or exec_assigned:
-                exec_assigned.append(quote)
-            elif not exec_assigned:
-                exec_assigned.append(quote)
-            else:
-                mdna_assigned.append(quote)
+    preferred_mdna = next(
+        (q for q in selected if q in mdna_quotes_existing and q not in exec_assigned),
+        None,
+    )
+    if preferred_mdna:
+        mdna_assigned.append(preferred_mdna)
     else:
-        preferred_exec = next((q for q in selected if q in exec_quotes_existing), None)
-        exec_assigned.append(preferred_exec or selected[0])
+        fallback_mdna = next((q for q in selected if q not in exec_assigned), None)
+        if fallback_mdna:
+            mdna_assigned.append(fallback_mdna)
 
-        preferred_mdna = next(
-            (q for q in selected if q in mdna_quotes_existing and q not in exec_assigned),
-            None,
-        )
-        if preferred_mdna:
-            mdna_assigned.append(preferred_mdna)
-        else:
-            fallback_mdna = next((q for q in selected if q not in exec_assigned), None)
-            if fallback_mdna:
-                mdna_assigned.append(fallback_mdna)
+    for quote in selected:
+        if quote in exec_assigned or quote in mdna_assigned:
+            continue
+        mdna_assigned.append(quote)
 
-        for quote in selected:
-            if quote in exec_assigned or quote in mdna_assigned:
-                continue
-            mdna_assigned.append(quote)
-
-        if not mdna_assigned and len(selected) >= 2:
-            mdna_assigned.append(selected[1])
+    if not mdna_assigned and len(selected) >= 2:
+        mdna_assigned.append(selected[1])
 
     def _strip_direct_quotes(body: str) -> str:
         cleaned = quote_re.sub("", body or "")
@@ -12438,11 +12057,9 @@ def _has_management_voice_markers(
     if attribution_re.search(body):
         return True
     snippet_quotes = {
-        re.sub(r"\s+", " ", str(match.group(1) or "").strip().lower()).strip()
-        for match in re.finditer(
-            r'[“"]([^“”"\n]{3,260})[”"]', filing_language_snippets or ""
-        )
-        if str(match.group(1) or "").strip()
+        re.sub(r"\s+", " ", str(item or "").strip().lower()).strip()
+        for item in _extract_quotes_from_filing_snippets(filing_language_snippets or "")
+        if str(item or "").strip()
     }
     if not snippet_quotes:
         return False
@@ -12477,8 +12094,6 @@ def _management_snippet_candidates(filing_language_snippets: str) -> List[str]:
         if len(words) < 6 or len(words) > 36:
             return
         if not keyword_re.search(cleaned):
-            return
-        if not _is_high_signal_management_quote_candidate(cleaned):
             return
         norm = re.sub(r"[^a-z0-9 ]+", "", cleaned.lower())
         norm = re.sub(r"\s+", " ", norm).strip()
@@ -12693,12 +12308,10 @@ def _repair_section_management_voice_from_snippets(
         existing_quote_count = _count_direct_quotes_in_section(
             text, "Executive Summary"
         ) + _count_direct_quotes_in_section(text, "Management Discussion & Analysis")
-        chosen = candidates[0]
-        use_direct_quote = (
-            section_title != "Closing Takeaway"
-            and existing_quote_count < int(quote_policy.get("max_quotes", 0) or 0)
-            and _is_high_signal_management_quote_candidate(chosen)
+        use_direct_quote = existing_quote_count < int(
+            quote_policy.get("max_quotes", 0) or 0
         )
+        chosen = candidates[0]
         prefix = (
             f'Management noted, "{chosen.rstrip(".!?").strip()}."'
             if use_direct_quote
@@ -12761,17 +12374,6 @@ def _repair_timeout_editorial_contract_gaps(
         for failure in list(getattr(validation, "section_failures", []) or [])
         if str(failure.code or "").strip()
     }
-    management_voice_sections = {
-        str(failure.section_name or "").strip()
-        for failure in list(getattr(validation, "section_failures", []) or [])
-        if str(failure.section_name or "").strip()
-        and (
-            str(failure.code or "").strip() == "insufficient_management_voice"
-            or "management voice" in " ".join(str(failure.message or "").split()).lower()
-            or "clear management attribution"
-            in " ".join(str(failure.message or "").split()).lower()
-        )
-    }
     validation_flags = _issue_flags_from_validation_report(validation)
     timeout_quality_profile = SummaryFlowQualityProfile(
         max_same_opening=2,
@@ -12785,55 +12387,45 @@ def _repair_timeout_editorial_contract_gaps(
     if validation_flags.get("management_voice_issue") or (
         "insufficient_management_voice" in failure_codes
     ):
-        repair_all_management_sections = not management_voice_sections
-
-        if repair_all_management_sections or "Executive Summary" in management_voice_sections:
-            text, exec_voice_info = _repair_executive_summary_management_voice_from_snippets(
-                text,
-                filing_language_snippets=filing_language_snippets,
-                target_length=target_length,
-            )
-            if exec_voice_info.get("applied"):
-                info["changed"] = True
-                info["applied"] = True
-                info["actions"].append(
-                    str(
-                        exec_voice_info.get("action")
-                        or "executive_summary_management_voice_repair"
-                    )
+        text, exec_voice_info = _repair_executive_summary_management_voice_from_snippets(
+            text,
+            filing_language_snippets=filing_language_snippets,
+            target_length=target_length,
+        )
+        if exec_voice_info.get("applied"):
+            info["changed"] = True
+            info["applied"] = True
+            info["actions"].append(
+                str(
+                    exec_voice_info.get("action")
+                    or "executive_summary_management_voice_repair"
                 )
-
-        if (
-            repair_all_management_sections
-            or "Management Discussion & Analysis" in management_voice_sections
-        ):
-            text, voice_info = _repair_mdna_management_voice_from_snippets(
-                text,
-                filing_language_snippets=filing_language_snippets,
-                target_length=target_length,
             )
-            if voice_info.get("applied"):
-                info["changed"] = True
-                info["applied"] = True
-                info["actions"].append(
-                    str(voice_info.get("action") or "mdna_management_voice_repair")
-                )
 
-        if repair_all_management_sections or "Closing Takeaway" in management_voice_sections:
-            text, closing_voice_info = _repair_closing_takeaway_management_voice_from_snippets(
-                text,
-                filing_language_snippets=filing_language_snippets,
-                target_length=target_length,
-            )
-            if closing_voice_info.get("applied"):
-                info["changed"] = True
-                info["applied"] = True
-                info["actions"].append(
-                    str(
-                        closing_voice_info.get("action")
-                        or "closing_takeaway_management_voice_repair"
-                    )
+        text, voice_info = _repair_mdna_management_voice_from_snippets(
+            text,
+            filing_language_snippets=filing_language_snippets,
+            target_length=target_length,
+        )
+        if voice_info.get("applied"):
+            info["changed"] = True
+            info["applied"] = True
+            info["actions"].append(str(voice_info.get("action") or "mdna_management_voice_repair"))
+
+        text, closing_voice_info = _repair_closing_takeaway_management_voice_from_snippets(
+            text,
+            filing_language_snippets=filing_language_snippets,
+            target_length=target_length,
+        )
+        if closing_voice_info.get("applied"):
+            info["changed"] = True
+            info["applied"] = True
+            info["actions"].append(
+                str(
+                    closing_voice_info.get("action")
+                    or "closing_takeaway_management_voice_repair"
                 )
+            )
 
         if (filing_language_snippets or "").strip():
             quote_policy = _summary_quote_policy_for_target_length(target_length)
@@ -13438,25 +13030,11 @@ def _make_instruction_leak_validator() -> Callable[[str], Optional[str]]:
         re.compile(r"keep this section concrete", re.IGNORECASE),
         re.compile(r"keep this section", re.IGNORECASE),
         re.compile(r"this section should\b", re.IGNORECASE),
-        re.compile(
-            r"the\s+(?:financial health rating|executive summary|financial performance|management discussion(?:\s*&\s*analysis)?|md&a|risk factors|closing takeaway|key metrics)\s+should\b",
-            re.IGNORECASE,
-        ),
         re.compile(r"each risk should map to", re.IGNORECASE),
         re.compile(r"as instructed", re.IGNORECASE),
         re.compile(r"per the guidelines", re.IGNORECASE),
         re.compile(r"the analysis should\b", re.IGNORECASE),
         re.compile(r"the memo should\b", re.IGNORECASE),
-        re.compile(
-            r"(?:this section|the memo|the analysis|the executive summary|the financial performance section|the management discussion(?:\s*&\s*analysis)?|the closing takeaway)\s+should\s+(?:frame|start|open|lead|focus|surface|end|include)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(r"should frame\s+[A-Z][A-Za-z0-9&.,'’ -]{0,80}\s+as\b", re.IGNORECASE),
-        re.compile(r"section focus:", re.IGNORECASE),
-        re.compile(r"style contract:", re.IGNORECASE),
-        re.compile(r"quote mandate:", re.IGNORECASE),
-        re.compile(r"citation mandate:", re.IGNORECASE),
-        re.compile(r"return only the section body", re.IGNORECASE),
         re.compile(r"connect revenue trends to", re.IGNORECASE),
         re.compile(r"unit economics need to improve via", re.IGNORECASE),
         re.compile(r"reconciles KPI commentary", re.IGNORECASE),
@@ -13468,8 +13046,6 @@ def _make_instruction_leak_validator() -> Callable[[str], Optional[str]]:
         re.compile(r"suggested length:", re.IGNORECASE),
         re.compile(r"voice discipline:", re.IGNORECASE),
         re.compile(r"numbers discipline:", re.IGNORECASE),
-        re.compile(r"golden thread", re.IGNORECASE),
-        re.compile(r"aha insight", re.IGNORECASE),
     ]
 
     def _validator(text: str) -> Optional[str]:
@@ -14148,7 +13724,7 @@ def _make_closing_recommendation_validator(
         closing_body = _extract_markdown_section_body(text, "Closing Takeaway")
         if not closing_body:
             return None
-        if not _EXPLICIT_STANCE_TOKEN_RE.search(closing_body):
+        if not re.search(r"\b(buy|hold|sell)\b", closing_body, re.IGNORECASE):
             voice = "first-person" if persona_requested else "third-person"
             return (
                 "Closing Takeaway is missing an explicit Buy/Hold/Sell recommendation. "
@@ -14424,7 +14000,7 @@ def _make_section_differentiation_validator(
 def _make_closing_structure_validator() -> Callable[[str], Optional[str]]:
     """Enforce a decisive closing with one stance and measurable trigger(s)."""
 
-    stance_re = _EXPLICIT_STANCE_OR_NEUTRAL_TOKEN_RE
+    stance_re = re.compile(r"\b(buy|hold|sell|neutral)\b", re.IGNORECASE)
     time_window_re = re.compile(
         r"\b(?:over|for|in)\s+the\s+next\s+[a-z0-9\-\s]+?\b(?=[,.;]|$)",
         re.IGNORECASE,
@@ -14516,7 +14092,7 @@ def _make_closing_structure_validator() -> Callable[[str], Optional[str]]:
         trigger_sentences: List[Tuple[int, str]] = []
         for idx, sentence in enumerate(sentences):
             lowered = sentence.lower()
-            if not re.search(r"\b(if|unless|would|should|when|once|provided|assuming|while|trigger|flip|change)\b", lowered):
+            if not re.search(r"\b(if|unless|would|trigger|flip|change)\b", lowered):
                 continue
             if not measurable_re.search(sentence):
                 continue
@@ -14606,10 +14182,10 @@ def _make_stance_consistency_validator() -> Callable[[str], Optional[str]]:
        Takeaway's stance.
     """
 
-    _stance_re = _EXPLICIT_STANCE_OR_NEUTRAL_TOKEN_RE
+    _stance_re = re.compile(r"\b(buy|hold|sell|neutral)\b", re.IGNORECASE)
 
     def _last_stance(text: str) -> Optional[str]:
-        matches = list(_EXPLICIT_STANCE_TOKEN_RE.finditer(text or ""))
+        matches = list(re.finditer(r"\b(buy|hold|sell)\b", text or "", re.IGNORECASE))
         if not matches:
             return None
         return (matches[-1].group(1) or "").strip().lower() or None
@@ -14903,7 +14479,6 @@ def _apply_short_form_structural_seal(
     persona_requested: bool = False,
     target_length: Optional[int] = None,
     preserve_pipeline_editorial: bool = False,
-    what_matters_lines: Optional[List[str]] = None,
 ) -> str:
     text = (summary_text or "").strip()
     if not text:
@@ -14926,11 +14501,7 @@ def _apply_short_form_structural_seal(
         target_length=target_length,
     )
     if (metrics_lines or "").strip():
-        text = _canonicalize_key_metrics_section(
-            text,
-            metrics_lines,
-            what_matters_lines=what_matters_lines,
-        )
+        text = _canonicalize_key_metrics_section(text, metrics_lines)
     text = _inject_data_grid_markers_if_missing(text)
     if not preserve_pipeline_editorial:
         text = _ensure_section_transition_handoffs(
@@ -14974,11 +14545,6 @@ def _apply_short_form_structural_seal(
                         "Risk Factors",
                         normalized_risk_body,
                     )
-    text = _rewrite_instruction_leaks_in_place(
-        text,
-        calculated_metrics=calculated_metrics or {},
-        company_name=str(company_name or "").strip() or "the company",
-    )
     if not preserve_pipeline_editorial:
         text = _cleanup_sentence_artifacts(text)
         text = _validate_complete_sentences(text)
@@ -14990,38 +14556,6 @@ def _apply_short_form_structural_seal(
             calculated_metrics=calculated_metrics,
             persona_requested=bool(persona_requested or persona_name),
         )
-        final_risk_body = _extract_markdown_section_body(text, "Risk Factors") or ""
-        if final_risk_body.strip() and target_length:
-            final_risk_budget_words = int(
-                _calculate_section_word_budgets(
-                    int(target_length),
-                    include_health_rating=include_health_rating,
-                ).get("Risk Factors", 0)
-                or 0
-            )
-            if final_risk_budget_words > 0:
-                normalized_final_risk_body, final_risk_info = _normalize_risk_factors_section_body(
-                    final_risk_body,
-                    risk_budget_words=final_risk_budget_words,
-                    risk_factors_excerpt=risk_factors_excerpt or "",
-                    calculated_metrics=calculated_metrics,
-                    health_score_data=health_score_data,
-                    rewrite_risk_name_fn=lambda name: _rewrite_generic_risk_name_for_repair(
-                        name,
-                        risk_factors_excerpt=risk_factors_excerpt or "",
-                    ),
-                    synthesize_risk_factors_addendum_fn=(
-                        _synthesize_risk_factors_addendum
-                        if "_synthesize_risk_factors_addendum" in globals()
-                        else None
-                    ),
-                )
-                if final_risk_info.get("applied") and normalized_final_risk_body:
-                    text = _replace_markdown_section_body(
-                        text,
-                        "Risk Factors",
-                        normalized_final_risk_body,
-                    )
     text = _merge_duplicate_canonical_sections(
         text, include_health_rating=include_health_rating
     )
@@ -15035,7 +14569,10 @@ def _is_blocking_quality_validator_issue(issue: str) -> bool:
 
     flags = _parse_summary_contract_missing_requirements([str(issue)])
     if (
-        flags.get("closing_trigger_issue")
+        flags.get("bridge_issue")
+        or flags.get("closing_trigger_issue")
+        or flags.get("numbers_discipline_issue")
+        or flags.get("quote_distribution_issue")
         or flags.get("quote_grounding_issue")
         or flags.get("management_voice_issue")
     ):
@@ -15050,8 +14587,8 @@ def _is_blocking_quality_validator_issue(issue: str) -> bool:
         "should use extracted management expectations",
         "should assess promise-vs-delivery",
         "should tie the stance to management credibility",
-        "verified direct quote or clear management attribution",
-        "forward-looking implication about what management expects",
+        "should include at least one forward-looking implication",
+        "should include either a verified direct quote or clear management attribution",
     )
     if any(snippet in normalized for snippet in blocking_snippets):
         return True
@@ -15083,7 +14620,6 @@ def _evaluate_summary_contract_requirements(
     source_text: Optional[str],
     filing_language_snippets: str,
     enforce_quote_contract: bool,
-    calculated_metrics: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[str], Dict[str, Any]]:
     text = (summary_text or "").strip()
     missing_requirements: List[str] = []
@@ -15123,14 +14659,11 @@ def _evaluate_summary_contract_requirements(
         issue = validator(text)
         if issue:
             normalized_issue = " ".join(str(issue or "").split()).strip().lower()
-            sparse_filing_evidence = len((filing_language_snippets or "").strip()) < 200
-            risk_specificity_issue = bool(
+            if (
                 "risk_specificity" in str(validator_name or "").lower()
                 or _is_risk_specificity_requirement(normalized_issue)
-            )
-            if risk_specificity_issue and sparse_filing_evidence:
-                quality_issues.append(f"{validator_name}: {issue}")
-            elif risk_specificity_issue or _is_blocking_quality_validator_issue(str(issue)):
+                or _is_blocking_quality_validator_issue(str(issue))
+            ):
                 missing_requirements.append(str(issue))
             else:
                 quality_issues.append(f"{validator_name}: {issue}")
@@ -15149,11 +14682,10 @@ def _evaluate_summary_contract_requirements(
         quote_count_total = exec_quotes + mdna_quotes
 
         key_metrics_body = _extract_markdown_section_body(text, "Key Metrics") or ""
-        _km_min_rows = _adaptive_key_metrics_min_rows(calculated_metrics)
         key_metrics_issue, key_metrics_numeric_rows = (
             _validate_key_metrics_numeric_block(
                 key_metrics_body,
-                min_rows=_km_min_rows,
+                min_rows=5,
                 require_markers=True,
             )
         )
@@ -15162,7 +14694,7 @@ def _evaluate_summary_contract_requirements(
             key_metrics_issue, key_metrics_numeric_rows = (
                 _validate_key_metrics_numeric_block(
                     key_metrics_body,
-                    min_rows=_km_min_rows,
+                    min_rows=5,
                     require_markers=False,
                 )
         )
@@ -15170,15 +14702,28 @@ def _evaluate_summary_contract_requirements(
             missing_requirements.append(key_metrics_issue)
 
         if enforce_quote_contract:
-            quote_policy = _summary_quote_policy_for_target_length(target_length)
-            quote_issue = _make_quote_grounding_validator(
-                source_text=source_text,
-                require_quotes=bool(quote_policy["min_quotes"] > 0),
-                min_required_quotes=quote_policy["min_quotes"],
-                max_allowed_quotes=quote_policy["max_quotes"],
-            )(text)
-            if quote_issue:
-                missing_requirements.append(quote_issue)
+            if not (filing_language_snippets or "").strip():
+                missing_requirements.append(
+                    "Insufficient filing-language evidence for quote contract. Re-ingest filing text with richer narrative context."
+                )
+            else:
+                quote_policy = _summary_quote_policy_for_target_length(target_length)
+                quote_issue = _make_quote_grounding_validator(
+                    source_text=source_text,
+                    require_quotes=True,
+                    min_required_quotes=quote_policy["min_quotes"],
+                    max_allowed_quotes=quote_policy["max_quotes"],
+                )(text)
+                if quote_issue:
+                    missing_requirements.append(quote_issue)
+                if quote_policy["exec_min"] >= 1 and exec_quotes < 1:
+                    missing_requirements.append(
+                        "Executive Summary must include at least one verified direct quote."
+                    )
+                if quote_policy["mdna_min"] >= 1 and mdna_quotes < 1:
+                    missing_requirements.append(
+                        "Management Discussion & Analysis must include at least one verified direct quote."
+                    )
 
     # Remaining quality issues are preserved in meta["quality_issues"] for
     # diagnostics only. Blocking editorial failures are promoted into
@@ -16271,7 +15816,6 @@ def _parse_summary_contract_missing_requirements(
         "duplicate_sentence_issue": False,
         "near_duplicate_paragraph_issue": False,
         "section_repetition_issue": False,
-        "section_instruction_issue": False,
         "risk_schema_issue": False,
         "risk_specificity_issue": False,
         "management_voice_issue": False,
@@ -16384,8 +15928,6 @@ def _parse_summary_contract_missing_requirements(
                     )
                     if section_title not in existing_sections:
                         flags["numbers_discipline_sections"].append(section_title)
-        if "instruction leak detected" in normalized:
-            flags["section_instruction_issue"] = True
         if "closing takeaway" in normalized and "parenthetical" in normalized:
             flags["closing_parenthetical_issue"] = True
         if "duplicate sentences detected" in normalized:
@@ -16427,7 +15969,6 @@ def _parse_summary_contract_missing_requirements(
         or flags["near_duplicate_paragraph_issue"]
         or flags["section_repetition_issue"]
         or flags["section_balance_issue"]
-        or flags["section_instruction_issue"]
     )
     flags["needs_editorial_deterministic_repair"] = bool(
         flags["number_repetition_issue"]
@@ -16439,7 +15980,6 @@ def _parse_summary_contract_missing_requirements(
         or flags["duplicate_sentence_issue"]
         or flags["near_duplicate_paragraph_issue"]
         or flags["section_repetition_issue"]
-        or flags["section_instruction_issue"]
     )
     flags["needs_deterministic_repair"] = bool(
         flags["quote_distribution_issue"]
@@ -16459,7 +15999,6 @@ def _select_short_form_structural_failure_requirements(
     missing_requirements: Optional[List[str]],
     include_health_rating: bool,
     enforce_section_balance: bool = False,
-    calculated_metrics: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """Select structural failures that must remain fatal for short sectioned memos."""
     text = str(summary_text or "").strip()
@@ -16532,25 +16071,23 @@ def _select_short_form_structural_failure_requirements(
         )
 
     key_metrics_body = _extract_markdown_section_body(text, "Key Metrics") or ""
-    _km_min_rows = _adaptive_key_metrics_min_rows(calculated_metrics)
     key_metrics_issue, key_metrics_numeric_rows = _validate_key_metrics_numeric_block(
         key_metrics_body,
-        min_rows=_km_min_rows,
+        min_rows=5,
         require_markers=True,
     )
     # Fallback: accept valid numeric rows even without DATA_GRID markers.
     if key_metrics_issue and "Missing DATA_GRID" in str(key_metrics_issue):
         key_metrics_issue, key_metrics_numeric_rows = _validate_key_metrics_numeric_block(
             key_metrics_body,
-            min_rows=_km_min_rows,
+            min_rows=5,
             require_markers=False,
         )
     if key_metrics_issue:
-        if key_metrics_numeric_rows < _km_min_rows:
+        if key_metrics_numeric_rows < 5:
             _append_matching(
                 key_metrics_issue,
                 "key metrics must include at least 5 numeric rows",
-                f"key metrics must include at least {_km_min_rows} numeric rows",
             )
         else:
             _append_matching(
@@ -16560,7 +16097,7 @@ def _select_short_form_structural_failure_requirements(
             )
 
     closing_body = _extract_markdown_section_body(text, "Closing Takeaway") or ""
-    if closing_body and not _EXPLICIT_STANCE_TOKEN_RE.search(closing_body):
+    if closing_body and not re.search(r"\b(buy|hold|sell)\b", closing_body, re.IGNORECASE):
         _append_matching(
             "Closing Takeaway is missing an explicit Buy/Hold/Sell recommendation.",
             "closing takeaway is missing an explicit buy/hold/sell recommendation",
@@ -16633,88 +16170,32 @@ def _select_short_form_editorial_hard_failure_requirements(
     *,
     missing_requirements: Optional[List[str]],
 ) -> List[str]:
-    """Soft editorial misses should degrade with warnings, not hard-fail delivery."""
-    return []
+    """Escalate unresolved short-form editorial misses that make the memo feel templated."""
+    items = [
+        str(item) for item in (missing_requirements or []) if str(item or "").strip()
+    ]
+    if not items:
+        return []
 
-
-def _is_cv2_hard_section_failure_code(code: str) -> bool:
-    normalized = str(code or "").strip().lower()
-    if not normalized:
-        return False
-    structural_codes = {
-        "missing_section",
-        "key_metrics_contract_under",
-        "missing_terminal_punctuation",
-        "dangling_ending",
-        "too_few_sentences",
-        "risk_schema",
-    }
-    contradiction_codes = {
-        "conflicting_stance",
-        "stance_outside_closing",
-        "health_closing_misalignment",
-    }
-    return normalized in structural_codes or normalized in contradiction_codes
-
-
-def _is_cv2_soft_global_failure(message: str) -> bool:
-    normalized = " ".join(str(message or "").split()).strip().lower()
-    if not normalized:
-        return False
-    soft_snippets = (
-        "under word target",
-        "over word target",
-        "extra sections",
-        "duplicate sentences",
-        "near-duplicate paragraphs",
-        "repeated lead-in",
-        "repeated clause",
-        "management voice",
-        "filing grounding",
-        "readability drift",
-        "tone drift",
-        "thread not resolved",
-        "thread anchor",
+    hard_fail_snippets = (
+        "section is too brief",
+        "generic filler detected",
+        "excessive generic filler",
+        "question-framing repetition",
+        "theme over-repetition",
+        "number repetition across sections",
     )
-    return any(snippet in normalized for snippet in soft_snippets)
-
-
-def _cv2_has_hard_validation_failure(validation: "SummaryValidationReport") -> bool:
-    for message in list(validation.global_failures or []):
-        if not _is_cv2_soft_global_failure(str(message or "")):
-            return True
-
-    for failure in list(validation.section_failures or []):
-        code = str(failure.code or "").strip().lower()
-        if not code:
+    hard_fail: List[str] = []
+    seen: Set[str] = set()
+    for item in items:
+        normalized = " ".join(item.split()).strip().lower()
+        if not normalized:
             continue
-        if code in {"section_budget_under", "section_budget_over"}:
-            continue
-        if _is_cv2_hard_section_failure_code(code):
-            return True
-        editorial_codes = {
-            "repetition",
-            "repeated_leadin",
-            "repeated_clause_family",
-            "cross_section_dollars",
-            "placeholder_number_artifact",
-            "insufficient_management_voice",
-            "insufficient_filing_grounding",
-            "section_overlap",
-            "instruction_leak",
-            "instruction_miss",
-            "closing_soft",
-            "risk_not_actionable",
-            "risk_specificity",
-            "tone_drift",
-            "readability_drift",
-            "thread_not_resolved",
-            "thread_anchor_invalid",
-        }
-        if code in editorial_codes:
-            continue
-        return True
-    return False
+        if any(snippet in normalized for snippet in hard_fail_snippets):
+            if normalized not in seen:
+                seen.add(normalized)
+                hard_fail.append(item)
+    return hard_fail
 
 
 def _select_continuous_v2_hard_failure_requirements(
@@ -16769,18 +16250,21 @@ def _select_continuous_v2_hard_failure_requirements(
     )
     hard_snippets = (
         "quoted phrase is not grounded in filing text",
+        "should include either a verified direct quote or clear management attribution when filing snippets are available",
+        "should include at least one forward-looking implication about what management expects, plans, or what happens next",
+        "must include at least one verified direct quote",
+        "period-over-period comparison",
+        "financial performance must cover revenue, margin interpretation, and cash conversion",
+        "should end with a conceptual handoff into",
         "must state exactly one explicit stance",
-        "contains conflicting stances",
+        "metric hierarchy drift in closing takeaway",
+        "numbers discipline:",
     )
     for item in items:
         normalized = " ".join(str(item or "").split()).strip().lower()
-        # Risk specificity and closing quote attribution are quality signals,
-        # not structural requirements.  Demote them so they remain as warnings
-        # but do not block summary delivery (especially at ~1000-word targets
-        # where the LLM has limited budget to satisfy every evidence gate).
-        if _is_risk_specificity_requirement(normalized):
-            continue
-        if any(snippet in normalized for snippet in risk_hard_snippets):
+        if _is_risk_specificity_requirement(normalized) or any(
+            snippet in normalized for snippet in risk_hard_snippets
+        ):
             _append(item)
             continue
         if any(snippet in normalized for snippet in hard_snippets):
@@ -16849,13 +16333,13 @@ def _summary_payload_is_fast_cache_eligible(
     summary_text = str(payload.get("summary") or "").strip()
     if not summary_text:
         return False
-    quality_mode = str(payload.get("quality_mode") or "").strip().lower()
-    if quality_mode == "fast":
-        if include_health_rating and _validated_health_score_value(payload.get("health_score")) is None:
-            return False
-        return True
-    missing_requirements = list(payload.get("contract_warnings") or [])
-    if missing_requirements and _select_non_degradable_contract_requirements(
+    summary_meta = (
+        payload.get("summary_meta") if isinstance(payload.get("summary_meta"), dict) else {}
+    )
+    missing_requirements = list(summary_meta.get("contract_missing_requirements") or [])
+    if not missing_requirements:
+        missing_requirements = list(payload.get("contract_warnings") or [])
+    if _select_non_degradable_contract_requirements(
         summary_text=summary_text,
         missing_requirements=missing_requirements,
         include_health_rating=include_health_rating,
@@ -16888,7 +16372,6 @@ def _select_one_shot_contract_failure_requirements(
         return items
 
     fatal: List[str] = []
-    _short_mid = _is_short_mid_precision_target(target_length)
     for item in items:
         normalized = " ".join(item.split()).strip().lower()
         if "word-count band violation" in normalized:
@@ -16898,11 +16381,6 @@ def _select_one_shot_contract_failure_requirements(
             _is_risk_specificity_requirement(normalized)
             or "risk factors lack filing grounding" in normalized
         ):
-            # At short-mid targets (300-1499), per-risk filing grounding
-            # failures are demoted — thin filings may not have quotable
-            # risk language and the LLM cannot cite what does not exist.
-            if _short_mid and "missing a direct filing quote" in normalized:
-                continue
             fatal.append(item)
             continue
         if "missing the heading '## " in normalized:
@@ -16991,12 +16469,6 @@ def _explicit_target_word_band_status(
     _ = summary_meta if isinstance(summary_meta, dict) else {}
     final_split_word_count = int(len((summary_text or "").split()))
     final_word_count = int(_count_words(summary_text or ""))
-    split_in_band = bool(
-        int(band["lower"]) <= final_split_word_count <= int(band["upper"])
-    )
-    stripped_in_band = bool(
-        int(band["lower"]) <= final_word_count <= int(band["upper"])
-    )
     return {
         "lower": int(band["lower"]),
         "upper": int(band["upper"]),
@@ -17004,56 +16476,10 @@ def _explicit_target_word_band_status(
         "target_band": dict(band),
         "final_split_word_count": int(final_split_word_count),
         "final_word_count": int(final_word_count),
-        "split_in_band": bool(split_in_band),
-        "stripped_in_band": bool(stripped_in_band),
-        "in_band": bool(split_in_band and stripped_in_band),
+        "in_band": bool(
+            int(band["lower"]) <= final_word_count <= int(band["upper"])
+        ),
     }
-
-
-def _summary_contract_is_word_band_requirement(item: Any) -> bool:
-    lowered = str(item or "").lower()
-    return (
-        "word-count band violation" in lowered
-        or "under word target" in lowered
-        or "over word target" in lowered
-    )
-
-
-def _sync_explicit_target_word_band_requirements(
-    *,
-    summary_text: str,
-    target_length: Optional[int],
-    summary_meta: Optional[Dict[str, Any]] = None,
-    missing_requirements: Optional[List[str]] = None,
-) -> Tuple[List[str], Dict[str, Any], Optional[Dict[str, Any]]]:
-    status = _explicit_target_word_band_status(
-        summary_text=summary_text,
-        target_length=target_length,
-        summary_meta=summary_meta,
-    )
-    meta = dict(summary_meta or {}) if isinstance(summary_meta, dict) else {}
-    items = [
-        str(item).strip()
-        for item in (missing_requirements or [])
-        if str(item or "").strip()
-    ]
-    if status is None:
-        return items, meta, None
-
-    meta["final_split_word_count"] = int(status["final_split_word_count"])
-    meta["final_word_count"] = int(status["final_word_count"])
-
-    non_band_items = [
-        item for item in items if not _summary_contract_is_word_band_requirement(item)
-    ]
-    if bool(status.get("split_in_band")) and bool(status.get("stripped_in_band")):
-        return non_band_items, meta, status
-
-    band_requirement = (
-        f"Final word-count band violation: expected {int(status['lower'])}-{int(status['upper'])}, "
-        f"got split={int(status['final_split_word_count'])}, stripped={int(status['final_word_count'])}."
-    )
-    return list(dict.fromkeys(non_band_items + [band_requirement])), meta, status
 
 
 def _explicit_target_word_band_failure_detail(
@@ -17355,7 +16781,18 @@ def _estimate_contract_quote_pool_size(
     if len(quote_pool) >= int(target_quotes):
         return len(quote_pool)
 
-    fallback_quotes = _management_snippet_candidates(snippets)
+    management_patterns = [
+        r"(?:we|the company|management)\s+(?:believe|expect|anticipate|continue|remain|plan|intend)[^.]{10,120}\.",
+        r"(?:our|the)\s+(?:strategy|focus|priority|goal|objective)[^.]{10,120}\.",
+    ]
+    fallback_quotes: List[str] = []
+    for pattern in management_patterns:
+        for match in re.finditer(pattern, snippets, re.IGNORECASE):
+            candidate = str(match.group(0) or "").strip().rstrip(".")
+            if 10 <= len(candidate.split()) <= 30:
+                fallback_quotes.append(candidate)
+        if len(quote_pool) + len(fallback_quotes) >= int(target_quotes):
+            break
     quote_pool = _dedupe(quote_pool + fallback_quotes)
     return len(quote_pool)
 
@@ -17607,7 +17044,7 @@ def _cap_closing_takeaway_sentences_preserve_triggers(
     if len(sentences) <= max_allowed:
         return body, 0
 
-    stance_re = _EXPLICIT_STANCE_OR_NEUTRAL_TOKEN_RE
+    stance_re = re.compile(r"\b(buy|hold|sell|neutral)\b", re.IGNORECASE)
     trigger_indexes = {
         idx
         for idx, sentence in enumerate(sentences)
@@ -18460,20 +17897,6 @@ def _repair_brief_sections_deterministically(
 
         attempts = 0
         section_changed = False
-        if section_title == "Risk Factors":
-            expanded_body = _top_up_brief_risk_factors_section(
-                body,
-                min_words=int(min_words),
-                risk_factors_excerpt=risk_factors_excerpt or "",
-            )
-            expanded_words = _count_words(expanded_body)
-            if expanded_body != body and expanded_words > current_words:
-                info["words_added"] = int(info.get("words_added", 0) or 0) + int(
-                    expanded_words - current_words
-                )
-                body = expanded_body
-                current_words = expanded_words
-                section_changed = True
         while current_words < int(min_words) and attempts < 4:
             remaining_words = max(0, int(min_words) - int(current_words))
             extended_body, added_words = _extend_section_tail_clause_for_brief_repair(
@@ -18750,7 +18173,6 @@ def _extract_section_balance_anchor_terms(text: str, *, limit: int = 6) -> List[
         _add(match.group(0), 3.0)
     for match in re.finditer(
         r"\b("
-        r"backlog conversion|balance[- ]sheet flexibility|margin discipline|revenue quality|"
         r"backlog|renewals?|enterprise agreements?|usage monetization|installed base|shipment(?:s)?|"
         r"euv|duv|scanner(?:s)?|lithography|deposits?|loan growth|charge[- ]offs?|cet1|combined ratio|"
         r"premium growth|aum|net flows|pipeline|trial(?:s)?|launch uptake|reimbursement|"
@@ -18815,33 +18237,7 @@ def _looks_like_placeholder_balance_text(text: str) -> bool:
 
 
 def _low_signal_section_balance_sentences(section_title: str) -> List[str]:
-    templates: Dict[str, List[str]] = {
-        "Financial Health Rating": [
-            "The balance-sheet cushion only holds if liquidity and funding flexibility stay intact through the next stretch.",
-            "That keeps balance-sheet flexibility as the key buffer if operating conditions soften from here.",
-        ],
-        "Executive Summary": [
-            "The next proof point is whether operating execution starts confirming the setup described above.",
-            "That leaves the next few quarters as the real test of whether the thesis can hold.",
-        ],
-        "Financial Performance": [
-            "The quarter matters more if margin discipline and cash conversion keep supporting the reported growth.",
-            "The cleaner read-through is whether recent operating momentum keeps showing up in repeatable results.",
-        ],
-        "Management Discussion & Analysis": [
-            "Management now has to show that execution priorities can translate into cleaner operating follow-through.",
-            "The next management test is whether stated priorities start showing up as measurable execution.",
-        ],
-        "Risk Factors": [
-            "Investors should watch for early signals that current execution pressure is turning into reported downside.",
-            "The risk case accelerates if current operating strain starts showing up before results fully reset.",
-        ],
-        "Closing Takeaway": [
-            "The stance holds only if the next few quarters keep validating the current underwriting case.",
-            "The view changes fastest if the next operating proof points stop supporting the present thesis.",
-        ],
-    }
-    return list(templates.get(section_title, []))
+    return []
 
 
 def _company_anchor_sentences_for_balance(
@@ -18895,8 +18291,6 @@ def _company_anchor_sentences_for_balance(
             f"The next management test is whether {secondary} shows up as disciplined execution rather than stated intent.",
         ],
         "Risk Factors": [
-            f"{primary} is still the first downside signal to watch.",
-            f"{secondary} remains the earliest risk watchpoint here.",
             f"A break in {primary} would be the earliest signal that the downside path is becoming real.",
             f"The risk case moves faster if {secondary} weakens before reported results fully reflect it.",
             f"That keeps {primary} on the short list of leading indicators investors should watch.",
@@ -18920,7 +18314,6 @@ def _section_balance_top_up_sentence(
     health_score_data: Optional[Dict[str, Any]] = None,
     risk_factors_excerpt: str = "",
     existing_body: str = "",
-    used_anchors: Optional[Set[str]] = None,
 ) -> str:
     # NOTE: Do NOT include score_band here – values like "Healthy" or
     # "Early-warning" pollute anchor extraction and produce broken
@@ -18945,11 +18338,6 @@ def _section_balance_top_up_sentence(
         return candidates[attempt_idx]
 
     anchors = _extract_section_balance_anchor_terms(anchor_context, limit=4)
-    # Filter out anchors already used by other sections to reduce repetition
-    if used_anchors and anchors:
-        fresh = [a for a in anchors if a.lower() not in {u.lower() for u in used_anchors}]
-        if fresh:
-            anchors = fresh
     if not anchors:
         return candidates[attempt_idx % len(candidates)]
 
@@ -18972,22 +18360,22 @@ def _section_balance_top_up_sentence(
         ],
         "Executive Summary": [
             "{a} still deserves emphasis because it is the clearest company-specific hinge in the current filing.",
-            "Without {b}, the opening frame lacks the operating detail that separates this filing from a generic earnings recap.",
-            "Can {c} hold up long enough to justify the current valuation, or is the market pricing in a trajectory that the filing does not yet support?",
+            "The opening thesis works better when {b} is tied to how the business actually monetizes rather than to a generic quality label.",
+            "That leaves {c} as the operating thread readers should keep in mind before the memo moves into proof points.",
             "A sharper summary still needs {a} to explain why this filing is different from the last one.",
-            "The next proof point is whether {b} translates into durable operating improvement or just a favorable comparables window.",
+            "Investors can carry the thesis forward more cleanly when {b} links management's message to the current operating setup.",
             "The narrative stays company-specific only if {a} and {c} both remain visible in the first read-through.",
-            "What makes {b} worth highlighting here is its direct connection to how the business actually monetizes.",
+            "That is why {b} belongs in the opening frame instead of being saved for a later section.",
             "If {a} stops anchoring the story, the summary becomes too generic to explain this filing's setup.",
         ],
         "Financial Performance": [
             "{a} matters because it determines whether revenue, margin quality, and cash conversion are reinforcing one another rather than masking trade-offs.",
             "If {a} improves while {b} weakens, the quarter reads better than the underlying economics actually are.",
-            "Without {c} confirming the trend, growth could be borrowing from future periods rather than compounding.",
+            "That makes {c} the cross-check on whether growth is staying self-funding instead of leaning on timing.",
             "The cleaner performance read is one where {a} supports pricing, mix, and cash durability in the same period.",
-            "Can {b} sustain this pace once reinvestment demands and working-capital timing normalize?",
+            "Investors still need {b} to confirm that the income statement is not getting ahead of the cash outcome.",
             "A durable quarter usually shows up when {a} and {c} improve without asking the balance sheet to absorb the gap.",
-            "What separates this quarter from a one-time beat is whether {b} holds through a tougher comparable window.",
+            "That is why {b} still deserves more weight than a single headline growth figure.",
             "When {a} holds up, management has better evidence that the current mix is compounding rather than merely shifting reported timing.",
             "The underlying question is whether {b} keeps validating operating leverage after reinvestment and working-capital demands are accounted for.",
             "This read gets stronger only if {a}, {b}, and cash generation point in the same direction.",
@@ -19007,20 +18395,20 @@ def _section_balance_top_up_sentence(
         "Risk Factors": [
             "{a} is still a live watchpoint because it could deteriorate before the revenue line makes the downside obvious.",
             "If {b} weakens first, investors usually see the damage in margin absorption or cash conversion before reported growth fully resets.",
-            "What makes {c} a useful leading indicator is its direct link to the operating model, not just its presence in the filing.",
+            "That makes {c} a useful leading indicator rather than just a generic risk label.",
             "The downside case becomes more credible when {a} and {b} start weakening in the same direction.",
-            "Can management contain {c} without sacrificing the reinvestment plan, or does one have to give?",
+            "Risk discipline still depends on monitoring {c} before management has to respond defensively.",
             "A cleaner downside map links {a} directly to revenue quality, margin durability, and funding flexibility.",
-            "Without visibility on {b}, the current risk picture looks incomplete rather than reassuring.",
+            "That is why {b} should stay on the risk watchlist even when the current quarter still looks stable.",
             "Investors usually lose the valuation cushion first when {a} stops supporting the operating model.",
         ],
         "Closing Takeaway": [
             "{a} still belongs in the final stance because it is the fastest way the thesis gets confirmed or broken.",
             "The recommendation stays more credible when {b} is tied to the next operating proof point instead of a generic quality judgment.",
-            "What investors should watch next is whether {c} confirms or contradicts the trajectory implied by this filing.",
+            "That leaves {c} as the condition investors should watch before changing the stance.",
             "A stronger closing still needs {a} to show what would change the current view rather than just repeat the current one.",
-            "Without {b} holding up, the conviction level resets regardless of what the headline numbers suggest.",
-            "The verdict depends less on broad market conditions and more on whether {c} follows through in the next quarter.",
+            "The final call improves when {b} is linked to valuation support, cash durability, and downside protection at the same time.",
+            "That is why {c} remains more useful than a broad market-style conclusion in this memo.",
             "If {a} stops holding up, the stance can change faster than the headline quarter would initially imply.",
             "The closing read is clearest when {a} and {b} both remain visible in the next proof point investors need to see.",
         ],
@@ -19156,83 +18544,6 @@ def _append_section_balance_sentence(
     if clean_body and not clean_body.endswith((".", "!", "?")):
         clean_body += "."
     return f"{clean_body} {clean_sentence}".strip() if clean_body else clean_sentence
-
-
-def _top_up_brief_risk_factors_section(
-    body: str,
-    *,
-    min_words: int,
-    risk_factors_excerpt: str = "",
-) -> str:
-    entries = [
-        (str(name or "").strip(), str(desc or "").strip())
-        for name, desc in _extract_risk_entries_for_repair(body)
-        if str(name or "").strip() and str(desc or "").strip()
-    ]
-    if not entries:
-        return str(body or "").strip()
-
-    excerpt_anchors = [
-        " ".join(str(anchor or "").split()).strip()
-        for anchor in _risk_named_anchor_phrases_from_excerpt(
-            risk_factors_excerpt or "",
-            limit=8,
-        )
-        if " ".join(str(anchor or "").split()).strip()
-    ]
-
-    def _entry_anchor(name: str) -> str:
-        base = re.sub(r"\brisk\b", "", str(name or ""), flags=re.IGNORECASE)
-        base = re.sub(r"[^A-Za-z0-9/& -]+", " ", base)
-        base = " ".join(base.split()).strip(" -:/")
-        if base:
-            return base
-        if excerpt_anchors:
-            return excerpt_anchors[0]
-        return "the risk"
-
-    updated_entries = list(entries)
-    rounds = 0
-    while _count_words(
-        "\n\n".join(f"**{name}**: {desc}" for name, desc in updated_entries)
-    ) < int(min_words) and rounds < 4:
-        changed = False
-        for idx, (name, desc) in enumerate(updated_entries):
-            current_body = "\n\n".join(
-                f"**{entry_name}**: {entry_desc}"
-                for entry_name, entry_desc in updated_entries
-            )
-            if _count_words(current_body) >= int(min_words):
-                break
-            anchor = _entry_anchor(name)
-            candidates = [
-                f"{anchor} is still the first downside signal to watch.",
-                f"Investors should keep {anchor.lower()} on the risk watchlist.",
-            ]
-            chosen = ""
-            for candidate in candidates:
-                if not _section_body_contains_equivalent_sentence(desc, candidate):
-                    chosen = candidate
-                    break
-            if not chosen:
-                continue
-            new_desc = str(desc or "").strip()
-            if new_desc and not new_desc.endswith((".", "!", "?")):
-                new_desc += "."
-            new_desc = f"{new_desc} {chosen}".strip()
-            if _count_words(new_desc) <= _count_words(desc):
-                continue
-            updated_entries[idx] = (name, new_desc)
-            changed = True
-        if not changed:
-            break
-        rounds += 1
-
-    return "\n\n".join(
-        f"**{name}**: {desc}".strip()
-        for name, desc in updated_entries
-        if str(name or "").strip() and str(desc or "").strip()
-    ).strip()
 
 
 def _split_sentences(blob: str) -> List[str]:
@@ -19737,31 +19048,10 @@ def _build_filing_specific_risk_entries(
         r")\b",
         re.IGNORECASE,
     )
-    regulatory_noise_re = re.compile(
-        r"\b("
-        r"disclosure requirements?|income taxes?|tax disclosure|market risk|"
-        r"quantitative and qualitative disclosures|finsa|swiss financial market|"
-        r"fair value|carrying value|accounting standards?"
-        r")\b",
-        re.IGNORECASE,
-    )
-    regulatory_business_re = re.compile(
-        r"\b("
-        r"antitrust|anti-corruption|bribery|export controls?|privacy|gdpr|doj|ftc|"
-        r"bundling|license|licensing|shipment|shipments|rollout|product|customer|"
-        r"advertiser|merchant|distribution|approval|reimbursement|platform"
-        r")\b",
-        re.IGNORECASE,
-    )
 
     def _candidate_materiality_score(candidate: RiskEvidenceCandidate) -> int:
         blob = _candidate_body(candidate)
         score = score_risk_evidence_candidate(candidate, company_terms=company_terms)
-        theme_key = _risk_theme_key_from_excerpt_text(
-            " ".join(
-                part for part in (candidate.risk_name, candidate.source_quote) if part
-            )
-        )
         if trigger_re.search(blob):
             score += 4
         if transmission_re.search(blob):
@@ -19770,13 +19060,6 @@ def _build_filing_specific_risk_entries(
             score += 2
         if low_signal_re.search(blob) and len(candidate.source_anchor_terms or ()) <= 1:
             score -= 7
-        if theme_key == "regulatory":
-            if regulatory_noise_re.search(blob):
-                score -= 12
-            if not transmission_re.search(blob):
-                score -= 4
-            if not regulatory_business_re.search(blob):
-                score -= 4
         return int(score)
 
     def _primary_anchor(candidate: RiskEvidenceCandidate) -> str:
@@ -19939,26 +19222,14 @@ def _build_filing_specific_risk_entries(
     for candidate in candidates:
         primary_anchor = _primary_anchor(candidate)
         refined_name = str(candidate.risk_name or "").strip()
-        theme_key = _risk_theme_key_from_excerpt_text(
-            " ".join(
-                part
-                for part in (primary_anchor, candidate.risk_name, candidate.source_quote)
-                if part
-            )
-        )
-        candidate_blob = _candidate_body(candidate)
-        if theme_key == "regulatory" and (
-            regulatory_noise_re.search(primary_anchor)
-            or (
-                regulatory_noise_re.search(candidate_blob)
-                and not regulatory_business_re.search(candidate_blob)
-            )
-        ):
-            continue
         if primary_anchor:
             refined_name = _filing_specific_risk_name_from_anchor(
                 primary_anchor,
-                theme_key,
+                _risk_theme_key_from_excerpt_text(
+                    " ".join(
+                        part for part in (primary_anchor, candidate.source_quote) if part
+                    )
+                ),
             )
         refined_candidate = RiskEvidenceCandidate(
             risk_name=refined_name,
@@ -20432,16 +19703,8 @@ def _build_filing_specific_risk_entries(
             f"{_risk_trigger_clause(theme_key, anchor_phrase, quote)} "
             f"it can {_risk_impact_clause(theme_key, anchor_phrase, quote)}."
         )
-        if quote and _is_high_signal_management_quote_candidate(quote):
-            evidence_sentence = (
-                f'As the filing notes, "{quote}," which ties this risk directly to {anchor_phrase}.'
-            )
-        else:
-            evidence_sentence = (
-                f"The filing ties this risk to {anchor_phrase}, which is where the pressure would first show up."
-            )
         sentences = [
-            evidence_sentence,
+            f'As the filing notes, "{quote}," which underscores this exposure.',
             mechanism_sentence,
             f"Investors should watch {_risk_watch_clause(theme_key, anchor_phrase, quote)}.",
         ]
@@ -20991,7 +20254,7 @@ def _normalize_risk_factors_section_body(
             if len(cleaned_entries) >= expected_risk_count:
                 break
 
-    if len(cleaned_entries) < expected_risk_count:
+    if not cleaned_entries and not strict_entries_added:
         for anchor in anchor_fallback_candidates:
             fixed_name = _filing_specific_risk_name_from_anchor(
                 anchor,
@@ -21334,7 +20597,7 @@ def _trim_section_for_balance(
         if bridge_sentence in sentence:
             continue
         if section_title == "Closing Takeaway":
-            if _EXPLICIT_STANCE_OR_NEUTRAL_TOKEN_RE.search(sentence):
+            if re.search(r"\b(buy|hold|sell|neutral)\b", sentence, re.IGNORECASE):
                 continue
             if _is_closing_trigger_sentence_for_balance_trim(sentence):
                 continue
@@ -21584,12 +20847,8 @@ def _rebalance_section_budgets_deterministically(
             continue
         trim_budget += int(excess_to_max)
 
-    if (section_balance_contract_required or long_form) and under_titles:
+    if section_balance_contract_required and under_titles:
         current_add_room = max(0, upper_total - current_total)
-        redistribution_trim_room = max(
-            0,
-            int(trim_budget) - int(overflow_trim_needed),
-        )
         total_under_deficit = 0
         for section_title in under_titles:
             meta = section_meta.get(section_title) or {}
@@ -21600,9 +20859,7 @@ def _rebalance_section_budgets_deterministically(
 
         redistribution_gap = max(
             0,
-            int(total_under_deficit)
-            - int(current_add_room)
-            - int(redistribution_trim_room),
+            int(total_under_deficit) - int(current_add_room) - int(trim_budget),
         )
         if redistribution_gap > 0:
             under_title_set = set(under_titles)
@@ -21859,10 +21116,8 @@ def _rebalance_section_budgets_deterministically(
             and local_add_room > 0
         ):
             current_wc = _section_wc(new_body)
-            section_room = max(0, int(max_allowed) - int(current_wc))
-            deficit_room = max(0, int(min_allowed) - int(current_wc))
             remaining_allowance = min(
-                int(section_room if section_title == "Risk Factors" else deficit_room),
+                max(0, int(min_allowed) - int(current_wc)),
                 max(0, int(local_add_room)),
             )
             if remaining_allowance <= 0:
@@ -21976,48 +21231,6 @@ def _rebalance_section_budgets_deterministically(
                 info["changed"] = True
                 info["applied"] = True
                 expanded_titles.append(section_title)
-
-    if long_form and add_room > 0 and "Risk Factors" in set(under_titles):
-        risk_body = _extract_markdown_section_body(text, "Risk Factors")
-        expected = int(budgets.get("Risk Factors", 0) or 0)
-        if risk_body is not None and expected > 0:
-            observed = int(counts.get("Risk Factors", 0) or 0)
-            section_tol = _section_budget_tolerance_words(
-                expected,
-                max_tolerance=10,
-            )
-            min_allowed = max(1, expected - section_tol)
-            max_allowed = expected + section_tol
-            remaining_deficit = max(0, int(min_allowed) - int(observed))
-            section_room = max(0, int(max_allowed) - int(observed))
-            allowed_add = min(int(add_room), int(section_room))
-            if remaining_deficit > 0 and allowed_add > 0:
-                addition = _next_unique_section_balance_top_up_sentence(
-                    str(risk_body or "").strip(),
-                    section_title="Risk Factors",
-                    attempt=0,
-                    calculated_metrics=calculated_metrics,
-                    health_score_data=health_score_data,
-                    risk_factors_excerpt=risk_factors_excerpt,
-                )
-                if addition:
-                    updated_body = _append_section_balance_sentence(
-                        str(risk_body or "").strip(),
-                        section_title="Risk Factors",
-                        sentence=addition,
-                    )
-                    updated_words = _section_wc(updated_body)
-                    gained = max(0, int(updated_words) - int(observed))
-                    if 0 < gained <= int(allowed_add):
-                        text = _replace_markdown_section_body(
-                            text, "Risk Factors", updated_body
-                        )
-                        counts["Risk Factors"] = int(updated_words)
-                        add_room = max(0, int(add_room) - int(gained))
-                        info["words_added"] += int(gained)
-                        info["changed"] = True
-                        info["applied"] = True
-                        expanded_titles.append("Risk Factors")
 
     counts = _collect_section_body_word_counts(
         text, include_health_rating=include_health_rating
@@ -22697,9 +21910,6 @@ def _issue_flags_from_validation_report(
         elif failure.code == "section_overlap":
             flags["section_overlap_issue"] = True
             flags["needs_editorial_deterministic_repair"] = True
-        elif failure.code == "instruction_leak":
-            flags["section_instruction_issue"] = True
-            flags["needs_editorial_deterministic_repair"] = True
         elif failure.code == "instruction_miss":
             flags["section_instruction_issue"] = True
             flags["needs_editorial_deterministic_repair"] = True
@@ -22738,7 +21948,6 @@ def _cv2_has_editorial_failures(
         "insufficient_management_voice",
         "insufficient_filing_grounding",
         "section_overlap",
-        "instruction_leak",
         "instruction_miss",
         "closing_soft",
         "risk_not_actionable",
@@ -24355,7 +23564,6 @@ def _apply_strict_contract_seal(
     quality_profile: Optional[SummaryFlowQualityProfile] = None,
     final_issue_flags: Optional[Dict[str, Any]] = None,
     preserve_pipeline_editorial: bool = False,
-    what_matters_lines: Optional[List[str]] = None,
 ) -> str:
     """Apply deterministic, contract-preserving repairs in a fixed order."""
     text = (summary_text or "").strip()
@@ -24449,51 +23657,30 @@ def _apply_strict_contract_seal(
         text = _ensure_health_to_exec_bridge(text, target_length=target_length)
 
     if (metrics_lines or "").strip():
-        text = _canonicalize_key_metrics_section(
-            text,
-            metrics_lines,
-            what_matters_lines=what_matters_lines,
-        )
+        text = _canonicalize_key_metrics_section(text, metrics_lines)
         key_metrics_body = _extract_markdown_section_body(text, "Key Metrics") or ""
-        key_metrics_min_rows = _adaptive_key_metrics_min_rows(calculated_metrics)
         key_metrics_issue, _ = _validate_key_metrics_numeric_block(
             key_metrics_body,
-            min_rows=key_metrics_min_rows,
+            min_rows=5,
             require_markers=True,
         )
         if key_metrics_issue:
-            text = _canonicalize_key_metrics_section(
-                text,
-                metrics_lines,
-                what_matters_lines=what_matters_lines,
-            )
+            text = _canonicalize_key_metrics_section(text, metrics_lines)
             if not re.search(r"^\s*##\s*(?:Key\s)", text, re.IGNORECASE | re.MULTILINE):
-                intro_lines = _normalize_key_metrics_intro_lines(what_matters_lines)
-                inject_body = metrics_lines
-                if intro_lines:
-                    inject_body = "\n\n".join(
-                        ["\n".join(intro_lines), metrics_lines]
-                    ).strip()
                 closing_match = re.search(
                     r"(^\s*##\s*Closing\s+Takeaway)",
                     text,
                     re.IGNORECASE | re.MULTILINE,
                 )
                 if closing_match:
-                    inject_block = f"\n\n## Key Metrics\n{inject_body}\n\n"
+                    inject_block = f"\n\n## Key Metrics\n{metrics_lines}\n\n"
                     text = (
                         text[: closing_match.start()]
                         + inject_block
                         + text[closing_match.start() :]
                     )
                 else:
-                    text = text.rstrip() + f"\n\n## Key Metrics\n{inject_body}\n"
-
-    text = _rewrite_instruction_leaks_in_place(
-        text,
-        calculated_metrics=calculated_metrics or {},
-        company_name=str(company_name or "").strip() or "the company",
-    )
+                    text = text.rstrip() + f"\n\n## Key Metrics\n{metrics_lines}\n"
 
     # Final editorial polish inside the seal: run after structural repairs but before
     # final word-band enforcement so the seal's band logic remains the last length authority.
@@ -27878,21 +27065,16 @@ def _expand_key_metrics_block_to_min_words(
     block: str,
     *,
     required_words: int,
-    min_rows: int = 5,
 ) -> str:
     text = str(block or "").strip()
     if not text or int(required_words or 0) <= 0:
         return text
     issue, numeric_rows = _validate_key_metrics_numeric_block(
         text,
-        min_rows=min_rows,
+        min_rows=5,
         require_markers=True,
     )
-    if (
-        issue
-        or int(numeric_rows) < int(min_rows)
-        or _count_words(text) >= int(required_words)
-    ):
+    if issue or int(numeric_rows) < 5 or _count_words(text) >= int(required_words):
         return text
 
     row_lines = [
@@ -28107,17 +27289,17 @@ def _expand_key_metrics_block_to_min_words(
     return rendered
 
 
-def _coerce_key_metrics_candidate_block(block: str, *, min_rows: int = 5) -> str:
+def _coerce_key_metrics_candidate_block(block: str) -> str:
     text = str(block or "").strip()
     if not text:
         return text
 
     issue, numeric_rows = _validate_key_metrics_numeric_block(
         text,
-        min_rows=min_rows,
+        min_rows=5,
         require_markers=True,
     )
-    if not issue and int(numeric_rows) >= int(min_rows):
+    if not issue and int(numeric_rows) >= 5:
         return text
 
     marker_match = re.search(
@@ -28167,7 +27349,7 @@ def _coerce_key_metrics_candidate_block(block: str, *, min_rows: int = 5) -> str
         seen_rows.add(rendered_row)
         candidate_rows.append(rendered_row)
 
-    if len(candidate_rows) < int(min_rows):
+    if len(candidate_rows) < 5:
         return text
     return "\n".join(["DATA_GRID_START", *candidate_rows, "DATA_GRID_END"]).strip()
 
@@ -28208,7 +27390,6 @@ def _repair_short_form_key_metrics_underflow(
     if current_words >= int(required_words):
         return summary_text, info
 
-    _repair_min_rows = _adaptive_key_metrics_min_rows(calculated_metrics) or 5
     candidate_blocks: List[Tuple[int, str, int]] = []
     fresh_metrics_lines = _build_key_metrics_block(
         calculated_metrics or {},
@@ -28219,8 +27400,7 @@ def _repair_short_form_key_metrics_underflow(
     seen_candidate_blocks: Set[str] = set()
     for candidate in (current_body, fresh_metrics_lines, metrics_lines):
         candidate_block = _coerce_key_metrics_candidate_block(
-            str(candidate or "").strip(),
-            min_rows=_repair_min_rows,
+            str(candidate or "").strip()
         )
         if not candidate_block:
             continue
@@ -28230,7 +27410,6 @@ def _repair_short_form_key_metrics_underflow(
         candidate_block = _expand_key_metrics_block_to_min_words(
             candidate_block,
             required_words=int(required_words),
-            min_rows=_repair_min_rows,
         )
         preview_text = _canonicalize_key_metrics_section(text, candidate_block)
         preview_body = (
@@ -28240,7 +27419,7 @@ def _repair_short_form_key_metrics_underflow(
         preview_words = _count_words(preview_body)
         preview_issue, numeric_rows = _validate_key_metrics_numeric_block(
             preview_body,
-            min_rows=_repair_min_rows,
+            min_rows=5,
             require_markers=True,
         )
         guard = 0
@@ -28250,7 +27429,6 @@ def _repair_short_form_key_metrics_underflow(
                 required_words=int(
                     required_words + (int(required_words) - int(preview_words))
                 ),
-                min_rows=_repair_min_rows,
             )
             preview_text = _canonicalize_key_metrics_section(text, candidate_block)
             preview_body = (
@@ -28260,7 +27438,7 @@ def _repair_short_form_key_metrics_underflow(
             preview_words = _count_words(preview_body)
             preview_issue, numeric_rows = _validate_key_metrics_numeric_block(
                 preview_body,
-                min_rows=_repair_min_rows,
+                min_rows=5,
                 require_markers=True,
             )
             if preview_issue:
@@ -28286,7 +27464,7 @@ def _repair_short_form_key_metrics_underflow(
     rebuilt_words = _count_words(rebuilt_body)
     rebuilt_issue, rebuilt_numeric_rows = _validate_key_metrics_numeric_block(
         rebuilt_body,
-        min_rows=_repair_min_rows,
+        min_rows=5,
         require_markers=True,
     )
     if rebuilt_issue or rebuilt_words <= int(current_words):
@@ -28314,7 +27492,6 @@ def _should_attempt_short_form_key_metrics_repair(
     *,
     missing_requirements: Optional[List[str]],
     summary_meta: Optional[Dict[str, Any]],
-    calculated_metrics: Optional[Dict[str, Any]] = None,
 ) -> bool:
     issue_flags = _parse_summary_contract_missing_requirements(
         list(missing_requirements or [])
@@ -28326,9 +27503,8 @@ def _should_attempt_short_form_key_metrics_repair(
     numeric_rows_raw = meta.get("key_metrics_numeric_row_count")
     if numeric_rows_raw is None:
         return False
-    min_rows = _adaptive_key_metrics_min_rows(calculated_metrics)
     try:
-        return int(numeric_rows_raw) < int(min_rows)
+        return int(numeric_rows_raw) < 5
     except (TypeError, ValueError):
         return False
 
@@ -32602,13 +31778,10 @@ def generate_filing_summary(
         )
         preflight_key_metrics_numeric_rows = 0
         if target_length and not micro_plaintext_mode:
-            preflight_key_metrics_min_rows = _adaptive_key_metrics_min_rows(
-                calculated_metrics
-            )
             preflight_key_metrics_issue, preflight_key_metrics_numeric_rows = (
                 _validate_key_metrics_numeric_block(
                     metrics_lines,
-                    min_rows=preflight_key_metrics_min_rows,
+                    min_rows=5,
                     require_markers=True,
                 )
             )
@@ -32868,7 +32041,7 @@ def generate_filing_summary(
             f"Each risk should use {describe_sentence_range(int(risk_shape.per_risk_min_sentences or 2), int(risk_shape.per_risk_max_sentences or 3))} "
             "of natural prose that explains what could go wrong, why it matters for this company, and what investors should watch. Rank risks by probability first, then magnitude, and do not pad the section with weaker placeholders if fewer risks are truly supportable."
             if risk_shape is not None
-            else "Write 1-2 named risks in natural prose grounded in company-specific business exposures."
+            else "Write 2-3 named risks in natural prose grounded in company-specific business exposures."
         )
         exec_structure_instruction = (
             "Write 2-3 connected paragraphs (roughly 6-10 sentences) with one clear through-line."
@@ -32899,7 +32072,13 @@ def generate_filing_summary(
             if statement_only_source_mode
             else (
                 (
-                    f"When filing language snippets are provided, direct quotes are optional. Use 0-{quote_policy['max_quotes']} short direct quotes total only when a verbatim line materially sharpens the analysis; otherwise use management attribution or attributed paraphrase."
+                    f"When filing language snippets are provided, use {quote_policy['min_quotes']}-{quote_policy['max_quotes']} short direct quotes total"
+                    + (
+                        ", with at least one in Executive Summary."
+                        if quote_policy["exec_min"] and not quote_policy["mdna_min"]
+                        else ", with at least one in Executive Summary and one in MD&A."
+                    )
+                    + " Keep them verbatim and use management attribution when a direct quote is not required in that section."
                 )
                 if filing_language_snippets
                 else "Do not invent management quotes."
@@ -32956,9 +32135,7 @@ def generate_filing_summary(
                         else "Frame the core issue once here, then let later sections answer it directly without restating the thesis as a question.\n\n"
                     )
                     + f"{quote_instruction}\n"
-                    + "Open with the main takeaway immediately, then name the one core business driver and the top 2-3 insights that matter most. "
                     + "Lead with what this company specifically does, how it makes money, what changed this filing period, and how management sounds about what comes next. "
-                    + "Include one non-obvious implication that reframes the quarter for an investor. "
                     + "Prefer company-specific operating KPIs over generic Revenue/EPS when choosing evidence. "
                     + "Use at most 1-2 anchor figures — this section is about framing, not numbers. "
                     + "No bullet lists, no process narration, no meta language.",
@@ -32995,7 +32172,7 @@ def generate_filing_summary(
                         + (
                             "- There is no narrative filing text for this filing. Infer likely capital-allocation priorities, operating mechanisms, and execution trade-offs only from the financial evidence. Do not attribute commentary to management.\n"
                             if statement_only_source_mode
-                            else "- Use attributed paraphrase for management's own words about strategy, priorities, or outlook by default, and quote only when the verbatim line materially improves the point "
+                            else "- Quote or closely paraphrase management's own words about strategy, priorities, or outlook "
                         )
                     )
                     + (
@@ -33004,7 +32181,7 @@ def generate_filing_summary(
                         else (
                             "from the filing excerpts. Quotes are optional; use at most one short verbatim quote if it materially adds signal.\n"
                             if short_quality_mode
-                            else "from the filing excerpts. Clear attribution matters more than quote count.\n"
+                            else "from the filing excerpts. Use at least one verbatim quote if snippets are available.\n"
                         )
                     )
                     + "- Explain the business model mechanism: HOW does this company make money, and what is management "
@@ -33024,7 +32201,7 @@ def generate_filing_summary(
                 ),
                 (
                     "Risk Factors",
-                    "Focus on the 1-2 GENUINE BUSINESS RISKS that most directly threaten the thesis from the Executive Summary.\n"
+                    "2-3 GENUINE BUSINESS RISKS that directly threaten the thesis from the Executive Summary.\n"
                     f"{risk_budget_sentence_block}"
                     f"{risk_structure_instruction}\n"
                     "REQUIRED: Each risk must be about BUSINESS EXPOSURE, not metric decline:\n"
@@ -33046,10 +32223,9 @@ def generate_filing_summary(
                 ),
                 (
                     "Key Metrics",
-                    "Scannable watchlist plus data appendix.\n"
+                    "Scannable data appendix (numeric DATA_GRID format only).\n"
                     f"{key_metrics_budget_sentence or ''}\n"
-                    "Start with `What Matters:` followed by 2-4 concise bullets that say what to watch and why it matters. If the filing is sparse, 2 bullets are enough; do not pad with generic filler.\n"
-                    "Then use numeric rows only in `Label | Value` form within DATA_GRID_START/END markers. No narrative paragraphs, no formulas, no invented numbers.\n"
+                    "Use numeric rows only in `Label | Value` form within DATA_GRID_START/END markers. No narrative paragraphs, no formulas, no invented numbers.\n"
                     "When company-specific operational KPIs are available, list 2-4 of them before the core financial rows. If a metric is missing, omit the line.\n\n"
                     "Suggested rows (include what is available):\n"
                     "Revenue | $X.XB\n"
@@ -33157,8 +32333,8 @@ Write in third person, stay metric-anchored, and avoid persona mimicry or catchp
                 " 1. NUMBERS ARE SUPPORT, NOT STRUCTURE: use only the few figures that change the underwriting view.\n"
                 " 2. QUALITATIVE FIRST: lead with business meaning, then support it with evidence.\n"
                 " 3. Frame the central question only in Executive Summary; do not repeat 'the key question is whether' elsewhere.\n"
-                f" 4. If filing language snippets are provided, use 0-{quote_policy['max_quotes']} direct quotes total, only when a verbatim line adds real signal. Otherwise use management attribution.\n"
-                " 5. Use management attribution even when a direct quote is not used in a given section.\n"
+                f" 4. If filing language snippets are provided, use {quote_policy['min_quotes']}-{quote_policy['max_quotes']} direct quotes total and keep them short, high-signal, and verbatim.\n"
+                " 5. Use management attribution even when a direct quote is not required in a given section.\n"
                 " 6. No generic fallback language, no 'watchpoint' phrasing, no 'future filings will clarify' filler, and no padding to hit a round number.\n"
                 " 7. Do not repeat the same thesis, clause ending, or sentence opening across sections.\n"
                 " 8. Keep each narrative section to one tight paragraph unless the section budget clearly requires more.\n"
@@ -33176,8 +32352,14 @@ Write in third person, stay metric-anchored, and avoid persona mimicry or catchp
                 "If you could delete a sentence and the argument doesn't change, delete it now.\n"
                 " 4. Connect sections: the last sentence of each section raises a question; "
                 "the first sentence of the next section answers it. The reader should feel momentum, not topic changes.\n"
-                f" 5. QUOTES ARE BUDGET-AWARE when filing language snippets are provided: use 0-{quote_policy['max_quotes']} short direct "
-                + "quotes only when the exact wording adds signal. Otherwise prefer attributed paraphrase.\n"
+                f" 5. QUOTES ARE BUDGET-AWARE when filing language snippets are provided: include {quote_policy['min_quotes']}-{quote_policy['max_quotes']} short direct "
+                + (
+                    "quotes, with at least one in Executive Summary"
+                    if quote_policy["exec_min"]
+                    else "quotes"
+                )
+                + (" and one in MD&A" if quote_policy["mdna_min"] else "")
+                + " — keep them verbatim and drawn from the snippets only.\n"
                 " 6. Do not repeat sentence openings across a section (e.g., multiple sentences starting with the same first word).\n"
                 " 7. Do not end consecutive sentences with the same clause or repeated wording.\n"
                 " 8. Stop writing once the memo is complete and within the target band; do not pad to a round number.\n"
@@ -33355,7 +32537,7 @@ CORE WRITING CONTRACT (MANDATORY):
 - Enforce metric hierarchy: identify at most 3 primary drivers for the memo; treat all other figures as supporting evidence.
 - Executive Summary and Closing Takeaway must each use at most 2 numeric anchors.
 - Do not invent missing data; omit unavailable points without adding placeholder commentary.
-- If filing language snippets are provided, {f"use 0-{quote_policy['max_quotes']} short direct quotes total only when verbatim wording materially sharpens the analysis; otherwise use attributed paraphrase."}
+- If filing language snippets are provided, {f"use {quote_policy['min_quotes']}-{quote_policy['max_quotes']} short direct quotes total and keep them verbatim." + (" Use at least one in Executive Summary." if quote_policy["exec_min"] and not quote_policy["mdna_min"] else " Use at least one in Executive Summary and one in MD&A." if quote_policy["exec_min"] and quote_policy["mdna_min"] else "")}
 - Avoid process/meta language ("this memo should", "this section should", "as instructed", "per guidelines").
 - Keep sentences complete and fully punctuated; never end mid-thought or mid-number.
 FLOW AND QUALITY RULES:
@@ -34935,7 +34117,6 @@ FLOW AND QUALITY RULES:
                 company_name=company_name,
                 persona_requested=persona_requested,
                 metrics_lines=metrics_lines or "",
-                what_matters_lines=key_metrics_intro_lines,
                 filing_language_snippets=filing_language_snippets or "",
                 strict_quote_contract=strict_quote_contract,
                 generation_stats=generation_stats,
@@ -34952,7 +34133,6 @@ FLOW AND QUALITY RULES:
                 summary_text,
                 include_health_rating=include_health_rating,
                 metrics_lines=metrics_lines or "",
-                what_matters_lines=key_metrics_intro_lines,
                 calculated_metrics=calculated_metrics,
                 company_name=company_name,
                 risk_factors_excerpt=risk_factors_excerpt,
@@ -35026,14 +34206,6 @@ FLOW AND QUALITY RULES:
             source_text=context_excerpt,
             filing_language_snippets=filing_language_snippets,
             enforce_quote_contract=strict_quote_contract,
-        )
-        missing_requirements, summary_meta, _initial_contract_band_status = (
-            _sync_explicit_target_word_band_requirements(
-                summary_text=summary_text,
-                target_length=target_length,
-                summary_meta=summary_meta,
-                missing_requirements=missing_requirements,
-            )
         )
         generation_stats["contract_missing_requirements"] = missing_requirements
         generation_stats["contract_verified_quote_count"] = summary_meta.get(
@@ -35112,14 +34284,6 @@ FLOW AND QUALITY RULES:
                     str(last_agent2_prompt or "").strip()
                     or str(base_prompt or "").strip()
                 )
-                if not base_recovery_prompt:
-                    current_summary_snapshot = str(summary_text or "").strip()
-                    if current_summary_snapshot:
-                        base_recovery_prompt = (
-                            "Regenerate this equity-research memo from scratch while "
-                            "fixing the failed contract requirements:\n\n"
-                            f"{current_summary_snapshot}"
-                        )
                 if not base_recovery_prompt:
                     return None
                 effective_recovery_requirements = [
@@ -35315,7 +34479,6 @@ FLOW AND QUALITY RULES:
                         company_name=company_name,
                         persona_requested=persona_requested,
                         metrics_lines=metrics_lines or "",
-                        what_matters_lines=key_metrics_intro_lines,
                         filing_language_snippets=filing_language_snippets or "",
                         strict_quote_contract=strict_quote_contract,
                         generation_stats=generation_stats,
@@ -35430,16 +34593,6 @@ FLOW AND QUALITY RULES:
                             filing_language_snippets=filing_language_snippets,
                             enforce_quote_contract=strict_quote_contract,
                         )
-                    )
-                    (
-                        missing_requirements,
-                        summary_meta,
-                        _deterministic_contract_band_status,
-                    ) = _sync_explicit_target_word_band_requirements(
-                        summary_text=summary_text,
-                        target_length=target_length,
-                        summary_meta=summary_meta,
-                        missing_requirements=missing_requirements,
                     )
                     generation_stats["contract_missing_requirements"] = (
                         missing_requirements
@@ -35576,8 +34729,8 @@ FLOW AND QUALITY RULES:
                 retry_iteration_event["retry_target"] = int(retry_target)
                 preemptive_recovery_text: Optional[str] = None
                 should_preemptively_recover = bool(
-                    not one_shot_band_only_contract_retry
-                    and (catastrophic_underflow or material_underflow)
+                    catastrophic_underflow
+                    or (one_shot_band_only_contract_retry and material_underflow)
                 )
                 if should_preemptively_recover:
                     preemptive_recovery_text = _run_contract_recovery_generation(
@@ -35797,21 +34950,9 @@ FLOW AND QUALITY RULES:
                                         _cand_dist = _band_distance(_recovery_candidate)
                                         if _cand_dist > _base_dist and _cand_dist > 0:
                                             _accept_recovery_candidate = False
-                                            last_contract_recovery_candidate = None
                                             retry_iteration_event[
                                                 "recovery_generation_rejected_worse_band_distance"
                                             ] = True
-                                    if (
-                                        _accept_recovery_candidate
-                                        and catastrophic_underflow
-                                        and one_shot_band_only_contract_retry
-                                        and not rewrite_noop
-                                    ):
-                                        _accept_recovery_candidate = False
-                                        last_contract_recovery_candidate = None
-                                        retry_iteration_event[
-                                            "recovery_generation_rejected_after_changed_catastrophic_rewrite"
-                                        ] = True
                                     if _accept_recovery_candidate:
                                         rewritten_contract = recovered_contract
                                         recovery_generation_applied = True
@@ -35922,26 +35063,19 @@ FLOW AND QUALITY RULES:
                     )
                 if (metrics_lines or "").strip():
                     summary_text = _canonicalize_key_metrics_section(
-                        summary_text,
-                        metrics_lines,
-                        what_matters_lines=key_metrics_intro_lines,
+                        summary_text, metrics_lines
                     )
                 key_metrics_body = (
                     _extract_markdown_section_body(summary_text, "Key Metrics") or ""
                 )
-                key_metrics_min_rows = _adaptive_key_metrics_min_rows(
-                    calculated_metrics
-                )
                 key_metrics_issue, _ = _validate_key_metrics_numeric_block(
                     key_metrics_body,
-                    min_rows=key_metrics_min_rows,
+                    min_rows=5,
                     require_markers=True,
                 )
                 if key_metrics_issue and (metrics_lines or "").strip():
                     summary_text = _canonicalize_key_metrics_section(
-                        summary_text,
-                        metrics_lines,
-                        what_matters_lines=key_metrics_intro_lines,
+                        summary_text, metrics_lines
                     )
                 if key_metrics_issue and (metrics_lines or "").strip():
                     if not re.search(
@@ -35965,9 +35099,7 @@ FLOW AND QUALITY RULES:
                             summary_text += f"\n\n## Key Metrics\n{metrics_lines}\n"
                 if strict_contract_required and (metrics_lines or "").strip():
                     summary_text = _canonicalize_key_metrics_section(
-                        summary_text,
-                        metrics_lines,
-                        what_matters_lines=key_metrics_intro_lines,
+                        summary_text, metrics_lines
                     )
 
                 # ── Structural repairs BEFORE precision expansion ─────────
@@ -36001,9 +35133,7 @@ FLOW AND QUALITY RULES:
                 # Canonicalize Key Metrics after quote changes
                 if strict_contract_required and (metrics_lines or "").strip():
                     summary_text = _canonicalize_key_metrics_section(
-                        summary_text,
-                        metrics_lines,
-                        what_matters_lines=key_metrics_intro_lines,
+                        summary_text, metrics_lines
                     )
 
                 # Apply bridge before precision expansion so the loop accounts
@@ -36387,9 +35517,7 @@ FLOW AND QUALITY RULES:
                     )
                 if strict_contract_required and (metrics_lines or "").strip():
                     summary_text = _canonicalize_key_metrics_section(
-                        summary_text,
-                        metrics_lines,
-                        what_matters_lines=key_metrics_intro_lines,
+                        summary_text, metrics_lines
                     )
                 if include_health_rating:
                     summary_text = _ensure_health_to_exec_bridge(
@@ -36531,7 +35659,6 @@ FLOW AND QUALITY RULES:
                     company_name=company_name,
                     persona_requested=persona_requested,
                     metrics_lines=metrics_lines or "",
-                    what_matters_lines=key_metrics_intro_lines,
                     filing_language_snippets=filing_language_snippets or "",
                     strict_quote_contract=strict_quote_contract,
                     generation_stats=generation_stats,
@@ -36556,16 +35683,6 @@ FLOW AND QUALITY RULES:
                         enforce_quote_contract=strict_quote_contract,
                     )
                 )
-                (
-                    missing_requirements,
-                    summary_meta,
-                    _post_retry_contract_band_status,
-                ) = _sync_explicit_target_word_band_requirements(
-                    summary_text=summary_text,
-                    target_length=target_length,
-                    summary_meta=summary_meta,
-                    missing_requirements=missing_requirements,
-                )
                 generation_stats["contract_missing_requirements"] = missing_requirements
                 generation_stats["contract_verified_quote_count"] = summary_meta.get(
                     "verified_quote_count", 0
@@ -36573,178 +35690,6 @@ FLOW AND QUALITY RULES:
                 generation_stats["contract_final_word_count"] = summary_meta.get(
                     "final_word_count", 0
                 )
-                _post_retry_non_band_requirements = [
-                    item
-                    for item in list(missing_requirements or [])
-                    if not _summary_contract_is_word_band_requirement(item)
-                ]
-                if (
-                    one_shot_band_only_contract_retry
-                    and not recovery_generation_applied
-                    and contract_recovery_generation_calls < 1
-                    and _post_retry_non_band_requirements
-                    and _post_retry_contract_band_status is not None
-                    and not bool(_post_retry_contract_band_status.get("in_band"))
-                ):
-                    _post_retry_recovered_contract = _run_contract_recovery_generation(
-                        observed_split_wc=int(
-                            _post_retry_contract_band_status.get(
-                                "final_split_word_count"
-                            )
-                            or len((summary_text or "").split())
-                        ),
-                        observed_stripped_wc=int(
-                            _post_retry_contract_band_status.get("final_word_count")
-                            or _count_words(summary_text or "")
-                        ),
-                        requested_retry_target=retry_target,
-                        recovery_requirements=list(missing_requirements or []),
-                    )
-                    if (
-                        _post_retry_recovered_contract
-                        and _post_retry_recovered_contract.strip()
-                    ):
-                        summary_text = str(_post_retry_recovered_contract or "").strip()
-                        recovery_generation_applied = True
-                        retry_iteration_event[
-                            "post_retry_recovery_generation_used"
-                        ] = True
-                        summary_text = _fix_inline_section_headers(summary_text)
-                        summary_text = _normalize_section_headings(
-                            summary_text, include_health_rating
-                        )
-                        summary_text = _merge_duplicate_canonical_sections(
-                            summary_text,
-                            include_health_rating=include_health_rating,
-                        )
-                        summary_text = _enforce_section_order(
-                            summary_text,
-                            include_health_rating=include_health_rating,
-                        )
-                        generation_stats["pre_contract_split_word_count"] = len(
-                            (summary_text or "").split()
-                        )
-                        generation_stats["pre_contract_stripped_word_count"] = (
-                            _count_words(summary_text or "")
-                        )
-                        missing_requirements, summary_meta = (
-                            _evaluate_summary_contract_requirements(
-                                summary_text=summary_text,
-                                target_length=target_length,
-                                include_health_rating=include_health_rating,
-                                quality_validators=contract_quality_validators,
-                                source_text=context_excerpt,
-                                filing_language_snippets=filing_language_snippets,
-                                enforce_quote_contract=strict_quote_contract,
-                            )
-                        )
-                        (
-                            missing_requirements,
-                            summary_meta,
-                            _post_retry_contract_band_status,
-                        ) = _sync_explicit_target_word_band_requirements(
-                            summary_text=summary_text,
-                            target_length=target_length,
-                            summary_meta=summary_meta,
-                            missing_requirements=missing_requirements,
-                        )
-                        generation_stats["contract_missing_requirements"] = (
-                            missing_requirements
-                        )
-                        generation_stats["contract_verified_quote_count"] = (
-                            summary_meta.get("verified_quote_count", 0)
-                        )
-                        generation_stats["contract_final_word_count"] = (
-                            summary_meta.get("final_word_count", 0)
-                        )
-                        _post_retry_non_band_requirements = [
-                            item
-                            for item in list(missing_requirements or [])
-                            if not _summary_contract_is_word_band_requirement(item)
-                        ]
-                if (
-                    one_shot_band_only_contract_retry
-                    and not recovery_generation_applied
-                    and not any(
-                        not _summary_contract_is_word_band_requirement(item)
-                        for item in list(missing_requirements or [])
-                    )
-                    and _post_retry_contract_band_status is not None
-                    and not bool(_post_retry_contract_band_status.get("in_band"))
-                    and int(
-                        _post_retry_contract_band_status.get("final_word_count") or 0
-                    )
-                    < int(_post_retry_contract_band_status.get("lower") or 0)
-                ):
-                    _pre_late_one_shot_retry_rescue = str(summary_text or "")
-                    (
-                        summary_text,
-                        _late_one_shot_retry_rescue_info,
-                    ) = _rescue_one_shot_long_form_length_underflow(
-                        summary_text,
-                        target_length=target_length,
-                        include_health_rating=include_health_rating,
-                        calculated_metrics=calculated_metrics,
-                        company_name=company_name,
-                        generation_stats=generation_stats,
-                        gemini_client=gemini_client,
-                        quality_validators=contract_quality_validators,
-                        token_budget=token_budget,
-                        cost_budget=cost_budget,
-                        max_output_tokens=max_output_tokens,
-                        persona_intensity=(
-                            "subtle"
-                            if generation_stats.get("persona_intensity_downgraded")
-                            else "strong"
-                        ),
-                    )
-                    if summary_text.strip() != _pre_late_one_shot_retry_rescue.strip():
-                        retry_iteration_event[
-                            "late_one_shot_underflow_rescue_applied"
-                        ] = bool(
-                            _late_one_shot_retry_rescue_info.get("applied")
-                        )
-                        retry_iteration_event[
-                            "late_one_shot_underflow_rescue_words_added"
-                        ] = int(
-                            _late_one_shot_retry_rescue_info.get("words_added", 0) or 0
-                        )
-                        generation_stats["pre_contract_split_word_count"] = len(
-                            (summary_text or "").split()
-                        )
-                        generation_stats["pre_contract_stripped_word_count"] = (
-                            _count_words(summary_text or "")
-                        )
-                        missing_requirements, summary_meta = (
-                            _evaluate_summary_contract_requirements(
-                                summary_text=summary_text,
-                                target_length=target_length,
-                                include_health_rating=include_health_rating,
-                                quality_validators=contract_quality_validators,
-                                source_text=context_excerpt,
-                                filing_language_snippets=filing_language_snippets,
-                                enforce_quote_contract=strict_quote_contract,
-                            )
-                        )
-                        (
-                            missing_requirements,
-                            summary_meta,
-                            _post_retry_contract_band_status,
-                        ) = _sync_explicit_target_word_band_requirements(
-                            summary_text=summary_text,
-                            target_length=target_length,
-                            summary_meta=summary_meta,
-                            missing_requirements=missing_requirements,
-                        )
-                        generation_stats["contract_missing_requirements"] = (
-                            missing_requirements
-                        )
-                        generation_stats["contract_verified_quote_count"] = (
-                            summary_meta.get("verified_quote_count", 0)
-                        )
-                        generation_stats["contract_final_word_count"] = (
-                            summary_meta.get("final_word_count", 0)
-                        )
                 retry_iteration_event["post_split_wc"] = len(
                     (summary_text or "").split()
                 )
@@ -36799,16 +35744,6 @@ FLOW AND QUALITY RULES:
                         enforce_quote_contract=strict_quote_contract,
                     )
                 )
-                (
-                    missing_requirements,
-                    summary_meta,
-                    _recovery_candidate_band_status,
-                ) = _sync_explicit_target_word_band_requirements(
-                    summary_text=summary_text,
-                    target_length=target_length,
-                    summary_meta=summary_meta,
-                    missing_requirements=missing_requirements,
-                )
                 generation_stats["contract_missing_requirements"] = missing_requirements
                 generation_stats["contract_verified_quote_count"] = summary_meta.get(
                     "verified_quote_count", 0
@@ -36816,60 +35751,6 @@ FLOW AND QUALITY RULES:
                 generation_stats["contract_final_word_count"] = summary_meta.get(
                     "final_word_count", 0
                 )
-            if (
-                missing_requirements
-                and one_shot_longform_contract_repairs
-                and not last_contract_recovery_candidate
-                and contract_recovery_generation_calls < 1
-                and any(
-                    _summary_contract_is_word_band_requirement(item)
-                    for item in list(missing_requirements or [])
-                )
-                and any(
-                    not _summary_contract_is_word_band_requirement(item)
-                    for item in list(missing_requirements or [])
-                )
-            ):
-                _late_recovery_base_prompt = (
-                    str(last_agent2_prompt or "").strip()
-                    or str(base_prompt or "").strip()
-                    or (
-                        "Regenerate this equity-research memo from scratch while "
-                        "fixing the failed contract requirements:\n\n"
-                        + str(summary_text or "").strip()
-                    )
-                )
-                if _late_recovery_base_prompt.strip():
-                    _late_recovery_prompt = _build_contract_recovery_prompt(
-                        base_prompt=_late_recovery_base_prompt,
-                        target_length=int(target_length or 0),
-                        retry_target=int(target_length or _count_words(summary_text)),
-                        missing_requirements=list(missing_requirements or []),
-                        section_budgets=section_budgets,
-                        include_health_rating=include_health_rating,
-                    )
-                    try:
-                        _late_recovery_timeout_seconds = (
-                            min(float(_summary_rewrite_timeout_seconds()), 60.0)
-                            if one_shot_band_only_contract_retry
-                            else float(_summary_rewrite_timeout_seconds())
-                        )
-                        _late_recovered_contract = _generate_agent2_summary(
-                            _late_recovery_prompt,
-                            float(_late_recovery_timeout_seconds),
-                        )
-                    except Exception:  # noqa: BLE001
-                        _late_recovered_contract = None
-                    if _late_recovered_contract and _late_recovered_contract.strip():
-                        last_contract_recovery_candidate = str(
-                            _late_recovered_contract or ""
-                        ).strip()
-                        contract_recovery_generation_calls += 1
-                        generation_stats["contract_recovery_used"] = True
-                        generation_stats["contract_recovery_generation_calls"] = int(
-                            contract_recovery_generation_calls
-                        )
-                        generation_stats["late_contract_recovery_probe_used"] = True
             if missing_requirements:
                 (
                     summary_text,
@@ -36919,21 +35800,6 @@ FLOW AND QUALITY RULES:
                     or split_only_band_issue
                 ):
                     late_repair_original = str(summary_text or "")
-                    if (
-                        split_only_band_issue
-                        and not bool(generation_stats.get("contract_recovery_used"))
-                    ):
-                        tightened_summary_text = (
-                            _tighten_split_only_word_band_overflow(
-                                summary_text,
-                                target_length=int(target_length),
-                                tolerance=_effective_word_band_tolerance(
-                                    target_length
-                                ),
-                            )
-                        )
-                        if tightened_summary_text.strip():
-                            summary_text = tightened_summary_text
                     summary_text, late_editorial_info = (
                         _apply_editorial_contract_repairs(
                             summary_text,
@@ -36991,16 +35857,6 @@ FLOW AND QUALITY RULES:
                                 enforce_quote_contract=strict_quote_contract,
                             )
                         )
-                        (
-                            missing_requirements,
-                            summary_meta,
-                            _late_editorial_band_status,
-                        ) = _sync_explicit_target_word_band_requirements(
-                            summary_text=summary_text,
-                            target_length=target_length,
-                            summary_meta=summary_meta,
-                            missing_requirements=missing_requirements,
-                        )
                         generation_stats["contract_missing_requirements"] = (
                             missing_requirements
                         )
@@ -37046,7 +35902,6 @@ FLOW AND QUALITY RULES:
                     summary_text,
                     include_health_rating=include_health_rating,
                     metrics_lines=metrics_lines or "",
-                    what_matters_lines=key_metrics_intro_lines,
                     calculated_metrics=calculated_metrics,
                     company_name=company_name,
                     risk_factors_excerpt=risk_factors_excerpt,
@@ -37106,14 +35961,6 @@ FLOW AND QUALITY RULES:
                     source_text=context_excerpt,
                     filing_language_snippets=filing_language_snippets,
                     enforce_quote_contract=strict_quote_contract,
-                )
-            )
-            missing_requirements, summary_meta, _final_contract_band_status = (
-                _sync_explicit_target_word_band_requirements(
-                    summary_text=summary_text,
-                    target_length=target_length,
-                    summary_meta=summary_meta,
-                    missing_requirements=missing_requirements,
                 )
             )
             generation_stats["contract_missing_requirements"] = missing_requirements
@@ -37413,7 +36260,6 @@ FLOW AND QUALITY RULES:
                 and _should_attempt_short_form_key_metrics_repair(
                     missing_requirements=missing_requirements,
                     summary_meta=summary_meta,
-                    calculated_metrics=calculated_metrics,
                 )
             ):
                 summary_text, key_metrics_repair_info = (
@@ -37617,7 +36463,6 @@ FLOW AND QUALITY RULES:
                     missing_requirements=missing_requirements,
                     include_health_rating=include_health_rating,
                     enforce_section_balance=bool(section_balance_contract_required),
-                    calculated_metrics=calculated_metrics,
                 )
             )
             if short_form_structural_fatal_requirements and short_mid_precision_mode:
@@ -37628,7 +36473,6 @@ FLOW AND QUALITY RULES:
                     summary_text,
                     include_health_rating=include_health_rating,
                     metrics_lines=metrics_lines or "",
-                    what_matters_lines=key_metrics_intro_lines,
                     calculated_metrics=calculated_metrics,
                     company_name=company_name,
                     risk_factors_excerpt=risk_factors_excerpt,
@@ -37772,7 +36616,6 @@ FLOW AND QUALITY RULES:
                             enforce_section_balance=bool(
                                 section_balance_contract_required
                             ),
-                            calculated_metrics=calculated_metrics,
                         )
                     )
                     structural_only_requirements = (
@@ -37813,7 +36656,6 @@ FLOW AND QUALITY RULES:
                                     source_text=context_excerpt,
                                     filing_language_snippets=filing_language_snippets,
                                     enforce_quote_contract=strict_quote_contract,
-                                    calculated_metrics=calculated_metrics,
                                 )
                             )
                             structural_only_requirements = (
@@ -37824,7 +36666,6 @@ FLOW AND QUALITY RULES:
                                     enforce_section_balance=bool(
                                         section_balance_contract_required
                                     ),
-                                    calculated_metrics=calculated_metrics,
                                 )
                             )
                             structural_only_requirements = (
@@ -37859,7 +36700,6 @@ FLOW AND QUALITY RULES:
                                     source_text=context_excerpt,
                                     filing_language_snippets=filing_language_snippets,
                                     enforce_quote_contract=strict_quote_contract,
-                                    calculated_metrics=calculated_metrics,
                                 )
                             )
                             structural_only_requirements = (
@@ -37870,7 +36710,6 @@ FLOW AND QUALITY RULES:
                                     enforce_section_balance=bool(
                                         section_balance_contract_required
                                     ),
-                                    calculated_metrics=calculated_metrics,
                                 )
                             )
                             structural_only_requirements = (
@@ -37932,16 +36771,8 @@ FLOW AND QUALITY RULES:
                                 source_text=context_excerpt,
                                 filing_language_snippets=filing_language_snippets,
                                 enforce_quote_contract=strict_quote_contract,
-                                calculated_metrics=calculated_metrics,
                             )
                         )
-                # Re-apply section-transition bridges in case word-band rebalancing
-                # trimmed any handoff sentences between MD&A and Risk Factors.
-                summary_text = _ensure_section_transition_handoffs(
-                    summary_text,
-                    include_health_rating=include_health_rating,
-                    target_length=target_length,
-                )
                 # Final closing recommendation repair — restore verdict stripped by
                 # any prior word-band enforcement or rebalancing pass.
                 summary_text = _repair_closing_recommendation_in_summary(
@@ -37956,7 +36787,6 @@ FLOW AND QUALITY RULES:
                         missing_requirements=missing_requirements,
                         include_health_rating=include_health_rating,
                         enforce_section_balance=bool(section_balance_contract_required),
-                        calculated_metrics=calculated_metrics,
                     )
                 )
             generation_stats["short_form_structural_fatal_requirements"] = (
@@ -38027,13 +36857,7 @@ FLOW AND QUALITY RULES:
                     generation_stats["contract_final_word_count"] = summary_meta.get(
                         "final_word_count", 0
                     )
-                    # Restore bridges and recommendation if editorial recovery /
-                    # word-band trimming removed them.
-                    summary_text = _ensure_section_transition_handoffs(
-                        summary_text,
-                        include_health_rating=include_health_rating,
-                        target_length=target_length,
-                    )
+                    # Restore recommendation if editorial recovery / word-band trimming removed it.
                     summary_text = _repair_closing_recommendation_in_summary(
                         summary_text,
                         company_name=company_name,
@@ -38048,7 +36872,6 @@ FLOW AND QUALITY RULES:
                             enforce_section_balance=bool(
                                 section_balance_contract_required
                             ),
-                            calculated_metrics=calculated_metrics,
                         )
                     )
                     if short_form_structural_fatal_requirements:
@@ -38639,23 +37462,23 @@ FLOW AND QUALITY RULES:
                 lower_gap = max(0, int(report.lower_bound) - int(report.total_words))
                 upper_gap = max(0, int(report.total_words) - int(report.upper_bound))
                 total_gap = lower_gap + upper_gap
+                soft_section_codes = {
+                    "section_budget_under",
+                    "section_budget_over",
+                }
                 fatal_section_failures = [
                     failure
                     for failure in list(report.section_failures or [])
-                    if _is_cv2_hard_section_failure_code(str(failure.code or ""))
+                    if str(failure.code or "") not in soft_section_codes
                 ]
                 soft_section_failures = [
                     failure
                     for failure in list(report.section_failures or [])
-                    if not _is_cv2_hard_section_failure_code(str(failure.code or ""))
-                ]
-                fatal_global_failures = [
-                    message
-                    for message in list(report.global_failures or [])
-                    if not _is_cv2_soft_global_failure(str(message or ""))
+                    if str(failure.code or "") in soft_section_codes
                 ]
                 return (
-                    len(fatal_global_failures) + len(fatal_section_failures),
+                    len(list(report.global_failures or []))
+                    + len(fatal_section_failures),
                     int(total_gap),
                     float(
                         sum(
@@ -38818,7 +37641,6 @@ FLOW AND QUALITY RULES:
                         target_length=target_length,
                         calculated_metrics=calculated_metrics,
                         metrics_lines=metrics_lines or "",
-                        what_matters_lines=key_metrics_intro_lines,
                         filing_language_snippets=filing_language_snippets or "",
                         strict_quote_contract=strict_quote_contract,
                         company_name=company_name,
@@ -38833,7 +37655,6 @@ FLOW AND QUALITY RULES:
                             repaired_summary_text,
                             include_health_rating=include_health_rating,
                             metrics_lines=metrics_lines or "",
-                            what_matters_lines=key_metrics_intro_lines,
                             calculated_metrics=calculated_metrics,
                             company_name=company_name,
                             risk_factors_excerpt=risk_factors_excerpt,
@@ -39322,8 +38143,10 @@ FLOW AND QUALITY RULES:
                 # misses are common because the LLM cannot precisely control
                 # per-section word counts within ±8 words.  Downgrade to
                 # warnings so the user gets a usable summary instead of a 422.
-                _cv2_has_structural_failure = _cv2_has_hard_validation_failure(
-                    continuous_v2_validation
+                _cv2_has_structural_failure = any(
+                    getattr(f, "code", "") not in ("section_budget_over", "section_budget_under")
+                    for f in (continuous_v2_validation.section_failures or [])
+                    if getattr(f, "code", "")
                 )
                 _cv2_balance_is_soft = bool(
                     (
@@ -39334,10 +38157,6 @@ FLOW AND QUALITY RULES:
                         continuous_v2_validation,
                         section_budgets=section_budgets,
                         target_length=target_length,
-                    )
-                    or (
-                        not _cv2_has_structural_failure
-                        and _cv2_has_editorial_failures(continuous_v2_validation)
                     )
                 )
                 if not continuous_v2_validation.passed and not _cv2_balance_is_soft:
@@ -40387,10 +39206,6 @@ def _rewrite_instruction_leaks_in_place(
         re.compile(r"commentary not provided", re.IGNORECASE),
         re.compile(r"not provided in the draft", re.IGNORECASE),
         re.compile(r"this section should\b", re.IGNORECASE),
-        re.compile(
-            r"the\s+(?:financial health rating|executive summary|financial performance|management discussion(?:\s*&\s*analysis)?|md&a|risk factors|closing takeaway|key metrics)\s+should\b",
-            re.IGNORECASE,
-        ),
         re.compile(r"keep this section concrete\b", re.IGNORECASE),
         re.compile(r"each risk should map to\b", re.IGNORECASE),
         re.compile(
@@ -40401,33 +39216,9 @@ def _rewrite_instruction_leaks_in_place(
         re.compile(r"per the guidelines\b", re.IGNORECASE),
         re.compile(r"the memo should\b", re.IGNORECASE),
         re.compile(r"the analysis should\b", re.IGNORECASE),
-        re.compile(
-            r"(?:this section|the memo|the analysis|the executive summary|the financial performance section|the management discussion(?:\s*&\s*analysis)?|the closing takeaway)\s+should\s+(?:frame|start|open|lead|focus|surface|end|include)\b",
-            re.IGNORECASE,
-        ),
-        re.compile(r"should frame\s+[A-Z][A-Za-z0-9&.,'’ -]{0,80}\s+as\b", re.IGNORECASE),
-        re.compile(r"section focus:\b", re.IGNORECASE),
-        re.compile(r"style contract:\b", re.IGNORECASE),
-        re.compile(r"quote mandate:\b", re.IGNORECASE),
-        re.compile(r"citation mandate:\b", re.IGNORECASE),
-        re.compile(r"return only the section body\b", re.IGNORECASE),
-        re.compile(r"golden thread\b", re.IGNORECASE),
-        re.compile(r"aha insight\b", re.IGNORECASE),
     ]
     strip_spans = [
         re.compile(r"\bthis section should\b[^.\n]{0,220}(?:\.|\n|$)", re.IGNORECASE),
-        re.compile(
-            r"\bthe\s+(?:financial health rating|executive summary|financial performance|management discussion(?:\s*&\s*analysis)?|md&a|risk factors|closing takeaway|key metrics)\s+should\b[^.\n]{0,220}(?:\.|\n|$)",
-            re.IGNORECASE,
-        ),
-        re.compile(
-            r"\b(?:this section|the memo|the analysis|the executive summary|the financial performance section|the management discussion(?:\s*&\s*analysis)?|the closing takeaway)\s+should\s+(?:frame|start|open|lead|focus|surface|end|include)\b[^.\n]{0,220}(?:\.|\n|$)",
-            re.IGNORECASE,
-        ),
-        re.compile(
-            r"\bshould frame\s+[A-Z][A-Za-z0-9&.,'’ -]{0,80}\s+as\b[^.\n]{0,180}(?:\.|\n|$)",
-            re.IGNORECASE,
-        ),
         re.compile(
             r"\bkeep this section concrete\b[^.\n]{0,220}(?:\.|\n|$)", re.IGNORECASE
         ),
@@ -40448,9 +39239,6 @@ def _rewrite_instruction_leaks_in_place(
             r"\badd\s+revenue(?:/margin/cash\s*flow|,?\s*margin,?\s*(?:and\s*)?cash\s*flow)\s+context\b[^.\n]{0,220}(?:\.|\n|$)",
             re.IGNORECASE,
         ),
-        re.compile(r"\b(?:section focus|style contract|quote mandate|citation mandate)\s*:[^.\n]{0,260}(?:\.|\n|$)", re.IGNORECASE),
-        re.compile(r"\breturn only the section body\b[^.\n]{0,80}(?:\.|\n|$)", re.IGNORECASE),
-        re.compile(r"\b(?:golden thread|aha insight)\b[^.\n]{0,180}(?:\.|\n|$)", re.IGNORECASE),
     ]
 
     def _section_anchor(section: str) -> str:
@@ -41194,7 +39982,7 @@ _EXPLICIT_PERSONAL_RECOMMENDATION_RE = re.compile(
     r"|for\s+my\s+(?:own\s+)?portfolio"
     r"|for\s+me"
     r"|bottom\s+line\s*:?"
-    r"|my\s+(?:call|stance|recommendation|rating)\s*:?"
+    r"|my\s+(?:call|stance|recommendation)\s*:?"
     r")\b[\s\S]{0,160}\b(?:buy|hold|sell)\b"
 )
 
@@ -41340,11 +40128,13 @@ def _ensure_personal_verdict(
     digest = hashlib.sha256(seed_material.encode("utf-8")).digest()
     rng = random.Random(int.from_bytes(digest[:8], "big"))
     verdict_variants = [
-        f"My call is {verdict_word} on {company_name}{driver_clause}.",
-        f"My stance is {verdict_word} on {company_name}{driver_clause}.",
-        f"My recommendation is {verdict_word} on {company_name}{driver_clause}.",
-        f"My rating is {verdict_word} on {company_name}{driver_clause}.",
-        f"On balance, I would {verdict_word} {company_name}{driver_clause}.",
+        f"For my own portfolio, I'd {verdict_word} {company_name}{driver_clause}.",
+        f"If I had to act today, I'd {verdict_word} {company_name}{driver_clause}.",
+        f"On balance, I'd {verdict_word} {company_name}{driver_clause}.",
+        f"My call: {verdict_word} {company_name}{f' ({driver})' if driver else ''}.",
+        f"I'd {verdict_word} {company_name}{driver_clause}.",
+        f"Personally, I'd {verdict_word} {company_name}{driver_clause}.",
+        f"For me, it's a {verdict_word} on {company_name}{driver_clause}.",
         f"Bottom line: {verdict_word} {company_name}{driver_clause}.",
     ]
     closing += " " + rng.choice(verdict_variants)
@@ -41638,9 +40428,10 @@ def _generate_fallback_closing_takeaway(
                         .startswith("what breaks the thesis")
                     ]
                     extension_clauses = [
-                        ", and investors should watch for whether that trend holds into the next quarter",
-                        ", because the next filing still needs to confirm that cash conversion and operating discipline stay aligned",
-                        ", and that is the proof point management still has to earn",
+                        ", which keeps valuation support tied to cash durability rather than optimism alone",
+                        ", and that is why the funding profile matters as much as the headline margin profile",
+                        ", because investors need the same evidence to support both reinvestment capacity and downside protection",
+                        ", while weaker evidence would force a narrower multiple and a more defensive posture",
                     ]
                     extension_idx = 0
                     target_indexes = expandable_indexes or [0]
@@ -41658,7 +40449,13 @@ def _generate_fallback_closing_takeaway(
                         extension_idx += 1
                     fitted = " ".join(closing_sentences).strip()
             if _count_words(fitted) > upper_band:
-                fitted = _truncate_text_to_word_limit(fitted, upper_band).strip()
+                over_by = _count_words(fitted) - upper_band
+                if 0 < over_by <= 20:
+                    tokens = fitted.split()
+                    if len(tokens) > over_by + 1:
+                        fitted = " ".join(tokens[: len(tokens) - over_by]).strip()
+                else:
+                    fitted = _truncate_text_to_word_limit(fitted, upper_band).strip()
         fitted = _normalize_closing_prose_spacing(fitted)
         if fitted and fitted[-1] not in ".!?":
             fitted += "."
@@ -43254,31 +42051,6 @@ def _ensure_required_sections(
 
         return " ".join([s for s in sentences if s]).strip()
 
-    def _clean_risk_excerpt(raw: str) -> str:
-        """Strip legal boilerplate, TOC lines, and fragments from risk excerpts."""
-        if not raw:
-            return ""
-        _toc_re = re.compile(
-            r"^\s*(?:ITEM\s+\d|Part\s+[IViv]+|Page\s+\d|TABLE OF CONTENTS)",
-            re.IGNORECASE,
-        )
-        _legal_re = re.compile(
-            r"incorporated by reference|filed as an exhibit|see Part\b|"
-            r"Any Trust must|pursuant to Rule|Commission file",
-            re.IGNORECASE,
-        )
-        cleaned_lines: List[str] = []
-        for line in raw.splitlines():
-            stripped = line.strip()
-            if not stripped or len(stripped.split()) < 5:
-                continue
-            if _toc_re.match(stripped):
-                continue
-            if _legal_re.search(stripped):
-                continue
-            cleaned_lines.append(stripped)
-        return "\n".join(cleaned_lines)
-
     def _synthesize_risk_factors_addendum(*, budget_words: Optional[int] = None) -> str:
         """Add concrete risk scenarios when Risk Factors is too thin.
 
@@ -43291,15 +42063,14 @@ def _ensure_required_sections(
         per_risk_min = int(shape.per_risk_min_sentences or 2)
         per_risk_max = int(shape.per_risk_max_sentences or 3)
         per_risk_budget = (
-            max(35, budget // max(1, expected_count)) if budget > 0 else 110
+            max(18, budget // max(1, expected_count)) if budget > 0 else 110
         )
         long_form = per_risk_min >= 4
         very_long_form = per_risk_budget >= 170
 
         lead = "A key risk is that"
 
-        cleaned_excerpt = _clean_risk_excerpt(risk_factors_excerpt or "")
-        excerpt_lower = cleaned_excerpt.lower()
+        excerpt_lower = (risk_factors_excerpt or "").lower()
         reg_driver = _regulatory_driver_label(risk_factors_excerpt)
         has_cloud_backlog = "cloud" in excerpt_lower or "backlog" in excerpt_lower
         has_ads = any(
@@ -44026,38 +42797,6 @@ def _ensure_required_sections(
                 if final_words > current_words:
                     body = final_body
                     current_words = final_words
-                    remaining_words = max(0, int(min_words) - int(current_words))
-
-        extra_focus_rounds = 0
-        while (
-            is_focus_section
-            and current_words < int(min_words)
-            and extra_focus_rounds < 6
-        ):
-            remaining_words = max(0, int(min_words) - int(current_words))
-            fallback_sentence = _section_balance_micro_top_up_sentence(
-                title,
-                max_words=int(remaining_words),
-                existing_body=body,
-            )
-            if not fallback_sentence:
-                fallback_sentence = _next_unique_section_balance_top_up_sentence(
-                    body,
-                    section_title=title,
-                    attempt=fallback_attempt_base + rounds + 2 + extra_focus_rounds,
-                    calculated_metrics=calculated_metrics,
-                    health_score_data=health_score_data,
-                    risk_factors_excerpt=risk_factors_excerpt,
-                )
-            if not fallback_sentence:
-                break
-            updated_body = _append_continuation(body, fallback_sentence)
-            updated_words = _count_words(updated_body)
-            if updated_words <= current_words:
-                break
-            body = updated_body
-            current_words = updated_words
-            extra_focus_rounds += 1
 
         text = pattern.sub(lambda _mm: f"## {title}\n{body}\n", text, count=1)
 

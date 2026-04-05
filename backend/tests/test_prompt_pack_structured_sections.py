@@ -23,7 +23,7 @@ def test_build_structured_output_contract_includes_budget_and_counting_instructi
 
     assert "Return a single JSON object only." in contract
     assert '"Executive Summary": target 150 body words' in contract
-    assert "allowed range 144-156" in contract  # ±3% of 150 = ±6 words
+    assert "allowed range 140-160" in contract  # ±floor 10 for budget 150
     assert "use code to calculate the word count" in contract
     assert "Financial Health Rating" not in contract
 
@@ -113,7 +113,7 @@ def test_long_form_budget_instruction_uses_budget_aware_closing_contract() -> No
     assert "what breaks the thesis" in closing_instruction
 
 
-def test_long_form_budget_instruction_requires_early_warning_signals_for_risks() -> None:
+def test_long_form_budget_instruction_uses_probability_first_natural_prose_for_risks() -> None:
     ctx = PromptContext(
         company_name="Alphabet Inc.",
         section_budgets={"Risk Factors": 556},
@@ -122,5 +122,6 @@ def test_long_form_budget_instruction_requires_early_warning_signals_for_risks()
     risk_instruction = _budget_instruction(ctx, "Risk Factors")
 
     assert "NO early-warning" not in risk_instruction
-    assert "early-warning signal" in risk_instruction
+    assert "probability first" in risk_instruction
+    assert "natural prose" in risk_instruction
     assert "4-5 sentences" in risk_instruction

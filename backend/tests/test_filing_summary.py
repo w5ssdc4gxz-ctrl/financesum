@@ -287,24 +287,6 @@ def test_build_filing_specific_risk_entries_rejects_marketing_sentence_anchor_fa
     assert "related management commentary" not in body
 
 
-def test_build_filing_specific_risk_entries_filters_low_signal_regulatory_disclosure_noise():
-    excerpt = (
-        "The Swiss Financial Market rules under FinSA expand the disclosure requirements for income taxes and other reporting items. "
-        "Ongoing antitrust scrutiny in Europe could force Microsoft to change bundling terms, which could slow seat expansion and raise remedy costs."
-    )
-
-    entries = filings_api._build_filing_specific_risk_entries(
-        risk_factors_excerpt=excerpt,
-        expected_count=1,
-    )
-
-    assert entries
-    title, body = entries[0]
-    assert "finsa" not in title.lower()
-    assert "swiss financial market" not in body.lower()
-    assert "antitrust" in title.lower() or "bundling terms" in body.lower()
-
-
 def test_trim_section_for_balance_preserves_risk_quote_grounding():
     risk_body = (
         '**Financial Condition Execution/Conversion Risk**: '
@@ -624,23 +606,6 @@ def _rich_key_metrics_metrics() -> dict[str, float]:
         "current_liabilities": 750.0,
         "total_debt": 1_125.0,
     }
-
-
-def _sparse_key_metrics_metrics() -> dict[str, float]:
-    return {
-        "revenue": 2_500.0,
-        "operating_margin": 30.0,
-    }
-
-
-def _sparse_numeric_key_metrics_block() -> str:
-    return (
-        "DATA_GRID_START\n"
-        "Revenue | $2.50B\n"
-        "Operating Margin | 30.0%\n"
-        "Free Cash Flow | $0.75B\n"
-        "DATA_GRID_END"
-    )
 
 
 def _build_key_metrics_underflow_summary(
@@ -1191,7 +1156,7 @@ def test_apply_strict_contract_seal_repairs_and_restores_core_contract_elements(
         generation_stats={},
     )
 
-    assert "balance sheet is not the debate" in sealed.lower()
+    assert "next thing investors need to underwrite" in sealed
     assert filings_api._count_direct_quotes_in_section(sealed, "Executive Summary") >= 1
     assert (
         filings_api._count_direct_quotes_in_section(
@@ -1216,7 +1181,7 @@ def test_apply_strict_contract_seal_repairs_and_restores_core_contract_elements(
 
     # Simulate a post-processing mutation that strips the bridge and MD&A quotes.
     mutated = sealed.replace(
-        "the balance sheet is not the debate; the real question is whether operating momentum can earn the next leg of investment.", ""
+        "next thing investors need to underwrite", ""
     )
     mdna_body = (
         filings_api._extract_markdown_section_body(
@@ -1241,7 +1206,7 @@ def test_apply_strict_contract_seal_repairs_and_restores_core_contract_elements(
         strict_quote_contract=True,
         generation_stats={},
     )
-    assert "balance sheet is not the debate" in resealed.lower()
+    assert "next thing investors need to underwrite" in resealed
     assert (
         filings_api._count_direct_quotes_in_section(
             resealed, "Management Discussion & Analysis"
@@ -1282,7 +1247,7 @@ def test_repair_brief_sections_deterministically_tops_up_brief_short_form_risk_f
     assert issue is not None
     assert "risk factors" in issue.lower()
     assert f"too brief ({risk_words} words)" in issue.lower()
-    assert "at least 94 words" in issue.lower()
+    assert "at least 108 words" in issue.lower()
 
     repaired, repair_info = filings_api._repair_brief_sections_deterministically(
         summary,
@@ -1299,7 +1264,7 @@ def test_repair_brief_sections_deterministically_tops_up_brief_short_form_risk_f
     assert repair_info.get("applied") is True
     assert repaired_risk is not None
     assert validator(repaired) is None
-    assert filings_api._count_words(repaired_risk) >= 94
+    assert filings_api._count_words(repaired_risk) >= 109
     assert repaired_risk.strip().endswith((".", "!", "?"))
     assert filings_api._extract_risk_entries_for_repair(repaired_risk)
 
@@ -2230,12 +2195,9 @@ def test_ensure_required_sections_rebuilds_long_form_risk_and_closing_without_he
         budgets["Closing Takeaway"], max_tolerance=15
     )
 
-    assert len(re.findall(r"\*\*[^*:\n]{2,120}\*\*:", risk_body)) == 2
-    assert filings_api._count_words(risk_body) >= 120
-    assert (
-        'As the filing notes, "' in risk_body
-        or "The filing ties this risk to" in risk_body
-    )
+    assert len(re.findall(r"\*\*[^*:\n]{2,120}\*\*:", risk_body)) == 3
+    assert filings_api._count_words(risk_body) >= 170
+    assert 'As the filing notes, "' in risk_body
     assert "Cost Absorption Risk" not in risk_body
     assert "Asset Deployment and Returns Risk" not in risk_body
     assert (
@@ -2323,12 +2285,9 @@ def test_ensure_required_sections_rebuilds_mid_precision_plain_risk_block_and_sh
         budgets["Closing Takeaway"], max_tolerance=15
     )
 
-    assert len(re.findall(r"\*\*[^*:\n]{2,120}\*\*:", risk_body)) == 2
-    assert filings_api._count_words(risk_body) >= 100
-    assert (
-        'As the filing notes, "' in risk_body
-        or "The filing ties this risk to" in risk_body
-    )
+    assert len(re.findall(r"\*\*[^*:\n]{2,120}\*\*:", risk_body)) == 3
+    assert filings_api._count_words(risk_body) >= 150
+    assert 'As the filing notes, "' in risk_body
     assert "Asset Deployment and Returns Risk" not in risk_body
     assert (
         budgets["Closing Takeaway"] - closing_tol
@@ -2402,7 +2361,7 @@ def test_ensure_required_sections_prefers_named_filing_exposures_for_risk_factor
         filings_api._extract_markdown_section_body(repaired, "Risk Factors") or ""
     )
 
-    assert len(re.findall(r"\*\*[^*:\n]{2,120}\*\*:", risk_body)) == 2
+    assert len(re.findall(r"\*\*[^*:\n]{2,120}\*\*:", risk_body)) == 3
     assert 'As the filing notes, "' in risk_body
     assert "Infrastructure Capex Payback Risk" not in risk_body
     assert "Infrastructure Cost Absorption Risk" not in risk_body
@@ -2815,8 +2774,8 @@ def test_strict_contract_seal_rebalances_ungrounded_quote_to_filing_snippet_quot
     )
     quote_validator = filings_api._make_quote_grounding_validator(
         source_text=filing_language_snippets,
-        require_quotes=False,
-        min_required_quotes=0,
+        require_quotes=True,
+        min_required_quotes=3,
         max_allowed_quotes=3,
     )
     pre_issue = quote_validator(memo)
@@ -3155,9 +3114,7 @@ def test_rebalance_short_contract_uses_key_metrics_and_soft_donors_for_850_hidde
     )
 
     assert info["applied"] is True
-    # With wider Risk Factors tolerance (12%), the total underweight deficit
-    # may fit within the word-band headroom, so trimming is not always needed.
-    assert info["words_trimmed"] >= 0
+    assert info["words_trimmed"] > 0
     # Filler padding is disabled, so the rebalancer may not expand all
     # underweight sections.  Verify at least one was expanded.
     expanded = info.get("expanded_sections") or []
@@ -3169,7 +3126,11 @@ def test_rebalance_short_contract_uses_key_metrics_and_soft_donors_for_850_hidde
     # Without filler padding, Closing Takeaway may not reach the old 92
     # threshold.  Verify it grew from its initial 61 words.
     assert counts_after["Closing Takeaway"] > counts_before["Closing Takeaway"]
-    assert filings_api._count_words(repaired) <= 890
+    # Key Metrics or narrative sections may serve as donors depending on the
+    # budget distribution.  Verify donors contributed words (already checked
+    # via words_trimmed > 0 above).
+    assert counts_after["Key Metrics"] <= counts_before["Key Metrics"]
+    assert filings_api._count_words(repaired) <= 880
 
 
 def test_rebalance_short_contract_can_exact_fit_tiny_health_underweight_without_expanding_closing() -> (
@@ -3991,7 +3952,7 @@ def test_apply_editorial_contract_repairs_restores_health_exec_bridge() -> None:
 
     assert info["changed"] is True
     assert health_body is not None
-    assert "balance sheet is not the debate" in health_body.lower()
+    assert "next thing investors need to underwrite" in health_body.lower()
 
 
 def test_contract_retry_editorial_bundle_deterministic_repairs_clear_650word_failures() -> (
@@ -10973,25 +10934,6 @@ def test_repair_short_form_key_metrics_underflow_repairs_57_word_850_grid() -> N
     assert filings_api._count_words(repaired_body or "") >= 64
 
 
-def test_expand_key_metrics_block_to_min_words_accepts_sparse_adaptive_grid() -> None:
-    required_words = 28
-
-    expanded = filings_api._expand_key_metrics_block_to_min_words(
-        _sparse_numeric_key_metrics_block(),
-        required_words=required_words,
-        min_rows=3,
-    )
-    issue, numeric_rows = filings_api._validate_key_metrics_numeric_block(
-        expanded,
-        min_rows=3,
-        require_markers=True,
-    )
-
-    assert issue is None
-    assert numeric_rows == 3
-    assert filings_api._count_words(expanded) >= required_words
-
-
 def test_continuous_v2_route_keeps_422_when_structural_risk_contract_cannot_be_repaired(
     monkeypatch,
 ):
@@ -11334,11 +11276,9 @@ def test_long_form_route_auto_uses_continuous_v2_pipeline(monkeypatch):
         filler_tokens = " ".join(f"{prefix}{idx}" for idx in range(remaining - 2))
         return f"{base} Monitoring markers include {filler_tokens}.".strip()
 
-    risk_shape = filings_api.get_risk_factors_shape(int(section_budgets["Risk Factors"]))
-    risk_count = max(1, int(getattr(risk_shape, "risk_count", 2) or 2))
-    risk_bases = [
-        (
-            "ren",
+    per_risk_budget = max(1, int(section_budgets["Risk Factors"]) // 3)
+    risk_entries = [
+        _pad_exact(
             (
                 "**Deferred Enterprise Renewals:** The filing warns that if larger customers delay deployment approvals or stagger contract starts, "
                 "recognized revenue can trail backlog expectations through slower seat activation, deferred implementation work, "
@@ -11349,9 +11289,10 @@ def test_long_form_route_auto_uses_continuous_v2_pipeline(monkeypatch):
                 "renewal cohorts, more implementation milestones shifting right, or a longer gap between bookings and production "
                 "use, because those indicators show backlog quality weakening before headline revenue fully reflects it."
             ),
+            per_risk_budget,
+            "ren",
         ),
-        (
-            "aim",
+        _pad_exact(
             (
                 "**AI Monetization Lag:** The filing warns that if compute investment and serving intensity rise faster than paid workload adoption, "
                 "the company can lose operating leverage even while demand signals still look constructive. The financial path is "
@@ -11362,9 +11303,10 @@ def test_long_form_route_auto_uses_continuous_v2_pipeline(monkeypatch):
                 "matching usage monetization, deteriorating payback on new capacity cohorts, or management emphasizing adoption "
                 "before discussing pricing, because that combination suggests demand is scaling faster than economics."
             ),
+            per_risk_budget,
+            "aim",
         ),
-        (
-            "chn",
+        _pad_exact(
             (
                 "**Channel Execution Friction:** The filing warns that if partner enablement, field handoffs, or bundled attach execution slow in the "
                 "highest-value channels, backlog can remain healthy on paper while billings, deployment cadence, and service mix "
@@ -11375,21 +11317,10 @@ def test_long_form_route_auto_uses_continuous_v2_pipeline(monkeypatch):
                 "partner certification, weaker pilot-to-production conversion, or lower services attach on indirect deals, because "
                 "those metrics would show commercial friction building before the backlog narrative breaks."
             ),
+            int(section_budgets["Risk Factors"]) - (per_risk_budget * 2),
+            "chn",
         ),
     ]
-    selected_risks = risk_bases[:risk_count]
-    per_risk_budget = max(1, int(section_budgets["Risk Factors"]) // risk_count)
-    risk_entries = []
-    allocated_words = 0
-    for idx, (prefix, base_text) in enumerate(selected_risks):
-        if idx == len(selected_risks) - 1:
-            target_words = max(
-                1, int(section_budgets["Risk Factors"]) - int(allocated_words)
-            )
-        else:
-            target_words = per_risk_budget
-            allocated_words += per_risk_budget
-        risk_entries.append(_pad_exact(base_text, target_words, prefix))
     risk_body = "\n\n".join(risk_entries)
     smoke_summary = "\n\n".join(
         [
@@ -13375,40 +13306,6 @@ def test_repair_key_metrics_contract_underflow_and_revalidate_chains_short_form_
     assert "late_key_metrics_top_up" in (repair_info.get("actions") or [])
 
 
-def test_should_attempt_short_form_key_metrics_repair_uses_adaptive_min_rows() -> None:
-    assert (
-        filings_api._should_attempt_short_form_key_metrics_repair(
-            missing_requirements=[],
-            summary_meta={"key_metrics_numeric_row_count": 2},
-            calculated_metrics={"revenue": 100.0, "free_cash_flow": 40.0},
-        )
-        is True
-    )
-    assert (
-        filings_api._should_attempt_short_form_key_metrics_repair(
-            missing_requirements=[],
-            summary_meta={"key_metrics_numeric_row_count": 3},
-            calculated_metrics={"revenue": 100.0, "free_cash_flow": 40.0},
-        )
-        is False
-    )
-    assert (
-        filings_api._should_attempt_short_form_key_metrics_repair(
-            missing_requirements=[],
-            summary_meta={"key_metrics_numeric_row_count": 4},
-            calculated_metrics={
-                "revenue": 100.0,
-                "operating_margin": 10.0,
-                "net_margin": 8.0,
-                "free_cash_flow": 40.0,
-                "current_ratio": 1.5,
-            },
-        )
-        is True
-    )
-
-
-
 def test_recover_short_form_editorial_issues_once_repairs_850_key_metrics_underflow(
     monkeypatch,
 ) -> None:
@@ -14298,86 +14195,6 @@ def test_insufficient_numeric_key_metrics_returns_422(monkeypatch) -> None:
         _clear_filing_bundle(filing_id, company_id)
 
 
-def test_sparse_numeric_key_metrics_preflight_accepts_three_rows(monkeypatch) -> None:
-    settings = get_settings()
-    settings.openai_api_key = "test-key"
-
-    filing_id = "sparse-key-metrics-filing"
-    company_id = "sparse-key-metrics-company"
-    _seed_filing_bundle(filing_id, company_id)
-    _relax_non_contract_quality_validators(monkeypatch)
-    _stabilize_summary_pipeline(monkeypatch)
-
-    sparse_summary = (
-        "## Executive Summary\n"
-        "Revenue remains durable, and the margin profile suggests the core business is still self-funding.\n\n"
-        "## Financial Performance\n"
-        "Top-line resilience and disciplined cost control kept the operating model intact through the period.\n\n"
-        "## Management Discussion & Analysis\n"
-        "Management is prioritizing reinvestment without giving up the operating discipline that underpins returns.\n\n"
-        "## Risk Factors\n"
-        "**Demand Risk**: A slower enterprise spending cycle could pressure volume and delay margin recovery.\n\n"
-        "## Key Metrics\n"
-        "DATA_GRID_START\n"
-        "Revenue | $2.50B\n"
-        "Operating Margin | 30.0%\n"
-        "Free Cash Flow | $0.75B\n"
-        "DATA_GRID_END\n\n"
-        "## Closing Takeaway\n"
-        "Hold while operating margin stays above 25% over the next four quarters."
-    )
-
-    monkeypatch.setattr(
-        filings_api,
-        "_build_calculated_metrics",
-        lambda *_args, **_kwargs: _sparse_key_metrics_metrics(),
-    )
-    monkeypatch.setattr(
-        filings_api,
-        "_build_key_metrics_block",
-        lambda *_args, **_kwargs: _sparse_numeric_key_metrics_block(),
-    )
-    monkeypatch.setattr(
-        filings_api,
-        "_generate_summary_with_quality_control",
-        lambda *args, **kwargs: sparse_summary,
-    )
-    monkeypatch.setattr(
-        filings_api,
-        "_evaluate_summary_contract_requirements",
-        lambda **kwargs: (
-            [],
-            {
-                "target_length": int(kwargs.get("target_length") or 0),
-                "final_word_count": filings_api._count_words(
-                    str(kwargs.get("summary_text") or "")
-                ),
-                "final_split_word_count": len(
-                    str(kwargs.get("summary_text") or "").split()
-                ),
-                "verified_quote_count": 0,
-                "key_metrics_numeric_row_count": 3,
-                "quality_checks_passed": [],
-            },
-        ),
-    )
-    monkeypatch.setattr(filings_api, "get_gemini_client", lambda *args, **kwargs: None)
-
-    client = TestClient(app)
-    response = client.post(
-        f"/api/v1/filings/{filing_id}/summary",
-        json={"mode": "custom", "target_length": 650},
-    )
-
-    try:
-        assert response.status_code == 200
-        payload = response.json() or {}
-        assert "failure_code" not in (payload.get("detail") or {})
-        assert str(payload.get("summary") or "").strip()
-    finally:
-        _clear_filing_bundle(filing_id, company_id)
-
-
 @pytest.mark.parametrize("target_length", [850, 1000, 1225])
 def test_short_form_endpoint_recovers_key_metrics_underflow_across_lengths(
     monkeypatch,
@@ -14491,11 +14308,14 @@ def test_short_form_missing_closing_takeaway_returns_summary_contract_422(
     )
 
     try:
-        assert response.status_code == 422
-        detail = (response.json() or {}).get("detail", {})
-        assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
-        missing = detail.get("missing_requirements") or []
-        assert any("closing takeaway" in str(item).lower() for item in missing)
+        assert response.status_code == 200, (
+            f"Expected 200 (degraded), got {response.status_code}"
+        )
+        payload = response.json() or {}
+        assert payload.get("degraded") is True
+        assert payload.get("degraded_reason") == "contract_miss"
+        warnings = payload.get("contract_warnings") or []
+        assert any("closing takeaway" in str(item).lower() for item in warnings)
     finally:
         _clear_filing_bundle(filing_id, company_id)
 
@@ -14531,7 +14351,7 @@ def test_short_form_invalid_key_metrics_returns_summary_contract_422(
     monkeypatch.setattr(
         filings_api,
         "_canonicalize_key_metrics_section",
-        lambda text, _metrics, **kwargs: text,
+        lambda text, _metrics: text,
     )
     monkeypatch.setattr(
         filings_api,
@@ -14546,13 +14366,16 @@ def test_short_form_invalid_key_metrics_returns_summary_contract_422(
     )
 
     try:
-        assert response.status_code == 422
-        detail = (response.json() or {}).get("detail", {})
-        assert detail.get("failure_code") == "SUMMARY_CONTRACT_FAILED"
-        missing = detail.get("missing_requirements") or []
+        assert response.status_code == 200, (
+            f"Expected 200 (degraded), got {response.status_code}"
+        )
+        payload = response.json() or {}
+        assert payload.get("degraded") is True
+        assert payload.get("degraded_reason") == "contract_miss"
+        warnings = payload.get("contract_warnings") or []
         assert any(
             "key metrics" in str(item).lower() or "data_grid" in str(item).lower()
-            for item in missing
+            for item in warnings
         )
     finally:
         _clear_filing_bundle(filing_id, company_id)
@@ -15232,8 +15055,8 @@ def test_short_quality_prompt_uses_budget_aware_quote_requirement(monkeypatch) -
         assert "quotes are mandatory" not in prompt
         assert "include at least 3 short direct quotes" not in prompt
         assert "the last sentence of each section must raise a question" not in prompt
-        assert "direct quotes are optional" in prompt
-        assert "0-2 short direct quotes total" in prompt
+        assert "direct quotes are optional" not in prompt
+        assert "2-3 direct quotes total" in prompt
         assert "frame the central question only in executive summary" in prompt
     finally:
         _clear_filing_bundle(filing_id, company_id)
@@ -15247,22 +15070,22 @@ def test_quote_policy_scales_by_target_length() -> None:
         "mdna_min": 0,
     }
     assert filings_api._summary_quote_policy_for_target_length(350) == {
-        "min_quotes": 0,
+        "min_quotes": 1,
         "max_quotes": 1,
-        "exec_min": 0,
+        "exec_min": 1,
         "mdna_min": 0,
     }
     assert filings_api._summary_quote_policy_for_target_length(650) == {
-        "min_quotes": 0,
-        "max_quotes": 2,
-        "exec_min": 0,
-        "mdna_min": 0,
+        "min_quotes": 2,
+        "max_quotes": 3,
+        "exec_min": 1,
+        "mdna_min": 1,
     }
     long_policy = filings_api._summary_quote_policy_for_target_length(1800)
-    assert long_policy["min_quotes"] == 0
-    assert long_policy["max_quotes"] == 3
-    assert long_policy["exec_min"] == 0
-    assert long_policy["mdna_min"] == 0
+    assert long_policy["min_quotes"] >= 3
+    assert long_policy["max_quotes"] >= 5
+    assert long_policy["exec_min"] == 1
+    assert long_policy["mdna_min"] == 1
 
 
 def test_management_forward_looking_validator_requires_attribution_and_future_signal() -> (
@@ -15339,59 +15162,10 @@ def test_evaluate_summary_contract_requirements_promotes_blocking_editorial_issu
     )
 
     lowered_missing = [str(item).lower() for item in missing]
-    lowered_quality = [str(item).lower() for item in meta.get("quality_issues", [])]
-    # "replaying financial performance themes" is a blocking snippet → fatal
+    assert any("conceptual handoff" in item for item in lowered_missing)
     assert any("replaying financial performance themes" in item for item in lowered_missing)
-    # bridge_issue and numbers_discipline_issue are now quality warnings, not fatal
-    assert any("conceptual handoff" in item for item in lowered_quality)
-    assert any("numbers discipline:" in item for item in lowered_quality)
-    assert not any("conceptual handoff" in item for item in lowered_missing)
-    assert not any("numbers discipline:" in item for item in lowered_missing)
-
-
-def test_evaluate_summary_contract_requirements_demotes_risk_specificity_when_filing_evidence_is_sparse() -> (
-    None
-):
-    memo = (
-        "## Executive Summary\n"
-        "A durable quarter still depends on execution.\n\n"
-        "## Financial Performance\n"
-        "Revenue and free cash flow improved.\n\n"
-        "## Management Discussion & Analysis\n"
-        "Management kept investing behind enterprise distribution.\n\n"
-        "## Risk Factors\n"
-        "**Liquidity Risk**: If working capital weakens, funding flexibility could narrow. Early-warning signal: lower cash conversion and tighter funding capacity if collections slip.\n\n"
-        "**Margin Compression**: If promotional intensity rises, profitability could weaken and reduce reinvestment capacity. Early-warning signal: lower gross margin and weaker operating leverage.\n\n"
-        "## Key Metrics\n"
-        "DATA_GRID_START\n"
-        "Revenue | $10.0B\n"
-        "Operating Margin | 30.0%\n"
-        "Free Cash Flow | $2.0B\n"
-        "Current Ratio | 1.4x\n"
-        "Net Debt | $5.0B\n"
-        "DATA_GRID_END\n\n"
-        "## Closing Takeaway\n"
-        "HOLD while cash conversion stays durable."
-    )
-
-    risk_validator = filings_api._make_risk_specificity_validator(
-        risk_factors_excerpt="merchant acquiring volume branded checkout dispute rates funding partners"
-    )
-
-    missing, meta = filings_api._evaluate_summary_contract_requirements(
-        summary_text=memo,
-        target_length=650,
-        include_health_rating=False,
-        quality_validators=[risk_validator],
-        source_text="",
-        filing_language_snippets="too sparse",
-        enforce_quote_contract=False,
-    )
-
-    lowered_missing = [str(item).lower() for item in missing]
-    lowered_quality = [str(item).lower() for item in meta.get("quality_issues", [])]
-    assert not any("too generic" in item for item in lowered_missing)
-    assert any("too generic" in item for item in lowered_quality)
+    assert any("numbers discipline:" in item for item in lowered_missing)
+    assert meta["quality_issues"] == []
 
 
 def test_evaluate_summary_contract_requirements_promotes_management_forward_looking_failures() -> (
@@ -15660,7 +15434,7 @@ def test_mid_length_quote_contract_requires_exec_and_mdna_coverage() -> None:
         enforce_quote_contract=True,
     )
 
-    assert not any(
+    assert any(
         "management discussion & analysis must include at least one verified direct quote"
         in str(item).lower()
         for item in missing

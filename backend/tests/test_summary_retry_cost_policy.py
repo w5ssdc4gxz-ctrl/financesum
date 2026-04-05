@@ -227,6 +227,51 @@ def test_rewrite_skips_gracefully_when_cost_cap_would_be_crossed(monkeypatch) ->
     assert stats.get("rewrite_skipped_budget_guard") is True
 
 
+def test_rewrite_rejects_candidate_that_drops_required_sections(monkeypatch) -> None:
+    draft = (
+        "## Executive Summary\n"
+        "Demand remained stable and the next proof point is whether the numbers confirm that setup.\n\n"
+        "## Financial Performance\n"
+        "Revenue and cash conversion held up, leaving management execution as the next test.\n\n"
+        "## Management Discussion & Analysis\n"
+        "Management kept investing behind the product roadmap, and the real downside is what happens if execution slips.\n\n"
+        "## Risk Factors\n"
+        "**Capacity Risk**: Deployment timing could delay monetization. The clearest indicators to watch are utilization and conversion.\n\n"
+        "## Key Metrics\n"
+        "DATA_GRID_START\n"
+        "Revenue | $10.0B\n"
+        "Operating Margin | 30.0%\n"
+        "Free Cash Flow | $2.0B\n"
+        "Current Ratio | 1.4x\n"
+        "Net Debt | $5.0B\n"
+        "DATA_GRID_END\n\n"
+        "## Closing Takeaway\n"
+        "HOLD while utilization catches up with infrastructure spend."
+    )
+    bad_rewrite = (
+        "## Executive Summary\n"
+        "Rewritten opening.\n\n"
+        "## Financial Performance\n"
+        "Rewritten performance section.\n"
+        f"\nWORD COUNT: {filings_api._count_words('Rewritten opening. Rewritten performance section.')}"
+    )
+
+    monkeypatch.setattr(
+        filings_api,
+        "_call_gemini_client",
+        lambda *_args, **_kwargs: bad_rewrite,
+    )
+
+    result, _ = filings_api._rewrite_summary_to_length(
+        gemini_client=object(),
+        summary_text=draft,
+        target_length=220,
+        quality_validators=None,
+    )
+
+    assert result == draft
+
+
 def test_underflow_regeneration_skips_when_optional_retry_would_exceed_budget(
     monkeypatch,
 ) -> None:

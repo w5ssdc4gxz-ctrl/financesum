@@ -293,6 +293,19 @@ def get_company_logo(ticker: str, exchange: str = "US"):
         return _logo_placeholder_response(clean_ticker)
 
 
+def _deduplicate_companies(companies: list[Company]) -> list[Company]:
+    """Remove duplicate companies, keeping the first occurrence per ticker."""
+    seen_tickers: set[str] = set()
+    unique: list[Company] = []
+    for company in companies:
+        ticker_key = (company.ticker or "").strip().upper()
+        if ticker_key and ticker_key in seen_tickers:
+            continue
+        seen_tickers.add(ticker_key)
+        unique.append(company)
+    return unique
+
+
 async def _lookup_companies(raw_query: str) -> CompanyLookupResponse:
     """
     Search for companies by ticker, CIK, or name.
@@ -330,7 +343,7 @@ async def _lookup_companies(raw_query: str) -> CompanyLookupResponse:
             if response and response.data:
                 supabase_client = get_supabase_client() if _supabase_configured(settings) else None
                 hydrated_records = await _fix_and_persist_countries(response.data, supabase_client)
-                companies = [Company(**company) for company in hydrated_records]
+                companies = _deduplicate_companies([Company(**company) for company in hydrated_records])
                 if companies:
                     print(f"Found {len(companies)} companies in Supabase")
                     return CompanyLookupResponse(companies=companies)
@@ -342,7 +355,7 @@ async def _lookup_companies(raw_query: str) -> CompanyLookupResponse:
 
     fallback_matches = _search_fallback_companies(query_raw)
     if fallback_matches:
-        return CompanyLookupResponse(companies=fallback_matches)
+        return CompanyLookupResponse(companies=_deduplicate_companies(fallback_matches))
     
     # If not found in database, search EDGAR
     try:
@@ -447,7 +460,7 @@ async def _lookup_companies(raw_query: str) -> CompanyLookupResponse:
                 saved_companies.append(fallback_company)
                 continue
         
-        return CompanyLookupResponse(companies=saved_companies)
+        return CompanyLookupResponse(companies=_deduplicate_companies(saved_companies))
     
     except HTTPException:
         raise

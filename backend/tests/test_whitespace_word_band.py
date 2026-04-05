@@ -10,7 +10,7 @@ def test_enforce_whitespace_word_band_guarantees_dual_counting() -> None:
     """
 
     target_length = 650
-    tolerance = 10
+    tolerance = 15
     lower = target_length - tolerance
     upper = target_length + tolerance
 
@@ -34,3 +34,39 @@ def test_enforce_whitespace_word_band_guarantees_dual_counting() -> None:
 
     assert lower <= filings_api._count_words(enforced) <= upper
     assert lower <= len(enforced.split()) <= upper
+
+
+def test_enforce_whitespace_word_band_compacts_key_metrics_pipes_when_split_count_dominates() -> None:
+    target_length = 20
+    tolerance = 2
+    lower = target_length - tolerance
+    upper = target_length + tolerance
+
+    text = "\n".join(
+        [
+            "## Key Metrics",
+            "DATA_GRID_START",
+            "Revenue | $1.0B",
+            "Operating Income | $0.2B",
+            "Operating Margin | 20%",
+            "Free Cash Flow | $0.1B",
+            "Cash | $0.5B",
+            "Debt | $0.3B",
+            "DATA_GRID_END",
+        ]
+    )
+
+    assert lower <= filings_api._count_words(text) <= upper
+    assert len(text.split()) > upper
+
+    enforced = filings_api._enforce_whitespace_word_band(
+        text,
+        target_length,
+        tolerance=tolerance,
+        allow_padding=False,
+        dedupe=False,
+    )
+
+    assert lower <= filings_api._count_words(enforced) <= upper
+    assert lower <= len(enforced.split()) <= upper
+    assert "Revenue| $1.0B" in enforced

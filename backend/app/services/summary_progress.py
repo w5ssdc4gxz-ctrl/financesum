@@ -26,6 +26,45 @@ class SummaryProgressSnapshot:
     eta_seconds: Optional[int]
     started_at: str
     updated_at: str
+    error: bool
+    last_failure_code: Optional[str]
+    last_error_message: Optional[str]
+    last_error_details: Optional[Dict[str, Any]]
+
+
+def _truncate_progress_error_details(value: Any, *, depth: int = 0) -> Any:
+    """Keep error payloads compact and JSON-safe for in-memory progress snapshots."""
+    if depth > 3:
+        return "..."
+    if value is None:
+        return None
+    if isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        normalized = " ".join(value.split()).strip()
+        return normalized[:500] + ("..." if len(normalized) > 500 else "")
+    if isinstance(value, list):
+        return [
+            _truncate_progress_error_details(item, depth=depth + 1)
+            for item in value[:12]
+        ]
+    if isinstance(value, tuple):
+        return [
+            _truncate_progress_error_details(item, depth=depth + 1)
+            for item in list(value)[:12]
+        ]
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for idx, (key, item) in enumerate(value.items()):
+            if idx >= 20:
+                out["truncated"] = True
+                break
+            out[str(key)] = _truncate_progress_error_details(item, depth=depth + 1)
+        return out
+    try:
+        return _truncate_progress_error_details(str(value), depth=depth + 1)
+    except Exception:  # noqa: BLE001
+        return "<unserializable>"
 
 
 def start_summary_progress(filing_id: str, *, expected_total_seconds: int) -> None:
@@ -41,6 +80,9 @@ def start_summary_progress(filing_id: str, *, expected_total_seconds: int) -> No
         "last_percent": 0.0,
         "done": False,
         "error": False,
+        "last_failure_code": None,
+        "last_error_message": None,
+        "last_error_details": None,
     }
     progress_cache[str(filing_id)] = "Initializing AI Agent..."
 
@@ -52,6 +94,10 @@ def set_summary_progress(
     stage_percent: Optional[int] = None,
     done: Optional[bool] = None,
     error: Optional[bool] = None,
+    last_failure_code: Optional[str] = None,
+    last_error_message: Optional[str] = None,
+    last_error_details: Optional[Any] = None,
+    clear_error_details: bool = False,
 ) -> None:
     key = str(filing_id)
     entry = summary_progress_cache.get(key)
@@ -68,9 +114,20 @@ def set_summary_progress(
             "last_percent": float(stage_percent or 0),
             "done": bool(done) if done is not None else False,
             "error": bool(error) if error is not None else False,
+            "last_failure_code": None,
+            "last_error_message": None,
+            "last_error_details": None,
         }
         if status:
             progress_cache[key] = status
+        if last_failure_code is not None:
+            summary_progress_cache[key]["last_failure_code"] = str(last_failure_code)
+        if last_error_message is not None:
+            summary_progress_cache[key]["last_error_message"] = str(last_error_message)
+        if last_error_details is not None:
+            summary_progress_cache[key]["last_error_details"] = (
+                _truncate_progress_error_details(last_error_details)
+            )
         return
 
     if status is not None:
@@ -91,12 +148,35 @@ def set_summary_progress(
         entry["done"] = bool(done)
     if error is not None:
         entry["error"] = bool(error)
+    if clear_error_details:
+        entry["last_failure_code"] = None
+        entry["last_error_message"] = None
+        entry["last_error_details"] = None
+    if last_failure_code is not None:
+        entry["last_failure_code"] = str(last_failure_code)
+    if last_error_message is not None:
+        entry["last_error_message"] = str(last_error_message)
+    if last_error_details is not None:
+        entry["last_error_details"] = _truncate_progress_error_details(last_error_details)
+
+    if bool(entry.get("done")):
+        entry["error"] = False
+        entry["last_failure_code"] = None
+        entry["last_error_message"] = None
+        entry["last_error_details"] = None
 
     entry["updated_ts"] = now
 
 
 def complete_summary_progress(filing_id: str) -> None:
-    set_summary_progress(filing_id, status="Complete", stage_percent=100, done=True)
+    set_summary_progress(
+        filing_id,
+        status="Complete",
+        stage_percent=100,
+        done=True,
+        error=False,
+        clear_error_details=True,
+    )
 
 
 def get_summary_progress_snapshot(filing_id: str) -> SummaryProgressSnapshot:
@@ -113,6 +193,21 @@ def get_summary_progress_snapshot(filing_id: str) -> SummaryProgressSnapshot:
     started_ts = float(entry.get("started_ts") or _now_ts())
     updated_ts = float(entry.get("updated_ts") or started_ts)
     done = bool(entry.get("done"))
+    error = bool(entry.get("error"))
+    last_failure_code = (
+        str(entry.get("last_failure_code"))
+        if entry.get("last_failure_code") not in (None, "")
+        else None
+    )
+    last_error_message = (
+        str(entry.get("last_error_message"))
+        if entry.get("last_error_message") not in (None, "")
+        else None
+    )
+    raw_error_details = entry.get("last_error_details")
+    last_error_details = (
+        raw_error_details if isinstance(raw_error_details, dict) else None
+    )
 
     if done:
         percent = 100
@@ -165,4 +260,8 @@ def get_summary_progress_snapshot(filing_id: str) -> SummaryProgressSnapshot:
         eta_seconds=eta_seconds,
         started_at=_iso_from_ts(started_ts),
         updated_at=_iso_from_ts(updated_ts),
+        error=error,
+        last_failure_code=last_failure_code,
+        last_error_message=last_error_message,
+        last_error_details=last_error_details,
     )

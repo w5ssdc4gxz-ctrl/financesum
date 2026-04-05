@@ -8,7 +8,7 @@ from app.services import local_cache
 
 
 def test_spotlight_endpoint_returns_null_when_no_gemini_and_no_regex_kpi(tmp_path, monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("OPENAI_API_KEY", "")
     monkeypatch.setenv("SPOTLIGHT_CACHE_TTL_SECONDS", "0")
     get_settings.cache_clear()
 
@@ -50,7 +50,7 @@ def test_spotlight_endpoint_returns_null_when_no_gemini_and_no_regex_kpi(tmp_pat
 
 
 def test_spotlight_endpoint_returns_regex_kpi_when_no_gemini(tmp_path, monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("OPENAI_API_KEY", "")
     monkeypatch.setenv("SPOTLIGHT_CACHE_TTL_SECONDS", "0")
     get_settings.cache_clear()
 

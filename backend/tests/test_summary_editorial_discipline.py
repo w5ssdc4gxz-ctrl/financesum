@@ -194,6 +194,46 @@ def test_micro_pad_tail_words_avoids_parenthetical_buzzword_chains() -> None:
     assert padded == base
 
 
+def test_section_exact_fit_micro_pad_sentence_is_disabled() -> None:
+    assert (
+        filings_api._section_exact_fit_micro_pad_sentence(
+            "Executive Summary",
+            max_words=4,
+            existing_body="Microsofts still anchors the case.",
+        )
+        == ""
+    )
+
+
+def test_risk_anchor_phrase_extractor_rejects_header_fragments() -> None:
+    anchors = filings_api._risk_named_anchor_phrases_from_excerpt(
+        "Table of Contents. To risks and uncertainties. Actual results may differ materially. "
+        "Export controls could delay shipments into certain markets."
+    )
+
+    lowered = [anchor.lower() for anchor in anchors]
+    assert "export controls" in lowered
+    assert "to risks and" not in lowered
+    assert "actual results" not in lowered
+
+
+def test_remove_filler_phrases_strips_garbled_sentences_from_soft_target_path() -> None:
+    text = (
+        "Microsofts matters. "
+        "The rating still depends on whether Microsoft keeps supporting financial resilience. "
+        "Execution credibility now depends on how leadership sequences Investments. "
+        "Azure demand still supports the operating case."
+    )
+
+    cleaned = filings_api._remove_filler_phrases(text)
+    lowered = cleaned.lower()
+
+    assert "microsofts matters" not in lowered
+    assert "rating still depends on whether" not in lowered
+    assert "leadership sequences investments" not in lowered
+    assert "azure demand still supports the operating case" in lowered
+
+
 def test_numbers_discipline_validator_flags_numeric_overload_in_financial_performance() -> (
     None
 ):
@@ -408,6 +448,194 @@ def test_remove_metric_echo_loops_collapses_one_liner_reinforcement_patterns() -
         s.strip() for s in re.split(r"(?<=[.!?])\s+", closing_body.strip()) if s.strip()
     ]
     assert len(closing_sentences) <= 4
+
+
+def test_short_form_editorial_recovery_prefers_pipeline_regeneration_over_generic_underflow(
+    monkeypatch,
+) -> None:
+    summary = (
+        "## Executive Summary\n"
+        "Azure demand remained healthy.\n\n"
+        "## Financial Performance\n"
+        "Revenue and cash conversion remained solid.\n\n"
+        "## Management Discussion & Analysis\n"
+        "Management kept investing in datacenter capacity.\n\n"
+        "## Risk Factors\n"
+        "**Azure Capacity Risk**: Power and deployment timing could delay monetization.\n\n"
+        "## Key Metrics\n"
+        "→ Revenue: $10.0B\n"
+        "→ Operating Margin: 30.0%\n"
+        "→ Free Cash Flow: $2.0B\n"
+        "→ Current Ratio: 1.4x\n"
+        "→ Net Debt: $5.0B\n\n"
+        "## Closing Takeaway\n"
+        "HOLD while utilization catches up with infrastructure spend."
+    )
+    issues = [
+        "Section balance issue: 'Executive Summary' is underweight (80 words; target ~208±8).",
+        "Final word-count band violation: expected 1195-1255, got split=1197, stripped=1160.",
+    ]
+    eval_calls = {"count": 0}
+    pipeline_helper_calls = {"count": 0}
+
+    def fake_eval(**_kwargs):
+        eval_calls["count"] += 1
+        if eval_calls["count"] == 1:
+            return list(issues), {"final_word_count": 1160}
+        return [], {"final_word_count": 1215}
+
+    def fake_pipeline_helper(text, **_kwargs):
+        pipeline_helper_calls["count"] += 1
+        return text + "\n", {"applied": True, "changed": True}
+
+    monkeypatch.setattr(
+        filings_api,
+        "_evaluate_summary_contract_requirements",
+        fake_eval,
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_apply_editorial_contract_repairs",
+        lambda text, **_kwargs: (text, {"applied": False, "changed": False}),
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_repair_brief_sections_deterministically",
+        lambda text, **_kwargs: (text, {"applied": False, "changed": False}),
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_repair_short_form_key_metrics_underflow",
+        lambda text, **_kwargs: (text, {"applied": False, "changed": False}),
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_regenerate_short_form_sections_from_pipeline_evidence",
+        fake_pipeline_helper,
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_precise_short_contract_underflow_top_up",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("generic short-form top-up should not run")
+        ),
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_expand_narrative_sections_for_short_contract_underflow",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("generic narrative underflow expansion should not run")
+        ),
+    )
+
+    text, remaining, meta, attempted = filings_api._recover_short_form_editorial_issues_once(
+        summary,
+        target_length=1225,
+        include_health_rating=False,
+        missing_requirements=list(issues),
+        quality_profile=filings_api.SummaryFlowQualityProfile(),
+        quality_validators=[],
+        calculated_metrics={},
+        company_name="Microsoft Corporation",
+        source_text="",
+        filing_language_snippets="",
+        enforce_quote_contract=False,
+        gemini_client=None,
+        pipeline_section_regenerator=lambda **_kwargs: "Expanded section body.",
+    )
+
+    assert attempted is True
+    assert pipeline_helper_calls["count"] == 1
+    assert remaining == []
+    assert meta["final_word_count"] == 1215
+    assert text.startswith("## Executive Summary")
+
+
+def test_mdna_management_voice_validator_accepts_curly_quote_attribution() -> None:
+    text = (
+        "## Executive Summary\n"
+        "Setup is improving.\n\n"
+        "## Financial Performance\n"
+        "Revenue and cash conversion improved.\n\n"
+        "## Management Discussion & Analysis\n"
+        "Management’s near-term plan is to keep scaling Azure capacity while preserving liquidity flexibility. "
+        "Management frames the outlook with the caution that forward-looking statements are “subject to risks and uncertainties that may cause actual results to differ materially,” which ties the quarter’s capex surge to explicit execution risk. "
+        "That attribution should satisfy the management-voice requirement because it uses both a direct quote and clear management framing rather than generic narration.\n\n"
+        "## Risk Factors\n"
+        "**Azure Capacity Risk**: Capacity deployment delays could pressure cloud gross margin. Early-warning signal: watch utilization and onboarding.\n\n"
+        "## Key Metrics\n"
+        "→ Revenue: $10.0B\n"
+        "→ Operating Margin: 30.0%\n"
+        "→ Free Cash Flow: $2.0B\n"
+        "→ Current Ratio: 1.4x\n"
+        "→ Net Debt: $5.0B\n\n"
+        "## Closing Takeaway\n"
+        "HOLD while utilization catches up with infrastructure spend."
+    )
+
+    validation = filings_api.validate_summary(
+        text,
+        target_words=650,
+        section_budgets={
+            "Executive Summary": 90,
+            "Financial Performance": 100,
+            "Management Discussion & Analysis": 120,
+            "Risk Factors": 110,
+            "Key Metrics": 80,
+            "Closing Takeaway": 70,
+        },
+        include_health_rating=False,
+        risk_factors_excerpt="Azure capacity and utilization remain the key operating risks.",
+    )
+
+    assert not any(
+        failure.code == "insufficient_management_voice"
+        for failure in validation.section_failures
+    )
+
+
+def test_pipeline_evidence_regeneration_passes_structured_section_memory() -> None:
+    summary = (
+        "## Executive Summary\n"
+        "Azure backlog remains the main proof point while cash conversion is still under pressure.\n\n"
+        "## Financial Performance\n"
+        "Cash conversion weakened as capex accelerated.\n\n"
+        "## Management Discussion & Analysis\n"
+        "Management highlighted Azure capacity additions and Copilot attach across enterprise agreements.\n\n"
+        "## Risk Factors\n"
+        "**Azure Capacity Risk**: Utilization can lag deployment. Early-warning signal: watch backlog conversion.\n\n"
+        "## Key Metrics\n"
+        "→ Revenue: $10.0B\n"
+        "→ Free Cash Flow: $2.0B\n\n"
+        "## Closing Takeaway\n"
+        "HOLD while Azure backlog converts cleanly."
+    )
+    captured: dict[str, object] = {}
+
+    def fake_regenerator(**kwargs):
+        captured.update(kwargs)
+        return "Expanded section body with new management expectations and proof points."
+
+    text, info = filings_api._regenerate_short_form_sections_from_pipeline_evidence(
+        summary,
+        target_length=1225,
+        include_health_rating=False,
+        issue_flags={
+            "section_balance_issue": True,
+            "section_balance_underweight_titles": ["Executive Summary"],
+        },
+        regenerate_section_fn=fake_regenerator,
+    )
+
+    assert info["applied"] is True
+    assert captured["section_name"] in {
+        "Executive Summary",
+        "Closing Takeaway",
+    }
+    assert captured["section_memory"]["used_theme_keys"]
+    assert "cash conversion" in captured["section_memory"]["used_theme_keys"]
+    assert "Azure" in " ".join(captured["section_memory"]["used_company_terms"])
+    assert text.startswith("## Executive Summary")
 
 
 def test_whitespace_band_padding_avoids_legacy_tail_template_loops() -> None:
@@ -797,7 +1025,7 @@ def test_health_to_exec_bridge_injection_adds_transition_sentence() -> None:
     )
     bridged = filings_api._ensure_health_to_exec_bridge(summary)
     body = filings_api._extract_markdown_section_body(bridged, "Financial Health Rating") or ""
-    assert "Executive Summary" in body
+    assert "next thing investors need to underwrite" in body
 
 
 def test_risk_specificity_validator_allows_mechanism_without_numeric_anchor() -> None:
@@ -809,14 +1037,91 @@ def test_risk_specificity_validator_allows_mechanism_without_numeric_anchor() ->
     )
     text = (
         "## Risk Factors\n"
-        "**Pricing Pressure Risk**: If competition intensifies in distribution channels, pricing concessions can arrive faster than cost actions. "
+        "**Pricing Pressure Risk**: The filing warns that competition in distribution channels can intensify and pricing concessions can arrive faster than cost actions. "
         "That can compress contribution margins and weaken reinvestment capacity before demand stabilizes. "
         "Early warning signal: watch retention and partner concentration trends for deterioration.\n\n"
-        "**Reinvestment Timing Risk**: If reinvestment ramps ahead of realized demand elasticity, operating leverage can reverse even with stable revenue. "
+        "**Reinvestment Timing Risk**: The filing warns that reinvestment can ramp ahead of realized demand elasticity, so operating leverage can reverse even with stable revenue. "
         "This mechanism matters because customer retention can soften while fixed-cost commitments remain elevated. "
         "Early warning signal: watch utilization trends and retention slippage in core cohorts."
     )
     assert validator(text) is None
+
+
+def test_editorial_anchor_validator_flags_generic_microsoft_style_summary() -> None:
+    validator = filings_api._make_editorial_anchor_validator(
+        company_terms=[
+            "Azure backlog",
+            "Copilot attach",
+            "AI infrastructure",
+            "enterprise agreements",
+        ],
+        management_expectations=[
+            "Azure backlog conversion Management expects capacity additions to translate into revenue over the next several quarters.",
+            "Copilot attach Management expects adoption to deepen inside enterprise agreements this fiscal year.",
+        ],
+        promise_scorecard_items=[
+            "convert AI capacity into monetized workload demand on_track management says backlog conversion is improving",
+            "expand Copilot inside enterprise agreements new_commitment management is now prioritizing attach and renewal expansion",
+        ],
+    )
+    summary = (
+        "## Executive Summary\n"
+        "Microsoft monetizes a deeply embedded enterprise stack through recurring subscriptions and consumption-based cloud usage. "
+        "The core question is whether Microsoft can keep scaling infrastructure fast enough to capture AI-driven workload growth without eroding free cash flow.\n\n"
+        "## Financial Performance\n"
+        "Operating cash flow strengthened and free cash flow rose even as investment accelerated.\n\n"
+        "## Management Discussion & Analysis\n"
+        "Management is prioritizing rapid scaling of cloud and AI capacity while preserving liquidity and capital-return flexibility. "
+        "Execution hinges on matching the infrastructure build to utilization and pricing discipline as AI hardware cycles and power constraints evolve.\n\n"
+        "## Risk Factors\n"
+        "**AI Capacity Timing Risk**: If deployment timing slips, utilization can ramp more slowly than expected. "
+        "That can pressure revenue conversion and free cash flow. Early warning signal: watch backlog conversion and utilization trends.\n\n"
+        "## Key Metrics\n"
+        "→ Revenue: $61.86B\n"
+        "→ Free Cash Flow: $20.96B\n\n"
+        "## Closing Takeaway\n"
+        "HOLD Microsoft for now because the financial profile remains solid, but the next few quarters still need to prove the investment cycle will pay off."
+    )
+
+    issue = validator(summary)
+    assert issue is not None
+    assert (
+        "management credibility" in issue.lower()
+        or "filing-specific company language" in issue.lower()
+    )
+
+
+def test_apply_contract_structural_repairs_can_skip_narrative_top_up() -> None:
+    summary = (
+        "## Executive Summary\n"
+        "The setup is mixed.\n\n"
+        "## Financial Performance\n"
+        "Revenue improved.\n\n"
+        "## Management Discussion & Analysis\n"
+        "Management is investing.\n\n"
+        "## Risk Factors\n"
+        "**Capacity Timing Risk**: Capacity can arrive before demand and pressure margins. "
+        "Early warning signal: watch utilization.\n\n"
+        "## Key Metrics\n"
+        "→ Revenue: $10.0B\n"
+        "→ Free Cash Flow: $2.0B\n\n"
+        "## Closing Takeaway\n"
+        "HOLD remains appropriate."
+    )
+
+    repaired = filings_api._apply_contract_structural_repairs(
+        summary,
+        include_health_rating=False,
+        target_length=1225,
+        calculated_metrics={"operating_margin": 26.5, "free_cash_flow": 2_000_000_000},
+        allow_narrative_top_up=False,
+    )
+
+    lowered = repaired.lower()
+    assert "this view remains intact over the next two quarters" not in lowered
+    assert "the view would warrant a downgrade" not in lowered
+    assert "monitoring these transmission paths through the earliest confirmation signals remains essential" not in lowered
+    assert "management's capital-allocation and execution choices determine whether these trends can persist" not in lowered
 
 
 def test_numbers_discipline_validator_flags_numeric_overload_in_risk_factors() -> None:
@@ -1134,7 +1439,7 @@ def test_numbers_discipline_validator_flags_numeric_overload_in_mdna_long_form()
     assert "Management Discussion & Analysis is too numeric" in issue
 
 
-def test_section_transition_validator_requires_explicit_handoffs() -> None:
+def test_section_transition_validator_accepts_subtle_handoffs() -> None:
     validator = filings_api._make_section_transition_validator(
         include_health_rating=False,
         target_length=1800,
@@ -1153,18 +1458,117 @@ def test_section_transition_validator_requires_explicit_handoffs() -> None:
     )
     issue = validator(missing_bridges)
     assert issue is not None
-    assert "explicit bridge" in issue
+    assert "conceptual handoff" in issue
 
     coherent_flow = (
         "## Executive Summary\n"
-        "The thesis is constructive, and Financial Performance below tests whether conversion quality is durable.\n\n"
+        "The thesis is constructive, and the next proof point is whether conversion quality is durable enough to justify the optimism.\n\n"
         "## Financial Performance\n"
-        "Revenue and cash conversion held up, and the next question for management discussion is whether capital allocation can sustain this profile.\n\n"
+        "Revenue and cash conversion held up, and the next question is whether management's capital allocation can sustain this profile.\n\n"
         "## Management Discussion & Analysis\n"
-        "Management emphasized disciplined investment, which sets up the downside analysis in the risk factors section.\n\n"
+        "Management emphasized disciplined investment, and the real watchpoint now is where that plan could still fail under heavier reinvestment.\n\n"
         "## Risk Factors\n"
-        "**Execution Risk**: If reinvestment outruns realized demand, margins can compress; the key metrics below track that transmission path.\n\n"
+        "**Execution Risk**: If reinvestment outruns realized demand, margins can compress; the main indicators to monitor are utilization, bookings conversion, and the proof points tracked below.\n\n"
         "## Key Metrics\n"
         "→ Revenue: $12.0B\n"
     )
     assert validator(coherent_flow) is None
+
+
+def test_short_form_structural_seal_restores_missing_transition_handoffs() -> None:
+    metrics_lines = (
+        "DATA_GRID_START\n"
+        "Revenue | $10.0B\n"
+        "Operating Margin | 30.0%\n"
+        "Free Cash Flow | $2.0B\n"
+        "Current Ratio | 1.4x\n"
+        "Net Debt | $5.0B\n"
+        "DATA_GRID_END"
+    )
+    summary = (
+        "## Executive Summary\n"
+        "Demand remained healthy and the setup still depends on durable monetization.\n\n"
+        "## Financial Performance\n"
+        "Revenue and cash conversion remained solid through the quarter.\n\n"
+        "## Management Discussion & Analysis\n"
+        "Management kept investing in datacenter capacity and product rollout.\n\n"
+        "## Risk Factors\n"
+        "**Azure Capacity Risk**: Power and deployment timing could delay monetization.\n\n"
+        "## Key Metrics\n"
+        f"{metrics_lines}\n\n"
+        "## Closing Takeaway\n"
+        "HOLD while utilization catches up with infrastructure spend."
+    )
+
+    sealed = filings_api._apply_short_form_structural_seal(
+        summary,
+        include_health_rating=False,
+        metrics_lines=metrics_lines,
+        calculated_metrics={
+            "revenue": 10_000_000_000,
+            "operating_margin": 30.0,
+            "free_cash_flow": 2_000_000_000,
+            "current_assets": 7_000_000_000,
+            "current_liabilities": 5_000_000_000,
+            "total_debt": 8_000_000_000,
+            "cash": 3_000_000_000,
+        },
+        company_name="Microsoft Corporation",
+        risk_factors_excerpt="azure capacity deployment utilization monetization",
+        target_length=1000,
+    )
+
+    validator = filings_api._make_section_transition_validator(
+        include_health_rating=False,
+        target_length=1000,
+    )
+    assert validator(sealed) is None
+
+
+def test_section_differentiation_validator_flags_cross_section_replay() -> None:
+    validator = filings_api._make_section_differentiation_validator(
+        company_terms=[
+            "Azure backlog",
+            "Copilot attach",
+            "enterprise agreements",
+        ],
+        management_expectations=[
+            "Azure backlog conversion should improve over the next several quarters.",
+            "Copilot attach should deepen inside enterprise agreements this year.",
+        ],
+        promise_scorecard_items=[
+            "convert AI capacity into monetized workload demand on_track",
+            "expand Copilot attach inside enterprise agreements new_commitment",
+        ],
+    )
+    repetitive = (
+        "## Executive Summary\n"
+        "Microsoft's central issue is whether cash conversion, reinvestment, and balance-sheet flexibility can all hold together while Azure backlog and Copilot attach scale.\n\n"
+        "## Financial Performance\n"
+        "Cash conversion weakened as reinvestment accelerated, and balance-sheet flexibility is now the main proof point in the quarter.\n\n"
+        "## Management Discussion & Analysis\n"
+        "At $81.3B of revenue and $35.8B of operating cash flow, cash conversion and reinvestment remain the central issue while balance-sheet flexibility still matters. "
+        "Azure backlog and Copilot attach are important, but the section mostly repeats the same cash-conversion and reinvestment framing.\n\n"
+        "## Closing Takeaway\n"
+        "HOLD because cash conversion, reinvestment, and balance-sheet flexibility still define the case, and the same quarterly performance themes remain the core of the decision."
+    )
+
+    issue = validator(repetitive)
+    assert issue is not None
+    assert "recycling too many of the same themes" in issue.lower() or "replaying" in issue.lower()
+
+
+def test_generic_risk_name_rewrite_for_repair_avoids_old_bucket_names() -> None:
+    rewritten = filings_api._rewrite_generic_risk_name_for_repair(
+        "Margin Compression Risk",
+        risk_factors_excerpt="AI infrastructure demand and cloud capacity utilization remain the core risk drivers.",
+    )
+    assert rewritten == "Cloud Capacity Utilization Risk"
+
+
+def test_execution_risk_rewrite_for_repair_uses_industrial_anchor() -> None:
+    rewritten = filings_api._rewrite_generic_risk_name_for_repair(
+        "Project Execution Risk",
+        risk_factors_excerpt="Order intake, backlog conversion, aftermarket attachment, and project execution remain the core industrial risks.",
+    )
+    assert rewritten == "Backlog Conversion Capacity / Deployment Risk"

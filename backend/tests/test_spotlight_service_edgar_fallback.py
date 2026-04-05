@@ -108,7 +108,7 @@ class _FakeGeminiClientForEdgarFallback:
 
 
 class _DummySettings:
-    gemini_api_key = "test"
+    openai_api_key = "test"
 
 
 @pytest.mark.anyio

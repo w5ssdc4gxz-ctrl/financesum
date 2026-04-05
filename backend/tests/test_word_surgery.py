@@ -449,6 +449,18 @@ class TestCleanEnding:
     def test_empty_text_returns_empty(self) -> None:
         assert clean_ending("", target_words=100) == ""
 
+    def test_preserves_markdown_sections_when_trimming(self) -> None:
+        text = (
+            "## Executive Summary\n"
+            "First sentence here. Second sentence here. Third sentence here.\n\n"
+            "## Risk Factors\n"
+            "Risk sentence one. Risk sentence two. Risk sentence three."
+        )
+        result = clean_ending(text, target_words=12, tolerance=3)
+        assert "## Executive Summary" in result
+        assert "## Risk Factors" in result
+        assert result.count("## ") >= 2
+
 
 # ===================================================================
 # Integration: trim then expand round-trip

@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.config import get_settings
 from app.models.database import get_supabase_client
 from app.services import local_cache
+from app.services.posthog import capture_posthog_event
 from app.utils.supabase_errors import is_supabase_table_missing_error
 
 logger = logging.getLogger(__name__)
@@ -154,6 +155,7 @@ def record_summary_generated_event(
     supabase_client=None,
 ) -> None:
     """Best-effort event logging for summary/analysis activity tracking."""
+    timestamp = datetime.now(timezone.utc).isoformat()
     payload: Dict[str, Any] = {
         "filing_id": str(summary_id),
         "company_id": str(company_id) if company_id else None,
@@ -163,6 +165,24 @@ def record_summary_generated_event(
     }
     if user_id:
         payload["user_id"] = str(user_id)
+
+    try:
+        capture_posthog_event(
+            event="summary_generated",
+            distinct_id=str(user_id or summary_id),
+            timestamp=timestamp,
+            properties={
+                "source": "backend",
+                "summary_id": str(summary_id),
+                "company_id": str(company_id) if company_id else None,
+                "user_id": str(user_id) if user_id else None,
+                "mode": kind,
+                "cached": bool(cached),
+                "summary_source": source,
+            },
+        )
+    except Exception:  # pragma: no cover - defensive, capture helper is already best-effort
+        pass
 
     if supabase_client is None:
         settings = get_settings()
@@ -181,7 +201,7 @@ def record_summary_generated_event(
                 logger.debug("Unable to persist %s to Supabase: %s", SUMMARY_EVENTS_TABLE, exc)
 
     try:
-        local_cache.append_summary_event({**payload, "created_at": datetime.now(timezone.utc).isoformat()})
+        local_cache.append_summary_event({**payload, "created_at": timestamp})
     except Exception as exc:  # noqa: BLE001
         logger.debug("Unable to persist local summary events cache: %s", exc)
 

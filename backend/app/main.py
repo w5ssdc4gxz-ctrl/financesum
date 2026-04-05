@@ -4,7 +4,7 @@ import os
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import analysis, companies, filings, dashboard, billing
+from app.api import admin, analysis, companies, filings, dashboard, billing
 from app.config import DEFAULT_CORS_ORIGINS, get_settings
 
 settings = get_settings()
@@ -95,6 +95,12 @@ app.include_router(
     billing.router,
     prefix=f"/api/{settings.api_version}/billing",
     tags=["billing"],
+)
+
+app.include_router(
+    admin.router,
+    prefix=f"/api/{settings.api_version}/admin",
+    tags=["admin"],
 )
 
 

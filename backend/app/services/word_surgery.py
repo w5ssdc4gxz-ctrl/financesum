@@ -242,6 +242,7 @@ def clean_ending(text: str, target_words: int, tolerance: int = 10) -> str:
     - If over-target + tolerance: find the last sentence that ends at or before
       the upper bound (target + tolerance words), truncate there.
     - Never cut mid-sentence; never leave a dangling clause.
+    - Preserve markdown section structure when the text is sectioned.
     - If under-target (but within tolerance): return as-is — do NOT pad.
     """
     if not text or target_words <= 0:
@@ -252,6 +253,10 @@ def clean_ending(text: str, target_words: int, tolerance: int = 10) -> str:
 
     if wc <= upper:
         return text  # within band or under target — no truncation
+
+    sections = _split_into_sections(text)
+    if any(header for header, _body in sections):
+        return trim_to_target(text, target=target_words, tolerance=tolerance)
 
     # Split into sentences and rebuild up to the upper limit.
     sentences_raw = re.split(r"(?<=[.!?])\s+", text.strip())

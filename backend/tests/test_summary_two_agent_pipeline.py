@@ -16,7 +16,7 @@ def _run_pipeline(
         sector="Industrials",
         industry="Machinery",
         filing_type="10-K",
-        model_name="gpt-5.2",
+        model_name="gpt-5.4-mini",
         build_summary_prompt=build_summary_prompt
         or (lambda company_research_block: f"PROMPT\n{company_research_block}\nEND"),
         generate_summary=generate_summary
@@ -111,7 +111,7 @@ def test_two_agent_pipeline_forwards_usage_context_to_research(monkeypatch):
         sector="Industrials",
         industry="Machinery",
         filing_type="10-K",
-        model_name="gpt-5.2",
+        model_name="gpt-5.4-mini",
         build_summary_prompt=lambda company_research_block: f"PROMPT\n{company_research_block}",
         generate_summary=lambda prompt, timeout_seconds: "## Executive Summary\nGenerated.",
         usage_context={
@@ -163,7 +163,7 @@ def test_two_agent_pipeline_skips_research_when_budget_too_tight(monkeypatch):
         sector="Industrials",
         industry="Machinery",
         filing_type="10-K",
-        model_name="gpt-5.2",
+        model_name="gpt-5.4-mini",
         build_summary_prompt=lambda company_research_block: f"PROMPT\n{company_research_block}",
         generate_summary=_generate,
         total_timeout_seconds=30.0,
@@ -198,7 +198,7 @@ def test_two_agent_pipeline_clamps_research_timeout_to_preserve_agent2_budget(
         sector="Industrials",
         industry="Machinery",
         filing_type="10-K",
-        model_name="gpt-5.2",
+        model_name="gpt-5.4-mini",
         build_summary_prompt=lambda company_research_block: f"PROMPT\n{company_research_block}",
         generate_summary=_generate,
         total_timeout_seconds=100.0,

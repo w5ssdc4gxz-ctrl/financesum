@@ -26,7 +26,7 @@ def test_record_ai_usage_uses_token_rate_basis_when_env_rates_unset(
         prompt="Prompt text",
         response_text="Response text",
         usage_metadata=None,
-        model="gpt-5.2",
+        model="gpt-5.4-mini",
         usage_context={"request_id": "req-1"},
     )
 

@@ -361,9 +361,9 @@ def test_tolerance_scales_with_budget() -> None:
 
 
 def test_risk_factors_tolerance_wider_at_mid_range_budgets() -> None:
-    """Risk Factors at 110-250 word budgets uses 12% band (not 5%)."""
+    """Risk Factors at 110-250 word budgets uses 8% band (not 5%)."""
     tol = section_budget_tolerance_words("Risk Factors", 172)
-    assert tol == max(10, round(172 * 0.12))  # 21
+    assert tol == max(10, round(172 * 0.08))  # 14
     # Non-Risk section at same budget unchanged
     tol_exec = section_budget_tolerance_words("Executive Summary", 172)
     assert tol_exec == max(10, round(172 * 0.05))  # 10 (floor)

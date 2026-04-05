@@ -1,4 +1,6 @@
 """Premium Investor Persona Engine - Radically Distinctive Voice Implementation."""
+
+import logging
 from typing import Dict, List, Optional, Any, Tuple
 from app.services.gemini_client import GeminiClient
 from app.services.summary_length import (
@@ -7,6 +9,8 @@ from app.services.summary_length import (
 )
 import re
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -48,16 +52,35 @@ def normalize_persona_id(persona_id: str) -> str:
 # =============================================================================
 
 BANNED_GENERIC_PHRASES = [
-    "robust financial", "strong fundamentals", "poised for growth",
-    "driving shareholder value", "showcases its dominance", "incredibly encouraging",
-    "fueling future growth", "welcome addition", "testament to",
-    "remains to be seen", "clear indication", "well-positioned",
-    "solid execution", "attractive opportunity", "compelling valuation",
-    "favorable outlook", "strategic initiatives", "operational excellence",
-    "market leadership", "competitive positioning", "growth trajectory",
-    "value creation", "shareholder returns", "industry tailwinds",
-    "macro headwinds", "regulatory uncertainty", "data privacy concerns",
-    "cloud infrastructure", "digital transformation",  # unless actually relevant
+    "robust financial",
+    "strong fundamentals",
+    "poised for growth",
+    "driving shareholder value",
+    "showcases its dominance",
+    "incredibly encouraging",
+    "fueling future growth",
+    "welcome addition",
+    "testament to",
+    "remains to be seen",
+    "clear indication",
+    "well-positioned",
+    "solid execution",
+    "attractive opportunity",
+    "compelling valuation",
+    "favorable outlook",
+    "strategic initiatives",
+    "operational excellence",
+    "market leadership",
+    "competitive positioning",
+    "growth trajectory",
+    "value creation",
+    "shareholder returns",
+    "industry tailwinds",
+    "macro headwinds",
+    "regulatory uncertainty",
+    "data privacy concerns",
+    "cloud infrastructure",
+    "digital transformation",  # unless actually relevant
 ]
 
 # Corporate analyst phrases that instantly break persona immersion
@@ -159,160 +182,160 @@ GENERIC_RISK_PHRASES = [
 # =============================================================================
 
 INCOMPLETE_SENTENCE_PATTERNS = [
-    r'\.\s*The\s+cost\s+of\s+revenue\s+at\s+\$\d+\.?\s*$',  # "The cost of revenue at $17."
-    r'\.\s*\w+\s+at\s+\$[\d,]+\.?\s*$',  # Ends with "X at $Y."
-    r'\.\s*\w+\s+of\s+\$[\d,]+\.?\s*$',  # Ends with "X of $Y."
-    r'\.\s*\w+\s+is\s+\$[\d,]+\.?\s*$',  # Ends with "X is $Y."
-    r'\.\s*\w+\s+was\s+\$[\d,]+\.?\s*$',  # Ends with "X was $Y."
-    r'(?:,|;)\s*(?:and|or|but|while|as|with)\s*$',  # Ends with conjunction
-    r'\.\s*(?:However|Moreover|Furthermore|Additionally|Meanwhile),?\s*$',  # Transition word at end
-    r':\s*$',  # Ends with colon
-    r'\.\s*\d+\.?\d*%?\s*$',  # Ends with just a number/percentage
-    r'\.\s*(?:The|A|An|This|That|These|Those|It|Its)\s+\w+\s*$',  # Incomplete "The X" fragment
+    r"\.\s*The\s+cost\s+of\s+revenue\s+at\s+\$\d+\.?\s*$",  # "The cost of revenue at $17."
+    r"\.\s*\w+\s+at\s+\$[\d,]+\.?\s*$",  # Ends with "X at $Y."
+    r"\.\s*\w+\s+of\s+\$[\d,]+\.?\s*$",  # Ends with "X of $Y."
+    r"\.\s*\w+\s+is\s+\$[\d,]+\.?\s*$",  # Ends with "X is $Y."
+    r"\.\s*\w+\s+was\s+\$[\d,]+\.?\s*$",  # Ends with "X was $Y."
+    r"(?:,|;)\s*(?:and|or|but|while|as|with)\s*$",  # Ends with conjunction
+    r"\.\s*(?:However|Moreover|Furthermore|Additionally|Meanwhile),?\s*$",  # Transition word at end
+    r":\s*$",  # Ends with colon
+    r"\.\s*\d+\.?\d*%?\s*$",  # Ends with just a number/percentage
+    r"\.\s*(?:The|A|An|This|That|These|Those|It|Its)\s+\w+\s*$",  # Incomplete "The X" fragment
     # New patterns for common truncation issues
-    r'repurchases\s+\(\$\d+\.?\s*$',  # "share repurchases ($14." - cuts off mid-number
-    r'\(\$[\d.,]+\.?\s*$',  # Ends with incomplete dollar amount in parens
-    r'alignment\s+with\s*\.?\s*$',  # "strategic alignment with..." trails off
-    r'with\s+secular\s*\.?\s*$',  # "with secular..." trails off
-    r'FCF/Net\s+Income\s*\.?\s*$',  # "FCF/Net Income..." cuts off
-    r'/Net\s+Income\s*\.?\s*$',  # "FCF/Net Income" incomplete
-    r'positions\s+the\s+company\s+for\s*\.?\s*$',  # "positions the company for..." trails off
-    r'continued\s+long-term\s*\.?\s*$',  # "continued long-term..." trails off
-    r'(?:strategic|long-term|secular)\s+(?:alignment|growth|trends?)\s*\.?\s*$',  # Common trailing phrases
-    r'\d+/\d+\s*\([^)]*\s*$',  # "25/25 (FCF/Net Income..." incomplete parens
-    r'\d+/\d+\s*$',  # Ends with just a score like "25/25"
+    r"repurchases\s+\(\$\d+\.?\s*$",  # "share repurchases ($14." - cuts off mid-number
+    r"\(\$[\d.,]+\.?\s*$",  # Ends with incomplete dollar amount in parens
+    r"alignment\s+with\s*\.?\s*$",  # "strategic alignment with..." trails off
+    r"with\s+secular\s*\.?\s*$",  # "with secular..." trails off
+    r"FCF/Net\s+Income\s*\.?\s*$",  # "FCF/Net Income..." cuts off
+    r"/Net\s+Income\s*\.?\s*$",  # "FCF/Net Income" incomplete
+    r"positions\s+the\s+company\s+for\s*\.?\s*$",  # "positions the company for..." trails off
+    r"continued\s+long-term\s*\.?\s*$",  # "continued long-term..." trails off
+    r"(?:strategic|long-term|secular)\s+(?:alignment|growth|trends?)\s*\.?\s*$",  # Common trailing phrases
+    r"\d+/\d+\s*\([^)]*\s*$",  # "25/25 (FCF/Net Income..." incomplete parens
+    r"\d+/\d+\s*$",  # Ends with just a score like "25/25"
     # New patterns from user feedback - mid-thought truncation
-    r'establishes\s+a\s+strong\s*\.?\s*$',  # "establishes a strong..."
-    r'indicator\s+of\s+(?:overall\s+)?(?:financial|operational)\s*\.?\s*$',  # "indicator of overall financial..."
-    r'essential\s+for\s+(?:sustaining|maintaining)\s+(?:its|the)?\s*\.?\s*$',  # "essential for sustaining its..."
-    r'resources\s+(?:to|and)\s*\.?\s*$',  # "resources to..." or "resources and..."
-    r'sign\s+of\s+(?:management|strong)\s*\.?\s*$',  # "sign of management..."
-    r'(?:a|the)\s+key\s+(?:indicator|driver|factor)\s+of\s*\.?\s*$',  # "a key indicator of..."
-    r'which\s+is\s+(?:essential|critical|important)\s+for\s*\.?\s*$',  # "which is essential for..."
-    r'as\s+(?:existing|current)\s+players\s+have\s+the\s*\.?\s*$',  # "as existing players have the..."
-    r'have\s+the\s+resources\s*\.?\s*$',  # "have the resources..."
+    r"establishes\s+a\s+strong\s*\.?\s*$",  # "establishes a strong..."
+    r"indicator\s+of\s+(?:overall\s+)?(?:financial|operational)\s*\.?\s*$",  # "indicator of overall financial..."
+    r"essential\s+for\s+(?:sustaining|maintaining)\s+(?:its|the)?\s*\.?\s*$",  # "essential for sustaining its..."
+    r"resources\s+(?:to|and)\s*\.?\s*$",  # "resources to..." or "resources and..."
+    r"sign\s+of\s+(?:management|strong)\s*\.?\s*$",  # "sign of management..."
+    r"(?:a|the)\s+key\s+(?:indicator|driver|factor)\s+of\s*\.?\s*$",  # "a key indicator of..."
+    r"which\s+is\s+(?:essential|critical|important)\s+for\s*\.?\s*$",  # "which is essential for..."
+    r"as\s+(?:existing|current)\s+players\s+have\s+the\s*\.?\s*$",  # "as existing players have the..."
+    r"have\s+the\s+resources\s*\.?\s*$",  # "have the resources..."
     # Generic mid-thought patterns
-    r'\ba\s+strong\s*\.?\s*$',  # Ends with "a strong..."
-    r'\bthe\s+(?:overall|key|main|primary)\s*\.?\s*$',  # "the overall..."
-    r'\bfor\s+(?:sustaining|maintaining|ensuring)\s*\.?\s*$',  # "for sustaining..."
-    r'\bof\s+(?:management|overall|strong)\s*\.?\s*$',  # "of management..."
+    r"\ba\s+strong\s*\.?\s*$",  # Ends with "a strong..."
+    r"\bthe\s+(?:overall|key|main|primary)\s*\.?\s*$",  # "the overall..."
+    r"\bfor\s+(?:sustaining|maintaining|ensuring)\s*\.?\s*$",  # "for sustaining..."
+    r"\bof\s+(?:management|overall|strong)\s*\.?\s*$",  # "of management..."
     # CRITICAL: Ackman/activist voice trailing patterns
-    r'but\s+I\s+acknowledge\s+the\s*\.?\s*$',  # "but I acknowledge the..."
-    r'which\s+I\s+(?:want|need)\s+to\s+see\s*\.?\s*$',  # "which I want to see..."
-    r'I\s+need\s+to\s+see\s+(?:evidence\s+of\s+)?[^.]*\s*$',  # "I need to see evidence of..." incomplete
-    r'and\s+I\s+need\s+to\s+see\s*\.?\s*$',  # "and I need to see..."
-    r'address\s+this\s+risk\s*\.?\s*$',  # "address this risk..." incomplete
-    r'mitigation\s+strategies\s*\.?\s*$',  # "mitigation strategies..." incomplete
-    r'contingency\s+planning\s+to\s*\.?\s*$',  # "contingency planning to..."
-    r',\s*but\s*\.?\s*$',  # Just ", but..." trailing
-    r';\s*but\s*\.?\s*$',  # "; but..." trailing
-    r'I\s+am\s+concerned\s*\.?\s*$',  # "I am concerned..." incomplete
-    r'I\s+remain\s+(?:cautious|concerned|skeptical)\s*\.?\s*$',  # "I remain cautious..." incomplete
-    r'requiring\s+proactive\s*\.?\s*$',  # "requiring proactive..." incomplete
+    r"but\s+I\s+acknowledge\s+the\s*\.?\s*$",  # "but I acknowledge the..."
+    r"which\s+I\s+(?:want|need)\s+to\s+see\s*\.?\s*$",  # "which I want to see..."
+    r"I\s+need\s+to\s+see\s+(?:evidence\s+of\s+)?[^.]*\s*$",  # "I need to see evidence of..." incomplete
+    r"and\s+I\s+need\s+to\s+see\s*\.?\s*$",  # "and I need to see..."
+    r"address\s+this\s+risk\s*\.?\s*$",  # "address this risk..." incomplete
+    r"mitigation\s+strategies\s*\.?\s*$",  # "mitigation strategies..." incomplete
+    r"contingency\s+planning\s+to\s*\.?\s*$",  # "contingency planning to..."
+    r",\s*but\s*\.?\s*$",  # Just ", but..." trailing
+    r";\s*but\s*\.?\s*$",  # "; but..." trailing
+    r"I\s+am\s+concerned\s*\.?\s*$",  # "I am concerned..." incomplete
+    r"I\s+remain\s+(?:cautious|concerned|skeptical)\s*\.?\s*$",  # "I remain cautious..." incomplete
+    r"requiring\s+proactive\s*\.?\s*$",  # "requiring proactive..." incomplete
     # GREENBLATT-specific truncation patterns
-    r'operating\s+in\s+a\s+high\s*\.?\s*$',  # "operating in a high..." incomplete
-    r'operating\s+in\s+a\s+high[^.]*\.\s*$',  # "operating in a high..." ends mid-thought
-    r'(?:present|presents?)\s+a\s+major\s+risk\s*\.?\s*$',  # "presents a major risk." without explanation
-    r'this\s+reliance\s+presents?\s+a\s+major\s+risk\s*\.?\s*$',  # incomplete risk statement
-    r'major\s+risk\.\s*$',  # ends with "major risk." without probability/severity
-    r'and\s+this\s+earnings\s+power\s+is\s+precisely\s+what\s+I\s+seek\s*\.?\s*$',  # conversational ending
-    r'precisely\s+what\s+I\s+seek\s*\.?\s*$',  # "precisely what I seek..." incomplete
-    r'which\s+I\s+seek\s*\.?\s*$',  # trailing "which I seek"
-    r'what\s+I\s+(?:seek|want|need)\s*\.?\s*$',  # "what I seek..." incomplete
+    r"operating\s+in\s+a\s+high\s*\.?\s*$",  # "operating in a high..." incomplete
+    r"operating\s+in\s+a\s+high[^.]*\.\s*$",  # "operating in a high..." ends mid-thought
+    r"(?:present|presents?)\s+a\s+major\s+risk\s*\.?\s*$",  # "presents a major risk." without explanation
+    r"this\s+reliance\s+presents?\s+a\s+major\s+risk\s*\.?\s*$",  # incomplete risk statement
+    r"major\s+risk\.\s*$",  # ends with "major risk." without probability/severity
+    r"and\s+this\s+earnings\s+power\s+is\s+precisely\s+what\s+I\s+seek\s*\.?\s*$",  # conversational ending
+    r"precisely\s+what\s+I\s+seek\s*\.?\s*$",  # "precisely what I seek..." incomplete
+    r"which\s+I\s+seek\s*\.?\s*$",  # trailing "which I seek"
+    r"what\s+I\s+(?:seek|want|need)\s*\.?\s*$",  # "what I seek..." incomplete
     # Generic truncation with ellipsis or incomplete thoughts
-    r'in\s+a\s+(?:high|low|strong|weak)\s*…\s*$',  # "in a high…" with ellipsis
-    r'[^.!?]\s*…\s*$',  # ends with ellipsis mid-sentence
+    r"in\s+a\s+(?:high|low|strong|weak)\s*…\s*$",  # "in a high…" with ellipsis
+    r"[^.!?]\s*…\s*$",  # ends with ellipsis mid-sentence
     # BOGLE-specific truncation patterns
-    r'(?:Given|With)\s+my\s+emphasis\s+on\s+(?:diversification|risk)[^.]*\.{3}\s*$',  # "Given my emphasis on diversification..."
-    r'the\s+missing\s+(?:growth\s+)?data[^.]*\.{3}\s*$',  # "the missing growth data..."
-    r'moderate\s+liquidity\s*\.{3}\s*$',  # "moderate liquidity..."
-    r',\s*the\s+missing\s+[^,]+,\s*(?:moderate|low|high)\s+\w+\s*\.{3}\s*$',  # list trails off
-    r'compared\s+to\s+\$\d+\.?\s*$',  # "compared to $22." incomplete comparison
-    r'compared\s+to\s+\$\d+\.\s*$',  # "compared to $22." with period but no context
-    r'versus\s+\$\d+\.?\s*$',  # "versus $22." incomplete
-    r'from\s+\$\d+\.?\s*$',  # "from $22." incomplete
-    r'at\s+\$\d+\.?\s*$',  # "at $22." incomplete without context
-    r'risk\s+minimization[^.]*\.{3}\s*$',  # "risk minimization..." trails off
-    r'concentration[^.]*\.{3}\s*$',  # "concentration..." trails off
-    r'diversification[^.]*\.{3}\s*$',  # "diversification..." trails off
+    r"(?:Given|With)\s+my\s+emphasis\s+on\s+(?:diversification|risk)[^.]*\.{3}\s*$",  # "Given my emphasis on diversification..."
+    r"the\s+missing\s+(?:growth\s+)?data[^.]*\.{3}\s*$",  # "the missing growth data..."
+    r"moderate\s+liquidity\s*\.{3}\s*$",  # "moderate liquidity..."
+    r",\s*the\s+missing\s+[^,]+,\s*(?:moderate|low|high)\s+\w+\s*\.{3}\s*$",  # list trails off
+    r"compared\s+to\s+\$\d+\.?\s*$",  # "compared to $22." incomplete comparison
+    r"compared\s+to\s+\$\d+\.\s*$",  # "compared to $22." with period but no context
+    r"versus\s+\$\d+\.?\s*$",  # "versus $22." incomplete
+    r"from\s+\$\d+\.?\s*$",  # "from $22." incomplete
+    r"at\s+\$\d+\.?\s*$",  # "at $22." incomplete without context
+    r"risk\s+minimization[^.]*\.{3}\s*$",  # "risk minimization..." trails off
+    r"concentration[^.]*\.{3}\s*$",  # "concentration..." trails off
+    r"diversification[^.]*\.{3}\s*$",  # "diversification..." trails off
     # Incomplete lists (Bogle often lists concerns)
-    r',\s*(?:and|or)\s*\.{3}\s*$',  # ", and..." or ", or..." trailing
-    r'(?:first|second|third|finally)[^.]*\.{3}\s*$',  # enumeration trails off
+    r",\s*(?:and|or)\s*\.{3}\s*$",  # ", and..." or ", or..." trailing
+    r"(?:first|second|third|finally)[^.]*\.{3}\s*$",  # enumeration trails off
     # NEW: "which is..." trailing patterns (common mid-thought truncation)
-    r'which\s+is\s*\.?\s*$',  # "which is..." incomplete
-    r'which\s+is\s+\w+\s*\.?\s*$',  # "which is essential..." incomplete (one word after)
-    r',\s*which\s+is\s*\.?\s*$',  # ", which is..." trailing
-    r';\s*which\s+is\s*\.?\s*$',  # "; which is..." trailing
-    r'which\s+is\s+(?:essential|critical|important|key|vital)\s*\.?\s*$',  # "which is essential..." incomplete
-    r'underscores\s+the\s+company\'?s?\s+commitment\s+to[^.]*which\s+is\s*\.?\s*$',  # specific pattern from user feedback
+    r"which\s+is\s*\.?\s*$",  # "which is..." incomplete
+    r"which\s+is\s+\w+\s*\.?\s*$",  # "which is essential..." incomplete (one word after)
+    r",\s*which\s+is\s*\.?\s*$",  # ", which is..." trailing
+    r";\s*which\s+is\s*\.?\s*$",  # "; which is..." trailing
+    r"which\s+is\s+(?:essential|critical|important|key|vital)\s*\.?\s*$",  # "which is essential..." incomplete
+    r"underscores\s+the\s+company\'?s?\s+commitment\s+to[^.]*which\s+is\s*\.?\s*$",  # specific pattern from user feedback
     # Score truncation patterns (e.g., "Liquidity: 6/15 (Current Ratio is 4.")
-    r':\s*\d+/\d+\s*\([^)]*\s+is\s+\d+\.?\s*$',  # "Liquidity: 6/15 (Current Ratio is 4." - incomplete
-    r'\(Current\s+Ratio\s+is\s+\d+\.?\s*$',  # "(Current Ratio is 4." - incomplete
-    r'Ratio\s+is\s+\d+\.?\s*$',  # "Ratio is 4." without context
-    r'\([A-Za-z\s]+is\s+\d+\.?\s*$',  # "(X is 4." incomplete parenthetical
+    r":\s*\d+/\d+\s*\([^)]*\s+is\s+\d+\.?\s*$",  # "Liquidity: 6/15 (Current Ratio is 4." - incomplete
+    r"\(Current\s+Ratio\s+is\s+\d+\.?\s*$",  # "(Current Ratio is 4." - incomplete
+    r"Ratio\s+is\s+\d+\.?\s*$",  # "Ratio is 4." without context
+    r"\([A-Za-z\s]+is\s+\d+\.?\s*$",  # "(X is 4." incomplete parenthetical
     # Additional "which is" patterns seen in production
-    r'technological\s+edge,?\s*which\s+is\s*\.?\s*$',  # "technological edge, which is..." incomplete
-    r'commitment\s+to\s+\w+,?\s*which\s+is\s*\.?\s*$',  # "commitment to X, which is..." incomplete
+    r"technological\s+edge,?\s*which\s+is\s*\.?\s*$",  # "technological edge, which is..." incomplete
+    r"commitment\s+to\s+\w+,?\s*which\s+is\s*\.?\s*$",  # "commitment to X, which is..." incomplete
     # Mid-number truncation patterns (e.g., "0..." or "$1..." or "24..." cutting off)
-    r'\b\d+\s*\.{2,}\s*$',  # "0..." or "24..." - number followed by ellipsis
-    r'\$\d+\.{2,}\s*$',  # "$1..." - dollar amount with ellipsis
-    r'\d+\.\d*\.{2,}\s*$',  # "1.2..." - decimal with ellipsis
-    r'[\d.]+%\.{2,}\s*$',  # "25%..." - percentage with ellipsis
-    r'\(\d+\.{2,}\s*$',  # "(0..." - parenthetical number cut off
-    r'of\s+\d+\.{2,}\s*$',  # "of 0..." - "of X..." truncation
-    r'at\s+\d+\.{2,}\s*$',  # "at 0..." - "at X..." truncation
-    r'is\s+\d+\.{2,}\s*$',  # "is 0..." - "is X..." truncation
-    r'to\s+\d+\.{2,}\s*$',  # "to 0..." - "to X..." truncation
-    r'\d+\s+(?:to|and|or)\s*\.{2,}\s*$',  # "24 to..." or "24 and..." - incomplete range
-    r'\$[\d.,]+\s+(?:to|and|or)\s*\.{2,}\s*$',  # "$1.2B to..." - incomplete dollar range
-    r'[\d.]+%\s+(?:to|and|or)\s*\.{2,}\s*$',  # "25% to..." - incomplete percentage range
+    r"\b\d+\s*\.{2,}\s*$",  # "0..." or "24..." - number followed by ellipsis
+    r"\$\d+\.{2,}\s*$",  # "$1..." - dollar amount with ellipsis
+    r"\d+\.\d*\.{2,}\s*$",  # "1.2..." - decimal with ellipsis
+    r"[\d.]+%\.{2,}\s*$",  # "25%..." - percentage with ellipsis
+    r"\(\d+\.{2,}\s*$",  # "(0..." - parenthetical number cut off
+    r"of\s+\d+\.{2,}\s*$",  # "of 0..." - "of X..." truncation
+    r"at\s+\d+\.{2,}\s*$",  # "at 0..." - "at X..." truncation
+    r"is\s+\d+\.{2,}\s*$",  # "is 0..." - "is X..." truncation
+    r"to\s+\d+\.{2,}\s*$",  # "to 0..." - "to X..." truncation
+    r"\d+\s+(?:to|and|or)\s*\.{2,}\s*$",  # "24 to..." or "24 and..." - incomplete range
+    r"\$[\d.,]+\s+(?:to|and|or)\s*\.{2,}\s*$",  # "$1.2B to..." - incomplete dollar range
+    r"[\d.]+%\s+(?:to|and|or)\s*\.{2,}\s*$",  # "25% to..." - incomplete percentage range
     # Truncation with trailing periods only (no ellipsis)
-    r'\b\d+\.\s*$',  # Just "0." at end (not in context of complete sentence)
-    r'\$\d+\.\s*$',  # Just "$1." at end without context
-    r'ratio\s+of\s+\d+\.\s*$',  # "ratio of 4." incomplete
-    r'is\s+\d+x\s*\.?\s*$',  # "is 4x." incomplete multiple
-    r'at\s+\d+x\s*\.?\s*$',  # "at 4x." incomplete multiple
+    r"\b\d+\.\s*$",  # Just "0." at end (not in context of complete sentence)
+    r"\$\d+\.\s*$",  # Just "$1." at end without context
+    r"ratio\s+of\s+\d+\.\s*$",  # "ratio of 4." incomplete
+    r"is\s+\d+x\s*\.?\s*$",  # "is 4x." incomplete multiple
+    r"at\s+\d+x\s*\.?\s*$",  # "at 4x." incomplete multiple
 ]
 
 # Additional patterns for section-specific truncation
 SECTION_TRUNCATION_PATTERNS = [
     # Financial Health Rating truncation
-    r'(?:Cash\s+Flow\s+Quality|Profitability|Leverage|Liquidity):\s*\d+/\d+\s*(?:\([^)]*)?$',
+    r"(?:Cash\s+Flow\s+Quality|Profitability|Leverage|Liquidity):\s*\d+/\d+\s*(?:\([^)]*)?$",
     # Executive Summary trailing off
-    r'strategic\s+alignment\s+with[^.]*$',
-    r'positions?\s+(?:the\s+)?company\s+for[^.]*$',
-    r'establishes\s+a\s+strong[^.]*$',
+    r"strategic\s+alignment\s+with[^.]*$",
+    r"positions?\s+(?:the\s+)?company\s+for[^.]*$",
+    r"establishes\s+a\s+strong[^.]*$",
     # Capital Allocation truncation
-    r'share\s+repurchases?\s+\([^)]*$',
-    r'dividends?\s+\([^)]*$',
-    r'buybacks?\s+\([^)]*$',
+    r"share\s+repurchases?\s+\([^)]*$",
+    r"dividends?\s+\([^)]*$",
+    r"buybacks?\s+\([^)]*$",
     # Financial Performance trailing off
-    r'key\s+indicator\s+of\s+overall\s+financial[^.]*$',
-    r'indicator\s+of\s+(?:financial|operational)[^.]*$',
+    r"key\s+indicator\s+of\s+overall\s+financial[^.]*$",
+    r"indicator\s+of\s+(?:financial|operational)[^.]*$",
     # MD&A trailing off
-    r'essential\s+for\s+sustaining\s+its[^.]*$',
-    r'which\s+is\s+essential\s+for[^.]*$',
+    r"essential\s+for\s+sustaining\s+its[^.]*$",
+    r"which\s+is\s+essential\s+for[^.]*$",
     # Competitive Landscape trailing off
-    (r'existing\s+players\s+have\s+the\s+resources[^.]*$'),
-    (r'as\s+existing\s+players\s+have[^.]*$'),
+    (r"existing\s+players\s+have\s+the\s+resources[^.]*$"),
+    (r"as\s+existing\s+players\s+have[^.]*$"),
     # Strategic Initiatives trailing off
-    (r'a\s+sign\s+of\s+management[^.]*$'),
+    (r"a\s+sign\s+of\s+management[^.]*$"),
 ]
 
 # Phrases that indicate uncontextualized numbers
 UNCONTEXTUALIZED_NUMBER_PATTERNS = [
-    r'revenue\s+(?:of\s+)?\$[\d.,]+[BM]?\s*(?:\.|$)',  # "revenue of $X." without context
-    r'margin\s+(?:of\s+)?[\d.]+%\s*(?:\.|$)',  # "margin of X%." without context
-    r'growth\s+(?:of\s+)?[\d.]+%\s*(?:\.|$)',  # "growth of X%." without context
+    r"revenue\s+(?:of\s+)?\$[\d.,]+[BM]?\s*(?:\.|$)",  # "revenue of $X." without context
+    r"margin\s+(?:of\s+)?[\d.]+%\s*(?:\.|$)",  # "margin of X%." without context
+    r"growth\s+(?:of\s+)?[\d.]+%\s*(?:\.|$)",  # "growth of X%." without context
 ]
 
 # Strong sentence completion patterns - output MUST end with one of these
 VALID_ENDING_PATTERNS = [
-    r'\.\s*$',  # Ends with period
-    r'\!\s*$',  # Ends with exclamation
-    r'\?\s*$',  # Ends with question mark
-    r'"\s*$',   # Ends with closing quote
-    r"'\s*$",   # Ends with single quote
+    r"\.\s*$",  # Ends with period
+    r"\!\s*$",  # Ends with exclamation
+    r"\?\s*$",  # Ends with question mark
+    r'"\s*$',  # Ends with closing quote
+    r"'\s*$",  # Ends with single quote
 ]
 
 # Lynch-specific ending requirements - must have a verdict
@@ -331,9 +354,15 @@ LYNCH_VERDICT_PATTERNS = [
 
 # Generic risk factors that should be avoided unless company-specific
 GENERIC_RISK_FACTORS = [
-    "macroeconomic volatility", "regulatory scrutiny", "competitive pressures",
-    "interest rate sensitivity", "currency fluctuations", "supply chain disruptions",
-    "cybersecurity risks", "talent retention", "geopolitical tensions",
+    "macroeconomic volatility",
+    "regulatory scrutiny",
+    "competitive pressures",
+    "interest rate sensitivity",
+    "currency fluctuations",
+    "supply chain disruptions",
+    "cybersecurity risks",
+    "talent retention",
+    "geopolitical tensions",
 ]
 
 # =============================================================================
@@ -342,57 +371,113 @@ GENERIC_RISK_FACTORS = [
 # Maps industry to phrases that should NEVER appear in that industry's analysis
 RISK_INDUSTRY_MISMATCHES = {
     "semiconductors": [
-        "advertising budget", "ad spend", "social media engagement", "content moderation",
-        "subscription churn", "app store", "streaming", "subscriber growth",
-        "same-store sales", "retail footprint", "inventory shrinkage",
+        "advertising budget",
+        "ad spend",
+        "social media engagement",
+        "content moderation",
+        "subscription churn",
+        "app store",
+        "streaming",
+        "subscriber growth",
+        "same-store sales",
+        "retail footprint",
+        "inventory shrinkage",
     ],
     "semiconductor_equipment": [
-        "advertising budget", "ad spend", "social media engagement", "content moderation",
-        "subscription churn", "app store", "streaming", "subscriber growth",
-        "same-store sales", "retail footprint", "inventory shrinkage",
+        "advertising budget",
+        "ad spend",
+        "social media engagement",
+        "content moderation",
+        "subscription churn",
+        "app store",
+        "streaming",
+        "subscriber growth",
+        "same-store sales",
+        "retail footprint",
+        "inventory shrinkage",
     ],
     "software": [
-        "inventory shrinkage", "retail footprint", "same-store sales",
-        "drilling costs", "exploration risk", "commodity prices",
-        "OPEC", "refinery margins",
+        "inventory shrinkage",
+        "retail footprint",
+        "same-store sales",
+        "drilling costs",
+        "exploration risk",
+        "commodity prices",
+        "OPEC",
+        "refinery margins",
     ],
     "pharma": [
-        "advertising budget", "social media", "content creation",
-        "subscriber churn", "streaming", "app downloads",
-        "same-store sales", "retail footprint",
+        "advertising budget",
+        "social media",
+        "content creation",
+        "subscriber churn",
+        "streaming",
+        "app downloads",
+        "same-store sales",
+        "retail footprint",
     ],
     "biotech": [
-        "advertising budget", "social media", "content creation",
-        "subscriber churn", "streaming", "app downloads",
-        "same-store sales", "retail footprint",
+        "advertising budget",
+        "social media",
+        "content creation",
+        "subscriber churn",
+        "streaming",
+        "app downloads",
+        "same-store sales",
+        "retail footprint",
     ],
     "retail": [
-        "clinical trial", "FDA approval", "drug pipeline",
-        "GPU demand", "chip shortage", "wafer capacity",
+        "clinical trial",
+        "FDA approval",
+        "drug pipeline",
+        "GPU demand",
+        "chip shortage",
+        "wafer capacity",
     ],
     "banking": [
-        "subscriber churn", "content costs", "streaming wars",
-        "chip shortage", "GPU demand", "clinical trials",
+        "subscriber churn",
+        "content costs",
+        "streaming wars",
+        "chip shortage",
+        "GPU demand",
+        "clinical trials",
     ],
     "advertising": [
-        "clinical trials", "FDA approval", "drug pipeline",
-        "chip fabrication", "wafer capacity", "EUV lithography",
+        "clinical trials",
+        "FDA approval",
+        "drug pipeline",
+        "chip fabrication",
+        "wafer capacity",
+        "EUV lithography",
     ],
     "energy": [
-        "subscriber churn", "content costs", "streaming",
-        "app downloads", "clinical trials", "FDA approval",
+        "subscriber churn",
+        "content costs",
+        "streaming",
+        "app downloads",
+        "clinical trials",
+        "FDA approval",
     ],
     "automotive": [
-        "advertising budget cuts", "content moderation",
-        "subscriber churn", "streaming wars", "clinical trials",
+        "advertising budget cuts",
+        "content moderation",
+        "subscriber churn",
+        "streaming wars",
+        "clinical trials",
     ],
     "healthcare": [
-        "advertising budget", "content creation",
-        "GPU demand", "chip shortage", "streaming",
+        "advertising budget",
+        "content creation",
+        "GPU demand",
+        "chip shortage",
+        "streaming",
     ],
     "payments": [
-        "clinical trials", "drug pipeline", "FDA approval",
-        "chip fabrication", "content moderation",
+        "clinical trials",
+        "drug pipeline",
+        "FDA approval",
+        "chip fabrication",
+        "content moderation",
     ],
 }
 
@@ -407,117 +492,391 @@ RISK_INDUSTRY_MISMATCHES = {
 
 KNOWN_COMPANIES = {
     # Semiconductors & Equipment
-    "asml": {"industry": "semiconductor_equipment", "sub": "lithography", "moat": "monopoly on EUV"},
-    "nvidia": {"industry": "semiconductors", "sub": "GPUs/AI chips", "moat": "CUDA ecosystem"},
+    "asml": {
+        "industry": "semiconductor_equipment",
+        "sub": "lithography",
+        "moat": "monopoly on EUV",
+    },
+    "nvidia": {
+        "industry": "semiconductors",
+        "sub": "GPUs/AI chips",
+        "moat": "CUDA ecosystem",
+    },
     "amd": {"industry": "semiconductors", "sub": "CPUs/GPUs", "moat": "x86 license"},
-    "intel": {"industry": "semiconductors", "sub": "CPUs/foundry", "moat": "manufacturing scale"},
-    "tsmc": {"industry": "semiconductors", "sub": "foundry", "moat": "process leadership"},
-    "qualcomm": {"industry": "semiconductors", "sub": "mobile chips", "moat": "patent portfolio"},
-    "broadcom": {"industry": "semiconductors", "sub": "networking chips", "moat": "design expertise"},
-    "applied materials": {"industry": "semiconductor_equipment", "sub": "deposition", "moat": "installed base"},
-    "lam research": {"industry": "semiconductor_equipment", "sub": "etch", "moat": "process expertise"},
-    "klac": {"industry": "semiconductor_equipment", "sub": "inspection", "moat": "precision optics"},
-    
+    "intel": {
+        "industry": "semiconductors",
+        "sub": "CPUs/foundry",
+        "moat": "manufacturing scale",
+    },
+    "tsmc": {
+        "industry": "semiconductors",
+        "sub": "foundry",
+        "moat": "process leadership",
+    },
+    "qualcomm": {
+        "industry": "semiconductors",
+        "sub": "mobile chips",
+        "moat": "patent portfolio",
+    },
+    "broadcom": {
+        "industry": "semiconductors",
+        "sub": "networking chips",
+        "moat": "design expertise",
+    },
+    "applied materials": {
+        "industry": "semiconductor_equipment",
+        "sub": "deposition",
+        "moat": "installed base",
+    },
+    "lam research": {
+        "industry": "semiconductor_equipment",
+        "sub": "etch",
+        "moat": "process expertise",
+    },
+    "klac": {
+        "industry": "semiconductor_equipment",
+        "sub": "inspection",
+        "moat": "precision optics",
+    },
     # Big Tech
-    "apple": {"industry": "consumer_tech", "sub": "devices/services", "moat": "ecosystem lock-in"},
-    "microsoft": {"industry": "software", "sub": "enterprise/cloud", "moat": "enterprise relationships"},
-    "google": {"industry": "advertising", "sub": "search/cloud", "moat": "search dominance"},
-    "alphabet": {"industry": "advertising", "sub": "search/cloud", "moat": "search dominance"},
-    "amazon": {"industry": "retail_tech", "sub": "ecommerce/cloud", "moat": "logistics/AWS"},
-    "meta": {"industry": "advertising", "sub": "social media", "moat": "network effects"},
-    "facebook": {"industry": "advertising", "sub": "social media", "moat": "network effects"},
-    
+    "apple": {
+        "industry": "consumer_tech",
+        "sub": "devices/services",
+        "moat": "ecosystem lock-in",
+    },
+    "microsoft": {
+        "industry": "software",
+        "sub": "enterprise/cloud",
+        "moat": "enterprise relationships",
+    },
+    "google": {
+        "industry": "advertising",
+        "sub": "search/cloud",
+        "moat": "search dominance",
+    },
+    "alphabet": {
+        "industry": "advertising",
+        "sub": "search/cloud",
+        "moat": "search dominance",
+    },
+    "amazon": {
+        "industry": "retail_tech",
+        "sub": "ecommerce/cloud",
+        "moat": "logistics/AWS",
+    },
+    "meta": {
+        "industry": "advertising",
+        "sub": "social media",
+        "moat": "network effects",
+    },
+    "facebook": {
+        "industry": "advertising",
+        "sub": "social media",
+        "moat": "network effects",
+    },
     # Financials
-    "jpmorgan": {"industry": "banking", "sub": "universal bank", "moat": "scale/relationships"},
-    "berkshire": {"industry": "conglomerate", "sub": "insurance/investments", "moat": "float/capital allocation"},
+    "jpmorgan": {
+        "industry": "banking",
+        "sub": "universal bank",
+        "moat": "scale/relationships",
+    },
+    "berkshire": {
+        "industry": "conglomerate",
+        "sub": "insurance/investments",
+        "moat": "float/capital allocation",
+    },
     "visa": {"industry": "payments", "sub": "card networks", "moat": "network effects"},
-    "mastercard": {"industry": "payments", "sub": "card networks", "moat": "network effects"},
-    
+    "mastercard": {
+        "industry": "payments",
+        "sub": "card networks",
+        "moat": "network effects",
+    },
     # Healthcare
-    "unitedhealth": {"industry": "healthcare", "sub": "insurance/PBM", "moat": "vertical integration"},
-    "eli lilly": {"industry": "pharma", "sub": "diabetes/obesity", "moat": "GLP-1 franchise"},
-    "novo nordisk": {"industry": "pharma", "sub": "diabetes/obesity", "moat": "GLP-1 franchise"},
-    "pfizer": {"industry": "pharma", "sub": "diversified", "moat": "scale/distribution"},
-    "johnson": {"industry": "healthcare", "sub": "diversified", "moat": "brand/distribution"},
-    
+    "unitedhealth": {
+        "industry": "healthcare",
+        "sub": "insurance/PBM",
+        "moat": "vertical integration",
+    },
+    "eli lilly": {
+        "industry": "pharma",
+        "sub": "diabetes/obesity",
+        "moat": "GLP-1 franchise",
+    },
+    "novo nordisk": {
+        "industry": "pharma",
+        "sub": "diabetes/obesity",
+        "moat": "GLP-1 franchise",
+    },
+    "pfizer": {
+        "industry": "pharma",
+        "sub": "diversified",
+        "moat": "scale/distribution",
+    },
+    "johnson": {
+        "industry": "healthcare",
+        "sub": "diversified",
+        "moat": "brand/distribution",
+    },
     # Consumer
-    "costco": {"industry": "retail", "sub": "warehouse clubs", "moat": "membership model"},
-    "walmart": {"industry": "retail", "sub": "discount retail", "moat": "scale/logistics"},
-    "coca-cola": {"industry": "beverages", "sub": "soft drinks", "moat": "brand/distribution"},
-    "pepsi": {"industry": "beverages", "sub": "beverages/snacks", "moat": "brand/distribution"},
-    "mcdonalds": {"industry": "restaurants", "sub": "QSR/real estate", "moat": "franchise model"},
-    
+    "costco": {
+        "industry": "retail",
+        "sub": "warehouse clubs",
+        "moat": "membership model",
+    },
+    "walmart": {
+        "industry": "retail",
+        "sub": "discount retail",
+        "moat": "scale/logistics",
+    },
+    "coca-cola": {
+        "industry": "beverages",
+        "sub": "soft drinks",
+        "moat": "brand/distribution",
+    },
+    "pepsi": {
+        "industry": "beverages",
+        "sub": "beverages/snacks",
+        "moat": "brand/distribution",
+    },
+    "mcdonalds": {
+        "industry": "restaurants",
+        "sub": "QSR/real estate",
+        "moat": "franchise model",
+    },
     # Industrial
-    "caterpillar": {"industry": "industrial", "sub": "heavy equipment", "moat": "dealer network"},
-    "deere": {"industry": "industrial", "sub": "agricultural equipment", "moat": "dealer network/precision ag"},
+    "caterpillar": {
+        "industry": "industrial",
+        "sub": "heavy equipment",
+        "moat": "dealer network",
+    },
+    "deere": {
+        "industry": "industrial",
+        "sub": "agricultural equipment",
+        "moat": "dealer network/precision ag",
+    },
     "boeing": {"industry": "aerospace", "sub": "aircraft", "moat": "duopoly position"},
-    "lockheed": {"industry": "defense", "sub": "defense contractor", "moat": "classified programs"},
-    "general electric": {"industry": "industrial", "sub": "aerospace/energy", "moat": "installed base/services"},
-    "honeywell": {"industry": "industrial", "sub": "diversified", "moat": "aerospace/automation"},
-    "3m": {"industry": "industrial", "sub": "diversified", "moat": "innovation/distribution"},
-    "raytheon": {"industry": "defense", "sub": "missiles/defense systems", "moat": "classified programs"},
-    
+    "lockheed": {
+        "industry": "defense",
+        "sub": "defense contractor",
+        "moat": "classified programs",
+    },
+    "general electric": {
+        "industry": "industrial",
+        "sub": "aerospace/energy",
+        "moat": "installed base/services",
+    },
+    "honeywell": {
+        "industry": "industrial",
+        "sub": "diversified",
+        "moat": "aerospace/automation",
+    },
+    "3m": {
+        "industry": "industrial",
+        "sub": "diversified",
+        "moat": "innovation/distribution",
+    },
+    "raytheon": {
+        "industry": "defense",
+        "sub": "missiles/defense systems",
+        "moat": "classified programs",
+    },
     # Software/SaaS
-    "salesforce": {"industry": "software", "sub": "CRM/enterprise", "moat": "ecosystem/switching costs"},
-    "adobe": {"industry": "software", "sub": "creative/marketing", "moat": "creative suite dominance"},
-    "oracle": {"industry": "software", "sub": "database/cloud", "moat": "enterprise lock-in"},
-    "sap": {"industry": "software", "sub": "ERP", "moat": "enterprise mission-critical"},
-    "servicenow": {"industry": "software", "sub": "IT workflows", "moat": "enterprise automation"},
-    "snowflake": {"industry": "software", "sub": "data cloud", "moat": "data sharing network"},
-    "palantir": {"industry": "software", "sub": "data analytics", "moat": "government relationships"},
-    "crowdstrike": {"industry": "software", "sub": "cybersecurity", "moat": "cloud-native architecture"},
-    
+    "salesforce": {
+        "industry": "software",
+        "sub": "CRM/enterprise",
+        "moat": "ecosystem/switching costs",
+    },
+    "adobe": {
+        "industry": "software",
+        "sub": "creative/marketing",
+        "moat": "creative suite dominance",
+    },
+    "oracle": {
+        "industry": "software",
+        "sub": "database/cloud",
+        "moat": "enterprise lock-in",
+    },
+    "sap": {
+        "industry": "software",
+        "sub": "ERP",
+        "moat": "enterprise mission-critical",
+    },
+    "servicenow": {
+        "industry": "software",
+        "sub": "IT workflows",
+        "moat": "enterprise automation",
+    },
+    "snowflake": {
+        "industry": "software",
+        "sub": "data cloud",
+        "moat": "data sharing network",
+    },
+    "palantir": {
+        "industry": "software",
+        "sub": "data analytics",
+        "moat": "government relationships",
+    },
+    "crowdstrike": {
+        "industry": "software",
+        "sub": "cybersecurity",
+        "moat": "cloud-native architecture",
+    },
     # E-commerce/Internet
-    "shopify": {"industry": "software", "sub": "e-commerce platform", "moat": "merchant ecosystem"},
-    "spotify": {"industry": "advertising", "sub": "audio streaming", "moat": "user base/playlists"},
-    "netflix": {"industry": "entertainment", "sub": "streaming", "moat": "content/scale"},
-    "uber": {"industry": "mobility", "sub": "rideshare/delivery", "moat": "network effects"},
-    "airbnb": {"industry": "travel", "sub": "accommodations", "moat": "host/guest network"},
-    "doordash": {"industry": "delivery", "sub": "food delivery", "moat": "logistics network"},
-    
+    "shopify": {
+        "industry": "software",
+        "sub": "e-commerce platform",
+        "moat": "merchant ecosystem",
+    },
+    "spotify": {
+        "industry": "advertising",
+        "sub": "audio streaming",
+        "moat": "user base/playlists",
+    },
+    "netflix": {
+        "industry": "entertainment",
+        "sub": "streaming",
+        "moat": "content/scale",
+    },
+    "uber": {
+        "industry": "mobility",
+        "sub": "rideshare/delivery",
+        "moat": "network effects",
+    },
+    "airbnb": {
+        "industry": "travel",
+        "sub": "accommodations",
+        "moat": "host/guest network",
+    },
+    "doordash": {
+        "industry": "delivery",
+        "sub": "food delivery",
+        "moat": "logistics network",
+    },
     # Electric Vehicles / Clean Energy
-    "tesla": {"industry": "automotive", "sub": "EVs/energy", "moat": "brand/manufacturing"},
+    "tesla": {
+        "industry": "automotive",
+        "sub": "EVs/energy",
+        "moat": "brand/manufacturing",
+    },
     "rivian": {"industry": "automotive", "sub": "EVs", "moat": "adventure brand"},
-    "lucid": {"industry": "automotive", "sub": "luxury EVs", "moat": "powertrain technology"},
-    "enphase": {"industry": "clean_energy", "sub": "microinverters", "moat": "residential solar"},
-    "first solar": {"industry": "clean_energy", "sub": "solar panels", "moat": "thin-film technology"},
-    
+    "lucid": {
+        "industry": "automotive",
+        "sub": "luxury EVs",
+        "moat": "powertrain technology",
+    },
+    "enphase": {
+        "industry": "clean_energy",
+        "sub": "microinverters",
+        "moat": "residential solar",
+    },
+    "first solar": {
+        "industry": "clean_energy",
+        "sub": "solar panels",
+        "moat": "thin-film technology",
+    },
     # Biotech
-    "moderna": {"industry": "biotech", "sub": "mRNA therapeutics", "moat": "mRNA platform"},
-    "regeneron": {"industry": "biotech", "sub": "antibodies", "moat": "VelociSuite platform"},
+    "moderna": {
+        "industry": "biotech",
+        "sub": "mRNA therapeutics",
+        "moat": "mRNA platform",
+    },
+    "regeneron": {
+        "industry": "biotech",
+        "sub": "antibodies",
+        "moat": "VelociSuite platform",
+    },
     "vertex": {"industry": "biotech", "sub": "rare disease", "moat": "CF franchise"},
-    "illumina": {"industry": "biotech", "sub": "gene sequencing", "moat": "sequencing dominance"},
-    "dexcom": {"industry": "medical_devices", "sub": "CGM", "moat": "diabetes management"},
-    "intuitive": {"industry": "medical_devices", "sub": "surgical robots", "moat": "da Vinci platform"},
-    
+    "illumina": {
+        "industry": "biotech",
+        "sub": "gene sequencing",
+        "moat": "sequencing dominance",
+    },
+    "dexcom": {
+        "industry": "medical_devices",
+        "sub": "CGM",
+        "moat": "diabetes management",
+    },
+    "intuitive": {
+        "industry": "medical_devices",
+        "sub": "surgical robots",
+        "moat": "da Vinci platform",
+    },
     # Payments/Fintech
-    "paypal": {"industry": "payments", "sub": "digital payments", "moat": "network effects"},
+    "paypal": {
+        "industry": "payments",
+        "sub": "digital payments",
+        "moat": "network effects",
+    },
     "square": {"industry": "payments", "sub": "SMB payments", "moat": "ecosystem"},
     "block": {"industry": "payments", "sub": "SMB payments", "moat": "ecosystem"},
-    "adyen": {"industry": "payments", "sub": "payment processing", "moat": "unified platform"},
-    "coinbase": {"industry": "crypto", "sub": "crypto exchange", "moat": "regulatory compliance"},
-    
+    "adyen": {
+        "industry": "payments",
+        "sub": "payment processing",
+        "moat": "unified platform",
+    },
+    "coinbase": {
+        "industry": "crypto",
+        "sub": "crypto exchange",
+        "moat": "regulatory compliance",
+    },
     # REITs / Real Estate
-    "prologis": {"industry": "real_estate", "sub": "industrial logistics", "moat": "location/scale"},
-    "american tower": {"industry": "real_estate", "sub": "cell towers", "moat": "tower portfolio"},
-    "equinix": {"industry": "real_estate", "sub": "data centers", "moat": "interconnection"},
-    "realty income": {"industry": "real_estate", "sub": "retail REIT", "moat": "triple-net leases"},
-    
+    "prologis": {
+        "industry": "real_estate",
+        "sub": "industrial logistics",
+        "moat": "location/scale",
+    },
+    "american tower": {
+        "industry": "real_estate",
+        "sub": "cell towers",
+        "moat": "tower portfolio",
+    },
+    "equinix": {
+        "industry": "real_estate",
+        "sub": "data centers",
+        "moat": "interconnection",
+    },
+    "realty income": {
+        "industry": "real_estate",
+        "sub": "retail REIT",
+        "moat": "triple-net leases",
+    },
     # Energy
-    "exxon": {"industry": "energy", "sub": "oil/gas integrated", "moat": "scale/reserves"},
-    "chevron": {"industry": "energy", "sub": "oil/gas integrated", "moat": "scale/reserves"},
+    "exxon": {
+        "industry": "energy",
+        "sub": "oil/gas integrated",
+        "moat": "scale/reserves",
+    },
+    "chevron": {
+        "industry": "energy",
+        "sub": "oil/gas integrated",
+        "moat": "scale/reserves",
+    },
     "conocophillips": {"industry": "energy", "sub": "E&P", "moat": "low-cost reserves"},
-    "schlumberger": {"industry": "energy", "sub": "oilfield services", "moat": "technology/scale"},
-    
+    "schlumberger": {
+        "industry": "energy",
+        "sub": "oilfield services",
+        "moat": "technology/scale",
+    },
     # Telecom
     "verizon": {"industry": "telecom", "sub": "wireless", "moat": "network quality"},
-    "at&t": {"industry": "telecom", "sub": "wireless/fiber", "moat": "spectrum/network"},
+    "at&t": {
+        "industry": "telecom",
+        "sub": "wireless/fiber",
+        "moat": "spectrum/network",
+    },
     "t-mobile": {"industry": "telecom", "sub": "wireless", "moat": "5G spectrum"},
-    
     # Entertainment/Media
     "disney": {"industry": "entertainment", "sub": "media/parks", "moat": "IP/brand"},
-    "warner": {"industry": "entertainment", "sub": "media/streaming", "moat": "content library"},
-    "comcast": {"industry": "entertainment", "sub": "cable/media", "moat": "broadband/content"},
+    "warner": {
+        "industry": "entertainment",
+        "sub": "media/streaming",
+        "moat": "content library",
+    },
+    "comcast": {
+        "industry": "entertainment",
+        "sub": "cable/media",
+        "moat": "broadband/content",
+    },
 }
 
 # Industry-specific risk templates
@@ -675,7 +1034,9 @@ INDUSTRY_RISKS = {
 }
 
 
-def extract_company_specific_context(company_name: str, financial_data: Dict, ratios: Dict) -> Dict[str, Any]:
+def extract_company_specific_context(
+    company_name: str, financial_data: Dict, ratios: Dict
+) -> Dict[str, Any]:
     """
     Extract company-specific context for generating authentic, relevant analysis.
     Uses financial data signals + known company database for accurate classification.
@@ -689,25 +1050,27 @@ def extract_company_specific_context(company_name: str, financial_data: Dict, ra
         "known_moat": "",
         "industry": "",
     }
-    
+
     # =========================================================================
     # STEP 1: Check known company database first
     # =========================================================================
     name_lower = company_name.lower()
     matched_company = None
-    
+
     for company_key, company_info in KNOWN_COMPANIES.items():
         if company_key in name_lower:
             matched_company = company_info
             context["industry"] = company_info.get("industry", "")
-            context["business_model_signals"].append(f"{company_info.get('sub', '')} business")
+            context["business_model_signals"].append(
+                f"{company_info.get('sub', '')} business"
+            )
             context["known_moat"] = company_info.get("moat", "")
-            
+
             # Get industry-specific risks
             industry_risks = INDUSTRY_RISKS.get(company_info.get("industry", ""), [])
             context["sector_risks"] = industry_risks[:4]  # Top 4 risks
             break
-    
+
     # =========================================================================
     # STEP 2: Determine scale from revenue
     # =========================================================================
@@ -715,8 +1078,10 @@ def extract_company_specific_context(company_name: str, financial_data: Dict, ra
     if financial_data.get("income_statement"):
         rev_data = financial_data["income_statement"].get("revenue", {})
         if rev_data:
-            revenue = list(rev_data.values())[0] if isinstance(rev_data, dict) else rev_data
-    
+            revenue = (
+                list(rev_data.values())[0] if isinstance(rev_data, dict) else rev_data
+            )
+
     if revenue:
         try:
             rev_val = float(revenue)
@@ -734,7 +1099,7 @@ def extract_company_specific_context(company_name: str, financial_data: Dict, ra
                 context["scale_descriptor"] = "micro-cap enterprise"
         except (ValueError, TypeError):
             pass
-    
+
     # =========================================================================
     # STEP 3: Analyze financial character from ratios (data-driven)
     # =========================================================================
@@ -747,30 +1112,42 @@ def extract_company_specific_context(company_name: str, financial_data: Dict, ra
     roe = ratios.get("roe")
     current_ratio = ratios.get("current_ratio")
     revenue_growth = ratios.get("revenue_growth_yoy")
-    
+
     # Margin profile analysis
     if gross_margin is not None:
         if gross_margin > 0.70:
-            context["business_model_signals"].append("ultra-high gross margins (70%+) - likely software, IP, or luxury")
+            context["business_model_signals"].append(
+                "ultra-high gross margins (70%+) - likely software, IP, or luxury"
+            )
             if not context["sector_risks"]:
-                context["sector_risks"].append("margin sustainability as competition increases")
+                context["sector_risks"].append(
+                    "margin sustainability as competition increases"
+                )
         elif gross_margin > 0.50:
-            context["business_model_signals"].append("high gross margins (50%+) - differentiated product/service")
+            context["business_model_signals"].append(
+                "high gross margins (50%+) - differentiated product/service"
+            )
         elif gross_margin < 0.25:
-            context["business_model_signals"].append("low gross margins (<25%) - commodity/volume business")
+            context["business_model_signals"].append(
+                "low gross margins (<25%) - commodity/volume business"
+            )
             if not context["sector_risks"]:
-                context["sector_risks"].append("razor-thin margins leave no room for error")
-    
+                context["sector_risks"].append(
+                    "razor-thin margins leave no room for error"
+                )
+
     # Operating leverage analysis
     if operating_margin is not None and gross_margin is not None:
         opex_burden = gross_margin - operating_margin
         if opex_burden > 0.35:
-            context["business_model_signals"].append("heavy opex burden (35%+ of revenue on SG&A/R&D)")
+            context["business_model_signals"].append(
+                "heavy opex burden (35%+ of revenue on SG&A/R&D)"
+            )
             context["financial_character"].append("investing heavily in growth")
         elif opex_burden < 0.15 and gross_margin > 0.40:
             context["business_model_signals"].append("efficient cost structure")
             context["financial_character"].append("operating leverage potential")
-    
+
     # Cash flow character
     if fcf is not None:
         try:
@@ -778,43 +1155,61 @@ def extract_company_specific_context(company_name: str, financial_data: Dict, ra
             if fcf_val > 0:
                 context["financial_character"].append("cash generative")
                 if fcf_margin and fcf_margin > 0.20:
-                    context["financial_character"].append("exceptional cash conversion (20%+ FCF margin)")
+                    context["financial_character"].append(
+                        "exceptional cash conversion (20%+ FCF margin)"
+                    )
             else:
                 context["financial_character"].append("cash burning")
-                context["sector_risks"].append("dilution risk from future capital raises")
-                context["sector_risks"].append("runway concerns if growth doesn't materialize")
+                context["sector_risks"].append(
+                    "dilution risk from future capital raises"
+                )
+                context["sector_risks"].append(
+                    "runway concerns if growth doesn't materialize"
+                )
         except (ValueError, TypeError):
             pass
-    
+
     # Balance sheet health
     if debt_to_equity is not None:
         if debt_to_equity > 3.0:
             context["financial_character"].append("heavily leveraged (D/E > 3x)")
-            context["sector_risks"].append("refinancing risk in higher rate environment")
+            context["sector_risks"].append(
+                "refinancing risk in higher rate environment"
+            )
             context["sector_risks"].append("covenant pressure if earnings decline")
         elif debt_to_equity > 1.5:
             context["financial_character"].append("moderately leveraged")
         elif debt_to_equity < 0.3:
-            context["financial_character"].append("fortress balance sheet (minimal debt)")
-    
+            context["financial_character"].append(
+                "fortress balance sheet (minimal debt)"
+            )
+
     if current_ratio is not None:
         if current_ratio < 1.0:
-            context["financial_character"].append("liquidity concerns (current ratio < 1)")
+            context["financial_character"].append(
+                "liquidity concerns (current ratio < 1)"
+            )
             context["sector_risks"].append("short-term funding risk")
         elif current_ratio > 3.0:
-            context["financial_character"].append("excess liquidity (potentially inefficient capital)")
-    
+            context["financial_character"].append(
+                "excess liquidity (potentially inefficient capital)"
+            )
+
     # Returns analysis
     if roe is not None:
         if roe > 0.30:
-            context["financial_character"].append("exceptional returns on equity (30%+)")
+            context["financial_character"].append(
+                "exceptional returns on equity (30%+)"
+            )
         elif roe > 0.15:
             context["financial_character"].append("solid returns on equity (15%+)")
         elif roe < 0.05:
             context["financial_character"].append("subpar returns on equity (<5%)")
         elif roe < 0:
-            context["financial_character"].append("negative ROE (destroying equity value)")
-    
+            context["financial_character"].append(
+                "negative ROE (destroying equity value)"
+            )
+
     # Growth character
     if revenue_growth is not None:
         if revenue_growth > 0.30:
@@ -824,59 +1219,75 @@ def extract_company_specific_context(company_name: str, financial_data: Dict, ra
         elif revenue_growth < 0:
             context["sector_risks"].append("market share loss or industry headwinds")
             context["financial_character"].append("revenue declining")
-    
+
     # =========================================================================
     # STEP 3.5: Additional data-driven risk inference (NEW)
     # =========================================================================
-    
+
     # R&D intensity check
     r_and_d_ratio = ratios.get("r_and_d_ratio") or ratios.get("rd_ratio")
     if r_and_d_ratio is not None:
         try:
             rd_val = float(r_and_d_ratio)
             if rd_val > 0.15:
-                context["business_model_signals"].append("R&D intensive (15%+ of revenue)")
-                context["sector_risks"].append("R&D productivity and pipeline execution risk")
+                context["business_model_signals"].append(
+                    "R&D intensive (15%+ of revenue)"
+                )
+                context["sector_risks"].append(
+                    "R&D productivity and pipeline execution risk"
+                )
             elif rd_val > 0.08:
                 context["business_model_signals"].append("moderate R&D investment")
         except (ValueError, TypeError):
             pass
-    
+
     # Capex intensity check
     capex_ratio = ratios.get("capex_to_revenue") or ratios.get("capex_ratio")
     if capex_ratio is not None:
         try:
             capex_val = float(capex_ratio)
             if capex_val > 0.15:
-                context["business_model_signals"].append("capital intensive (15%+ capex/revenue)")
+                context["business_model_signals"].append(
+                    "capital intensive (15%+ capex/revenue)"
+                )
                 context["sector_risks"].append("ROIC vs WACC spread sustainability")
             elif capex_val > 0.08:
-                context["business_model_signals"].append("moderate capital requirements")
+                context["business_model_signals"].append(
+                    "moderate capital requirements"
+                )
         except (ValueError, TypeError):
             pass
-    
+
     # Distressed/declining business detection
     if gross_margin is not None and operating_margin is not None:
         if gross_margin < 0.30 and operating_margin < 0.05:
-            context["sector_risks"].append("commodity economics - limited pricing power")
-    
+            context["sector_risks"].append(
+                "commodity economics - limited pricing power"
+            )
+
     if revenue_growth is not None and net_margin is not None:
         if revenue_growth < 0 and net_margin < 0:
-            context["sector_risks"].append("declining business with no profitability - turnaround required")
-    
+            context["sector_risks"].append(
+                "declining business with no profitability - turnaround required"
+            )
+
     # High growth but low/negative margins
     if revenue_growth is not None and operating_margin is not None:
         if revenue_growth > 0.20 and operating_margin < 0:
-            context["sector_risks"].append("growth-at-all-costs model - path to profitability unclear")
-    
+            context["sector_risks"].append(
+                "growth-at-all-costs model - path to profitability unclear"
+            )
+
     # Working capital intensity
     if current_ratio is not None and revenue is not None:
         try:
             if current_ratio > 2.5 and float(revenue) > 1e9:
-                context["business_model_signals"].append("capital-light with excess working capital")
+                context["business_model_signals"].append(
+                    "capital-light with excess working capital"
+                )
         except (ValueError, TypeError):
             pass
-    
+
     # =========================================================================
     # STEP 4: Fallback industry inference if no known company match
     # =========================================================================
@@ -890,13 +1301,13 @@ def extract_company_specific_context(company_name: str, financial_data: Dict, ra
             "retail": ["retail", "store", "shop", "mart"],
             "advertising": ["advertising", "media", "social"],
         }
-        
+
         for industry, keywords in industry_keywords.items():
             if any(kw in name_lower for kw in keywords):
                 context["industry"] = industry
                 context["sector_risks"] = INDUSTRY_RISKS.get(industry, [])[:4]
                 break
-        
+
         # If still no match, derive risks from financial character
         if not context["sector_risks"]:
             if "cash burning" in context["financial_character"]:
@@ -917,48 +1328,49 @@ def extract_company_specific_context(company_name: str, financial_data: Dict, ra
                     "market share dynamics",
                     "management execution",
                 ]
-    
+
     return context
 
 
 def format_company_context_for_prompt(context: Dict[str, Any]) -> str:
     """Format company context as a prompt section with rich detail."""
     lines = []
-    
+
     # Industry & Moat (if known)
     if context.get("industry"):
         lines.append(f"Industry: {context['industry']}")
-    
+
     if context.get("known_moat"):
         lines.append(f"Competitive Moat: {context['known_moat']}")
-    
+
     # Scale
     if context.get("scale_descriptor"):
         lines.append(f"Scale: {context['scale_descriptor']}")
-    
+
     # Business model signals
     if context.get("business_model_signals"):
-        signals = context['business_model_signals']
+        signals = context["business_model_signals"]
         lines.append(f"Business Model: {', '.join(signals[:3])}")
-    
+
     # Financial character (what the numbers tell us)
     if context.get("financial_character"):
-        chars = context['financial_character']
+        chars = context["financial_character"]
         lines.append(f"Financial Character: {', '.join(chars[:4])}")
-    
+
     # Sector-specific risks (NOT generic macro risks)
     if context.get("sector_risks"):
-        risks = context['sector_risks'][:4]
+        risks = context["sector_risks"][:4]
         lines.append(f"\nCompany-Specific Risks (use these, NOT generic macro risks):")
         for risk in risks:
             lines.append(f"  • {risk}")
-    
+
     return "\n".join(lines) if lines else "No specific context available."
 
 
 # =============================================================================
 # OUTPUT SANITIZATION - Strip ratings, generic phrases, and section headers
 # =============================================================================
+
 
 def filter_placeholders_and_irrelevant_risks(output: str, company_context: Dict) -> str:
     """
@@ -968,21 +1380,21 @@ def filter_placeholders_and_irrelevant_risks(output: str, company_context: Dict)
     if not output:
         return output
 
-    lines = output.split('\n')
+    lines = output.split("\n")
     industry = company_context.get("industry", "")
 
     # Placeholder patterns to COMPLETELY remove lines containing them
     placeholder_patterns = [
-        r'data\s+(?:is\s+)?unavailable',
-        r'data\s+(?:is\s+)?not\s+(?:available|disclosed)',
-        r'information\s+(?:is\s+)?(?:not\s+)?(?:available|disclosed)',
-        r'not\s+disclosed',
-        r'metrics?\s+(?:is|are)\s+unavailable',
-        r'figures?\s+(?:is|are)\s+unavailable',
-        r'numbers?\s+(?:is|are)\s+unavailable',
-        r'\bN/?A\b(?!\s*\w)',  # N/A but not "N/A" followed by word (like N/America)
-        r'\[.*?unavailable.*?\]',  # [data unavailable] style brackets
-        r'\[.*?not\s+disclosed.*?\]',
+        r"data\s+(?:is\s+)?unavailable",
+        r"data\s+(?:is\s+)?not\s+(?:available|disclosed)",
+        r"information\s+(?:is\s+)?(?:not\s+)?(?:available|disclosed)",
+        r"not\s+disclosed",
+        r"metrics?\s+(?:is|are)\s+unavailable",
+        r"figures?\s+(?:is|are)\s+unavailable",
+        r"numbers?\s+(?:is|are)\s+unavailable",
+        r"\bN/?A\b(?!\s*\w)",  # N/A but not "N/A" followed by word (like N/America)
+        r"\[.*?unavailable.*?\]",  # [data unavailable] style brackets
+        r"\[.*?not\s+disclosed.*?\]",
     ]
 
     # Get industry-mismatched phrases
@@ -1018,9 +1430,11 @@ def filter_placeholders_and_irrelevant_risks(output: str, company_context: Dict)
             if generic_phrase.lower() in line_lower:
                 # Check if the line has company-specific context (dollar amounts, percentages, company names)
                 has_specifics = bool(
-                    re.search(r'\$[\d.,]+', line) or  # Dollar amounts
-                    re.search(r'\d+\.?\d*%', line) or  # Percentages
-                    re.search(r'\b(?:revenue|margin|growth|profit|loss)\b', line_lower)  # Financial terms with numbers nearby
+                    re.search(r"\$[\d.,]+", line)  # Dollar amounts
+                    or re.search(r"\d+\.?\d*%", line)  # Percentages
+                    or re.search(
+                        r"\b(?:revenue|margin|growth|profit|loss)\b", line_lower
+                    )  # Financial terms with numbers nearby
                 )
                 if not has_specifics:
                     skip_line = True
@@ -1031,7 +1445,7 @@ def filter_placeholders_and_irrelevant_risks(output: str, company_context: Dict)
 
         filtered_lines.append(line)
 
-    return '\n'.join(filtered_lines)
+    return "\n".join(filtered_lines)
 
 
 def detect_incomplete_sentences(output: str, persona_id: str = "") -> List[str]:
@@ -1045,7 +1459,9 @@ def detect_incomplete_sentences(output: str, persona_id: str = "") -> List[str]:
     # Check for incomplete sentence patterns at the end
     for pattern in INCOMPLETE_SENTENCE_PATTERNS:
         if re.search(pattern, output_stripped, re.IGNORECASE):
-            issues.append("TRUNCATION: Output appears to be cut off mid-sentence or mid-number")
+            issues.append(
+                "TRUNCATION: Output appears to be cut off mid-sentence or mid-number"
+            )
             break
 
     # Check for section-specific truncation patterns
@@ -1055,36 +1471,42 @@ def detect_incomplete_sentences(output: str, persona_id: str = "") -> List[str]:
             break
 
     # Check for unclosed parentheses (common in financial data)
-    open_parens = output_stripped.count('(')
-    close_parens = output_stripped.count(')')
+    open_parens = output_stripped.count("(")
+    close_parens = output_stripped.count(")")
     if open_parens > close_parens:
-        issues.append("TRUNCATION: Unclosed parenthesis detected - output may be cut off")
+        issues.append(
+            "TRUNCATION: Unclosed parenthesis detected - output may be cut off"
+        )
 
     # Check for sentences that end without proper punctuation
-    if output_stripped and not any(re.search(p, output_stripped) for p in VALID_ENDING_PATTERNS):
-        issues.append("INCOMPLETE: Output doesn't end with proper punctuation (., !, ?, or closing quote)")
+    if output_stripped and not any(
+        re.search(p, output_stripped) for p in VALID_ENDING_PATTERNS
+    ):
+        issues.append(
+            "INCOMPLETE: Output doesn't end with proper punctuation (., !, ?, or closing quote)"
+        )
 
     # Check for dangling modifiers/incomplete clauses
     dangling_patterns = [
-        r'\bincluding\s*$',
-        r'\bsuch\s+as\s*$',
-        r'\bespecially\s*$',
-        r'\bparticularly\s*$',
-        r'\bnamely\s*$',
-        r'\bfor example\s*$',
-        r'\bwhich\s*$',
-        r'\bthat\s*$',
-        r'\bwhere\s*$',
-        r'\bwhen\s*$',
-        r'\bbecause\s*$',
-        r'\balthough\s*$',
-        r'\bwhile\s*$',
-        r'\bif\s*$',
-        r'\bwhether\s*$',
-        r'\bto determine\s*$',
-        r'\bI need to\s*$',
-        r'\bmy take is\s*$',
-        r'\bcautiously optimistic;\s*I need to\s*$',
+        r"\bincluding\s*$",
+        r"\bsuch\s+as\s*$",
+        r"\bespecially\s*$",
+        r"\bparticularly\s*$",
+        r"\bnamely\s*$",
+        r"\bfor example\s*$",
+        r"\bwhich\s*$",
+        r"\bthat\s*$",
+        r"\bwhere\s*$",
+        r"\bwhen\s*$",
+        r"\bbecause\s*$",
+        r"\balthough\s*$",
+        r"\bwhile\s*$",
+        r"\bif\s*$",
+        r"\bwhether\s*$",
+        r"\bto determine\s*$",
+        r"\bI need to\s*$",
+        r"\bmy take is\s*$",
+        r"\bcautiously optimistic;\s*I need to\s*$",
     ]
     for pattern in dangling_patterns:
         if re.search(pattern, output_stripped, re.IGNORECASE | re.MULTILINE):
@@ -1093,12 +1515,12 @@ def detect_incomplete_sentences(output: str, persona_id: str = "") -> List[str]:
 
     # Check for mid-sentence endings like "I need to determine..."
     mid_sentence_patterns = [
-        r'\bneed to determine[^.!?]*$',
-        r'\bneed to assess[^.!?]*$',
-        r'\bneed to evaluate[^.!?]*$',
-        r'\bwill be watching[^.!?]*$',
-        r'\bremains to be[^.!?]*$',
-        r'\bI\'m looking at[^.!?]*$',
+        r"\bneed to determine[^.!?]*$",
+        r"\bneed to assess[^.!?]*$",
+        r"\bneed to evaluate[^.!?]*$",
+        r"\bwill be watching[^.!?]*$",
+        r"\bremains to be[^.!?]*$",
+        r"\bI\'m looking at[^.!?]*$",
     ]
     for pattern in mid_sentence_patterns:
         if re.search(pattern, output_stripped, re.IGNORECASE):
@@ -1108,15 +1530,33 @@ def detect_incomplete_sentences(output: str, persona_id: str = "") -> List[str]:
     # =========================================================================
     # NEW: Check for paragraphs that end mid-argument (setup without payoff)
     # =========================================================================
-    paragraphs = output_stripped.split('\n\n')
+    paragraphs = output_stripped.split("\n\n")
     setup_without_payoff_patterns = [
         # Patterns that indicate setup for content that never comes
-        (r'is critical[^.]*\.\s*$', "ends with 'is critical' but no explanation follows"),
-        (r'looking for[^.]*\.\s*$', "ends with 'looking for' but doesn't deliver what was sought"),
-        (r'must be addressed[^.]*\.\s*$', "mentions something must be addressed but doesn't address it"),
-        (r'requires? (?:further |careful |detailed )(?:analysis|examination|review)[^.]*\.\s*$', "defers to future analysis instead of providing it"),
-        (r'will be important[^.]*\.\s*$', "says something will be important but doesn't explain why"),
-        (r'we need to (?:see|understand|monitor)[^.]*\.\s*$', "ends with need statement without delivery"),
+        (
+            r"is critical[^.]*\.\s*$",
+            "ends with 'is critical' but no explanation follows",
+        ),
+        (
+            r"looking for[^.]*\.\s*$",
+            "ends with 'looking for' but doesn't deliver what was sought",
+        ),
+        (
+            r"must be addressed[^.]*\.\s*$",
+            "mentions something must be addressed but doesn't address it",
+        ),
+        (
+            r"requires? (?:further |careful |detailed )(?:analysis|examination|review)[^.]*\.\s*$",
+            "defers to future analysis instead of providing it",
+        ),
+        (
+            r"will be important[^.]*\.\s*$",
+            "says something will be important but doesn't explain why",
+        ),
+        (
+            r"we need to (?:see|understand|monitor)[^.]*\.\s*$",
+            "ends with need statement without delivery",
+        ),
     ]
 
     for para in paragraphs:
@@ -1127,7 +1567,10 @@ def detect_incomplete_sentences(output: str, persona_id: str = "") -> List[str]:
             if re.search(pattern, para_stripped, re.IGNORECASE):
                 # Check if the next paragraph follows up (if there is one)
                 para_idx = paragraphs.index(para)
-                has_followup = para_idx < len(paragraphs) - 1 and len(paragraphs[para_idx + 1].strip()) > 50
+                has_followup = (
+                    para_idx < len(paragraphs) - 1
+                    and len(paragraphs[para_idx + 1].strip()) > 50
+                )
                 if not has_followup:
                     issues.append(f"INCOMPLETE ARGUMENT: Paragraph {description}")
                     break
@@ -1137,24 +1580,30 @@ def detect_incomplete_sentences(output: str, persona_id: str = "") -> List[str]:
         output_lower = output_stripped.lower()
         has_verdict = any(re.search(p, output_lower) for p in LYNCH_VERDICT_PATTERNS)
         if not has_verdict:
-            issues.append("LYNCH VERDICT MISSING: Peter Lynch analysis must end with a clear verdict (buy/pass/wait)")
+            issues.append(
+                "LYNCH VERDICT MISSING: Peter Lynch analysis must end with a clear verdict (buy/pass/wait)"
+            )
 
     # Check minimum word count
     word_count = len(output_stripped.split())
     if word_count < 150 and persona_id not in ["greenblatt", "munger"]:
-        issues.append(f"TOO SHORT: Only {word_count} words, minimum 150 for substantive analysis")
+        issues.append(
+            f"TOO SHORT: Only {word_count} words, minimum 150 for substantive analysis"
+        )
 
     # Check for overly long sentences (45+ words) - weakens authority
-    sentences = re.split(r'[.!?]+', output_stripped)
+    sentences = re.split(r"[.!?]+", output_stripped)
     long_sentences = []
     for sentence in sentences:
         word_count_sentence = len(sentence.split())
         if word_count_sentence > 45:
             # Get first 10 words as preview
-            preview = ' '.join(sentence.split()[:10]) + '...'
+            preview = " ".join(sentence.split()[:10]) + "..."
             long_sentences.append(f"({word_count_sentence} words): '{preview}'")
     if long_sentences:
-        issues.append(f"VERBOSE SENTENCES: {len(long_sentences)} sentence(s) exceed 45 words - trim for clarity: {long_sentences[0]}")
+        issues.append(
+            f"VERBOSE SENTENCES: {len(long_sentences)} sentence(s) exceed 45 words - trim for clarity: {long_sentences[0]}"
+        )
 
     return issues
 
@@ -1168,8 +1617,14 @@ def detect_unsupported_valuation_claims(output: str) -> List[str]:
 
     # Valuation claims that need supporting metrics
     valuation_claims = [
-        ("undervalued", ["p/e", "multiple", "earnings yield", "fcf yield", "price-to", "discount"]),
-        ("overvalued", ["p/e", "multiple", "earnings yield", "fcf yield", "price-to", "premium"]),
+        (
+            "undervalued",
+            ["p/e", "multiple", "earnings yield", "fcf yield", "price-to", "discount"],
+        ),
+        (
+            "overvalued",
+            ["p/e", "multiple", "earnings yield", "fcf yield", "price-to", "premium"],
+        ),
         ("cheap", ["p/e", "multiple", "yield", "price-to", "trades at"]),
         ("expensive", ["p/e", "multiple", "yield", "price-to", "trades at"]),
         ("fair value", ["dcf", "intrinsic", "worth", "p/e", "multiple"]),
@@ -1180,11 +1635,13 @@ def detect_unsupported_valuation_claims(output: str) -> List[str]:
         if claim in output_lower:
             # Check if any supporting metric is mentioned within 200 chars of the claim
             claim_pos = output_lower.find(claim)
-            context_window = output_lower[max(0, claim_pos-200):claim_pos+200]
+            context_window = output_lower[max(0, claim_pos - 200) : claim_pos + 200]
 
             has_support = any(support in context_window for support in required_support)
             if not has_support:
-                issues.append(f"UNSUPPORTED VALUATION: Claim '{claim}' made without supporting valuation metric")
+                issues.append(
+                    f"UNSUPPORTED VALUATION: Claim '{claim}' made without supporting valuation metric"
+                )
 
     return issues
 
@@ -1200,24 +1657,60 @@ def check_financial_contextualization(output: str) -> List[str]:
     issues = []
 
     # Pattern to find dollar figures with B/M suffix
-    dollar_pattern = r'\$\d+\.?\d*[BM]'
+    dollar_pattern = r"\$\d+\.?\d*[BM]"
 
     # Context indicators that show the number has been interpreted
     context_indicators = [
         # Comparisons
-        'vs', 'versus', 'compared to', 'above', 'below', 'higher than', 'lower than',
-        'up from', 'down from', 'increase', 'decrease', 'growth', 'decline',
+        "vs",
+        "versus",
+        "compared to",
+        "above",
+        "below",
+        "higher than",
+        "lower than",
+        "up from",
+        "down from",
+        "increase",
+        "decrease",
+        "growth",
+        "decline",
         # Interpretations
-        'indicating', 'suggesting', 'which means', 'demonstrating', 'showing',
-        'reflects', 'represents', 'translating to',
+        "indicating",
+        "suggesting",
+        "which means",
+        "demonstrating",
+        "showing",
+        "reflects",
+        "represents",
+        "translating to",
         # Benchmarks
-        'average', 'benchmark', 'peer', 'industry', 'S&P', 'market',
+        "average",
+        "benchmark",
+        "peer",
+        "industry",
+        "S&P",
+        "market",
         # Ratios/calculations
-        '÷', 'divided by', 'ratio', '%', 'yield', 'margin',
+        "÷",
+        "divided by",
+        "ratio",
+        "%",
+        "yield",
+        "margin",
         # Quality indicators
-        'strong', 'weak', 'healthy', 'concerning', 'impressive', 'solid',
+        "strong",
+        "weak",
+        "healthy",
+        "concerning",
+        "impressive",
+        "solid",
         # Specific context words
-        'annual', 'quarterly', 'fiscal', 'YoY', 'year-over-year',
+        "annual",
+        "quarterly",
+        "fiscal",
+        "YoY",
+        "year-over-year",
     ]
 
     matches = list(re.finditer(dollar_pattern, output))
@@ -1233,15 +1726,19 @@ def check_financial_contextualization(output: str) -> List[str]:
         end_pos = match.end()
 
         # Look at the 80 characters after the figure (wider window)
-        context_after = output[end_pos:end_pos + 80].lower()
+        context_after = output[end_pos : end_pos + 80].lower()
 
         # Check if any context indicator appears
-        has_context = any(indicator in context_after for indicator in context_indicators)
+        has_context = any(
+            indicator in context_after for indicator in context_indicators
+        )
 
         if not has_context:
             # Also check if it's part of a calculation (X ÷ Y = Z)
-            calc_context = output[max(0, start_pos-20):end_pos + 50].lower()
-            is_calculation = '÷' in calc_context or '=' in calc_context or '/' in calc_context
+            calc_context = output[max(0, start_pos - 20) : end_pos + 50].lower()
+            is_calculation = (
+                "÷" in calc_context or "=" in calc_context or "/" in calc_context
+            )
 
             if not is_calculation:
                 figure = match.group()
@@ -1249,7 +1746,9 @@ def check_financial_contextualization(output: str) -> List[str]:
 
     # Only report if we have significant issues (more than 2 uncontextualized figures)
     if len(uncontextualized) > 2:
-        issues.append(f"Uncontextualized figures: {uncontextualized[:3]} - consider adding interpretation (what does this number mean?)")
+        issues.append(
+            f"Uncontextualized figures: {uncontextualized[:3]} - consider adding interpretation (what does this number mean?)"
+        )
 
     return issues
 
@@ -1265,7 +1764,7 @@ def detect_numerical_contradictions(output: str) -> List[str]:
 
     # Pattern 1: Ratio claimed to be in a range when it's not
     # Match patterns like "of 0.51 falls within the 0.7-1.0 range"
-    ratio_range_pattern = r'(?:of|is|at)\s+(\d+\.?\d*)\s+(?:falls within|is within|in|within)\s+(?:the\s+)?(\d+\.?\d*)\s*[-–to]+\s*(\d+\.?\d*)\s*(?:range|band|zone)?'
+    ratio_range_pattern = r"(?:of|is|at)\s+(\d+\.?\d*)\s+(?:falls within|is within|in|within)\s+(?:the\s+)?(\d+\.?\d*)\s*[-–to]+\s*(\d+\.?\d*)\s*(?:range|band|zone)?"
 
     for match in re.finditer(ratio_range_pattern, output, re.IGNORECASE):
         try:
@@ -1283,11 +1782,18 @@ def detect_numerical_contradictions(output: str) -> List[str]:
 
     # Pattern 2: Contradictory quality assessments for the same metric
     # E.g., "solid" and "concerning" for the same metric within 100 chars
-    positive_terms = ['solid', 'strong', 'healthy', 'excellent', 'impressive', 'robust']
-    negative_terms = ['concerning', 'weak', 'poor', 'disappointing', 'troubling', 'worrying']
+    positive_terms = ["solid", "strong", "healthy", "excellent", "impressive", "robust"]
+    negative_terms = [
+        "concerning",
+        "weak",
+        "poor",
+        "disappointing",
+        "troubling",
+        "worrying",
+    ]
 
     # Find sentences that contain both positive and negative terms for same concept
-    sentences = output.split('.')
+    sentences = output.split(".")
     for sentence in sentences:
         sentence_lower = sentence.lower()
         has_positive = any(term in sentence_lower for term in positive_terms)
@@ -1295,11 +1801,17 @@ def detect_numerical_contradictions(output: str) -> List[str]:
 
         if has_positive and has_negative:
             # Check if it's a legitimate contrast (e.g., "strong revenue but weak margins")
-            if ' but ' not in sentence_lower and ' however ' not in sentence_lower and ' while ' not in sentence_lower:
-                issues.append(f"CONTRADICTORY ASSESSMENT: Mixed positive/negative terms without contrast word: '{sentence[:80]}...'")
+            if (
+                " but " not in sentence_lower
+                and " however " not in sentence_lower
+                and " while " not in sentence_lower
+            ):
+                issues.append(
+                    f"CONTRADICTORY ASSESSMENT: Mixed positive/negative terms without contrast word: '{sentence[:80]}...'"
+                )
 
     # Pattern 3: FCF/NI specific validation
-    fcf_ni_pattern = r'FCF[/\\](?:Net\s+)?(?:Income|NI)\s+(?:of\s+)?(\d+\.?\d*)'
+    fcf_ni_pattern = r"FCF[/\\](?:Net\s+)?(?:Income|NI)\s+(?:of\s+)?(\d+\.?\d*)"
     for match in re.finditer(fcf_ni_pattern, output, re.IGNORECASE):
         try:
             ratio = float(match.group(1))
@@ -1308,14 +1820,22 @@ def detect_numerical_contradictions(output: str) -> List[str]:
             context = output[context_start:context_end].lower()
 
             # Check for incorrect range claims
-            if ratio < 0.7 and ('0.7-1' in context or '0.7 to 1' in context or 'healthy range' in context):
-                if 'below' not in context and 'outside' not in context and 'not' not in context:
+            if ratio < 0.7 and (
+                "0.7-1" in context
+                or "0.7 to 1" in context
+                or "healthy range" in context
+            ):
+                if (
+                    "below" not in context
+                    and "outside" not in context
+                    and "not" not in context
+                ):
                     issues.append(
                         f"FCF/NI CONTRADICTION: Ratio of {ratio} is described as within 0.7-1.0 healthy range, "
                         f"but {ratio} < 0.7. Should note: 'below the healthy range' or 'cash conversion needs improvement'."
                     )
-            elif ratio > 1.0 and ('0.7-1' in context or '0.7 to 1' in context):
-                if 'above' not in context and 'exceeds' not in context:
+            elif ratio > 1.0 and ("0.7-1" in context or "0.7 to 1" in context):
+                if "above" not in context and "exceeds" not in context:
                     issues.append(
                         f"FCF/NI CONTRADICTION: Ratio of {ratio} exceeds 1.0, which may indicate accounting adjustments. "
                         f"Context should note this is above the typical range."
@@ -1340,29 +1860,29 @@ def detect_internal_data_inconsistency(output: str) -> List[str]:
     # Group metrics by their type and check for inconsistency
 
     metric_patterns = {
-        "revenue": r'(?:revenue|sales|top[- ]line)\s+(?:reached\s+|of\s+|was\s+|totaled\s+|hit\s+)?\$?([\d,.]+)\s*([BMTbmt](?:illion)?)?',
-        "net_income": r'(?:net income|earnings|profit|bottom[- ]line)\s+(?:of\s+)?\$?([\d,.]+)\s*([BMTbmt](?:illion)?)?',
-        "fcf": r'(?:free cash flow|fcf|operating cash)\s+(?:of\s+)?\$?([\d,.]+)\s*([BMTbmt](?:illion)?)?',
-        "assets": r'(?:total assets|assets)\s+(?:of\s+)?\$?([\d,.]+)\s*([BMTbmt](?:illion)?)?',
-        "debt": r'(?:total debt|debt|liabilities)\s+(?:of\s+)?\$?([\d,.]+)\s*([BMTbmt](?:illion)?)?',
+        "revenue": r"(?:revenue|sales|top[- ]line)\s+(?:reached\s+|of\s+|was\s+|totaled\s+|hit\s+)?\$?([\d,.]+)\s*([BMTbmt](?:illion)?)?",
+        "net_income": r"(?:net income|earnings|profit|bottom[- ]line)\s+(?:of\s+)?\$?([\d,.]+)\s*([BMTbmt](?:illion)?)?",
+        "fcf": r"(?:free cash flow|fcf|operating cash)\s+(?:of\s+)?\$?([\d,.]+)\s*([BMTbmt](?:illion)?)?",
+        "assets": r"(?:total assets|assets)\s+(?:of\s+)?\$?([\d,.]+)\s*([BMTbmt](?:illion)?)?",
+        "debt": r"(?:total debt|debt|liabilities)\s+(?:of\s+)?\$?([\d,.]+)\s*([BMTbmt](?:illion)?)?",
     }
 
     # Also match patterns like "reported $60.9B in revenue" or "$60.9B revenue"
     alternate_patterns = {
-        "revenue": r'(?:reported\s+)?\$?([\d,.]+)\s*([BMTbmt](?:illion)?)\s+(?:in\s+)?(?:revenue|sales)',
-        "net_income": r'(?:reported\s+)?\$?([\d,.]+)\s*([BMTbmt](?:illion)?)\s+(?:in\s+)?(?:net income|earnings|profit)',
+        "revenue": r"(?:reported\s+)?\$?([\d,.]+)\s*([BMTbmt](?:illion)?)\s+(?:in\s+)?(?:revenue|sales)",
+        "net_income": r"(?:reported\s+)?\$?([\d,.]+)\s*([BMTbmt](?:illion)?)\s+(?:in\s+)?(?:net income|earnings|profit)",
     }
 
     def normalize_value(num_str: str, scale: str) -> float:
         """Convert number string with scale indicator to float."""
         try:
-            num = float(num_str.replace(',', ''))
-            scale_upper = (scale or '').upper()
-            if scale_upper.startswith('T'):
+            num = float(num_str.replace(",", ""))
+            scale_upper = (scale or "").upper()
+            if scale_upper.startswith("T"):
                 num *= 1e12
-            elif scale_upper.startswith('B'):
+            elif scale_upper.startswith("B"):
                 num *= 1e9
-            elif scale_upper.startswith('M'):
+            elif scale_upper.startswith("M"):
                 num *= 1e6
             return num
         except (ValueError, TypeError):
@@ -1373,7 +1893,9 @@ def detect_internal_data_inconsistency(output: str) -> List[str]:
 
         # Also check alternate patterns for this metric if they exist
         if metric_name in alternate_patterns:
-            alt_matches = list(re.finditer(alternate_patterns[metric_name], output, re.IGNORECASE))
+            alt_matches = list(
+                re.finditer(alternate_patterns[metric_name], output, re.IGNORECASE)
+            )
             matches.extend(alt_matches)
 
         if len(matches) >= 2:
@@ -1381,7 +1903,7 @@ def detect_internal_data_inconsistency(output: str) -> List[str]:
             values = []
             for match in matches:
                 num_str = match.group(1)
-                scale = match.group(2) if len(match.groups()) > 1 else ''
+                scale = match.group(2) if len(match.groups()) > 1 else ""
                 normalized = normalize_value(num_str, scale)
                 if normalized > 0:
                     values.append((normalized, match.group(0)[:50]))
@@ -1400,14 +1922,14 @@ def detect_internal_data_inconsistency(output: str) -> List[str]:
                     )
 
     # Also check conflicting fiscal periods
-    fy_pattern = r'(?:FY|fiscal year)\s*\'?(\d{2,4})'
+    fy_pattern = r"(?:FY|fiscal year)\s*\'?(\d{2,4})"
     fy_matches = list(re.finditer(fy_pattern, output, re.IGNORECASE))
     if len(fy_matches) >= 2:
         years = set()
         for match in fy_matches:
             year = match.group(1)
             if len(year) == 2:
-                year = '20' + year
+                year = "20" + year
             years.add(year)
 
         if len(years) > 1:
@@ -1467,14 +1989,16 @@ def validate_financial_data_sanity(financial_data: Dict, output: str) -> List[st
                 # asset turnover > 1.2 is unusual - revenue usually < assets
                 if asset_turnover > 1.5:  # Revenue is more than 1.5x assets
                     issues.append(
-                        f"DATA SANITY WARNING: Revenue (${rev/1e9:.2f}B) is {asset_turnover:.2f}x Total Assets (${assets/1e9:.2f}B). "
+                        f"DATA SANITY WARNING: Revenue (${rev / 1e9:.2f}B) is {asset_turnover:.2f}x Total Assets (${assets / 1e9:.2f}B). "
                         f"For capital-intensive businesses, revenue typically < assets. "
                         f"Verify: Is this comparing quarterly revenue to annual balance sheet? Or mixing fiscal periods?"
                     )
-                elif asset_turnover > 1.15 and rev > 50e9:  # Large companies with rev > assets
+                elif (
+                    asset_turnover > 1.15 and rev > 50e9
+                ):  # Large companies with rev > assets
                     # For large companies ($50B+ revenue), revenue > assets is notable
                     issues.append(
-                        f"DATA NOTE: Revenue (${rev/1e9:.2f}B) exceeds Total Assets (${assets/1e9:.2f}B). "
+                        f"DATA NOTE: Revenue (${rev / 1e9:.2f}B) exceeds Total Assets (${assets / 1e9:.2f}B). "
                         f"Asset turnover of {asset_turnover:.2f}x is high for a company this size. "
                         f"This could indicate: capital-light business model, or verify data extraction is correct."
                     )
@@ -1490,11 +2014,13 @@ def validate_financial_data_sanity(financial_data: Dict, output: str) -> List[st
             liabilities = float(total_liabilities)
             equity = float(total_equity)
             expected_assets = liabilities + equity
-            if assets > 0 and abs(assets - expected_assets) / assets > 0.05:  # More than 5% difference
+            if (
+                assets > 0 and abs(assets - expected_assets) / assets > 0.05
+            ):  # More than 5% difference
                 issues.append(
                     f"DATA SANITY WARNING: Balance sheet doesn't balance. "
-                    f"Assets: ${assets/1e9:.2f}B, Liabilities + Equity: ${expected_assets/1e9:.2f}B. "
-                    f"Difference: ${(assets - expected_assets)/1e9:.2f}B. Verify data extraction."
+                    f"Assets: ${assets / 1e9:.2f}B, Liabilities + Equity: ${expected_assets / 1e9:.2f}B. "
+                    f"Difference: ${(assets - expected_assets) / 1e9:.2f}B. Verify data extraction."
                 )
         except (ValueError, TypeError):
             pass
@@ -1511,13 +2037,13 @@ def validate_financial_data_sanity(financial_data: Dict, output: str) -> List[st
                 net_margin = ni / rev
                 if net_margin > 1.0:
                     issues.append(
-                        f"DATA SANITY ERROR: Net Income (${ni/1e9:.2f}B) > Revenue (${rev/1e9:.2f}B). "
-                        f"Net margin of {net_margin*100:.1f}% is impossible. Check data extraction."
+                        f"DATA SANITY ERROR: Net Income (${ni / 1e9:.2f}B) > Revenue (${rev / 1e9:.2f}B). "
+                        f"Net margin of {net_margin * 100:.1f}% is impossible. Check data extraction."
                     )
                 elif net_margin > 0.6 and net_margin <= 1.0:
                     # Very high but possible - just flag for awareness
                     issues.append(
-                        f"DATA NOTE: Exceptionally high net margin of {net_margin*100:.1f}%. "
+                        f"DATA NOTE: Exceptionally high net margin of {net_margin * 100:.1f}%. "
                         f"This is rare - verify it's accurate (could be one-time gains or software/IP business)."
                     )
         except (ValueError, TypeError):
@@ -1533,7 +2059,7 @@ def validate_financial_data_sanity(financial_data: Dict, output: str) -> List[st
             a = float(total_assets)
             if c > a and a > 0:
                 issues.append(
-                    f"DATA SANITY ERROR: Cash (${c/1e9:.2f}B) > Total Assets (${a/1e9:.2f}B). "
+                    f"DATA SANITY ERROR: Cash (${c / 1e9:.2f}B) > Total Assets (${a / 1e9:.2f}B). "
                     f"This is impossible - cash is a subset of assets. Check data extraction."
                 )
         except (ValueError, TypeError):
@@ -1542,11 +2068,323 @@ def validate_financial_data_sanity(financial_data: Dict, output: str) -> List[st
     return issues
 
 
+# =============================================================================
+# INTRA-SECTION SENTENCE DEDUPLICATION
+# =============================================================================
+
+_DEDUP_STOPWORDS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "if",
+        "then",
+        "so",
+        "to",
+        "of",
+        "in",
+        "on",
+        "for",
+        "with",
+        "as",
+        "at",
+        "by",
+        "from",
+        "into",
+        "that",
+        "this",
+        "it",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "will",
+        "would",
+        "can",
+        "could",
+        "should",
+        "may",
+        "might",
+        "we",
+        "i",
+        "my",
+        "our",
+        "your",
+        "not",
+        "no",
+        "its",
+    }
+)
+
+
+def _sentence_content_tokens(sentence: str) -> set:
+    """Return a set of meaningful content tokens for fuzzy dedup comparison."""
+    lowered = (sentence or "").lower()
+    tokens = re.split(r"[^a-z0-9$%]+", lowered)
+    return {t for t in tokens if t and t not in _DEDUP_STOPWORDS and len(t) >= 3}
+
+
+def _deduplicate_section_sentences(text: str) -> str:
+    """Remove near-duplicate sentences WITHIN each section independently.
+
+    Two sentences are considered duplicates if they share >70% of their
+    content tokens (stopword-stripped). The first occurrence is kept.
+    """
+    if not text:
+        return text
+
+    heading_re = re.compile(r"^\s*##\s+.+")
+    lines = text.splitlines()
+    result_lines: List[str] = []
+    section_seen_tokens: List[set] = []
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Headings reset per-section state
+        if heading_re.match(stripped):
+            section_seen_tokens = []
+            result_lines.append(line)
+            continue
+
+        if not stripped:
+            result_lines.append(line)
+            continue
+
+        # Split line into sentences
+        sentences = re.split(r"(?<=[.!?])\s+", stripped)
+        kept_sentences: List[str] = []
+
+        for sent in sentences:
+            sent = (sent or "").strip()
+            if not sent:
+                continue
+
+            tokens = _sentence_content_tokens(sent)
+            if len(tokens) < 3:
+                # Very short sentence — keep it (headers, scores, labels)
+                kept_sentences.append(sent)
+                continue
+
+            is_dup = False
+            for prior_tokens in section_seen_tokens:
+                if not prior_tokens:
+                    continue
+                overlap = tokens & prior_tokens
+                # Similarity = overlap / smaller set
+                smaller = min(len(tokens), len(prior_tokens))
+                if smaller > 0 and len(overlap) / smaller > 0.70:
+                    is_dup = True
+                    break
+
+            if not is_dup:
+                section_seen_tokens.append(tokens)
+                kept_sentences.append(sent)
+
+        if kept_sentences:
+            result_lines.append(" ".join(kept_sentences))
+
+    return "\n".join(result_lines)
+
+
+# =============================================================================
+# METHODOLOGY / FRAMEWORK SENTENCE FILTER
+# =============================================================================
+
+_METHODOLOGY_PATTERNS = [
+    re.compile(p, re.IGNORECASE)
+    for p in [
+        r"\bis best assessed through\b",
+        r"\bthe focus is\b",
+        r"\bis supported by repeatable\b",
+        r"\bcan be evaluated by\b",
+        r"\bthe key question is\b",
+        r"\bthe framework suggests\b",
+        r"\bwhen growth is strong,?\s+the focus\b",
+        r"\ba durable thesis is\b",
+        r"\bcash durability is best\b",
+        r"\bthe strongest signal is alignment\b",
+        r"\bthat is the practical trigger for\b",
+        r"\bthe way to assess\b",
+        r"\bthe right way to think about\b",
+        r"\bprofessional investors evaluate\b",
+        r"\bthe analytical priority is\b",
+        r"\bthe correct framing is\b",
+    ]
+]
+
+
+def _strip_methodology_sentences(text: str) -> str:
+    """Remove sentences that describe analytical methodology rather than
+    company-specific analysis.  Only strips sentences that contain NO
+    company-specific data ($, %, proper nouns > 2 chars starting with caps).
+    """
+    if not text:
+        return text
+
+    heading_re = re.compile(r"^\s*##\s+.+")
+    lines = text.splitlines()
+    result_lines: List[str] = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or heading_re.match(stripped):
+            result_lines.append(line)
+            continue
+
+        sentences = re.split(r"(?<=[.!?])\s+", stripped)
+        kept: List[str] = []
+
+        for sent in sentences:
+            sent = (sent or "").strip()
+            if not sent:
+                continue
+
+            # Check if sentence matches a methodology pattern
+            is_methodology = any(p.search(sent) for p in _METHODOLOGY_PATTERNS)
+
+            if is_methodology:
+                # Only strip if no company-specific data
+                has_data = bool(re.search(r"[\$%]|\d{2,}", sent))
+                if not has_data:
+                    continue  # Drop methodology sentence
+
+            kept.append(sent)
+
+        if kept:
+            result_lines.append(" ".join(kept))
+        elif stripped:
+            # Don't add empty line where content was — avoid structure gaps
+            pass
+
+    return "\n".join(result_lines)
+
+
+# =============================================================================
+# CLOSING TAKEAWAY SENTENCE CAP
+# =============================================================================
+
+
+def _cap_closing_takeaway_sentences(text: str, max_sentences: int = 4) -> str:
+    """Enforce a hard sentence cap on the Closing Takeaway section.
+
+    1. Extract the Closing Takeaway body (excluding STANCE/CONVICTION lines).
+    2. Deduplicate sentences with >70% token overlap (keep first).
+    3. Keep at most `max_sentences` sentences.
+    4. Re-attach STANCE/CONVICTION lines.
+    """
+    if not text:
+        return text
+
+    closing_match = re.search(
+        r"(##\s*(?:\d+\.\s*)?Closing\s+Takeaway\s*)\n+([\s\S]*?)(?=\n##\s|\Z)",
+        text,
+        re.IGNORECASE,
+    )
+    if not closing_match:
+        return text
+
+    heading = closing_match.group(1).strip()
+    body = closing_match.group(2).strip()
+    if not body:
+        return text
+
+    # Separate STANCE/CONVICTION metadata lines from prose
+    body_lines = body.splitlines()
+    prose_lines: List[str] = []
+    meta_lines: List[str] = []
+    for bl in body_lines:
+        bl_stripped = bl.strip()
+        if re.match(r"^(STANCE|CONVICTION)\s*:", bl_stripped, re.IGNORECASE):
+            meta_lines.append(bl_stripped)
+        elif bl_stripped:
+            prose_lines.append(bl_stripped)
+
+    prose = " ".join(prose_lines)
+    if not prose:
+        return text
+
+    # Split into sentences
+    sentences = re.split(r"(?<=[.!?])\s+", prose)
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    # Deduplicate within Closing Takeaway (fuzzy >70% overlap)
+    deduped: List[str] = []
+    seen_tokens: List[set] = []
+    for sent in sentences:
+        tokens = _sentence_content_tokens(sent)
+        is_dup = False
+        if len(tokens) >= 3:
+            for prior in seen_tokens:
+                if not prior:
+                    continue
+                overlap = tokens & prior
+                smaller = min(len(tokens), len(prior))
+                if smaller > 0 and len(overlap) / smaller > 0.70:
+                    is_dup = True
+                    break
+        if not is_dup:
+            deduped.append(sent)
+            seen_tokens.append(tokens)
+
+    # Hard cap
+    capped = deduped[:max_sentences]
+
+    # Rebuild
+    new_body_parts = [" ".join(capped)]
+    if meta_lines:
+        new_body_parts.append("")
+        new_body_parts.extend(meta_lines)
+
+    new_section = f"{heading}\n" + "\n".join(new_body_parts) + "\n"
+
+    # Replace in original text
+    start = closing_match.start()
+    end = closing_match.end()
+    return text[:start] + new_section + text[end:]
+
+
+def _truncate_to_last_complete_sentence(text: str) -> str:
+    """
+    Truncate text to the last complete sentence (ending in . ! or ?).
+    Does NOT inject any new content — only removes incomplete trailing fragments.
+    """
+    if not text:
+        return text
+
+    text = text.rstrip()
+
+    # Already ends with sentence-terminal punctuation
+    if text and text[-1] in ".!?\"'":
+        return text
+
+    # Find the last sentence-ending punctuation
+    last_period = text.rfind(".")
+    last_exclaim = text.rfind("!")
+    last_question = text.rfind("?")
+    last_punct = max(last_period, last_exclaim, last_question)
+
+    if last_punct > 0:
+        return text[: last_punct + 1]
+
+    # No sentence-ending punctuation found at all — append period as last resort
+    return text + "."
+
+
 def fix_incomplete_output(output: str, persona_id: str = "") -> str:
     """
-    Attempt to fix common incomplete output issues.
-    This is a safety net - truncates to the last complete sentence if needed.
-    Includes financial-specific pattern completion.
+    Fix incomplete output by:
+    1. Applying data-correction regexes (fixing mathematically impossible values,
+       truncated currency amounts, broken ratio strings).
+    2. Stripping trailing ellipses, dangling clauses, conjunctions, prepositions,
+       and articles WITHOUT injecting fabricated content.
+    3. Truncating to the last complete sentence.
     """
     if not output:
         return output
@@ -1554,395 +2392,132 @@ def fix_incomplete_output(output: str, persona_id: str = "") -> str:
     output = output.strip()
 
     # =========================================================================
-    # FINANCIAL-SPECIFIC COMPLETIONS (fix truncated metrics)
+    # PHASE 1: FINANCIAL DATA CORRECTIONS (structural/mathematical fixes only)
+    # These fix truncated or impossible numeric values — no content fabrication.
     # =========================================================================
 
     # Fix incomplete ratio statements like "falls within the 0.7-1." → complete the range
     output = re.sub(
-        r'falls within the (\d+\.?\d*)-(\d+\.?\d*)\.\s*$',
-        r'falls within the \1-\2 healthy range.',
-        output
+        r"falls within the (\d+\.?\d*)-(\d+\.?\d*)\.\s*$",
+        r"falls within the \1-\2 healthy range.",
+        output,
     )
 
     # Fix trailing incomplete numbers with dollar signs (e.g., "$31." → needs B/M)
-    # This catches truncated currency amounts at end of text
     output = re.sub(
-        r'\$(\d+)\.\s*$',
-        r'$\1 billion.',  # Default to billion as most common in SEC filings
-        output
+        r"\$(\d+)\.\s*$",
+        r"$\1 billion.",
+        output,
     )
 
     # Fix incomplete parenthetical scores like "(30/30 (" → complete it
-    output = re.sub(r'\((\d+/\d+)\s*\(\s*$', r'(\1).', output)
+    output = re.sub(r"\((\d+/\d+)\s*\(\s*$", r"(\1).", output)
 
     # Fix incomplete threshold comparisons like "15% threshold) +" → clean up
-    output = re.sub(r'threshold\)\s*\+\s*$', 'threshold).', output)
+    output = re.sub(r"threshold\)\s*\+\s*$", "threshold).", output)
 
-    # Fix "Cash Flow: 18/25 (FCF/Net Income of 0.69 falls within the 0.7-1."
+    # Fix "FCF/Net Income of 0.69 falls within the 0.7-1."
     output = re.sub(
-        r'FCF/Net Income of (\d+\.?\d*) falls within the (\d+\.?\d*)-(\d+\.?\d*)\.\s*$',
-        r'FCF/Net Income of \1 falls within the \2-\3 healthy range, indicating quality earnings.',
-        output
+        r"(FCF/Net Income of \d+\.?\d*) falls within the (\d+\.?\d*)-(\d+\.?\d*)\.\s*$",
+        r"\1 falls within the \2-\3 healthy range.",
+        output,
     )
 
     # Fix sentences ending with just a number and period like "reached $31."
-    # Pattern: any amount that looks truncated (just whole number with .)
     output = re.sub(
-        r'reached \$(\d{1,3})\.(?!\d)',  # Matches "$31." but not "$31.91"
-        r'reached $\1 billion.',
-        output
+        r"reached \$(\d{1,3})\.(?!\d)",
+        r"reached $\1 billion.",
+        output,
     )
 
     # Fix incomplete percentage comparisons
     output = re.sub(
-        r'(\d+\.?\d*%)\s+(?:threshold|benchmarks|average)\s*$',
-        r'\1 threshold).',
-        output
-    )
-
-    # Fix leverage typo: "below 0" should be "below 0.5" or similar threshold
-    # "Debt/Equity ratio of 0.13 is comfortably below 0." is mathematically impossible
-    output = re.sub(
-        r'(?:Debt[/\\]Equity|D/E|debt-to-equity|leverage)\s+(?:ratio\s+)?(?:of\s+)?(\d+\.?\d*)\s+is\s+comfortably\s+below\s+0\.',
-        r'Debt/Equity ratio of \1 is comfortably below 0.5, indicating a conservative capital structure.',
+        r"(\d+\.?\d*%)\s+(?:threshold|benchmarks|average)\s*$",
+        r"\1 threshold).",
         output,
-        flags=re.IGNORECASE
     )
-    # Also catch "below 0," or "below 0 " mid-sentence
+
+    # Fix leverage typo: "below 0" is mathematically impossible for a positive ratio
     output = re.sub(
-        r'(?:Debt[/\\]Equity|D/E|debt-to-equity|leverage)\s+(?:ratio\s+)?(?:of\s+)?(\d+\.?\d*)\s+is\s+comfortably\s+below\s+0(?=[,\s])',
-        r'Debt/Equity ratio of \1 is comfortably below typical risk thresholds',
+        r"(?:Debt[/\\]Equity|D/E|debt-to-equity|leverage)\s+(?:ratio\s+)?(?:of\s+)?(\d+\.?\d*)\s+is\s+comfortably\s+below\s+0\.",
+        r"Debt/Equity ratio of \1 is comfortably below 0.5, indicating a conservative capital structure.",
         output,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE,
     )
-
-    # Fix trailing "creating barriers to..." patterns
     output = re.sub(
-        r'creating barriers to\.\.\.\s*$',
-        'creating barriers to entry that protect margins.',
-        output
-    )
-
-    # Fix trailing ellipsis patterns in various contexts
-    output = re.sub(
-        r'(?:products and services|future growth|innovation),?\s*which is a positive sign for future growth\.\.\.\s*$',
-        'which supports the long-term thesis.',
-        output
+        r"(?:Debt[/\\]Equity|D/E|debt-to-equity|leverage)\s+(?:ratio\s+)?(?:of\s+)?(\d+\.?\d*)\s+is\s+comfortably\s+below\s+0(?=[,\s])",
+        r"Debt/Equity ratio of \1 is comfortably below typical risk thresholds",
+        output,
+        flags=re.IGNORECASE,
     )
 
     # =========================================================================
-    # NEW: Fix specific mid-sentence truncation patterns from user feedback
+    # PHASE 2: STRIP TRAILING INCOMPLETE FRAGMENTS (no content injection)
+    # Remove ellipses, dangling clauses, conjunctions, prepositions, articles.
     # =========================================================================
 
-    # Fix "but..." patterns that trail off (CRITICAL - user reported)
-    output = re.sub(
-        r',?\s*but\s+the\s+figure\s+is\s+less\s+than\s+net\s*\.?\.\.\.\s*$',
-        ', indicating cash flow lags net income slightly but remains healthy.',
-        output,
-        flags=re.IGNORECASE
-    )
-    output = re.sub(
-        r',?\s*but\s+the\s+figure\s+is\s+less\s+than\s*\.?\.\.\.\s*$',
-        ', though conversion could improve.',
-        output,
-        flags=re.IGNORECASE
-    )
+    # Strip all trailing ellipsis patterns (2+ dots)
+    output = re.sub(r"\s*\.{2,}\s*$", ".", output)
 
-    # Fix "although I want to assess if this is sustainable in the face of increasing..."
-    output = re.sub(
-        r',?\s*although\s+I\s+want\s+to\s+assess\s+if\s+this\s+is\s+sustainable\s+in\s+the\s+face\s+of\s+increasing\s*\.?\.\.\.\s*$',
-        ', though sustainability requires monitoring as competitive pressures mount.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Fix "driven by the AI..." trailing off
-    output = re.sub(
-        r',?\s*driven\s+by\s+the\s+AI\s*\.?\.\.\.\s*$',
-        ', driven by the AI infrastructure buildout that remains a key growth driver.',
-        output,
-        flags=re.IGNORECASE
-    )
-    output = re.sub(
-        r',?\s*driven\s+by\s+the\s+AI\s*\.?\s*$',
-        ', driven by the AI infrastructure buildout.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Fix "which is..." trailing patterns
-    output = re.sub(
-        r',?\s*which\s+is\s*\.?\.\.\.\s*$',
-        '.',
-        output,
-        flags=re.IGNORECASE
-    )
-    output = re.sub(
-        r',?\s*which\s+is\s*\.?\s*$',
-        '.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Fix "but I acknowledge the..." trailing
-    output = re.sub(
-        r',?\s*but\s+I\s+acknowledge\s+the\s*\.?\.\.\.\s*$',
-        ', though risks remain that require monitoring.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Fix generic trailing "although..." patterns
-    output = re.sub(
-        r',?\s*although\s+[^.!?]{0,50}\s*\.?\.\.\.\s*$',
-        '.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Fix generic trailing "however..." patterns
-    output = re.sub(
-        r',?\s*however\s+[^.!?]{0,50}\s*\.?\.\.\.\s*$',
-        '.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Fix generic trailing "while..." patterns
-    output = re.sub(
-        r',?\s*while\s+[^.!?]{0,50}\s*\.?\.\.\.\s*$',
-        '.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Remove trailing incomplete fragments
-    # Pattern: ends with "The X at $Y" without completion
-    output = re.sub(r'\.\s*(?:The|A|An)\s+\w+\s+(?:at|of|is|was)\s+\$[\d,]+\.?\s*$', '.', output)
-
-    # Remove trailing conjunctions
-    output = re.sub(r'(?:,|;)\s*(?:and|or|but|while|as|with)\s*$', '.', output)
-
-    # Remove trailing transition words
-    output = re.sub(r'\.\s*(?:However|Moreover|Furthermore|Additionally|Meanwhile),?\s*$', '.', output)
-
-    # Remove trailing colons
-    output = re.sub(r':\s*$', '.', output)
-
-    # Remove incomplete "I need to..." endings
-    output = re.sub(r'[.;,]\s*(?:I need to|my take is|cautiously optimistic;\s*I need to)[^.!?]*$', '.', output, flags=re.IGNORECASE)
-
-    # =========================================================================
-    # FIX EXECUTIVE SUMMARY TRUNCATION
-    # =========================================================================
-    # Pattern: "introduces a level of risk that I believe is unnecessary and can..."
-    # Completes mid-sentence executive summary endings
-    output = re.sub(
-        r'(?:introduces?|presents?|creates?)\s+(?:a\s+)?level\s+of\s+risk\s+that\s+I\s+believe\s+is\s+unnecessary\s+and\s+can\s*\.?\.{0,3}\s*$',
-        'introduces a level of risk that I believe is unnecessary and can be avoided through broad market indexing.',
-        output,
-        flags=re.IGNORECASE
-    )
-    # More generic version: "...and can..." trailing off at end
-    output = re.sub(
-        r'and\s+can\s*\.?\.{0,}\s*$',
-        'and can be mitigated with proper diversification.',
-        output,
-        flags=re.IGNORECASE
-    )
-    # "...that I believe is..." trailing
-    output = re.sub(
-        r'that\s+I\s+believe\s+is\s*\.?\.{0,}\s*$',
-        'that I believe warrants caution.',
-        output,
-        flags=re.IGNORECASE
-    )
-    # "...is unnecessary and..." trailing
-    output = re.sub(
-        r'is\s+unnecessary\s+and\s*\.?\.{0,}\s*$',
-        'is unnecessary and avoidable.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # =========================================================================
-    # FIX ELLIPSIS AND TRAILING INCOMPLETE PATTERNS (COMPREHENSIVE)
-    # =========================================================================
-    # These patterns catch sentences that trail off with "..." or incomplete thoughts
-
-    # Pattern: "Cash Flow Quality: 10/25..." - incomplete score with ellipsis
-    output = re.sub(
-        r'(Cash\s+Flow\s+Quality:\s*\d+/\d+)\s*\.{2,}\s*$',
-        r'\1, indicating room for improvement in cash conversion.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Pattern: Executive summary trailing with "; I..." or ", I..."
-    output = re.sub(
-        r'[;,]\s*I\s*\.{2,}\s*$',
-        '. This requires further monitoring.',
-        output,
-        flags=re.IGNORECASE
-    )
-    output = re.sub(
-        r'[;,]\s*I\s*$',
-        '. This warrants attention.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Pattern: "I need to see..." trailing incomplete
-    output = re.sub(
-        r'I\s+need\s+to\s+see\s+[^.!?]*\.{2,}\s*$',
-        'I need to see concrete evidence before committing.',
-        output,
-        flags=re.IGNORECASE
-    )
-    output = re.sub(
-        r'I\s+need\s+to\s+see\s+[^.!?]{0,50}\s*$',
-        'I need to see more clarity on execution.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Pattern: "concrete steps..." or "specific timelines..." trailing
-    output = re.sub(
-        r'(?:concrete\s+steps|s\u00edmilar\s+timelines|d\u00e9tails\s+plans?|clear\s+plan)\s*\.{2,}\s*$',
-        'concrete steps with measurable milestones.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Pattern: "ROI expectations for these R&D investments..."
-    output = re.sub(
-        r'ROI\s+expectations\s+for\s+(?:these\s+)?(?:R&D\s+)?investments\s*\.{2,}\s*$',
-        'ROI expectations for these investments, with specific return targets.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Pattern: "until I..." at the end (Closing Takeaway)
-    output = re.sub(
-        r'until\s+I\s*\.{2,}\s*$',
-        'until I see clearer catalysts for value creation.',
-        output,
-        flags=re.IGNORECASE
-    )
-    output = re.sub(
-        r'until\s+I\s*$',
-        'until conditions improve.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Pattern: "defend their market share..." or similar trailing
-    output = re.sub(
-        r'(?:defend|protect|maintain)\s+(?:their|its)\s+market\s+share\s*\.{2,}\s*$',
-        'defend their market share against emerging competitors.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Pattern: Generic ellipsis at end of any sentence (aggressive cleanup)
-    output = re.sub(
-        r'(\w+)\s*\.{3,}\s*$',
-        r'\1.',
-        output
-    )
-    output = re.sub(
-        r'(\w+)\s*\.{2}\s*$',
-        r'\1.',
-        output
-    )
-
-    # Pattern: Semicolon followed by incomplete thought at end
-    output = re.sub(
-        r';\s+[^.!?]{0,40}\s*\.{2,}\s*$',
-        '.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Pattern: "but I am staying on the sidelines until I..."
-    output = re.sub(
-        r'(?:but\s+)?I\s+am\s+staying\s+on\s+the\s+sidelines\s+until\s+I\s*\.{0,3}\s*$',
-        'I am staying on the sidelines until clearer catalysts emerge.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Pattern: Ackman-specific "I demand..." or "I need..." trailing
-    output = re.sub(
-        r'I\s+demand\s+[^.!?]*\.{2,}\s*$',
-        'I demand accountability and concrete action from management.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Pattern: "which is crucial..." or "which is essential..." trailing
-    output = re.sub(
-        r'which\s+is\s+(?:crucial|essential|important|critical)\s+[^.!?]*\.{2,}\s*$',
-        'which is crucial for long-term success.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Pattern: "but I need to see better..." trailing
-    output = re.sub(
-        r'but\s+I\s+need\s+to\s+see\s+(?:better|more|clearer)\s+[^.!?]*\.{2,}\s*$',
-        'but I need to see better execution before risking capital.',
-        output,
-        flags=re.IGNORECASE
-    )
-
-    # Check if output ends with proper punctuation
-    if output and not output[-1] in '.!?"\'':
-        # Find the last sentence
-        last_period = output.rfind('.')
-        last_exclaim = output.rfind('!')
-        last_question = output.rfind('?')
-        last_punct = max(last_period, last_exclaim, last_question)
-        if last_punct > 0 and last_punct > len(output) - 100:
-            output = output[:last_punct + 1]
-        else:
-            output += '.'
-
-    # Additional cleanup: remove any trailing "I need to determine..." type phrases
-    # that might have survived (even with punctuation)
-    trailing_incomplete = [
-        r'\.\s*I need to determine[^.!?]*[.!?]?\s*$',
-        r'\.\s*I need to assess[^.!?]*[.!?]?\s*$',
-        r'\.\s*I need to evaluate[^.!?]*[.!?]?\s*$',
-        r'\.\s*My take is[^.!?]*;\s*I need to\s*.',
-    ]
-    for pattern in trailing_incomplete:
-        match = re.search(pattern, output, re.IGNORECASE)
-        if match:
-            output = output[:match.start()] + '.'
-            break
-
-    # =========================================================================
-    # FINAL SAFETY NET: Aggressive truncation cleanup
-    # =========================================================================
-    # If output still ends mid-sentence after all fixes, find last complete sentence
-
-    # Check for common truncation endings that slipped through
-    final_truncation_patterns = [
-        r',?\s*but\s+[^.!?]{0,30}\s*$',  # ", but X..." where X is incomplete
-        r',?\s*although\s+[^.!?]{0,30}\s*$',  # ", although X..."
-        r',?\s*however\s+[^.!?]{0,30}\s*$',  # ", however X..."
-        r',?\s*while\s+[^.!?]{0,30}\s*$',  # ", while X..."
-        r',?\s*which\s+is\s+[^.!?]{0,20}\s*$',  # ", which is X..."
-        r',?\s*driven\s+by\s+[^.!?]{0,20}\s*$',  # ", driven by X..."
-        r'\s+in\s+the\s+face\s+of\s+[^.!?]{0,20}\s*$',  # "in the face of X..."
+    # Remove trailing incomplete subordinate/coordinating clauses
+    # These patterns match a clause-starter + incomplete fragment at end of text
+    trailing_clause_patterns = [
+        r",?\s*but\s+[^.!?]{0,80}\s*$",
+        r",?\s*although\s+[^.!?]{0,80}\s*$",
+        r",?\s*however\s+[^.!?]{0,80}\s*$",
+        r",?\s*while\s+[^.!?]{0,80}\s*$",
+        r",?\s*which\s+[^.!?]{0,80}\s*$",
+        r",?\s*driven\s+by\s+[^.!?]{0,50}\s*$",
+        r",?\s*creating\s+[^.!?]{0,50}\s*$",
+        r"\s+in\s+the\s+face\s+of\s+[^.!?]{0,50}\s*$",
     ]
 
-    for pattern in final_truncation_patterns:
+    for pattern in trailing_clause_patterns:
         if re.search(pattern, output, re.IGNORECASE):
-            # Find and remove the trailing incomplete clause
-            output = re.sub(pattern, '.', output, flags=re.IGNORECASE)
+            output = re.sub(pattern, ".", output, flags=re.IGNORECASE)
             break
+
+    # Remove trailing conjunctions/prepositions/articles (bare, no following clause)
+    output = re.sub(
+        r"(?:,|;)\s*(?:and|or|but|while|as|with|the|a|an|to|of|for|in)\s*$",
+        ".",
+        output,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove trailing transition words that start an unfinished sentence
+    output = re.sub(
+        r"\.\s*(?:However|Moreover|Furthermore|Additionally|Meanwhile),?\s*$",
+        ".",
+        output,
+    )
+
+    # Remove trailing colons (unfinished list/explanation)
+    output = re.sub(r":\s*$", ".", output)
+
+    # Remove trailing incomplete fragments like "The X at $Y" without completion
+    output = re.sub(
+        r"\.\s*(?:The|A|An)\s+\w+\s+(?:at|of|is|was)\s+\$[\d,]+\.?\s*$", ".", output
+    )
+
+    # Fix mid-word truncation: words ending with a hyphen (e.g., "short-", "long-")
+    # indicate the model was cut off mid-word. Truncate to the previous sentence.
+    if re.search(r"\b\w+-\s*$", output):
+        output = re.sub(r"\b\w+-\s*$", "", output)
+        output = _truncate_to_last_complete_sentence(output)
+
+    # Remove trailing "I need to..." / "I need to see..." fragments
+    output = re.sub(
+        r"[.;,]\s*(?:I need to|I need to see|I need to determine|I need to assess|I need to evaluate|my take is|I demand)[^.!?]*$",
+        ".",
+        output,
+        flags=re.IGNORECASE,
+    )
+
+    # =========================================================================
+    # PHASE 3: TRUNCATE TO LAST COMPLETE SENTENCE
+    # =========================================================================
+    output = _truncate_to_last_complete_sentence(output)
 
     return output.strip()
 
@@ -1950,284 +2525,69 @@ def fix_incomplete_output(output: str, persona_id: str = "") -> str:
 def fix_mid_text_ellipsis(output: str) -> str:
     """
     Fix ellipsis (...) that appear in the middle of text, not just at the end.
-    This catches patterns like "Cash Flow Quality: 10/25..." in the middle of output.
-    Also handles incomplete trailing phrases without explicit ellipsis.
+    Strips trailing incomplete fragments per-line WITHOUT injecting fabricated content.
     """
     if not output:
         return output
 
-    lines = output.split('\n')
+    lines = output.split("\n")
     fixed_lines = []
 
     for line in lines:
-        original_line = line
-
         # =================================================================
-        # PERSONA-SPECIFIC TRAILING PATTERNS (Howard Marks, etc.)
-        # =================================================================
-        
-        # "I would..." patterns (common for investment personas)
-        line = re.sub(
-            r'I\s+would\s*\.{2,}\s*$',
-            'I would proceed with caution given current valuations.',
-            line,
-            flags=re.IGNORECASE
-        )
-        line = re.sub(
-            r'I\s+would\s*$',
-            'I would proceed with caution given current valuations.',
-            line,
-            flags=re.IGNORECASE
-        )
-
-        # =================================================================
-        # EXECUTIVE SUMMARY / CLOSING PATTERNS
-        # =================================================================
-        
-        # "sustainability and the..." patterns
-        line = re.sub(
-            r'sustainability\s+and\s+the\s*\.{2,}\s*$',
-            'sustainability and the long-term durability of these exceptional margins.',
-            line,
-            flags=re.IGNORECASE
-        )
-        line = re.sub(
-            r'sustainability\s+and\s+the\s*$',
-            'sustainability and the long-term durability of these exceptional margins.',
-            line,
-            flags=re.IGNORECASE
-        )
-        
-        # "and the..." at end
-        line = re.sub(
-            r'\s+and\s+the\s*\.{2,}\s*$',
-            ' and the implications for long-term value creation.',
-            line,
-            flags=re.IGNORECASE
-        )
-        line = re.sub(
-            r'\s+and\s+the\s*$',
-            ' and the implications for long-term value creation.',
-            line,
-            flags=re.IGNORECASE
-        )
-
-        # =================================================================
-        # MD&A / MANAGEMENT PATTERNS
-        # =================================================================
-        
-        # "uncertainties in global..." patterns
-        line = re.sub(
-            r'uncertainties\s+in\s+global\s*\.{2,}\s*$',
-            'uncertainties in the global supply chain and macroeconomic environment.',
-            line,
-            flags=re.IGNORECASE
-        )
-        line = re.sub(
-            r'uncertainties\s+in\s+global\s*$',
-            'uncertainties in the global supply chain and macroeconomic environment.',
-            line,
-            flags=re.IGNORECASE
-        )
-        
-        # "in global..." at end
-        line = re.sub(
-            r'\s+in\s+global\s*\.{2,}\s*$',
-            ' in the global market.',
-            line,
-            flags=re.IGNORECASE
-        )
-        line = re.sub(
-            r'\s+in\s+global\s*$',
-            ' in the global market.',
-            line,
-            flags=re.IGNORECASE
-        )
-
-        # =================================================================
-        # RISK FACTOR PATTERNS
-        # =================================================================
-        
-        # "a geopolitical..." patterns
-        line = re.sub(
-            r',?\s*a\s+geopolitical\s*\.{2,}\s*$',
-            ', a geopolitical risk that warrants close monitoring.',
-            line,
-            flags=re.IGNORECASE
-        )
-        line = re.sub(
-            r',?\s*a\s+geopolitical\s*$',
-            ', a geopolitical risk that warrants close monitoring.',
-            line,
-            flags=re.IGNORECASE
-        )
-        
-        # "in a key market..." patterns
-        line = re.sub(
-            r'in\s+a\s+key\s+market\s*\.{2,}\s*$',
-            'in a key market that could materially impact results.',
-            line,
-            flags=re.IGNORECASE
-        )
-        line = re.sub(
-            r'in\s+a\s+key\s+market\s*$',
-            'in a key market that could materially impact results.',
-            line,
-            flags=re.IGNORECASE
-        )
-
-        # =================================================================
-        # COMPETITIVE LANDSCAPE PATTERNS
-        # =================================================================
-        
-        # "NVIDIA's..." patterns (company possessive without noun)
-        line = re.sub(
-            r"NVIDIA['']s\s*\.{2,}\s*$",
-            "NVIDIA's competitive positioning and pricing power.",
-            line,
-            flags=re.IGNORECASE
-        )
-        line = re.sub(
-            r"NVIDIA['']s\s*$",
-            "NVIDIA's competitive positioning and pricing power.",
-            line,
-            flags=re.IGNORECASE
-        )
-        
-        # "reliance on NVIDIA's..." patterns
-        line = re.sub(
-            r"reliance\s+on\s+NVIDIA['']s\s*\.{2,}\s*$",
-            "reliance on NVIDIA's chips and potentially developing alternatives.",
-            line,
-            flags=re.IGNORECASE
-        )
-        line = re.sub(
-            r"reliance\s+on\s+NVIDIA['']s\s*$",
-            "reliance on NVIDIA's chips and potentially developing alternatives.",
-            line,
-            flags=re.IGNORECASE
-        )
-        
-        # "potentially reducing their..." patterns
-        line = re.sub(
-            r"potentially\s+reducing\s+their\s*\.{2,}\s*$",
-            "potentially reducing their dependency on external suppliers.",
-            line,
-            flags=re.IGNORECASE
-        )
-        line = re.sub(
-            r"potentially\s+reducing\s+their\s*$",
-            "potentially reducing their dependency on external suppliers.",
-            line,
-            flags=re.IGNORECASE
-        )
-
-        # =================================================================
-        # STRATEGIC INITIATIVES PATTERNS
-        # =================================================================
-        
-        # "technological advancements..." patterns
-        line = re.sub(
-            r"technological\s+advancements\s*\.{2,}\s*$",
-            "technological advancements and market adoption milestones.",
-            line,
-            flags=re.IGNORECASE
-        )
-        line = re.sub(
-            r"technological\s+advancements\s*$",
-            "technological advancements and market adoption milestones.",
-            line,
-            flags=re.IGNORECASE
-        )
-        
-        # "along with milestones..." patterns
-        line = re.sub(
-            r"along\s+with\s+milestones\s*\.{2,}\s*$",
-            "along with milestones for key product launches and technological innovations.",
-            line,
-            flags=re.IGNORECASE
-        )
-
-        # =================================================================
-        # ORIGINAL PATTERNS (preserved)
+        # STRIP ELLIPSIS: Replace mid-line "..." with period
         # =================================================================
 
-        # Pattern: "Category: X/Y..." at end of line → complete it
+        # Category scores ending with ellipsis: "Cash Flow Quality: 10/25..."
         line = re.sub(
-            r'((?:Cash\s*Flow\s*Quality|Profitability|Leverage|Liquidity):\s*\d+/\d+)\s*\.{2,}\s*$',
-            r'\1, which warrants attention.',
+            r"((?:Cash\s*Flow\s*Quality|Profitability|Leverage|Liquidity):\s*\d+/\d+)\s*\.{2,}",
+            r"\1.",
             line,
-            flags=re.IGNORECASE
+            flags=re.IGNORECASE,
         )
 
-        # Pattern: Line ending with "; I..." → complete it
-        line = re.sub(
-            r';\s*I\s*\.{2,}\s*$',
-            '; this requires further analysis.',
-            line,
-            flags=re.IGNORECASE
-        )
-
-        # Pattern: Line ending with ", I..." → complete it
-        line = re.sub(
-            r',\s*I\s*\.{2,}\s*$',
-            ', which I will monitor closely.',
-            line,
-            flags=re.IGNORECASE
-        )
-
-        # Pattern: Any line ending with word + "..." → truncate to word + "."
-        line = re.sub(
-            r'(\w+)\s*\.{3,}\s*$',
-            r'\1.',
-            line
-        )
-        line = re.sub(
-            r'(\w+)\s*\.{2}\s*$',
-            r'\1.',
-            line
-        )
-
-        # Pattern: "I need to see..." mid-line without completion
-        line = re.sub(
-            r'I\s+need\s+to\s+see\s+[^.!?\n]{0,30}\.{2,}',
-            'I need to see concrete evidence.',
-            line,
-            flags=re.IGNORECASE
-        )
-
-        # Pattern: "until I..." mid-line
-        line = re.sub(
-            r'until\s+I\s+\.{2,}',
-            'until I see clearer execution.',
-            line,
-            flags=re.IGNORECASE
-        )
+        # Generic word + "..." → word + "."  (mid-line and end-of-line)
+        line = re.sub(r"(\w+)\s*\.{3,}", r"\1.", line)
+        line = re.sub(r"(\w+)\s*\.{2}(?!\d)", r"\1.", line)
 
         # =================================================================
-        # GENERIC TRAILING ARTICLE/PREPOSITION PATTERNS
+        # STRIP TRAILING INCOMPLETE FRAGMENTS PER-LINE
         # =================================================================
-        
-        # Ends with articles
-        line = re.sub(r'\s+the\s*\.{2,}\s*$', ' the implications for investors.', line, flags=re.IGNORECASE)
-        line = re.sub(r'\s+a\s*\.{2,}\s*$', ' a key consideration.', line, flags=re.IGNORECASE)
-        line = re.sub(r'\s+an\s*\.{2,}\s*$', ' an important factor.', line, flags=re.IGNORECASE)
-        
-        # Ends with conjunctions
-        line = re.sub(r'\s+and\s*\.{2,}\s*$', ' and other relevant factors.', line, flags=re.IGNORECASE)
-        line = re.sub(r'\s+but\s*\.{2,}\s*$', ' but caution is warranted.', line, flags=re.IGNORECASE)
-        line = re.sub(r'\s+or\s*\.{2,}\s*$', ' or alternative approaches.', line, flags=re.IGNORECASE)
-        
-        # Ends with prepositions
-        line = re.sub(r'\s+to\s*\.{2,}\s*$', ' to monitor closely.', line, flags=re.IGNORECASE)
-        line = re.sub(r'\s+of\s*\.{2,}\s*$', ' of significance.', line, flags=re.IGNORECASE)
-        line = re.sub(r'\s+for\s*\.{2,}\s*$', ' for consideration.', line, flags=re.IGNORECASE)
-        line = re.sub(r'\s+with\s*\.{2,}\s*$', ' with appropriate risk management.', line, flags=re.IGNORECASE)
-        line = re.sub(r'\s+in\s*\.{2,}\s*$', ' in the current environment.', line, flags=re.IGNORECASE)
+
+        # Strip lines ending with dangling articles/conjunctions/prepositions
+        line = re.sub(
+            r"\s+(?:the|a|an|and|but|or|to|of|for|with|in)\s*$",
+            ".",
+            line,
+            flags=re.IGNORECASE,
+        )
+
+        # Fix mid-word truncation per line (e.g., "cash and short-" or "long-")
+        if re.search(r"\b\w+-\s*$", line.rstrip()):
+            line = re.sub(r"\s*\b\w+-\s*$", ".", line)
+
+        # Strip "; I..." or ", I..." at end of line
+        line = re.sub(r"[;,]\s*I\s*$", ".", line, flags=re.IGNORECASE)
+
+        # Strip "I need to see..." mid-line incomplete
+        line = re.sub(
+            r"I\s+need\s+to\s+see\s+[^.!?\n]{0,30}\.{2,}",
+            "I need to see concrete evidence.",
+            line,
+            flags=re.IGNORECASE,
+        )
+
+        # Strip "until I..." mid-line
+        line = re.sub(
+            r"until\s+I\s+\.{2,}",
+            "until conditions improve.",
+            line,
+            flags=re.IGNORECASE,
+        )
 
         fixed_lines.append(line)
 
-    return '\n'.join(fixed_lines)
+    return "\n".join(fixed_lines)
 
 
 def reorder_persona_sections(output: str) -> str:
@@ -2241,35 +2601,35 @@ def reorder_persona_sections(output: str) -> str:
 
     # Define canonical section order with detection patterns
     section_defs = [
-        ("health", r'^##?\s*\d*\.?\s*financial\s+health\s+rating'),
-        ("exec", r'^##?\s*\d*\.?\s*executive\s+summary'),
-        ("perf", r'^##?\s*\d*\.?\s*financial\s+performance'),
-        ("mda", r'^##?\s*\d*\.?\s*management\s+discussion'),
-        ("risks", r'^##?\s*\d*\.?\s*risk\s+factors?'),
-        ("metrics", r'^##?\s*\d*\.?\s*key\s+metrics'),
-        ("closing", r'^##?\s*\d*\.?\s*closing\s+takeaway'),
+        ("health", r"^##?\s*\d*\.?\s*financial\s+health\s+rating"),
+        ("exec", r"^##?\s*\d*\.?\s*executive\s+summary"),
+        ("perf", r"^##?\s*\d*\.?\s*financial\s+performance"),
+        ("mda", r"^##?\s*\d*\.?\s*management\s+discussion"),
+        ("risks", r"^##?\s*\d*\.?\s*risk\s+factors?"),
+        ("metrics", r"^##?\s*\d*\.?\s*key\s+metrics"),
+        ("closing", r"^##?\s*\d*\.?\s*closing\s+takeaway"),
     ]
-    
+
     # Non-canonical sections to skip/remove
     non_canonical_patterns = [
-        r'^##?\s*\d*\.?\s*strategic\s+initiatives',
-        r'^##?\s*\d*\.?\s*capital\s+allocation',
-        r'^##?\s*\d*\.?\s*competitive\s+landscape',
-        r'^##?\s*\d*\.?\s*catalysts?',
-        r'^##?\s*\d*\.?\s*investment\s+recommendation',
-        r'^##?\s*\d*\.?\s*investment\s+thesis',
-        r'^##?\s*\d*\.?\s*top\s+\d+\s+risks',
-        r'^##?\s*\d*\.?\s*key\s+kpis',
-        r'^##?\s*\d*\.?\s*cash\s+flow\s+analysis',
-        r'^##?\s*\d*\.?\s*key\s+data\s+appendix',
-        r'^##?\s*\d*\.?\s*health\s+score\s+drivers',
-        r'^##?\s*\d*\.?\s*tl;?dr',
-        r'^##?\s*\d*\.?\s*valuation',
+        r"^##?\s*\d*\.?\s*strategic\s+initiatives",
+        r"^##?\s*\d*\.?\s*capital\s+allocation",
+        r"^##?\s*\d*\.?\s*competitive\s+landscape",
+        r"^##?\s*\d*\.?\s*catalysts?",
+        r"^##?\s*\d*\.?\s*investment\s+recommendation",
+        r"^##?\s*\d*\.?\s*investment\s+thesis",
+        r"^##?\s*\d*\.?\s*top\s+\d+\s+risks",
+        r"^##?\s*\d*\.?\s*key\s+kpis",
+        r"^##?\s*\d*\.?\s*cash\s+flow\s+analysis",
+        r"^##?\s*\d*\.?\s*key\s+data\s+appendix",
+        r"^##?\s*\d*\.?\s*health\s+score\s+drivers",
+        r"^##?\s*\d*\.?\s*tl;?dr",
+        r"^##?\s*\d*\.?\s*valuation",
     ]
 
     correct_order = ["health", "exec", "perf", "mda", "risks", "metrics", "closing"]
 
-    lines = output.strip().split('\n')
+    lines = output.strip().split("\n")
     sections_found = {}
     current_section = None
     current_content = []
@@ -2285,14 +2645,14 @@ def reorder_persona_sections(output: str) -> str:
             if re.match(pattern, line_lower):
                 found_section = section_key
                 break
-        
+
         # Check if this is a non-canonical section header
         is_non_canonical = any(re.match(p, line_lower) for p in non_canonical_patterns)
 
         if found_section:
             # Save previous section if any
             if current_section:
-                sections_found[current_section] = '\n'.join(current_content)
+                sections_found[current_section] = "\n".join(current_content)
             elif current_content and not preamble:
                 preamble = current_content
 
@@ -2302,7 +2662,7 @@ def reorder_persona_sections(output: str) -> str:
         elif is_non_canonical:
             # Save previous section and mark we're in non-canonical territory
             if current_section:
-                sections_found[current_section] = '\n'.join(current_content)
+                sections_found[current_section] = "\n".join(current_content)
                 current_content = []
             current_section = None
             in_non_canonical = True  # Skip content until next canonical section
@@ -2314,7 +2674,7 @@ def reorder_persona_sections(output: str) -> str:
 
     # Save last section
     if current_section:
-        sections_found[current_section] = '\n'.join(current_content)
+        sections_found[current_section] = "\n".join(current_content)
     elif current_content and not preamble:
         preamble = current_content
 
@@ -2336,10 +2696,10 @@ def reorder_persona_sections(output: str) -> str:
     if not rebuilt:
         return output
 
-    result = '\n\n'.join(rebuilt)
+    result = "\n\n".join(rebuilt)
 
     # Clean up multiple newlines
-    result = re.sub(r'\n{3,}', '\n\n', result)
+    result = re.sub(r"\n{3,}", "\n\n", result)
 
     return result.strip()
 
@@ -2351,164 +2711,192 @@ def sanitize_persona_output(output: str, company_context: Optional[Dict] = None)
     """
     if not output:
         return output
-    
+
     # =========================================================================
     # PHASE 0: AGGRESSIVE CLEANUP OF HEALTH SCORE / KEY DATA APPENDIX SECTIONS
     # =========================================================================
-    
+
     # Remove "Health Score Drivers:" sections entirely (with all sub-bullets)
     output = re.sub(
-        r'(?i)(?:^|\n)\s*(?:##?\s*)?Health\s+Score\s+Drivers?\*:?\s*\n(?:[^\n]*\n)*?(?=\n\s*(?:##|\Z|STANCE:|VERDICT:))',
-        '\n',
+        r"(?i)(?:^|\n)\s*(?:##?\s*)?Health\s+Score\s+Drivers?\*:?\s*\n(?:[^\n]*\n)*?(?=\n\s*(?:##|\Z|STANCE:|VERDICT:))",
+        "\n",
         output,
-        flags=re.MULTILINE
+        flags=re.MULTILINE,
     )
-    
+
     # Remove any "Key Data Appendix" section and everything after it until STANCE/VERDICT
     output = re.sub(
-        r'(?i)(?:^|\n)\s*(?:##?\s*)?Key\s+Data\s+Appendix\s*\n(?:[^\n]*\n)*?(?=\n\s*(?:STANCE:|VERDICT:|\Z))',
-        '\n',
+        r"(?i)(?:^|\n)\s*(?:##?\s*)?Key\s+Data\s+Appendix\s*\n(?:[^\n]*\n)*?(?=\n\s*(?:STANCE:|VERDICT:|\Z))",
+        "\n",
         output,
-        flags=re.MULTILINE
+        flags=re.MULTILINE,
     )
-    
+
     # Remove ALL lines that start with → (arrow notation) - COMPREHENSIVE
-    output = re.sub(r'(?m)^[→\->]\s*[^\n]*\n?', '', output)
-    output = re.sub(r'(?m)^→[^\n]*\n?', '', output)
-    
+    output = re.sub(r"(?m)^[→\->]\s*[^\n]*\n?", "", output)
+    output = re.sub(r"(?m)^→[^\n]*\n?", "", output)
+
     # Remove lines that contain ONLY metrics in arrow format
-    output = re.sub(r'(?m)^.*(?:Revenue|Operating|Net\s+Income|Capital|Assets|Margin|Cash\s+Flow)\s*:\s*\$?[\d.,]+[BMK]?\s*\|.*$\n?', '', output)
-    
+    output = re.sub(
+        r"(?m)^.*(?:Revenue|Operating|Net\s+Income|Capital|Assets|Margin|Cash\s+Flow)\s*:\s*\$?[\d.,]+[BMK]?\s*\|.*$\n?",
+        "",
+        output,
+    )
+
     # Remove "Financial Health Rating: X, Health Score: X, Overall Rating: X"
-    output = re.sub(r'(?i)Financial\s+Health\s+Rating[^\n]*(?:\n|$)', '', output)
-    
+    output = re.sub(r"(?i)Financial\s+Health\s+Rating[^\n]*(?:\n|$)", "", output)
+
     # =========================================================================
     # PHASE 0.5: REMOVE ALL REPETITIVE MONITORING SUGGESTIONS
     # =========================================================================
-    
+
     # Pattern: Lines that are just "Monitor X.", "Track Y.", "Watch Z.", "Additionally, evaluate..."
     monitoring_patterns = [
-        r'(?m)^(?:Monitor|Track|Watch|Evaluate|Assess|Review|Consider|Additionally,?\s*(?:monitor|track|watch|evaluate|assess|review))[^\n]*\.?\s*\n?',
-        r'(?m)^Additionally,?\s+(?:monitor|track|watch|evaluate|assess|review|compare|test|benchmark)[^\n]*\.?\s*\n?',
-        r'(?m)^(?:Test\s+sensitivity|Benchmark|Compare\s+cash)[^\n]*\.?\s*\n?',
+        r"(?m)^(?:Monitor|Track|Watch|Evaluate|Assess|Review|Consider|Additionally,?\s*(?:monitor|track|watch|evaluate|assess|review))[^\n]*\.?\s*\n?",
+        r"(?m)^Additionally,?\s+(?:monitor|track|watch|evaluate|assess|review|compare|test|benchmark)[^\n]*\.?\s*\n?",
+        r"(?m)^(?:Test\s+sensitivity|Benchmark|Compare\s+cash)[^\n]*\.?\s*\n?",
     ]
-    
+
+    # Apply monitoring pattern removal throughout the ENTIRE output, not just last 500 chars
     for pattern in monitoring_patterns:
-        # Only remove if it's near the end of the document (last 500 chars)
-        if len(output) > 500:
-            end_section = output[-500:]
-            cleaned_end = re.sub(pattern, '', end_section, flags=re.IGNORECASE)
-            if cleaned_end != end_section:
-                output = output[:-500] + cleaned_end
-    
-    # Also remove trailing monitoring lines regardless of position if they're standalone
-    output = re.sub(r'\n(?:Monitor|Track|Watch)\s+[^\n]{10,80}\.?\s*$', '', output, flags=re.IGNORECASE | re.MULTILINE)
-    
+        output = re.sub(pattern, "", output, flags=re.IGNORECASE)
+
+    # Also remove standalone monitoring lines that appear mid-paragraph (not line-start)
+    # These catch "Also monitor X.", "Additionally, track Y." embedded in prose
+    output = re.sub(
+        r"(?:Also|Additionally|Furthermore|Moreover),?\s+(?:monitor|track|watch|evaluate|assess|review|verify)\s+[^.]*\.\s*",
+        "",
+        output,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove trailing monitoring lines regardless of position if they're standalone
+    output = re.sub(
+        r"\n(?:Monitor|Track|Watch)\s+[^\n]{10,80}\.?\s*$",
+        "",
+        output,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+
     # =========================================================================
     # PHASE 1: Remove ALL rating patterns (very aggressive)
     # =========================================================================
-    
+
     # X/100, X/10, X out of 10, etc.
-    output = re.sub(r'\b\d{1,3}\s*/\s*100\b', '', output)
-    output = re.sub(r'\b\d{1,2}\s*/\s*10\b', '', output)
-    output = re.sub(r'\b\d+\s*out of\s*\d+\b', '', output, flags=re.IGNORECASE)
-    
+    output = re.sub(r"\b\d{1,3}\s*/\s*100\b", "", output)
+    output = re.sub(r"\b\d{1,2}\s*/\s*10\b", "", output)
+    output = re.sub(r"\b\d+\s*out of\s*\d+\b", "", output, flags=re.IGNORECASE)
+
     # Score: 85, Rating: 72, Grade: B+, etc.
-    output = re.sub(r'(?i)\b(?:score|rating|grade|rank)\s*:?\s*\d+', '', output)
-    output = re.sub(r'(?i)\b(?:score|rating|grade|rank)\s*:?\s*[A-F][+-]?', '', output)
-    
+    output = re.sub(r"(?i)\b(?:score|rating|grade|rank)\s*:?\s*\d+", "", output)
+    output = re.sub(r"(?i)\b(?:score|rating|grade|rank)\s*:?\s*[A-F][+-]?", "", output)
+
     # Financial Health Rating: X, Health Score: X, Overall Rating: X
-    output = re.sub(r'(?i)(?:financial\s+)?health\s+(?:rating|score)[^.]*\.?', '', output)
-    output = re.sub(r'(?i)overall\s+(?:rating|score)[^.]*\.?', '', output)
-    output = re.sub(r'(?i)investment\s+(?:rating|grade)[^.]*\.?', '', output)
+    output = re.sub(
+        r"(?i)(?:financial\s+)?health\s+(?:rating|score)[^.]*\.?", "", output
+    )
+    output = re.sub(r"(?i)overall\s+(?:rating|score)[^.]*\.?", "", output)
+    output = re.sub(r"(?i)investment\s+(?:rating|grade)[^.]*\.?", "", output)
 
     # Remove entire "Financial Health Rating" sections with category breakdowns
     output = re.sub(
-        r'(?i)(?:financial\s+)?health\s+(?:rating|score)[^.]*(?:\n[^\n]*(?:profitability|leverage|liquidity|cash\s*flow)[^.]*)+',
-        '',
-        output
+        r"(?i)(?:financial\s+)?health\s+(?:rating|score)[^.]*(?:\n[^\n]*(?:profitability|leverage|liquidity|cash\s*flow)[^.]*)+",
+        "",
+        output,
     )
 
     # Remove standalone "Financial Health Rating" sections entirely
     output = re.sub(
-        r'(?i)(?:^|\n)(?:##?\s*)?Financial\s+Health\s+Rating\s*\n(?:[^\n]*(?:Profitability|Cash\s*Flow\s*Quality|Leverage|Liquidity)[^\n]*\n?)+',
-        '\n',
-        output
+        r"(?i)(?:^|\n)(?:##?\s*)?Financial\s+Health\s+Rating\s*\n(?:[^\n]*(?:Profitability|Cash\s*Flow\s*Quality|Leverage|Liquidity)[^\n]*\n?)+",
+        "\n",
+        output,
     )
 
     # Remove category scoring lines like "Profitability: 25/30" or "Cash Flow Quality: 18/25"
     output = re.sub(
-        r'(?i)(?:^|\n)(?:Profitability|Cash\s*Flow\s*Quality|Leverage|Liquidity):\s*\d+\s*/\s*\d+[^\n]*',
-        '',
-        output
+        r"(?i)(?:^|\n)(?:Profitability|Cash\s*Flow\s*Quality|Leverage|Liquidity):\s*\d+\s*/\s*\d+[^\n]*",
+        "",
+        output,
     )
 
     # Remove category scoring lines with explanations
-    output = re.sub(r'(?i)\n[^\n]*(?:profitability|leverage|liquidity|cash\s*flow\s*quality)[^:]*:\s*\d+\s*/\d+[^\n]*', '', output)
+    output = re.sub(
+        r"(?i)\n[^\n]*(?:profitability|leverage|liquidity|cash\s*flow\s*quality)[^:]*:\s*\d+\s*/\d+[^\n]*",
+        "",
+        output,
+    )
 
     # Remove "Total: X/100" lines
-    output = re.sub(r'(?i)\n[^\n]*total[^:]*:\s*\d+\s*/\s*100[^\n]*', '', output)
+    output = re.sub(r"(?i)\n[^\n]*total[^:]*:\s*\d+\s*/\s*100[^\n]*", "", output)
 
     # Parenthetical ratings
-    output = re.sub(r'\(\s*\d+\s*(?:out of|/)\s*\d+\s*\)', '', output)
-    output = re.sub(r'\(\s*[A-F][+-]?\s*\)', '', output)
-    
+    output = re.sub(r"\(\s*\d+\s*(?:out of|/)\s*\d+\s*\)", "", output)
+    output = re.sub(r"\(\s*[A-F][+-]?\s*\)", "", output)
+
     # Remove "(W) - Watch" type annotations
-    output = re.sub(r'\([A-Z]\)\s*-\s*\w+', '', output)
-    
+    output = re.sub(r"\([A-Z]\)\s*-\s*\w+", "", output)
+
     # =========================================================================
     # PHASE 1.5: FIX CAPITALIZATION - Convert all-caps sentences to sentence case
     # =========================================================================
-    
+
     # Find sentences that are ALL CAPS (excluding headers which start with ##)
     def fix_all_caps_sentence(match):
         text = match.group(0)
         # Don't touch markdown headers
-        if text.strip().startswith('#'):
+        if text.strip().startswith("#"):
             return text
         # Don't touch STANCE: or VERDICT: lines
-        if text.strip().startswith(('STANCE:', 'VERDICT:')):
+        if text.strip().startswith(("STANCE:", "VERDICT:")):
             return text
         # Convert to sentence case
         return text.capitalize()
-    
+
     # Fix all-caps words in the middle of sentences (more than 3 consecutive caps words)
     def fix_caps_run(match):
         text = match.group(0)
         words = text.split()
         # Convert to title case for runs of caps words
-        return ' '.join(word.capitalize() for word in words)
-    
+        return " ".join(word.capitalize() for word in words)
+
     # Pattern: 3+ consecutive ALL-CAPS words (not at start of line)
-    output = re.sub(r'(?<![#\n])\b([A-Z]{2,}\s+){2,}[A-Z]{2,}\b', fix_caps_run, output)
-    
+    output = re.sub(r"(?<![#\n])\b([A-Z]{2,}\s+){2,}[A-Z]{2,}\b", fix_caps_run, output)
+
     # =========================================================================
     # PHASE 2: Preserve canonical section headers, remove others
     # =========================================================================
 
     # Canonical 7-section headers to preserve
     canonical_headers = [
-        'financial health rating', 'executive summary', 'financial performance',
-        'management discussion', 'risk factors', 'key metrics', 'closing takeaway'
+        "financial health rating",
+        "executive summary",
+        "financial performance",
+        "management discussion",
+        "risk factors",
+        "key metrics",
+        "closing takeaway",
     ]
 
     # Headers to explicitly remove
     banned_headers = [
-        'health score drivers', 'key data appendix', 'strategic initiatives',
-        'capital allocation', 'key data'
+        "health score drivers",
+        "key data appendix",
+        "strategic initiatives",
+        "capital allocation",
+        "key data",
     ]
 
-    lines = output.split('\n')
+    lines = output.split("\n")
     cleaned_lines = []
 
     for i, line in enumerate(lines):
         stripped = line.strip()
 
         # Handle markdown headers
-        if stripped.startswith('#'):
-            header_text = stripped.lstrip('#').strip().lower()
+        if stripped.startswith("#"):
+            header_text = stripped.lstrip("#").strip().lower()
             # Remove number prefixes like "1. " or "2. "
-            header_text = re.sub(r'^\d+\.\s*', '', header_text)
+            header_text = re.sub(r"^\d+\.\s*", "", header_text)
 
             # Check if it's a banned header - skip entirely
             if any(banned in header_text for banned in banned_headers):
@@ -2524,61 +2912,78 @@ def sanitize_persona_output(output: str, company_context: Optional[Dict] = None)
 
         # Remove standalone "Key Risks:", "Investment Thesis:", etc. without ## prefix
         generic_labels = [
-            'key risks:', 'investment thesis:',
-            'financial health:', 'key data:', 'catalysts:',
-            'conclusion:', 'summary:', 'overview:', 'analysis:',
-            'key points:', 'recommendations:', 'verdict:',
-            'key data appendix', 'health score drivers'
+            "key risks:",
+            "investment thesis:",
+            "financial health:",
+            "key data:",
+            "catalysts:",
+            "conclusion:",
+            "summary:",
+            "overview:",
+            "analysis:",
+            "key points:",
+            "recommendations:",
+            "verdict:",
+            "key data appendix",
+            "health score drivers",
         ]
         if any(stripped.lower().startswith(label) for label in generic_labels):
             # Keep the content after the colon if any, otherwise skip
-            if ':' in stripped:
-                content_after = stripped.split(':', 1)[1].strip()
+            if ":" in stripped:
+                content_after = stripped.split(":", 1)[1].strip()
                 if content_after:
                     cleaned_lines.append(content_after)
             continue
 
         cleaned_lines.append(line)
 
-    output = '\n'.join(cleaned_lines)
-    
+    output = "\n".join(cleaned_lines)
+
     # =========================================================================
     # PHASE 3: Convert bullet points to prose (optional, less aggressive)
     # =========================================================================
-    
+
     # Count bullet points - if too many, we have a structural problem
-    bullet_count = output.count('\n- ') + output.count('• ') + output.count('* ')
-    
+    bullet_count = output.count("\n- ") + output.count("• ") + output.count("* ")
+
     # If more than 3 bullet points, try to convert to prose
     if bullet_count > 3:
         # Simple conversion: replace bullet markers with sentence starters
-        output = re.sub(r'\n[-•*]\s+', '\n', output)
-    
+        output = re.sub(r"\n[-•*]\s+", "\n", output)
+
     # =========================================================================
     # PHASE 4: Remove banned generic phrases
     # =========================================================================
 
     banned_phrases_to_remove = [
-        'robust financial', 'strong fundamentals', 'poised for growth',
-        'driving shareholder value', 'showcases its dominance', 'incredibly encouraging',
-        'fueling future growth', 'welcome addition', 'testament to',
-        'well-positioned', 'solid execution', 'attractive opportunity',
+        "robust financial",
+        "strong fundamentals",
+        "poised for growth",
+        "driving shareholder value",
+        "showcases its dominance",
+        "incredibly encouraging",
+        "fueling future growth",
+        "welcome addition",
+        "testament to",
+        "well-positioned",
+        "solid execution",
+        "attractive opportunity",
     ]
 
     for phrase in banned_phrases_to_remove:
-        output = re.sub(rf'(?i)\b{re.escape(phrase)}\b', '', output)
+        output = re.sub(rf"(?i)\b{re.escape(phrase)}\b", "", output)
 
     # =========================================================================
     # PHASE 4.2: Remove "Key Data Appendix" sections entirely
     # =========================================================================
     # Pattern: "Key Data Appendix" followed by arrow lines with metrics
     output = re.sub(
-        r'(?i)(?:^|\n)(?:##?\s*)?Key\s+Data\s+Appendix\s*\n(?:[^\n]*(?:→|Revenue|Operating|Net\s+Income|Capital|Assets|Margin|Dividends)[^\n]*\n?)+',
-        '\n',
-        output
+        r"(?i)(?:^|\n)(?:##?\s*)?Key\s+Data\s+Appendix\s*\n(?:[^\n]*(?:→|Revenue|Operating|Net\s+Income|Capital|Assets|Margin|Dividends)[^\n]*\n?)+",
+        "\n",
+        output,
     )
     # Also remove individual lines that start with → (arrow notation)
-    output = re.sub(r'(?m)^→\s*[^\n]*\n?', '', output)
+    output = re.sub(r"(?m)^→\s*[^\n]*\n?", "", output)
 
     # =========================================================================
     # PHASE 4.5: Reduce repetitive phrases that make output feel robotic
@@ -2587,123 +2992,174 @@ def sanitize_persona_output(output: str, company_context: Optional[Dict] = None)
     # Map of overused phrases to their alternatives (keeps first occurrence, varies subsequent)
     repetitive_patterns = [
         # "as I always look for" variations
-        (r'\bas I always look for\b', [
-            'a key factor',
-            'which I prioritize',
-            'critical to my analysis',
-            'worth noting',
-            'an important consideration',
-        ]),
+        (
+            r"\bas I always look for\b",
+            [
+                "a key factor",
+                "which I prioritize",
+                "critical to my analysis",
+                "worth noting",
+                "an important consideration",
+            ],
+        ),
         # "which is always encouraging" variations
-        (r'\bwhich is always encouraging\b', [
-            'a positive signal',
-            'worth noting',
-            'reassuring',
-            'a good sign',
-        ]),
+        (
+            r"\bwhich is always encouraging\b",
+            [
+                "a positive signal",
+                "worth noting",
+                "reassuring",
+                "a good sign",
+            ],
+        ),
         # "I need to see" variations
-        (r'\bI need to see\b', [
-            "it's important to monitor",
-            'worth watching',
-            'requires attention',
-            'merits tracking',
-        ]),
+        (
+            r"\bI need to see\b",
+            [
+                "it's important to monitor",
+                "worth watching",
+                "requires attention",
+                "merits tracking",
+            ],
+        ),
         # "which is a key consideration" variations
-        (r'\bwhich is a key consideration\b', [
-            'an important factor',
-            'worth weighing',
-            'notable',
-            'relevant here',
-        ]),
+        (
+            r"\bwhich is a key consideration\b",
+            [
+                "an important factor",
+                "worth weighing",
+                "notable",
+                "relevant here",
+            ],
+        ),
         # "as I always consider" variations
-        (r'\bas I always consider\b', [
-            'factoring in',
-            'accounting for',
-            'weighing',
-            'considering',
-        ]),
+        (
+            r"\bas I always consider\b",
+            [
+                "factoring in",
+                "accounting for",
+                "weighing",
+                "considering",
+            ],
+        ),
         # "making it more challenging" variations
-        (r'\bmaking it more challenging\b', [
-            'adding complexity',
-            'complicating',
-            'creating uncertainty',
-        ]),
+        (
+            r"\bmaking it more challenging\b",
+            [
+                "adding complexity",
+                "complicating",
+                "creating uncertainty",
+            ],
+        ),
         # "requiring a robust" / "requiring careful" variations
-        (r'\brequiring (?:a )?(?:robust|careful) (?:contingency plan|consideration|mitigation)\b', [
-            'demanding attention',
-            'warranting caution',
-            'needing oversight',
-        ]),
+        (
+            r"\brequiring (?:a )?(?:robust|careful) (?:contingency plan|consideration|mitigation)\b",
+            [
+                "demanding attention",
+                "warranting caution",
+                "needing oversight",
+            ],
+        ),
         # "I always question" / "I question whether" variations
-        (r'\bI (?:always )?question (?:the sustainability|whether)\b', [
-            'the sustainability merits scrutiny',
-            'one must evaluate whether',
-            'it bears asking whether',
-            'sustainability is in question',
-        ]),
+        (
+            r"\bI (?:always )?question (?:the sustainability|whether)\b",
+            [
+                "the sustainability merits scrutiny",
+                "one must evaluate whether",
+                "it bears asking whether",
+                "sustainability is in question",
+            ],
+        ),
         # "I am vigilant about" variations
-        (r'\bI am vigilant about\b', [
-            'we must watch',
-            'monitoring',
-            'staying alert to',
-            'keeping an eye on',
-        ]),
+        (
+            r"\bI am vigilant about\b",
+            [
+                "we must watch",
+                "monitoring",
+                "staying alert to",
+                "keeping an eye on",
+            ],
+        ),
         # "what's priced in" repetition (for Marks/Dalio)
-        (r"\bwhat's priced in\b", [
-            'current expectations',
-            'embedded assumptions',
-            'the market believes',
-            'consensus view',
-        ]),
+        (
+            r"\bwhat's priced in\b",
+            [
+                "current expectations",
+                "embedded assumptions",
+                "the market believes",
+                "consensus view",
+            ],
+        ),
         # "sustainability of these margins" / "sustainability of margins" variations
-        (r'\bsustainability of (?:these |the )?margins?\b', [
-            'margin durability',
-            'whether margins persist',
-            'margin resilience',
-            'ongoing margin health',
-        ]),
+        (
+            r"\bsustainability of (?:these |the )?margins?\b",
+            [
+                "margin durability",
+                "whether margins persist",
+                "margin resilience",
+                "ongoing margin health",
+            ],
+        ),
         # "long-term reliability" variations
-        (r'\blong-term reliability\b', [
-            'durability',
-            'staying power',
-            'persistence',
-            'ongoing stability',
-        ]),
+        (
+            r"\blong-term reliability\b",
+            [
+                "durability",
+                "staying power",
+                "persistence",
+                "ongoing stability",
+            ],
+        ),
         # "I am always" / "I always" + verb variations (repetitive first-person patterns)
-        (r'\bI (?:am )?always (?:question|monitor|watch|consider|evaluate)\b', [
-            'it merits scrutiny',
-            'worth monitoring',
-            'deserves attention',
-            'requires evaluation',
-        ]),
+        (
+            r"\bI (?:am )?always (?:question|monitor|watch|consider|evaluate)\b",
+            [
+                "it merits scrutiny",
+                "worth monitoring",
+                "deserves attention",
+                "requires evaluation",
+            ],
+        ),
         # "lack of explicit MD&A" / "limited MD&A" / "MD&A is limited" variations
-        (r'\b(?:lack of|limited|absence of)(?:\s+explicit)?\s+(?:MD&A|management(?:\s+discussion)?(?:\s+and\s+analysis)?|management commentary)\b', [
-            'based on available disclosures',
-            'from the filing data',
-            'interpreting the financial statements',
-            'drawing from segment results',
-        ]),
+        (
+            r"\b(?:lack of|limited|absence of)(?:\s+explicit)?\s+(?:MD&A|management(?:\s+discussion)?(?:\s+and\s+analysis)?|management commentary)\b",
+            [
+                "based on available disclosures",
+                "from the filing data",
+                "interpreting the financial statements",
+                "drawing from segment results",
+            ],
+        ),
         # "sustainability of these margins" / "sustainability" repeated
-        (r'\bsustainability\b', [
-            'durability',
-            'persistence',
-            'ongoing health',
-            'resilience',
-        ]),
+        (
+            r"\bsustainability\b",
+            [
+                "durability",
+                "persistence",
+                "ongoing health",
+                "resilience",
+            ],
+        ),
         # "the lack of" variations (repetitive negativity)
-        (r'\bthe lack of\b', [
-            'limited',
-            'absent',
-            'the missing',
-            'without',
-        ]),
+        (
+            r"\bthe lack of\b",
+            [
+                "limited",
+                "absent",
+                "the missing",
+                "without",
+            ],
+        ),
         # "I am concerned about" / "my concern is" variations
-        (r'\b(?:I am concerned about|my concern is|I worry about)\b', [
-            'worth watching:',
-            'a key risk:',
-            'notable risk:',
-            'attention needed on',
-        ]),
+        (
+            r"\b(?:I am concerned about|my concern is|I worry about)\b",
+            [
+                "worth watching:",
+                "a key risk:",
+                "notable risk:",
+                "attention needed on",
+            ],
+        ),
     ]
 
     for pattern, alternatives in repetitive_patterns:
@@ -2724,29 +3180,31 @@ def sanitize_persona_output(output: str, company_context: Optional[Dict] = None)
     # =========================================================================
 
     # Remove empty parentheses left behind
-    output = re.sub(r'\(\s*\)', '', output)
+    output = re.sub(r"\(\s*\)", "", output)
 
     # Remove double spaces
-    output = re.sub(r'  +', ' ', output)
+    output = re.sub(r"  +", " ", output)
 
     # Clean up multiple blank lines (standardize to max 2 newlines between paragraphs)
-    output = re.sub(r'\n{3,}', '\n\n', output)
+    output = re.sub(r"\n{3,}", "\n\n", output)
 
     # Clean up lines that are just whitespace
-    lines = [line for line in output.split('\n') if line.strip()]
-    output = '\n'.join(lines)
+    lines = [line for line in output.split("\n") if line.strip()]
+    output = "\n".join(lines)
 
     # Normalize quotation marks (curly to straight)
     output = output.replace('"', '"').replace('"', '"')
-    output = output.replace(''', "'").replace(''', "'")
+    output = output.replace(""", "'").replace(""", "'")
 
     # Remove trailing whitespace from each line
-    output = '\n'.join(line.rstrip() for line in output.split('\n'))
+    output = "\n".join(line.rstrip() for line in output.split("\n"))
 
     # Ensure proper spacing after punctuation
-    output = re.sub(r'\.([A-Z])', r'. \1', output)  # Period followed by capital without space
-    output = re.sub(r'\?([A-Z])', r'? \1', output)
-    output = re.sub(r'!([A-Z])', r'! \1', output)
+    output = re.sub(
+        r"\.([A-Z])", r". \1", output
+    )  # Period followed by capital without space
+    output = re.sub(r"\?([A-Z])", r"? \1", output)
+    output = re.sub(r"!([A-Z])", r"! \1", output)
 
     # =========================================================================
     # PHASE 6: Filter placeholders and industry-mismatched risks
@@ -2765,6 +3223,21 @@ def sanitize_persona_output(output: str, company_context: Optional[Dict] = None)
     output = fix_mid_text_ellipsis(output)
 
     # =========================================================================
+    # PHASE 8.5: Strip methodology/framework sentences (no company data)
+    # =========================================================================
+    output = _strip_methodology_sentences(output)
+
+    # =========================================================================
+    # PHASE 8.6: Intra-section sentence deduplication
+    # =========================================================================
+    output = _deduplicate_section_sentences(output)
+
+    # =========================================================================
+    # PHASE 8.7: Hard cap Closing Takeaway to 4 sentences
+    # =========================================================================
+    output = _cap_closing_takeaway_sentences(output, max_sentences=4)
+
+    # =========================================================================
     # PHASE 9: Reorder sections to canonical order
     # =========================================================================
     output = reorder_persona_sections(output)
@@ -2779,121 +3252,199 @@ def sanitize_persona_output(output: str, company_context: Optional[Dict] = None)
 PERSONA_VOICE_ANCHORS = {
     "buffett": {
         "must_use_phrases": ["moat", "owner earnings", "circle of competence"],
-        "encouraged_phrases": ["Mr. Market", "toll bridge", "wonderful company", "fair price", "durable", "simple"],
-        "opening_patterns": ["I'll be honest", "Here's what I understand", "Let me tell you"],
-        "emotional_register": "folksy, patient, humble",
-        "structural_pattern": "conversational narrative with analogies",
+        "encouraged_phrases": [
+            "Mr. Market",
+            "toll bridge",
+            "wonderful company",
+            "fair price",
+            "durable",
+            "simple",
+        ],
         "never_says": ["EBITDA", "comps", "multiple expansion", "DCF", "target price"],
-        "forbidden_concepts": ["Magic Formula", "TAM", "S-curve", "disruption", "exponential growth", "Wright's Law", "activist catalyst", "index fund"],
+        "forbidden_concepts": [
+            "Magic Formula",
+            "TAM",
+            "S-curve",
+            "disruption",
+            "exponential growth",
+            "Wright's Law",
+            "activist catalyst",
+            "index fund",
+        ],
     },
     "munger": {
         "must_use_phrases": ["invert", "incentives", "stupid"],
-        "encouraged_phrases": ["mental models", "lollapalooza", "nothing to add", "obviously", "asinine"],
-        "opening_patterns": ["That's easy", "Let me explain", "The problem is"],
-        "emotional_register": "blunt, pithy, sardonic",
-        "structural_pattern": "short declarative sentences, minimal hedging",
+        "encouraged_phrases": [
+            "mental models",
+            "lollapalooza",
+            "nothing to add",
+            "obviously",
+            "asinine",
+        ],
         "never_says": ["I believe", "in my opinion", "potentially", "perhaps"],
-        "forbidden_concepts": ["Magic Formula", "PEG ratio", "TAM", "S-curve", "exponential", "activist catalyst", "stay the course"],
+        "forbidden_concepts": [
+            "Magic Formula",
+            "PEG ratio",
+            "TAM",
+            "S-curve",
+            "exponential",
+            "activist catalyst",
+            "stay the course",
+        ],
     },
     "graham": {
         "must_use_phrases": ["margin of safety", "intrinsic value"],
-        "encouraged_phrases": ["net current asset", "intelligent investor", "speculator", "Mr. Market"],
-        "opening_patterns": ["We begin, as we must", "The balance sheet reveals", "The investor is offered"],
-        "emotional_register": "academic, measured, quantitative",
-        "structural_pattern": "formal prose with specific numbers, no adjectives",
+        "encouraged_phrases": [
+            "net current asset",
+            "intelligent investor",
+            "speculator",
+            "Mr. Market",
+        ],
         "never_says": ["exciting", "impressive", "robust", "strong"],
-        "forbidden_concepts": ["TAM", "S-curve", "disruption", "exponential", "Wright's Law", "paradigm shift", "tenbagger", "catalyst"],
+        "forbidden_concepts": [
+            "TAM",
+            "S-curve",
+            "disruption",
+            "exponential",
+            "Wright's Law",
+            "paradigm shift",
+            "tenbagger",
+            "catalyst",
+        ],
     },
     "lynch": {
         "must_use_phrases": ["PEG ratio"],
-        "encouraged_phrases": ["story", "boring", "Fast Grower", "Stalwart", "tenbagger", "Wall Street is missing", "know the company", "kick the tires"],
-        "opening_patterns": ["I love this", "Here's the story", "Nobody's looking at", "Let me tell you about", "This is a simple business"],
-        "emotional_register": "enthusiastic, practical, accessible, explain-like-I'm-five",
-        "structural_pattern": "excited narrative about real products and customers with stock classification",
-        "never_says": ["macro", "Fed policy", "interest rates", "geopolitical", "factor-based", "scoring model"],
-        "forbidden_concepts": ["Magic Formula", "margin of safety", "debt cycle", "paradigm shift", "index fund", "activist catalyst", "health rating", "scoring formula"],
-        # Lynch-specific requirements
-        "required_lynch_elements": [
-            "STOCK CLASSIFICATION: Fast Grower, Stalwart, Slow Grower, Cyclical, Turnaround, or Asset Play",
-            "PEG RATIO: Calculate and interpret (PEG < 1 = undervalued, 1-2 = fair, > 2 = expensive)",
-            "THE STORY: What does the company actually do? Explain it simply.",
-            "CUSTOMERS: Who buys from them? Why? Can you see it in your daily life?",
-            "GROWTH RATE: Earnings growth rate and sustainability",
-            "VALUATION: P/E ratio and how it compares to growth rate",
-            "INNING: What inning of growth is this company in?",
+        "encouraged_phrases": [
+            "story",
+            "boring",
+            "Fast Grower",
+            "Stalwart",
+            "tenbagger",
+            "Wall Street is missing",
+            "know the company",
+            "kick the tires",
         ],
-        "anti_rating_guidance": "NEVER use factor-based scoring (72/100). Lynch uses intuition, stories, and simple math (PEG). No health ratings.",
+        "never_says": [
+            "macro",
+            "Fed policy",
+            "interest rates",
+            "geopolitical",
+            "factor-based",
+            "scoring model",
+        ],
+        "forbidden_concepts": [
+            "Magic Formula",
+            "margin of safety",
+            "debt cycle",
+            "paradigm shift",
+            "index fund",
+            "activist catalyst",
+            "health rating",
+            "scoring formula",
+        ],
     },
     "dalio": {
         "must_use_phrases": ["cycle", "machine", "paradigm"],
-        "encouraged_phrases": ["deleveraging", "correlation", "debt cycle", "mechanism", "risk parity", "credit", "liquidity"],
-        "opening_patterns": ["To understand this", "We are in", "The machine"],
-        "emotional_register": "systematic, mechanical, dispassionate",
-        "structural_pattern": "macro-first analysis connecting company to economic cycles",
+        "encouraged_phrases": [
+            "deleveraging",
+            "correlation",
+            "debt cycle",
+            "mechanism",
+            "risk parity",
+            "credit",
+            "liquidity",
+        ],
         "never_says": ["exciting", "love", "hate", "feel"],
-        "forbidden_concepts": ["tenbagger", "PEG ratio", "Magic Formula", "moat", "owner earnings", "S-curve", "index fund", "activist catalyst", "forward guidance"],
-        "required_macro_factors": [
-            "Where we are in the debt cycle (short-term and long-term)",
-            "Interest rate environment and cost of capital implications",
-            "Credit conditions and liquidity dynamics",
-            "Currency/FX exposure if international",
-            "Geopolitical risk factors (Taiwan/China for semiconductors)",
-            "Correlation to macro factors (rates, credit spreads, risk assets)",
-            "Supply chain concentration risk (TSMC dependency for chips)",
+        "forbidden_concepts": [
+            "tenbagger",
+            "PEG ratio",
+            "Magic Formula",
+            "moat",
+            "owner earnings",
+            "S-curve",
+            "index fund",
+            "activist catalyst",
+            "forward guidance",
         ],
     },
     "wood": {
         "must_use_phrases": ["disruption", "exponential"],
         "encouraged_phrases": ["Wright's Law", "S-curve", "TAM", "convergence", "2030"],
-        "opening_patterns": ["Traditional analysts", "Where are we on the S-curve", "By 2030"],
-        "emotional_register": "visionary, optimistic, long-horizon",
-        "structural_pattern": "future-focused thesis with exponential thinking",
         "never_says": ["P/E ratio", "current profitability", "near-term", "skeptical"],
-        "forbidden_concepts": ["margin of safety", "net current asset", "debt cycle", "Magic Formula", "index fund", "stay the course"],
+        "forbidden_concepts": [
+            "margin of safety",
+            "net current asset",
+            "debt cycle",
+            "Magic Formula",
+            "index fund",
+            "stay the course",
+        ],
     },
     "greenblatt": {
         "must_use_phrases": ["return on capital", "earnings yield"],
-        "encouraged_phrases": ["Magic Formula", "good company", "cheap price", "mean reversion", "ROIC", "EV/EBIT"],
-        "opening_patterns": ["Return on Capital:", "The formula says", "Simple:", "Two numbers matter:"],
-        "emotional_register": "minimal, formula-driven, matter-of-fact, no-nonsense",
-        "structural_pattern": "extremely brief with ROIC calculation, earnings yield, and binary verdict",
-        "never_says": ["story", "narrative", "management quality", "moat", "rating", "score", "guidance"],
-        "forbidden_concepts": ["tenbagger", "PEG ratio", "TAM", "S-curve", "debt cycle", "paradigm", "index fund", "activist catalyst", "forward guidance"],
-        # Greenblatt-specific requirements - Magic Formula
-        "required_greenblatt_elements": [
-            "ROIC or ROC calculation (EBIT / Net Working Capital + Net PPE)",
-            "Earnings Yield (EBIT / Enterprise Value)",
-            "Comparison to cost of capital (is ROIC > WACC?)",
-            "Binary conclusion: Good AND Cheap, Good but Expensive, or Not Good",
+        "encouraged_phrases": [
+            "Magic Formula",
+            "good company",
+            "cheap price",
+            "mean reversion",
+            "ROIC",
+            "EV/EBIT",
         ],
-        "magic_formula_framework": """
-GREENBLATT'S MAGIC FORMULA:
-1. Return on Capital (ROC) = EBIT / (Net Working Capital + Net PPE)
-   - High ROC = efficient use of capital = GOOD company
-   - Compare to industry average and cost of capital
-
-2. Earnings Yield = EBIT / Enterprise Value
-   - High earnings yield = CHEAP stock
-   - Compare to risk-free rate and market average
-
-3. VERDICT: Must answer "Is it GOOD and CHEAP?"
-   - Good AND Cheap = Buy
-   - Good but Expensive = Pass (wait for better price)
-   - Not Good = Pass (regardless of price)
-""",
-        "anti_rating_guidance": "NEVER give numeric ratings (72/100, 8/10). Greenblatt uses ROC rank + Earnings Yield rank, not arbitrary scores.",
+        "never_says": [
+            "story",
+            "narrative",
+            "management quality",
+            "moat",
+            "rating",
+            "score",
+            "guidance",
+        ],
+        "forbidden_concepts": [
+            "tenbagger",
+            "PEG ratio",
+            "TAM",
+            "S-curve",
+            "debt cycle",
+            "paradigm",
+            "index fund",
+            "activist catalyst",
+            "forward guidance",
+        ],
     },
     "bogle": {
         "must_use_phrases": ["costs", "index"],
-        "encouraged_phrases": ["haystack", "stay the course", "90%", "speculation", "compounding", "simplicity", "diversification", "fees", "long-term"],
-        "opening_patterns": ["Let me tell you a secret", "Here's what Wall Street won't", "The math is simple", "I've spent my career"],
-        "emotional_register": "wise, humble, grandfatherly, skeptical of stock-picking, patient",
-        "structural_pattern": "gentle but firm argument for indexing over individual stocks, with honest assessment of company fundamentals",
-        "never_says": ["buy this stock", "outperform", "beat the market", "alpha", "upside potential", "price target", "I'm bullish"],
-        "forbidden_concepts": ["tenbagger", "catalyst", "target price", "Magic Formula", "TAM", "disruption", "activist", "debt cycle", "guidance", "next quarter"],
-        # Bogle-specific requirements
-        "valuation_requirement": "You MUST discuss valuation - P/E ratio, earnings yield, or price-to-sales. Bogle believed in buying at reasonable prices, not at any price.",
-        "anti_rating_guidance": "NEVER give this stock a rating or score. Bogle would find that absurd. Instead, assess whether owning this single stock makes sense vs. owning the entire market.",
+        "encouraged_phrases": [
+            "haystack",
+            "stay the course",
+            "90%",
+            "speculation",
+            "compounding",
+            "simplicity",
+            "diversification",
+            "fees",
+            "long-term",
+        ],
+        "never_says": [
+            "buy this stock",
+            "outperform",
+            "beat the market",
+            "alpha",
+            "upside potential",
+            "price target",
+            "I'm bullish",
+        ],
+        "forbidden_concepts": [
+            "tenbagger",
+            "catalyst",
+            "target price",
+            "Magic Formula",
+            "TAM",
+            "disruption",
+            "activist",
+            "debt cycle",
+            "guidance",
+            "next quarter",
+        ],
     },
 }
 
@@ -2902,7 +3453,10 @@ GREENBLATT'S MAGIC FORMULA:
 # METRIC EXTRACTION - COMPANY-SPECIFIC, NOT GENERIC
 # =============================================================================
 
-def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_data: Dict, company_name: str = "") -> str:
+
+def extract_persona_relevant_metrics(
+    persona_id: str, ratios: Dict, financial_data: Dict, company_name: str = ""
+) -> str:
     """Extract metrics formatted for each persona's analytical style."""
 
     def fmt_currency(val):
@@ -2911,9 +3465,9 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
         try:
             val = float(val)
             if abs(val) >= 1e9:
-                return f"${val/1e9:.2f}B"  # Always 2 decimals for clarity (e.g., $31.91B not $31.9B or $31.)
+                return f"${val / 1e9:.2f}B"  # Always 2 decimals for clarity (e.g., $31.91B not $31.9B or $31.)
             if abs(val) >= 1e6:
-                return f"${val/1e6:.2f}M"  # Always 2 decimals
+                return f"${val / 1e6:.2f}M"  # Always 2 decimals
             return f"${val:,.2f}"  # 2 decimals for smaller amounts
         except (ValueError, TypeError):
             return None
@@ -2922,7 +3476,7 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
         if val is None:
             return None  # Return None instead of "N/A"
         try:
-            return f"{float(val)*100:.1f}%"
+            return f"{float(val) * 100:.1f}%"
         except (ValueError, TypeError):
             return None
 
@@ -2938,7 +3492,7 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
         """Only add metric to lines if value is not None."""
         if value is not None:
             lines.append(f"- {label}: {value}")
-    
+
     def get_val(data, *keys):
         current = data
         for key in keys:
@@ -2949,7 +3503,7 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
         if isinstance(current, dict) and current:
             return list(current.values())[0]
         return current if current else None
-    
+
     # Extract common metrics
     revenue = get_val(financial_data, "income_statement", "revenue")
     net_income = get_val(financial_data, "income_statement", "net_income")
@@ -2958,7 +3512,7 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
     total_equity = get_val(financial_data, "balance_sheet", "total_equity")
     current_assets = get_val(financial_data, "balance_sheet", "current_assets")
     total_liabilities = get_val(financial_data, "balance_sheet", "total_liabilities")
-    
+
     fcf = ratios.get("fcf")
     gross_margin = ratios.get("gross_margin")
     operating_margin = ratios.get("operating_margin")
@@ -2967,7 +3521,7 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
     current_ratio = ratios.get("current_ratio")
     debt_to_equity = ratios.get("debt_to_equity")
     revenue_growth = ratios.get("revenue_growth_yoy")
-    
+
     is_profitable = net_income is not None and float(net_income) > 0
     is_fcf_positive = fcf is not None and float(fcf) > 0
 
@@ -2981,11 +3535,15 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
 
     ni_fmt = fmt_currency(net_income)
     if ni_fmt:
-        lines.append(f"Net Income: {ni_fmt} {'(profitable)' if is_profitable else '(loss)'}")
+        lines.append(
+            f"Net Income: {ni_fmt} {'(profitable)' if is_profitable else '(loss)'}"
+        )
 
     fcf_fmt = fmt_currency(fcf)
     if fcf_fmt:
-        lines.append(f"Free Cash Flow: {fcf_fmt} {'(positive)' if is_fcf_positive else '(negative)'}")
+        lines.append(
+            f"Free Cash Flow: {fcf_fmt} {'(positive)' if is_fcf_positive else '(negative)'}"
+        )
 
     cash_fmt = fmt_currency(cash)
     if cash_fmt:
@@ -3051,7 +3609,9 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
 
         # Get additional balance sheet items
         total_assets = get_val(financial_data, "balance_sheet", "total_assets")
-        current_liabilities = get_val(financial_data, "balance_sheet", "current_liabilities")
+        current_liabilities = get_val(
+            financial_data, "balance_sheet", "current_liabilities"
+        )
         long_term_debt = get_val(financial_data, "balance_sheet", "long_term_debt")
         total_debt = get_val(financial_data, "balance_sheet", "total_debt")
 
@@ -3079,7 +3639,11 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
             # Fallback: use Total Equity + Total Debt
             try:
                 equity_val = float(total_equity)
-                debt_val = float(total_debt) if total_debt else (float(total_liabilities) * 0.4 if total_liabilities else 0)
+                debt_val = (
+                    float(total_debt)
+                    if total_debt
+                    else (float(total_liabilities) * 0.4 if total_liabilities else 0)
+                )
                 invested_capital = equity_val + debt_val
             except (ValueError, TypeError):
                 pass
@@ -3091,7 +3655,11 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
         if market_cap is not None:
             try:
                 mc = float(market_cap)
-                debt = float(total_debt) if total_debt else (float(total_liabilities) * 0.4 if total_liabilities else 0)
+                debt = (
+                    float(total_debt)
+                    if total_debt
+                    else (float(total_liabilities) * 0.4 if total_liabilities else 0)
+                )
                 cash_val = float(cash) if cash else 0
                 enterprise_value = mc + debt - cash_val
             except (ValueError, TypeError):
@@ -3119,45 +3687,83 @@ def extract_persona_relevant_metrics(persona_id: str, ratios: Dict, financial_da
         if ebit_fmt:
             greenblatt_lines.append(f"EBIT (Operating Income): {ebit_fmt}")
         else:
-            greenblatt_lines.append("EBIT: Cannot be calculated - operating income not available in this filing")
+            greenblatt_lines.append(
+                "EBIT: Cannot be calculated - operating income not available in this filing"
+            )
 
         if invested_capital is not None:
-            greenblatt_lines.append(f"Invested Capital (NWC + Net Fixed Assets): {fmt_currency(invested_capital)}")
+            greenblatt_lines.append(
+                f"Invested Capital (NWC + Net Fixed Assets): {fmt_currency(invested_capital)}"
+            )
         else:
-            greenblatt_lines.append("Invested Capital: Cannot be calculated - need current assets, current liabilities, and net fixed assets from balance sheet")
+            greenblatt_lines.append(
+                "Invested Capital: Cannot be calculated - need current assets, current liabilities, and net fixed assets from balance sheet"
+            )
 
         if enterprise_value is not None:
-            greenblatt_lines.append(f"Enterprise Value: {fmt_currency(enterprise_value)}")
+            greenblatt_lines.append(
+                f"Enterprise Value: {fmt_currency(enterprise_value)}"
+            )
         else:
-            greenblatt_lines.append("Enterprise Value: Cannot be calculated - requires market cap (current share price × shares outstanding), which is not in SEC filings")
+            greenblatt_lines.append(
+                "Enterprise Value: Cannot be calculated - requires market cap (current share price × shares outstanding), which is not in SEC filings"
+            )
 
         greenblatt_lines.append("\n--- CALCULATED RATIOS ---")
 
         if roc_pct is not None:
-            roc_assessment = "Excellent (>25%)" if roc_pct > 25 else "Good (15-25%)" if roc_pct >= 15 else "Average (10-15%)" if roc_pct >= 10 else "Poor (<10%)"
-            greenblatt_lines.append(f"Return on Capital (ROC): {roc_pct:.1f}% - {roc_assessment}")
+            roc_assessment = (
+                "Excellent (>25%)"
+                if roc_pct > 25
+                else "Good (15-25%)"
+                if roc_pct >= 15
+                else "Average (10-15%)"
+                if roc_pct >= 10
+                else "Poor (<10%)"
+            )
+            greenblatt_lines.append(
+                f"Return on Capital (ROC): {roc_pct:.1f}% - {roc_assessment}"
+            )
         else:
-            greenblatt_lines.append("Return on Capital (ROC): Cannot be calculated - need both EBIT and Invested Capital")
+            greenblatt_lines.append(
+                "Return on Capital (ROC): Cannot be calculated - need both EBIT and Invested Capital"
+            )
 
         if earnings_yield_pct is not None:
-            ey_assessment = "Cheap (>10%)" if earnings_yield_pct > 10 else "Fair (5-10%)" if earnings_yield_pct >= 5 else "Expensive (<5%)"
-            greenblatt_lines.append(f"Earnings Yield: {earnings_yield_pct:.1f}% - {ey_assessment}")
+            ey_assessment = (
+                "Cheap (>10%)"
+                if earnings_yield_pct > 10
+                else "Fair (5-10%)"
+                if earnings_yield_pct >= 5
+                else "Expensive (<5%)"
+            )
+            greenblatt_lines.append(
+                f"Earnings Yield: {earnings_yield_pct:.1f}% - {ey_assessment}"
+            )
         else:
-            greenblatt_lines.append("Earnings Yield: Cannot be calculated - requires Enterprise Value (market cap + debt - cash)")
+            greenblatt_lines.append(
+                "Earnings Yield: Cannot be calculated - requires Enterprise Value (market cap + debt - cash)"
+            )
 
         if market_cap is None:
-            greenblatt_lines.append("\nNOTE: P/E and FCF Yield cannot be calculated without current market price data, which is outside SEC filing scope.")
+            greenblatt_lines.append(
+                "\nNOTE: P/E and FCF Yield cannot be calculated without current market price data, which is outside SEC filing scope."
+            )
 
         lines.extend(greenblatt_lines)
 
     pe_ratio = ratios.get("pe_ratio")
     if pe_ratio is None and persona_id != "greenblatt":
-        lines.append("\nValuation Note: P/E ratio and market-based metrics require current share price data, which is not included in SEC filings. To calculate: obtain current market cap, then divide by net income.")
+        lines.append(
+            "\nValuation Note: P/E ratio and market-based metrics require current share price data, which is not included in SEC filings. To calculate: obtain current market cap, then divide by net income."
+        )
 
     return "\n".join(lines) if lines else "Limited financial data available."
 
 
-def calculate_authenticity_score(persona_id: str, output: str, persona: Dict) -> Tuple[int, List[str]]:
+def calculate_authenticity_score(
+    persona_id: str, output: str, persona: Dict
+) -> Tuple[int, List[str]]:
     """
     Calculate an authenticity score (0-100) for how well the output embodies the persona.
 
@@ -3175,16 +3781,109 @@ def calculate_authenticity_score(persona_id: str, output: str, persona: Dict) ->
     forbidden_concepts = voice_anchors.get("forbidden_concepts", [])
 
     persona_markers = {
-        "buffett": ["moat", "owner earnings", "wonderful company", "circle of competence", "durable competitive advantage", "margin of safety", "long-term value", "Mr. Market", "economic moat"],
-        "munger": ["invert", "lollapalooza", "mental models", "incentives", "stupid", "obviously", "asinine", "worldly wisdom"],
-        "graham": ["margin of safety", "intrinsic value", "net current asset", "intelligent investor", "speculator", "Mr. Market", "financial metrics"],
-        "lynch": ["tenbagger", "peg ratio", "fast grower", "stalwart", "story", "boring", "Wall Street is missing", "know the company", "kick the tires", "what inning"],
-        "dalio": ["debt cycle", "economic machine", "paradigm", "deleveraging", "correlation", "debt cycle", "mechanism", "risk parity", "credit", "liquidity"],
-        "wood": ["disruption", "exponential", "wright's law", "s-curve", "2030", "TAM", "convergence", "market potential"],
-        "greenblatt": ["return on capital", "earnings yield", "magic formula", "good company", "cheap price", "mean reversion", "ROIC", "EV/EBIT"],
-        "bogle": ["index", "costs", "haystack", "stay the course", "90%", "speculation", "compounding", "simplicity", "diversification", "fees", "long-term"],
-        "marks": ["second-level thinking", "cycle", "risk control", "durable competitive advantage", "long-term value", "competitive landscape"],
-        "ackman": ["activist", "catalyst", "simple business", "durable competitive advantage", "long-term value", "competitive landscape"],
+        "buffett": [
+            "moat",
+            "owner earnings",
+            "wonderful company",
+            "circle of competence",
+            "durable competitive advantage",
+            "margin of safety",
+            "long-term value",
+            "Mr. Market",
+            "economic moat",
+        ],
+        "munger": [
+            "invert",
+            "lollapalooza",
+            "mental models",
+            "incentives",
+            "stupid",
+            "obviously",
+            "asinine",
+            "worldly wisdom",
+        ],
+        "graham": [
+            "margin of safety",
+            "intrinsic value",
+            "net current asset",
+            "intelligent investor",
+            "speculator",
+            "Mr. Market",
+            "financial metrics",
+        ],
+        "lynch": [
+            "tenbagger",
+            "peg ratio",
+            "fast grower",
+            "stalwart",
+            "story",
+            "boring",
+            "Wall Street is missing",
+            "know the company",
+            "kick the tires",
+            "what inning",
+        ],
+        "dalio": [
+            "debt cycle",
+            "economic machine",
+            "paradigm",
+            "deleveraging",
+            "correlation",
+            "debt cycle",
+            "mechanism",
+            "risk parity",
+            "credit",
+            "liquidity",
+        ],
+        "wood": [
+            "disruption",
+            "exponential",
+            "wright's law",
+            "s-curve",
+            "2030",
+            "TAM",
+            "convergence",
+            "market potential",
+        ],
+        "greenblatt": [
+            "return on capital",
+            "earnings yield",
+            "magic formula",
+            "good company",
+            "cheap price",
+            "mean reversion",
+            "ROIC",
+            "EV/EBIT",
+        ],
+        "bogle": [
+            "index",
+            "costs",
+            "haystack",
+            "stay the course",
+            "90%",
+            "speculation",
+            "compounding",
+            "simplicity",
+            "diversification",
+            "fees",
+            "long-term",
+        ],
+        "marks": [
+            "second-level thinking",
+            "cycle",
+            "risk control",
+            "durable competitive advantage",
+            "long-term value",
+            "competitive landscape",
+        ],
+        "ackman": [
+            "activist",
+            "catalyst",
+            "simple business",
+            "durable competitive advantage",
+            "long-term value",
+            "competitive landscape",
+        ],
     }
 
     for phrase in must_use:
@@ -3210,9 +3909,13 @@ def calculate_authenticity_score(persona_id: str, output: str, persona: Dict) ->
     for other_persona, markers in persona_markers.items():
         if other_persona != persona_id:
             for marker in markers:
-                if marker.lower() in output_lower and marker.lower() not in [p.lower() for p in must_use + encouraged]:
+                if marker.lower() in output_lower and marker.lower() not in [
+                    p.lower() for p in must_use + encouraged
+                ]:
                     score -= 5
-                    feedback.append(f"Voice contamination: '{marker}' belongs to {other_persona}")
+                    feedback.append(
+                        f"Voice contamination: '{marker}' belongs to {other_persona}"
+                    )
 
     return max(0, score), feedback
 
@@ -3227,77 +3930,165 @@ PERSONAS = {
         "philosophy": "Invest in businesses with durable competitive advantages and long-term value creation. Focus on companies with strong moats, predictable earnings, and shareholder-friendly management. Buy when the market is irrational and sell when it's overvalued. The key is patience and understanding the business model.",
         "voice_style": "Folksy, patient, humble, conversational. Uses analogies like 'Mr. Market' and 'toll bridge'. Speaks in simple terms about business fundamentals and long-term value.",
         "framework": "Circle of Competence: Invest only in businesses you understand deeply. Focus on companies with durable competitive advantages (moats) that protect profits from competition. Value is in the business, not the stock price.",
-        "key_metrics": ["moat", "owner earnings", "circle of competence", "durable competitive advantage", "margin of safety", "long-term value"],
+        "key_metrics": [
+            "moat",
+            "owner earnings",
+            "circle of competence",
+            "durable competitive advantage",
+            "margin of safety",
+            "long-term value",
+        ],
     },
     "munger": {
         "name": "Charlie Munger",
         "philosophy": "Invest in businesses that solve real problems and create lasting value. Focus on companies with powerful mental models and simple business models. The key is understanding the business and avoiding complex financial engineering.",
         "voice_style": "Blunt, pithy, sardonic. Uses mental models like 'lollapalooza' and 'incentives matter'. Speaks in short, declarative sentences with minimal hedging.",
         "framework": "Mental Models: Use a diverse set of mental models (e.g., psychology, business, physics) to understand companies. Focus on businesses that solve real problems and create lasting value.",
-        "key_metrics": ["mental models", "lollapalooza", "incentives", "stupid", "obviously", "asinine", "simple business"],
+        "key_metrics": [
+            "mental models",
+            "lollapalooza",
+            "incentives",
+            "stupid",
+            "obviously",
+            "asinine",
+            "simple business",
+        ],
     },
     "graham": {
         "name": "Benjamin Graham",
         "philosophy": "Invest in companies with strong intrinsic value and a margin of safety. Focus on companies with predictable earnings, strong balance sheets, and low debt. The key is buying at a significant discount to intrinsic value.",
         "voice_style": "Academic, measured, quantitative. Uses formal prose with specific numbers and avoids adjectives. Focuses on financial metrics and risk management.",
         "framework": "Intrinsic Value: The true value of a company based on its financials. Margin of Safety: The buffer between intrinsic value and market price. Focus on companies with strong balance sheets and predictable earnings.",
-        "key_metrics": ["margin of safety", "intrinsic value", "net current asset", "intelligent investor", "speculator", "Mr. Market", "financial metrics"],
+        "key_metrics": [
+            "margin of safety",
+            "intrinsic value",
+            "net current asset",
+            "intelligent investor",
+            "speculator",
+            "Mr. Market",
+            "financial metrics",
+        ],
     },
     "lynch": {
         "name": "Peter Lynch",
         "philosophy": "Invest in companies with strong growth potential and simple business models. Focus on companies with clear stories and real products. The key is understanding the business and its customers.",
         "voice_style": "Enthusiastic, practical, accessible. Uses stories about real products and customers. Focuses on growth, valuation, and business classification.",
         "framework": "Story-Based Analysis: Understand the business story, customers, and growth potential. Focus on companies with clear stories and real products.",
-        "key_metrics": ["PEG ratio", "tenbagger", "fast grower", "stalwart", "story", "boring", "Wall Street is missing", "know the company", "kick the tires"],
+        "key_metrics": [
+            "PEG ratio",
+            "tenbagger",
+            "fast grower",
+            "stalwart",
+            "story",
+            "boring",
+            "Wall Street is missing",
+            "know the company",
+            "kick the tires",
+        ],
     },
     "dalio": {
         "name": "Ray Dalio",
         "philosophy": "Invest in businesses that align with macroeconomic cycles. Focus on companies that benefit from economic expansion and are resilient during downturns. The key is understanding the economic cycle and timing.",
         "voice_style": "Systematic, mechanical, dispassionate. Uses macroeconomic analysis and economic cycles. Focuses on the broader economic environment.",
         "framework": "Macro-Cycle Investing: Understand the current phase of the economic cycle (expansion, peak, contraction, trough). Invest in businesses that benefit from expansion and are resilient during downturns.",
-        "key_metrics": ["debt cycle", "economic machine", "paradigm", "deleveraging", "correlation", "debt cycle", "mechanism", "risk parity", "credit", "liquidity"],
+        "key_metrics": [
+            "debt cycle",
+            "economic machine",
+            "paradigm",
+            "deleveraging",
+            "correlation",
+            "debt cycle",
+            "mechanism",
+            "risk parity",
+            "credit",
+            "liquidity",
+        ],
     },
     "wood": {
         "name": "Cathie Wood",
         "philosophy": "Invest in companies with disruptive technologies and exponential growth potential. Focus on companies that are creating new markets and solving real problems. The key is understanding the technology and market potential.",
         "voice_style": "Visionary, optimistic, long-horizon. Uses future-focused analysis and exponential thinking. Focuses on disruptive technologies and market potential.",
         "framework": "Exponential Growth: Focus on companies with disruptive technologies and exponential growth potential. The key is understanding the technology and market potential.",
-        "key_metrics": ["disruption", "exponential", "Wright's Law", "S-curve", "TAM", "convergence", "2030", "market potential"],
+        "key_metrics": [
+            "disruption",
+            "exponential",
+            "Wright's Law",
+            "S-curve",
+            "TAM",
+            "convergence",
+            "2030",
+            "market potential",
+        ],
     },
     "greenblatt": {
         "name": "Joel Greenblatt",
         "philosophy": "Invest in companies with high return on capital and high earnings yield. Focus on companies with strong financials and low valuation. The key is using the Magic Formula to identify good companies.",
         "voice_style": "Minimal, formula-driven, matter-of-fact. Uses the Magic Formula to identify good companies. Focuses on financial metrics and simple calculations.",
         "framework": "Magic Formula: Use the Magic Formula to identify good companies. The key is high return on capital and high earnings yield.",
-        "key_metrics": ["return on capital", "earnings yield", "Magic Formula", "good company", "cheap price", "mean reversion", "ROIC", "EV/EBIT"],
+        "key_metrics": [
+            "return on capital",
+            "earnings yield",
+            "Magic Formula",
+            "good company",
+            "cheap price",
+            "mean reversion",
+            "ROIC",
+            "EV/EBIT",
+        ],
     },
     "bogle": {
         "name": "John Bogle",
         "philosophy": "Invest in index funds and diversified portfolios. Focus on low-cost, diversified investments. The key is long-term compounding and avoiding active management.",
         "voice_style": "Wise, humble, grandfatherly. Uses long-term perspective and diversified portfolios. Focuses on low-cost, diversified investments.",
         "framework": "Index Investing: Invest in low-cost index funds and diversified portfolios. The key is long-term compounding and avoiding active management.",
-        "key_metrics": ["costs", "index", "haystack", "stay the course", "90%", "speculation", "compounding", "simplicity", "diversification", "fees", "long-term"],
+        "key_metrics": [
+            "costs",
+            "index",
+            "haystack",
+            "stay the course",
+            "90%",
+            "speculation",
+            "compounding",
+            "simplicity",
+            "diversification",
+            "fees",
+            "long-term",
+        ],
     },
     "marks": {
         "name": "Howard Marks",
         "philosophy": "Invest in businesses with strong competitive advantages and long-term value. Focus on companies with durable competitive advantages and strong balance sheets. The key is understanding the business and its competitive landscape.",
         "voice_style": "Thoughtful, cyclical, risk-focused. Uses second-level thinking and cycle awareness. Focuses on risk control and contrarian positioning.",
         "framework": "Second-Level Thinking: Understand the business and its competitive landscape. Focus on companies with strong competitive advantages and long-term value.",
-        "key_metrics": ["second-level thinking", "cycle", "risk control", "durable competitive advantage", "long-term value", "competitive landscape"],
+        "key_metrics": [
+            "second-level thinking",
+            "cycle",
+            "risk control",
+            "durable competitive advantage",
+            "long-term value",
+            "competitive landscape",
+        ],
     },
     "ackman": {
         "name": "Bill Ackman",
         "philosophy": "Invest in companies with strong competitive advantages and long-term value. Focus on companies with durable competitive advantages and strong balance sheets. The key is understanding the business and its competitive landscape.",
         "voice_style": "Bold, activist, conviction-driven. Uses activist lens and catalyst focus. Focuses on simple businesses with clear improvement paths.",
         "framework": "Activist Value: Understand the business and its competitive landscape. Focus on companies with strong competitive advantages and long-term value.",
-        "key_metrics": ["activist", "catalyst", "simple business", "durable competitive advantage", "long-term value", "competitive landscape"],
+        "key_metrics": [
+            "activist",
+            "catalyst",
+            "simple business",
+            "durable competitive advantage",
+            "long-term value",
+            "competitive landscape",
+        ],
     },
 }
 
 
 class PersonaEngine:
     """Engine for generating persona-specific investment analyses."""
-    
+
     def __init__(self):
         self.gemini_client = GeminiClient()
 
@@ -3317,11 +4108,16 @@ class PersonaEngine:
         )
         prompt = template.format(company_name=company_name, metrics_block=metrics_block)
 
-        sector_risks = company_context.get("sector_risks") if isinstance(company_context, dict) else None
+        sector_risks = (
+            company_context.get("sector_risks")
+            if isinstance(company_context, dict)
+            else None
+        )
         risks_block = ""
         if isinstance(sector_risks, list) and sector_risks:
-            risks_block = "\n\nSector/Company-specific risks to consider:\n" + "\n".join(
-                f"- {risk}" for risk in sector_risks[:6] if risk
+            risks_block = (
+                "\n\nSector/Company-specific risks to consider:\n"
+                + "\n".join(f"- {risk}" for risk in sector_risks[:6] if risk)
             )
 
         prompt += (
@@ -3332,7 +4128,7 @@ class PersonaEngine:
             "Write a 2-3 sentence summary with your final verdict and the single biggest driver behind it."
         )
         return prompt
-    
+
     def generate_persona_analysis(
         self,
         persona_id: str,
@@ -3340,11 +4136,11 @@ class PersonaEngine:
         general_summary: str,
         ratios: Dict,
         financial_data: Dict,
-        target_length: Optional[int] = None
+        target_length: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Generate a persona-specific analysis for a company.
-        
+
         Args:
             persona_id: ID of the persona (e.g., 'buffett', 'bogle')
             company_name: Name of the company being analyzed
@@ -3352,7 +4148,7 @@ class PersonaEngine:
             ratios: Financial ratios dictionary
             financial_data: Raw financial data dictionary
             target_length: Optional target word count
-        
+
         Returns:
             Dictionary with persona analysis including summary, stance, reasoning, key_points
         """
@@ -3360,7 +4156,7 @@ class PersonaEngine:
 
         # Normalize persona ID
         normalized_id = normalize_persona_id(persona_id)
-        
+
         # Get persona info
         persona_info = PERSONAS.get(normalized_id)
         if not persona_info:
@@ -3369,20 +4165,22 @@ class PersonaEngine:
                 "summary": f"Unknown persona: {persona_id}",
                 "stance": "Hold",
                 "reasoning": "Persona not found",
-                "key_points": []
+                "key_points": [],
             }
-        
+
         # Extract company-specific context
-        company_context = extract_company_specific_context(company_name, financial_data, ratios)
-        
+        company_context = extract_company_specific_context(
+            company_name, financial_data, ratios
+        )
+
         # Get persona-relevant metrics
         metrics_context = extract_persona_relevant_metrics(
             persona_id=normalized_id,
             ratios=ratios,
             financial_data=financial_data,
-            company_name=company_name
+            company_name=company_name,
         )
-        
+
         # Build the persona prompt
         prompt = self._build_persona_prompt(
             persona_id=normalized_id,
@@ -3391,25 +4189,180 @@ class PersonaEngine:
             general_summary=general_summary,
             metrics_context=metrics_context,
             company_context=company_context,
-            target_length=target_length
+            target_length=target_length,
         )
-        
+
         # Generate using Gemini
         result = self.gemini_client.generate_premium_persona_view(
-            prompt=prompt,
-            persona_name=persona_info.get("name", persona_id)
+            prompt=prompt, persona_name=persona_info.get("name", persona_id)
         )
 
         # Post-process: sanitize output
         if result.get("summary"):
-            result["summary"] = sanitize_persona_output(result["summary"], company_context)
+            result["summary"] = sanitize_persona_output(
+                result["summary"], company_context
+            )
+
+            # --- Quality validator gate ---
+            summary_text = result["summary"]
+            quality_issues: List[str] = []
+
+            # 1. Incomplete sentences
+            incomplete = detect_incomplete_sentences(summary_text, normalized_id)
+            if incomplete:
+                quality_issues.extend(incomplete[:3])
+
+            # 2. Unsupported valuation claims
+            unsupported = detect_unsupported_valuation_claims(summary_text)
+            if unsupported:
+                quality_issues.extend(unsupported[:3])
+
+            # 3. Numerical contradictions
+            contradictions = detect_numerical_contradictions(summary_text)
+            if contradictions:
+                quality_issues.extend(contradictions[:3])
+
+            # 4. Internal data inconsistency
+            inconsistencies = detect_internal_data_inconsistency(summary_text)
+            if inconsistencies:
+                quality_issues.extend(inconsistencies[:3])
+
+            # 5. Financial data sanity (needs raw financial_data)
+            sanity = validate_financial_data_sanity(financial_data, summary_text)
+            if sanity:
+                quality_issues.extend(sanity[:3])
+
+            # 6. Authenticity score
+            auth_score, auth_feedback = calculate_authenticity_score(
+                normalized_id, summary_text, persona_info
+            )
+
+            if auth_score < 60:
+                quality_issues.extend(auth_feedback[:3])
+
+            # Log issues and attempt one rewrite if quality problems found
+            if quality_issues:
+                issue_summary = "; ".join(quality_issues[:5])
+                logger.warning(
+                    "Persona %s quality issues detected: %s",
+                    normalized_id,
+                    issue_summary[:300],
+                )
+
+                # Attempt one targeted rewrite
+                rewrite_hint = (
+                    f"The following quality issues were found in your analysis. "
+                    f"Please fix them while preserving your persona voice and analysis substance:\n"
+                    + "\n".join(f"- {issue}" for issue in quality_issues[:5])
+                )
+                rewrite_prompt = (
+                    f"{prompt}\n\n"
+                    f"QUALITY REWRITE INSTRUCTION:\n{rewrite_hint}\n\n"
+                    f"Here is your previous output that needs fixing:\n{summary_text}\n\n"
+                    f"Rewrite the analysis to fix the issues above. "
+                    f"Keep the same structure and persona voice."
+                )
+
+                rewrite_result = self.gemini_client.generate_premium_persona_view(
+                    prompt=rewrite_prompt,
+                    persona_name=persona_info.get("name", persona_id),
+                )
+
+                if rewrite_result.get("summary"):
+                    rewritten = sanitize_persona_output(
+                        rewrite_result["summary"], company_context
+                    )
+                    # Only accept rewrite if it actually reduced issues
+                    rewrite_issues: List[str] = []
+                    rewrite_issues.extend(
+                        detect_incomplete_sentences(rewritten, normalized_id)[:2]
+                    )
+                    rewrite_issues.extend(
+                        detect_unsupported_valuation_claims(rewritten)[:2]
+                    )
+                    rewrite_issues.extend(
+                        detect_numerical_contradictions(rewritten)[:2]
+                    )
+                    rewrite_issues.extend(
+                        detect_internal_data_inconsistency(rewritten)[:2]
+                    )
+
+                    if len(rewrite_issues) < len(quality_issues):
+                        result["summary"] = rewritten
+                        logger.info(
+                            "Persona %s quality rewrite accepted (%d -> %d issues)",
+                            normalized_id,
+                            len(quality_issues),
+                            len(rewrite_issues),
+                        )
+                    else:
+                        logger.info(
+                            "Persona %s quality rewrite rejected (no improvement: %d -> %d)",
+                            normalized_id,
+                            len(quality_issues),
+                            len(rewrite_issues),
+                        )
+
+            # Store quality metadata on result
+            result["quality_issues"] = quality_issues[:5] if quality_issues else []
+            result["authenticity_score"] = auth_score
+
             if target_length:
                 result["summary"] = enforce_summary_target_length(
                     result["summary"], target_length
                 )
-        
+
         return result
-    
+
+    def get_all_persona_ids(self) -> List[str]:
+        """Return all available persona IDs."""
+        return list(PERSONAS.keys())
+
+    def generate_multiple_personas(
+        self,
+        persona_ids: List[str],
+        company_name: str,
+        general_summary: str,
+        ratios: Dict,
+        financial_data: Optional[Dict] = None,
+        target_length: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Generate analyses for multiple personas.
+
+        Args:
+            persona_ids: List of persona IDs to generate for
+            company_name: Name of the company being analyzed
+            general_summary: Brief context about the company
+            ratios: Financial ratios dictionary
+            financial_data: Optional raw financial data dictionary
+            target_length: Optional target word count
+
+        Returns:
+            Dictionary mapping persona_id -> analysis result
+        """
+        results: Dict[str, Any] = {}
+        for pid in persona_ids:
+            try:
+                results[pid] = self.generate_persona_analysis(
+                    persona_id=pid,
+                    company_name=company_name,
+                    general_summary=general_summary,
+                    ratios=ratios,
+                    financial_data=financial_data or {},
+                    target_length=target_length,
+                )
+            except Exception as exc:
+                logger.error("Error generating persona %s: %s", pid, exc)
+                results[pid] = {
+                    "persona_name": pid,
+                    "summary": f"Error generating analysis: {str(exc)}",
+                    "stance": "Hold",
+                    "reasoning": "Generation failed",
+                    "key_points": [],
+                }
+        return results
+
     def _build_persona_prompt(
         self,
         persona_id: str,
@@ -3418,28 +4371,32 @@ class PersonaEngine:
         general_summary: str,
         metrics_context: str,
         company_context: Dict,
-        target_length: Optional[int] = None
+        target_length: Optional[int] = None,
     ) -> str:
         """Build the complete persona prompt."""
-        
+
         persona_name = persona_info.get("name", persona_id.title())
         philosophy = persona_info.get("philosophy", "")
         voice_style = persona_info.get("voice_style", "")
         framework = persona_info.get("framework", "")
         key_metrics = persona_info.get("key_metrics", [])
-        
+
         # Get voice anchors for authenticity
         voice_anchors = PERSONA_VOICE_ANCHORS.get(persona_id, {})
         must_use_phrases = voice_anchors.get("must_use_phrases", [])
         encouraged_phrases = voice_anchors.get("encouraged_phrases", [])
         never_says = voice_anchors.get("never_says", [])
-        
+
         # Default target length
         word_target = target_length if target_length else 750
-        
+
         # Format company context
-        company_context_str = format_company_context_for_prompt(company_context) if company_context else ""
-        
+        company_context_str = (
+            format_company_context_for_prompt(company_context)
+            if company_context
+            else ""
+        )
+
         prompt = f"""You ARE {persona_name}. Write EXACTLY as {persona_name} would speak - with their exact vocabulary, cadence, and philosophical lens.
 
 PERSONA PHILOSOPHY:
@@ -3452,12 +4409,12 @@ ANALYTICAL FRAMEWORK:
 {framework}
 
 KEY METRICS TO ANALYZE:
-{', '.join(key_metrics)}
+{", ".join(key_metrics)}
 
 AUTHENTICITY REQUIREMENTS:
-- You MUST naturally use these phrases: {', '.join(must_use_phrases[:3])}
-- You are encouraged to use: {', '.join(encouraged_phrases[:5])}
-- You MUST NEVER say: {', '.join(never_says[:5])}
+- Incorporate these phrases where they fit naturally: {", ".join(must_use_phrases[:3])}
+- You are encouraged to use: {", ".join(encouraged_phrases[:5])}
+- You MUST NEVER say: {", ".join(never_says[:5])}
 
 COMPANY: {company_name}
 
@@ -3475,56 +4432,27 @@ MANDATORY 7-SECTION STRUCTURE (OUTPUT IN EXACT ORDER - CRITICAL):
 You MUST output these 7 sections in EXACTLY this order. Do not skip, reorder, combine, or add extra sections.
 
 ## 1. Financial Health Rating
-[ONE LINE ONLY in YOUR voice: State your overall assessment with stance (bullish/bearish/neutral) and conviction (high/medium/low).
+[ONE LINE ONLY in YOUR voice: state your overall assessment with stance and conviction.
 Example: "From my perspective, this is a HOLD with medium conviction - strong business but rich valuation."]
 
 ## 2. Executive Summary
-[2-3 paragraphs in YOUR unique voice:
-- Your conviction and why
-- State ONE clear spine for the memo: operating strength (pricing/margins) versus cash conversion durability (OCF→FCF, capex, working capital), and keep the thesis aligned to it
-- Core investment thesis through YOUR analytical lens
-- What matters most to YOU as {persona_name}
-- Conviction tone MUST match the action: if your stance is PASS/WATCH/HOLD, explicitly explain the restraint (what blocks action now) and temper language accordingly
-- Do NOT describe your process ("here is how I think...", "my framework is..."). State conclusions; let structure imply process
-- Include ONE explicit "what changed vs prior comparable period" sentence (QoQ for quarterly, YoY for annual) and do not repeat that same change later
-Write in flowing prose. NO bullet lists of "Monitor X".]
+[Write 2-3 paragraphs of flowing prose stating your conviction and core thesis through YOUR analytical lens. Establish ONE clear spine for the memo and keep every later section aligned to it. If your stance is PASS/WATCH/HOLD, explain the restraint. State conclusions — do not describe your process. Mention the single most important change versus the prior comparable period, then move on; Sections 3 and 4 will handle the details.]
 
 ## 3. Financial Performance
-[Analyze through YOUR lens - what metrics matter to {persona_name}?
-- Cite specific figures with $ and %
-- Explain what the numbers MEAN, not just what they ARE
-- If operating margin and net margin diverge significantly, explain WHY (one-time items, non-operating income, etc.)
-- Explicitly compare this period vs the prior comparable period (QoQ for quarterly, YoY for annual): what improved, what deteriorated, and why
-Every metric must have interpretation, not just data.]
+[Analyze the financials through YOUR lens. Cite specific figures with $ and % and interpret each one — what does the number mean, not just what it is. Compare to the prior comparable period (QoQ for quarterly, YoY for annual): what improved, what deteriorated, and why. Use only 3-5 key figures in flowing prose; leave the rest for Key Metrics. Do not repeat figures already used in the Health Rating or Executive Summary.]
 
 ## 4. Management Discussion & Analysis
-[Evaluate through YOUR framework:
-- Capital allocation - does it align with {persona_name}'s principles?
-- Earnings quality concerns
-- What would YOU want management to do differently?
-- Explicitly call out what changed versus the prior comparable period in posture (capex pacing, cost discipline, capital return) and whether numbers corroborate it
-Do NOT speculate about "management commentary" not in filings.]
+[Evaluate management's capital allocation and earnings quality through YOUR framework. What would you want management to do differently? Focus on management decisions and posture — do not re-state the financial results already covered in Section 3. Do NOT speculate about "management commentary" not in filings.]
 
 ## 5. Risk Factors
-[3-5 SPECIFIC risks that concern YOU as {persona_name}:
-- Each risk must have a clear name and 2-4 sentence explanation
-- Be company-specific, not generic
-- Quantify impact where possible
-- Include explicit weighting: severity/likelihood (High/Med/Low) and one sentence on why it does NOT dominate your thesis yet (and what would make it dominate)
-- Include a change signal: one concrete sign the risk is getting worse versus the prior comparable period
-Format: "**Risk Name**: Explanation."
-Do NOT use generic risks without specific context.]
+[Name 3-5 company-specific risks in YOUR voice. Quantify impact where possible. Note whether each risk is worsening versus the prior period. This is the ONLY section for risk enumeration — Sections 2 and 4 should not list risks. No generic macro risks that apply to every company.]
 
 ## 6. Key Metrics
-[Write 5 specific metrics YOU would track, explained in PROSE:
-"I would watch [metric] because [reason]..."
-Do NOT use bullet points or "Monitor X" format.
-Write complete sentences explaining WHY each metric matters to your investment thesis.]
+[In prose, discuss 5 metrics you would track and why each matters to your thesis. Vary sentence structure — do not repeat the same "I would watch X because Y" template five times. Write complete sentences, not bullet points.]
 
 ## 7. Closing Takeaway
-[Your final verdict in YOUR authentic voice:
-- 2-3 sentences synthesizing your view
-- Clear stance and what would change it
+[Your final verdict in YOUR authentic voice — EXACTLY 3-4 sentences, no more. Each sentence MUST make a unique point; any sentence that rephrases or repeats an earlier one will be deleted. Sentence 1: your stance and primary reasoning. Sentence 2: one concrete metric anchor. Sentence 3: the single condition that would change your mind. Sentence 4 (optional): a nuance or second driver. ANY output beyond 4 sentences will be discarded.
+FORBIDDEN: parenthetical asides, qualifier chains like "(key swing factor)", generic watch-list filler, methodology notes about "how to assess" anything.
 End with these exact lines:
 
 STANCE: [Buy/Hold/Sell/Pass/Watch]
@@ -3546,8 +4474,13 @@ CRITICAL RULES (VIOLATIONS WILL BE REJECTED):
 11. EVERY section must have substantive content - no filler
 12. Each section must be COMPLETE - no trailing "but...", "although...", or unfinished thoughts
 13. The FINAL output must end with "CONVICTION: [level]" - nothing after that
+14. Do not repeat the same dollar figure or percentage in more than 2 sections — reference it by context elsewhere
+15. Do not begin more than 2 sentences per section with the same word
+16. Every sentence must add a new fact, mechanism, or conclusion — delete padding sentences that apply to every company
+17. Do not use parenthetical asides to qualify your stance — write clean prose
+18. Do not write generic financial axioms (e.g., "cash conversion can diverge from earnings through...") that are true for every company
 """
-        
+
         return prompt
 
 
@@ -3559,6 +4492,7 @@ def get_persona_engine() -> PersonaEngine:
 # =============================================================================
 # Backwards-compatible exports used by tests
 # =============================================================================
+
 
 # Public alias expected by tests.
 def _ordered_unique(values: List[str]) -> List[str]:
@@ -3760,7 +4694,9 @@ PERSONA_PROMPT_TEMPLATES: Dict[str, str] = {
 }
 
 
-def _detect_generic_section_headers(text: str, *, allow_markdown_headers: Optional[List[str]] = None) -> List[str]:
+def _detect_generic_section_headers(
+    text: str, *, allow_markdown_headers: Optional[List[str]] = None
+) -> List[str]:
     allow = {h.strip().lower() for h in (allow_markdown_headers or [])}
     issues: List[str] = []
     for line in text.splitlines():
@@ -3772,17 +4708,28 @@ def _detect_generic_section_headers(text: str, *, allow_markdown_headers: Option
             header = stripped.lstrip("#").strip().lower()
             if header in allow:
                 continue
-            if header in {"summary", "executive summary", "key risks", "investment thesis"}:
+            if header in {
+                "summary",
+                "executive summary",
+                "key risks",
+                "investment thesis",
+            }:
                 issues.append(f"Generic section header: '{stripped}'")
             continue
         # Colon-style headers like "Executive Summary: ..."
-        m = re.match(r"^(executive summary|key risks|investment thesis|summary)\s*:\s*", stripped, re.IGNORECASE)
+        m = re.match(
+            r"^(executive summary|key risks|investment thesis|summary)\s*:\s*",
+            stripped,
+            re.IGNORECASE,
+        )
         if m:
             issues.append(f"Generic section header: '{m.group(1)}'")
     return issues
 
 
-def validate_persona_output(persona_id: str, output: str, persona: Dict[str, Any]) -> Tuple[bool, List[str]]:
+def validate_persona_output(
+    persona_id: str, output: str, persona: Dict[str, Any]
+) -> Tuple[bool, List[str]]:
     """Lightweight validator used by tests to enforce persona distinctiveness."""
     issues: List[str] = []
     text = (output or "").strip()
@@ -3792,9 +4739,13 @@ def validate_persona_output(persona_id: str, output: str, persona: Dict[str, Any
     lower = text.lower()
 
     # Reject rating/score patterns
-    if re.search(r"\b\d{1,3}\s*/\s*100\b", text) or re.search(r"\b\d{1,2}\s*/\s*10\b", text):
+    if re.search(r"\b\d{1,3}\s*/\s*100\b", text) or re.search(
+        r"\b\d{1,2}\s*/\s*10\b", text
+    ):
         issues.append("Rating/score detected")
-    if re.search(r"\b(score|rating|grade)\b\s*:", lower) or re.search(r"\b\d+\s+out\s+of\s+\d+\b", lower):
+    if re.search(r"\b(score|rating|grade)\b\s*:", lower) or re.search(
+        r"\b\d+\s+out\s+of\s+\d+\b", lower
+    ):
         issues.append("Rating/score detected")
 
     # Reject generic equity research headers
@@ -3810,11 +4761,24 @@ def validate_persona_output(persona_id: str, output: str, persona: Dict[str, Any
     if pid == "marks":
         if not any(term in lower for term in ["cycle", "pendulum", "second-level"]):
             issues.append("Missing Marks cycle/pendulum/second-level thinking")
-        if any(term in lower for term in ["i demand", "demand", "investigation", "transparency"]):
+        if any(
+            term in lower
+            for term in ["i demand", "demand", "investigation", "transparency"]
+        ):
             issues.append("Confrontational tone not allowed for Marks")
 
     if pid == "munger":
-        if any(term in lower for term in ["i believe", "could", "might", "potentially", "seems", "in my opinion"]):
+        if any(
+            term in lower
+            for term in [
+                "i believe",
+                "could",
+                "might",
+                "potentially",
+                "seems",
+                "in my opinion",
+            ]
+        ):
             issues.append("Hedge/believe language not allowed for Munger")
 
     if pid == "lynch":
@@ -3833,17 +4797,36 @@ def validate_persona_output(persona_id: str, output: str, persona: Dict[str, Any
         words = len(text.split())
         if words > 200:
             issues.append(f"Too verbose: {words} words (max 200)")
-        if any(term in lower for term in ["i worry", "i remain cautious", "i am concerned", "excited", "compelling story"]):
+        if any(
+            term in lower
+            for term in [
+                "i worry",
+                "i remain cautious",
+                "i am concerned",
+                "excited",
+                "compelling story",
+            ]
+        ):
             issues.append("Emotional/narrative language not allowed for Greenblatt")
-        if "management should" in lower or "should provide" in lower or "roi" in lower and "provide" in lower:
+        if (
+            "management should" in lower
+            or "should provide" in lower
+            or "roi" in lower
+            and "provide" in lower
+        ):
             issues.append("Unrealistic management disclosure request")
-        if any(term in lower for term in ["what inning", "the story", "wall street is missing"]):
+        if any(
+            term in lower
+            for term in ["what inning", "the story", "wall street is missing"]
+        ):
             issues.append("Lynch contamination detected")
 
     return (len(issues) == 0), issues
 
 
-def validate_persona_output_strict(persona_id: str, output: str, persona: Dict[str, Any]) -> Tuple[bool, List[str]]:
+def validate_persona_output_strict(
+    persona_id: str, output: str, persona: Dict[str, Any]
+) -> Tuple[bool, List[str]]:
     """Stricter variant used by tests; allows only a small whitelist of extra headers."""
     issues: List[str] = []
     text = (output or "").strip()
@@ -3863,12 +4846,16 @@ def validate_persona_output_strict(persona_id: str, output: str, persona: Dict[s
             continue
         filtered.append(issue)
     issues = filtered
-    issues.extend(_detect_generic_section_headers(text, allow_markdown_headers=[allowed]))
+    issues.extend(
+        _detect_generic_section_headers(text, allow_markdown_headers=[allowed])
+    )
 
     return (len(issues) == 0), issues
 
 
-def generate_closing_persona_message(persona_id: str, company_name: str, ratios: Dict[str, Any]) -> str:
+def generate_closing_persona_message(
+    persona_id: str, company_name: str, ratios: Dict[str, Any]
+) -> str:
     """Generate a short persona-flavored closing message (used by frontend/dashboard tests)."""
     if not company_name:
         return ""
@@ -3889,12 +4876,18 @@ def generate_closing_persona_message(persona_id: str, company_name: str, ratios:
     if isinstance(fcf, (int, float)) and fcf and fcf > 0:
         quality_terms.append("cash generative")
 
-    quality_clause = " and ".join(quality_terms) if quality_terms else "a mixed quality profile"
-    is_high_quality = len(quality_terms) >= 2 and not (isinstance(fcf, (int, float)) and fcf < 0)
+    quality_clause = (
+        " and ".join(quality_terms) if quality_terms else "a mixed quality profile"
+    )
+    is_high_quality = len(quality_terms) >= 2 and not (
+        isinstance(fcf, (int, float)) and fcf < 0
+    )
     valuation_hot = isinstance(pe, (int, float)) and pe >= 40
 
     if pid == "marks":
-        quality_prefix = "an exceptional, high-quality" if is_high_quality else "a mixed-quality"
+        quality_prefix = (
+            "an exceptional, high-quality" if is_high_quality else "a mixed-quality"
+        )
         valuation_line = (
             "But the market has likely priced in a lot of perfection already, so the risk/reward asymmetry is not favorable today."
             if valuation_hot

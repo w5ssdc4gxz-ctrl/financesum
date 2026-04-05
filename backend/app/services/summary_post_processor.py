@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
 
-from app.services.repetition_guard import RepetitionReport, check_repetition, detect_cross_section_dollar_figures, strip_repeated_sentences
+from app.services.repetition_guard import RepetitionReport, check_repetition, detect_cross_section_dollar_figures
 from app.services.risk_evidence import assess_risk_overlap
 from app.services.summary_budget_controller import (
     CANONICAL_SECTION_ORDER,
@@ -192,10 +192,7 @@ _SECTION_MEMORY_PROMISE_RE = re.compile(
     r"\b(delivered|on track|missed|new commitment|commitment|commitments|credibility|proof point|watchpoint)\b",
     re.IGNORECASE,
 )
-_EXPLICIT_STANCE_RE = re.compile(
-    r"(?<![A-Za-z-])(buy|hold|sell)(?![A-Za-z-])",
-    re.IGNORECASE,
-)
+_EXPLICIT_STANCE_RE = re.compile(r"\b(buy|hold|sell)\b", re.IGNORECASE)
 _HEALTH_NEGATIVE_RE = re.compile(
     r"\b(pressure|strained|weak(?:ening)?|deteriorat(?:e|es|ing|ion)|funding risk|liquidity risk|refinancing|leverage pressure|balance-sheet pressure)\b",
     re.IGNORECASE,
@@ -425,20 +422,6 @@ def _strip_company_prefix_from_risk_name(name: str, company_name: str) -> str:
     return stripped
 
 
-def _repair_punctuation(text: str) -> str:
-    """Fix common LLM punctuation artifacts."""
-    result = text
-    # Fix ".:","!:","?:" → just the first punctuation
-    result = re.sub(r'([.!?])\s*:', r'\1', result)
-    # Fix double periods ".."
-    result = re.sub(r'\.{2,}', '.', result)
-    # Fix ". ." with space
-    result = re.sub(r'\.\s+\.', '.', result)
-    # Fix ",." or ",!"
-    result = re.sub(r',\s*([.!?])', r'\1', result)
-    return result
-
-
 _SELF_REFERENCE_RE = re.compile(
     r"(?:"
     r"[Tt]his sets up the \w[\w\s]* section"
@@ -450,73 +433,10 @@ _SELF_REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Instruction leakage — prompt/meta-instructions echoed verbatim in output.
-# Catches patterns that slip through all three pipeline paths.
-_INSTRUCTION_LEAK_RE = re.compile(
-    r"\b(?:"
-    # "should frame X as" / "should highlight" / "should emphasize"
-    r"(?:you\s+)?should\s+(?:frame|highlight|emphasize|focus\s+on|prioritize|avoid|include|mention|note)\b"
-    r"|(?:this|the)\s+(?:financial health rating|executive summary|financial performance|"
-    r"management discussion(?:\s*&\s*analysis)?|md&a|risk factors|closing takeaway|key metrics)\s+"
-    r"(?:should|must|needs?\s+to)\b"
-    # Direct prompt artifacts
-    r"|user instruction|section focus|style contract|quote mandate|citation mandate"
-    r"|return only the section body|per the guidelines|as instructed"
-    # "trying to accomplish" / "this memo will/should/must"
-    r"|trying to accomplish|this memo (?:will|should|must)\b"
-    r"|the summary should\b"
-    r")",
-    re.IGNORECASE,
-)
-
-# Aha insight signal — Executive Summary should contain a non-obvious reframe.
-_AHA_SIGNAL_RE = re.compile(
-    r"\b("
-    r"the real implication|the underappreciated point|"
-    r"what the market may be missing|what matters now|"
-    r"this means|that means|implies that|"
-    r"most investors would|counter-?intuitiv|"
-    r"what .{0,20}actually shows|"
-    r"the non-obvious|the overlooked|the hidden"
-    r")\b",
-    re.IGNORECASE,
-)
-
-# Casual first-person framing in Closing Takeaway (banned without explicit persona).
-_CASUAL_FIRST_PERSON_RE = re.compile(
-    r"\b(?:"
-    r"for my (?:own )?portfolio|in my portfolio|"
-    r"I would (?:buy|sell|hold)|"
-    r"I.{0,10}(?:am|would be) (?:buying|selling|holding)"
-    r")\b",
-    re.IGNORECASE,
-)
-
-# Regulatory minutiae in risk factors — disclosure/compliance/accounting that
-# doesn't affect revenue, margins, or growth.
-_REGULATORY_MINUTIAE_RE = re.compile(
-    r"\b("
-    r"fin[- ]?sa|fin[- ]?ia|"
-    r"disclosure\s+requirements?|"
-    r"income\s+tax\s+(?:reporting|disclosure)|"
-    r"accounting\s+standard\s+(?:adoption|change)|"
-    r"internal[- ]control\s+(?:over\s+financial\s+reporting|deficienc)|"
-    r"audit\s+committee|"
-    r"forward[- ]looking\s+statement\s+disclaimer|"
-    r"asu\s+\d{4}|asc\s+\d{3}|ifrs\s+\d+"
-    r")\b",
-    re.IGNORECASE,
-)
-
 
 def _detect_self_references(text: str) -> List[str]:
     """Return self-referential meta-language phrases found in *text*."""
     return [m.group(0) for m in _SELF_REFERENCE_RE.finditer(text or "")]
-
-
-def _detect_instruction_leakage(text: str) -> List[str]:
-    """Return instruction-leakage phrases found in *text*."""
-    return [m.group(0) for m in _INSTRUCTION_LEAK_RE.finditer(text or "")]
 
 
 def _validate_risk_factors(
@@ -545,9 +465,9 @@ def _validate_risk_factors(
     # returning immediately; the count mismatch is appended at the end.
     _deferred_count_mismatch: list[tuple[str, str]] = []
     if len(items) != expected_count:
-        min_viable_items = min(2, max(1, int(expected_count or 0)))
-        can_quality_check_present_items = len(items) >= int(min_viable_items)
-        if can_quality_check_present_items:
+        per_risk = max(1, int(risk_budget_words) // max(1, expected_count))
+        is_borderline = len(items) == expected_count - 1 and len(items) >= 2
+        if is_borderline:
             _deferred_count_mismatch.append((
                 "risk_schema",
                 f"Risk Factors has {len(items)} structured risk(s); expected exactly {expected_count} for this budget.",
@@ -557,7 +477,6 @@ def _validate_risk_factors(
                 ("risk_schema", f"Risk Factors has {len(items)} structured risk(s); expected exactly {expected_count} for this budget.")
             ]
 
-    per_risk_budget = max(1, int(risk_budget_words) // max(1, expected_count))
     excerpt_terms = {
         token
         for token in re.findall(r"[a-z]{5,}", (risk_factors_excerpt or "").lower())
@@ -622,19 +541,6 @@ def _validate_risk_factors(
                 f"Risk name '{name}' is built from financial metrics, not a business event. "
                 f"Name a specific product, segment, customer, geography, or regulation at risk.",
             ))
-        # Regulatory minutiae that doesn't affect revenue/margins/growth
-        if _REGULATORY_MINUTIAE_RE.search(name) or _REGULATORY_MINUTIAE_RE.search(body_text):
-            has_business_impact = bool(re.search(
-                r"\b(revenue|margin|growth|earnings|cash flow|profitability|competitive)\b",
-                body_text, re.IGNORECASE,
-            ))
-            if not has_business_impact:
-                failures.append((
-                    "risk_specificity",
-                    f"Risk '{name}' is regulatory minutiae (disclosure/compliance/accounting) "
-                    f"that does not affect revenue, margins, or growth. Replace with a "
-                    f"business-critical risk.",
-                ))
         sentence_count = _sentence_count(body_text)
         if not (
             int(shape.per_risk_min_sentences or 2)
@@ -678,17 +584,14 @@ def _validate_risk_factors(
                 "risk_schema",
                 f"Risk Factors are too thin under '{name}'. Expand each risk with enough sentence depth to explain the exposure and business impact.",
             ))
-        # At tight per-risk budgets (<90 words), mechanism/transmission misses
-        # are advisory — the LLM may not have enough room to hit every keyword.
-        _depth_code = "risk_quality" if per_risk_budget < 90 else "risk_schema"
         if not _MECHANISM_RE.search(body_text):
             failures.append((
-                _depth_code,
+                "risk_schema",
                 f"Risk Factors under '{name}' need a concrete mechanism (what causes the risk and how it hits the business).",
             ))
         if not _TRANSMISSION_RE.search(body_text):
             failures.append((
-                _depth_code,
+                "risk_schema",
                 f"Risk Factors under '{name}' must explain the financial impact path into revenue, margins, cash flow, or balance-sheet flexibility.",
             ))
         if not _EARLY_WARNING_RE.search(body_text):
@@ -1129,14 +1032,6 @@ def validate_summary(
             "Remove all references to the memo's own sections."
         )
 
-    # Detect instruction leakage (prompt text echoed in output)
-    instruction_leaks = _detect_instruction_leakage(working_text)
-    if instruction_leaks:
-        report.global_failures.append(
-            f"Instruction leakage detected: {'; '.join(instruction_leaks[:3])}. "
-            "Remove all meta-instructions from the output."
-        )
-
     # Management voice validation for MD&A
     mda_body = (sections.get("Management Discussion & Analysis") or "").strip()
     if mda_body and count_words(mda_body) >= 100:
@@ -1203,51 +1098,6 @@ def validate_summary(
                     severity=1.5,
                 )
             )
-
-    # Executive Summary opening quality check
-    exec_body_for_opening = (sections.get("Executive Summary") or "").strip()
-    if exec_body_for_opening:
-        first_sentence = (exec_body_for_opening.split(".")[0] or "").strip()
-        if re.match(r'^\s*["\u201c]', first_sentence):
-            report.section_failures.append(
-                SectionValidationFailure(
-                    section_name="Executive Summary",
-                    code="weak_exec_opening",
-                    message=(
-                        "Executive Summary opens with a quote. The first sentence must be "
-                        "an analytical claim about the company, not a quote."
-                    ),
-                    severity=2.8,
-                )
-            )
-        elif _INSTRUCTION_LEAK_RE.search(first_sentence):
-            report.section_failures.append(
-                SectionValidationFailure(
-                    section_name="Executive Summary",
-                    code="weak_exec_opening",
-                    message=(
-                        "Executive Summary opens with instruction leakage. The first sentence "
-                        "must be a core insight about the company."
-                    ),
-                    severity=3.0,
-                )
-            )
-
-    # Casual first-person in Closing Takeaway (banned without explicit persona)
-    closing_body = (sections.get("Closing Takeaway") or "").strip()
-    if closing_body and _CASUAL_FIRST_PERSON_RE.search(closing_body):
-        report.section_failures.append(
-            SectionValidationFailure(
-                section_name="Closing Takeaway",
-                code="casual_first_person",
-                message=(
-                    "Closing Takeaway uses casual first-person framing "
-                    "('For my own portfolio' or similar). Use institutional "
-                    "third-person analyst voice unless a persona was requested."
-                ),
-                severity=2.5,
-            )
-        )
 
     report.section_failures.extend(_validate_stance_location_and_consistency(sections))
     health_alignment_failure = _validate_health_closing_alignment(sections)
@@ -1329,25 +1179,17 @@ def _is_soft_pass(
         # Boilerplate quotes: never accept — always hard-fail
         if code == "boilerplate_quotes":
             return False
-        # Weak exec opening: never accept — must fix
-        if code == "weak_exec_opening":
-            return False
-        # Casual first-person: never accept — must fix
-        if code == "casual_first_person":
-            return False
-        # Aha insight: advisory only — never blocks pass or triggers regen
-        if code == "missing_aha_insight":
-            continue
         # Section balance: accept if within multiplied tolerance.
-        # Risk Factors naturally seesaws with Closing Takeaway and is most
-        # affected by thin filings — use 4x tolerance.  Closing uses 3x.
+        # Risk Factors and Closing Takeaway naturally seesaw — when Risk is
+        # under, the surplus flows to Closing.  Use a wider 3x multiplier for
+        # these sections to accept this expected variance.
         if code in {"section_budget_under", "section_budget_over"}:
             budget = int(failure.budget_words or 0)
             actual = int(failure.actual_words or 0)
             if budget <= 0:
                 return False
             tolerance = section_budget_tolerance_words(failure.section_name, budget)
-            multiplier = 4 if failure.section_name == "Risk Factors" else (3 if failure.section_name == "Closing Takeaway" else 2)
+            multiplier = 3 if failure.section_name in {"Risk Factors", "Closing Takeaway"} else 2
             if abs(actual - budget) > tolerance * multiplier:
                 return False
             continue
@@ -1463,133 +1305,6 @@ def _inject_soft_quality_failures(validation: SummaryValidationReport, text: str
                         severity=2.2,
                     )
                 )
-    # Aha insight — soft signal for regen only (does not block passed)
-    sections_map = _extract_sections(text)
-    exec_body = (sections_map.get("Executive Summary") or "").strip()
-    if exec_body and count_words(exec_body) >= 60:
-        if not _AHA_SIGNAL_RE.search(exec_body):
-            if not any(
-                f.section_name == "Executive Summary" and f.code == "missing_aha_insight"
-                for f in validation.section_failures
-            ):
-                validation.section_failures.append(
-                    SectionValidationFailure(
-                        section_name="Executive Summary",
-                        code="missing_aha_insight",
-                        message=(
-                            "Executive Summary lacks a non-obvious insight or reframe. "
-                            "Include at least one observation structured as: "
-                            "'Most investors would conclude X, but this filing shows Y because Z.'"
-                        ),
-                        severity=1.6,
-                    )
-                )
-
-
-_ARROW_ROW_RE = re.compile(
-    r"^\s*→\s*(?P<name>[^:]+?)\s*:\s*(?P<value>\S[\s\S]{0,80}?)\s*$",
-    re.MULTILINE,
-)
-_GENERIC_PROSE_RE = re.compile(
-    r"\b(was|were|increased|decreased|grew|declined|strong|weak|because|due to|demand|customers?|performed|good sign|well during|efficient)\b",
-    re.IGNORECASE,
-)
-_GRID_MARKER_RE = re.compile(
-    r"^(DATA_GRID_START|DATA_GRID_END|What Matters:|- )",
-)
-
-
-def _is_key_metrics_prose(body: str) -> bool:
-    """Return True if Key Metrics body looks like prose instead of structured data."""
-    if not body:
-        return False
-    lines = [l.strip() for l in body.splitlines() if l.strip()]
-    if not lines:
-        return False
-
-    arrow_lines = [l for l in lines if l.startswith("→")]
-    prose_line_count = 0
-    structural_line_count = 0
-
-    for line in lines:
-        if line.startswith("→"):
-            continue
-        if _GRID_MARKER_RE.match(line):
-            structural_line_count += 1
-        elif _GENERIC_PROSE_RE.search(line) and len(line.split()) > 5:
-            prose_line_count += 1
-
-    # Pure structural lines (markers + bullets) with arrow data = fine
-    non_arrow_non_structural = len(lines) - len(arrow_lines) - structural_line_count
-
-    if prose_line_count >= 1 and len(arrow_lines) < 3:
-        return True
-    if prose_line_count > max(0, len(lines) // 3):
-        return True
-    return False
-
-
-def _repair_key_metrics(text: str, metrics_lines: str) -> str:
-    """Repair Key Metrics section if it contains prose instead of structured data.
-
-    Strategy:
-    1. Extract any valid → rows from the existing body
-    2. Parse numeric values from remaining lines
-    3. Prepend any pre-formatted metrics_lines as fallback data rows
-    4. Replace the section body with the repaired version
-    """
-    body = _extract_section_body(text, "Key Metrics")
-    if not body or not _is_key_metrics_prose(body):
-        return text
-
-    # Keep valid arrow rows
-    existing_arrow = _ARROW_ROW_RE.findall(body)
-    kept_rows = [f"→ {name}: {value}" for name, value in existing_arrow if name and value]
-
-    # Extract any "What Matters:" lines
-    what_matters_lines: List[str] = []
-    for line in body.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("- ") and len(stripped) < 120:
-            what_matters_lines.append(stripped)
-            if len(what_matters_lines) >= 4:
-                break
-
-    # Pre-formatted metrics_lines as fallback rows
-    fallback_rows: List[str] = []
-    if metrics_lines:
-        for line in metrics_lines.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("- ") and ":" in stripped:
-                # Convert "- MetricName: value" to "→ MetricName: value"
-                parts = stripped[2:].split(":", 1)
-                if len(parts) == 2 and parts[1].strip():
-                    fallback_rows.append(f"→ {parts[0].strip()}: {parts[1].strip()}")
-
-    # Merge: kept rows first, then fallback rows (avoid duplicates by name)
-    seen_names: set = set()
-    all_rows: List[str] = []
-    for row in kept_rows + fallback_rows:
-        match = _ARROW_ROW_RE.match(row)
-        if match:
-            name = (match.group("name") or "").strip().lower()
-            if name not in seen_names:
-                seen_names.add(name)
-                all_rows.append(row)
-        elif row not in [r.lower() for r in kept_rows]:
-            all_rows.append(row)
-
-    if not all_rows:
-        return text  # nothing to repair with
-
-    header_section = ""
-    if what_matters_lines:
-        header_lines = [l for l in what_matters_lines if len(l.split()) < 20][:4]
-        if header_lines:
-            header_section = "What Matters:\n" + "\n".join(header_lines) + "\n"
-
-    repaired = f"DATA_GRID_START\n{header_section}" + "\n".join(all_rows) + "\nDATA_GRID_END"
-    return _replace_section_body(text, "Key Metrics", repaired)
 
 
 def post_process_summary(
@@ -1602,16 +1317,11 @@ def post_process_summary(
     max_retries: int = 12,
     max_retries_per_section: int = 3,
     regenerate_section_fn: Optional[Callable[..., str]] = None,
-    metrics_lines: str = "",
 ) -> PostProcessResult:
     """Run the validator-driven post-processing pipeline."""
     working_text = str(text or "").strip()
     retries = 0
     section_retry_counts: Dict[str, int] = {}
-
-    # Pre-flight: repair Key Metrics if it contains prose instead of data
-    if metrics_lines:
-        working_text = _repair_key_metrics(working_text, metrics_lines)
 
     while retries < int(max_retries):
         validation = validate_summary(
@@ -1684,28 +1394,6 @@ def post_process_summary(
         section_retry_counts[section_name] = int(section_retry_counts.get(section_name, 0) or 0) + 1
         retries += 1
 
-    if regenerate_section_fn is None and retries == 0:
-        final_validation = validate_summary(
-            working_text,
-            target_words=target_words,
-            section_budgets=section_budgets,
-            include_health_rating=include_health_rating,
-            risk_factors_excerpt=risk_factors_excerpt,
-        )
-        _inject_soft_quality_failures(final_validation, working_text)
-        violations = list(final_validation.global_failures) + [
-            failure.message
-            for failure in final_validation.section_failures
-            if not _is_advisory_risk_quality_failure(failure)
-        ]
-        return PostProcessResult(
-            text=working_text,
-            passed=final_validation.passed,
-            violations=violations,
-            retries=retries,
-            validation_report=final_validation,
-        )
-
     final_validation = validate_summary(
         working_text,
         target_words=target_words,
@@ -1751,29 +1439,6 @@ def post_process_summary(
                     ) + 1
                     retries += 1
 
-    # Strip duplicate sentences before final trim
-    working_text = strip_repeated_sentences(working_text)
-
-    # Punctuation cleanup — fix LLM punctuation artifacts
-    working_text = _repair_punctuation(working_text)
-
-    # Seal each section at a sentence boundary before global trim
-    for _sec_name, _sec_body in _extract_sections(working_text).items():
-        if _sec_name == "Key Metrics":
-            continue
-        if _sec_body and not _sec_body.rstrip().endswith((".", "!", "?")):
-            # Trim back to last sentence boundary
-            _last_boundary = max(
-                _sec_body.rfind("."),
-                _sec_body.rfind("!"),
-                _sec_body.rfind("?"),
-            )
-            if _last_boundary > 0:
-                _sealed = _sec_body[: _last_boundary + 1]
-            else:
-                _sealed = _sec_body.rstrip() + "."
-            working_text = _replace_section_body(working_text, _sec_name, _sealed)
-
     working_text = clean_ending(
         working_text,
         target_words,
@@ -1816,7 +1481,6 @@ def _select_regeneration_target(
         if (
             failure.section_name not in exhausted
             and not _is_advisory_risk_quality_failure(failure)
-            and getattr(failure, "code", "") != "missing_aha_insight"
         )
     ]
     priorities = {
@@ -1825,8 +1489,6 @@ def _select_regeneration_target(
         "risk_specificity": 0,
         "conflicting_stance": 0,
         "stance_outside_closing": 0,
-        "weak_exec_opening": 0,
-        "casual_first_person": 0,
         "health_closing_misalignment": 1,
         "insufficient_management_voice": 1,
         "insufficient_filing_grounding": 1,

@@ -63,13 +63,13 @@ def test_section_word_budgets_follow_v2_distribution_at_550_words() -> None:
 
     assert sum(budgets.values()) == 550 - _heading_word_count(True)
     assert budgets == {
-        "Financial Health Rating": 86,
-        "Executive Summary": 75,
-        "Financial Performance": 86,
-        "Management Discussion & Analysis": 86,
-        "Risk Factors": 95,
+        "Financial Health Rating": 85,
+        "Executive Summary": 74,
+        "Financial Performance": 85,
+        "Management Discussion & Analysis": 85,
+        "Risk Factors": 93,
         "Key Metrics": 43,
-        "Closing Takeaway": 63,
+        "Closing Takeaway": 69,
     }
 
 
@@ -78,13 +78,13 @@ def test_section_word_budgets_follow_v2_distribution_at_1000_words() -> None:
 
     assert sum(budgets.values()) == 1000 - _heading_word_count(True)
     assert budgets == {
-        "Financial Health Rating": 159,
-        "Executive Summary": 138,
-        "Financial Performance": 159,
-        "Management Discussion & Analysis": 159,
-        "Risk Factors": 174,
+        "Financial Health Rating": 157,
+        "Executive Summary": 135,
+        "Financial Performance": 157,
+        "Management Discussion & Analysis": 157,
+        "Risk Factors": 172,
         "Key Metrics": 79,
-        "Closing Takeaway": 116,
+        "Closing Takeaway": 127,
     }
 
 
@@ -97,12 +97,12 @@ def test_section_word_budgets_without_health_rating_follow_v2_distribution() -> 
     assert sum(budgets.values()) == 1000 - _heading_word_count(False)
     assert "Financial Health Rating" not in budgets
     assert budgets == {
-        "Executive Summary": 168,
-        "Financial Performance": 200,
-        "Management Discussion & Analysis": 200,
-        "Risk Factors": 204,
+        "Executive Summary": 165,
+        "Financial Performance": 195,
+        "Management Discussion & Analysis": 195,
+        "Risk Factors": 201,
         "Key Metrics": 79,
-        "Closing Takeaway": 136,
+        "Closing Takeaway": 152,
     }
 
 
@@ -141,99 +141,99 @@ def test_short_form_section_word_budgets_apply_narrative_floors_without_health(
             True,
             {
                 "Financial Health Rating": 45,
-                "Executive Summary": 40,
+                "Executive Summary": 39,
                 "Financial Performance": 45,
                 "Management Discussion & Analysis": 45,
-                "Risk Factors": 52,
+                "Risk Factors": 51,
                 "Key Metrics": 23,
-                "Closing Takeaway": 35,
+                "Closing Takeaway": 37,
             },
         ),
         (
             301,
             False,
             {
-                "Executive Summary": 49,
-                "Financial Performance": 57,
-                "Management Discussion & Analysis": 57,
-                "Risk Factors": 61,
+                "Executive Summary": 48,
+                "Financial Performance": 56,
+                "Management Discussion & Analysis": 56,
+                "Risk Factors": 60,
                 "Key Metrics": 23,
-                "Closing Takeaway": 41,
+                "Closing Takeaway": 45,
             },
         ),
         (
             742,
             True,
             {
-                "Financial Health Rating": 118,
-                "Executive Summary": 101,
-                "Financial Performance": 118,
-                "Management Discussion & Analysis": 118,
-                "Risk Factors": 128,
+                "Financial Health Rating": 116,
+                "Executive Summary": 100,
+                "Financial Performance": 116,
+                "Management Discussion & Analysis": 115,
+                "Risk Factors": 127,
                 "Key Metrics": 58,
-                "Closing Takeaway": 85,
+                "Closing Takeaway": 94,
             },
         ),
         (
             742,
             False,
             {
-                "Executive Summary": 124,
-                "Financial Performance": 148,
-                "Management Discussion & Analysis": 147,
-                "Risk Factors": 151,
+                "Executive Summary": 122,
+                "Financial Performance": 144,
+                "Management Discussion & Analysis": 144,
+                "Risk Factors": 149,
                 "Key Metrics": 58,
-                "Closing Takeaway": 101,
+                "Closing Takeaway": 112,
             },
         ),
         (
             1183,
             True,
             {
-                "Financial Health Rating": 190,
-                "Executive Summary": 164,
-                "Financial Performance": 189,
-                "Management Discussion & Analysis": 189,
-                "Risk Factors": 207,
+                "Financial Health Rating": 187,
+                "Executive Summary": 161,
+                "Financial Performance": 187,
+                "Management Discussion & Analysis": 187,
+                "Risk Factors": 204,
                 "Key Metrics": 90,
-                "Closing Takeaway": 138,
+                "Closing Takeaway": 151,
             },
         ),
         (
             1183,
             False,
             {
-                "Executive Summary": 200,
-                "Financial Performance": 237,
-                "Management Discussion & Analysis": 237,
-                "Risk Factors": 244,
+                "Executive Summary": 196,
+                "Financial Performance": 232,
+                "Management Discussion & Analysis": 232,
+                "Risk Factors": 239,
                 "Key Metrics": 90,
-                "Closing Takeaway": 162,
+                "Closing Takeaway": 181,
             },
         ),
         (
             2999,
             True,
             {
-                "Financial Health Rating": 509,
-                "Executive Summary": 440,
-                "Financial Performance": 509,
-                "Management Discussion & Analysis": 509,
-                "Risk Factors": 556,
+                "Financial Health Rating": 501,
+                "Executive Summary": 434,
+                "Financial Performance": 501,
+                "Management Discussion & Analysis": 501,
+                "Risk Factors": 550,
                 "Key Metrics": 90,
-                "Closing Takeaway": 370,
+                "Closing Takeaway": 406,
             },
         ),
         (
             2999,
             False,
             {
-                "Executive Summary": 536,
-                "Financial Performance": 637,
-                "Management Discussion & Analysis": 637,
-                "Risk Factors": 652,
+                "Executive Summary": 525,
+                "Financial Performance": 622,
+                "Management Discussion & Analysis": 622,
+                "Risk Factors": 641,
                 "Key Metrics": 90,
-                "Closing Takeaway": 434,
+                "Closing Takeaway": 486,
             },
         ),
     ],
@@ -260,18 +260,18 @@ def test_long_form_section_shapes_scale_with_2999_word_budgets() -> None:
     risk_shape = get_risk_factors_shape(budgets["Risk Factors"])
     closing_shape = get_closing_takeaway_shape(budgets["Closing Takeaway"])
 
-    assert budgets["Financial Health Rating"] == 509
+    assert budgets["Financial Health Rating"] == 501
     assert health_shape.min_sentences == 8
     assert health_shape.max_sentences == 10
     assert health_shape.preferred_paragraphs == 2
 
-    assert budgets["Risk Factors"] == 556
+    assert budgets["Risk Factors"] == 550
     assert risk_shape.risk_count == 3
     assert risk_shape.per_risk_min_sentences == 4
     assert risk_shape.per_risk_max_sentences == 5
-    assert risk_shape.requires_early_warning_signal is True
+    assert risk_shape.requires_early_warning_signal is False
 
-    assert budgets["Closing Takeaway"] == 370
+    assert budgets["Closing Takeaway"] == 406
     assert closing_shape.min_sentences == 7
     assert closing_shape.max_sentences == 9
     assert closing_shape.min_paragraphs == 2

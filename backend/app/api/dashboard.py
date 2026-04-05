@@ -17,7 +17,7 @@ from app.services.local_cache import (
     save_fallback_companies,
 )
 from app.services.summary_activity import get_summary_generation_metrics
-from app.utils.supabase_errors import is_supabase_table_missing_error
+from app.utils.supabase_errors import is_supabase_table_missing_error, coerce_supabase_rows
 from app.services.eodhd_client import should_hydrate_country
 from app.services.country_hydration_queue import mark_hydrated, queue_for_hydration
 from app.services.country_resolver import (
@@ -174,14 +174,15 @@ def _build_supabase_overview(*, user_id: str, tz_offset_minutes: Optional[int] =
         .execute()
     )
 
-    analyses: List[Dict[str, Any]] = response.data or []
+    analyses: List[Dict[str, Any]] = coerce_supabase_rows(response)
     total_analyses = getattr(response, "count", None) or len(analyses)
 
     company_ids = {analysis.get("company_id") for analysis in analyses if analysis.get("company_id")}
     company_map: Dict[str, Dict[str, Any]] = {}
     if company_ids:
         companies_response = supabase.table("companies").select("*").in_("id", list(company_ids)).execute()
-        company_map = {str(company["id"]): company for company in (companies_response.data or [])}
+        company_rows = coerce_supabase_rows(companies_response)
+        company_map = {str(company["id"]): company for company in company_rows}
         _hydrate_and_persist_countries(company_map, supabase)
 
     history = [_build_history_entry(analysis, company_map.get(analysis.get("company_id"))) for analysis in analyses]
@@ -271,6 +272,7 @@ def _build_history_entry(analysis: Dict[str, Any], company: Optional[Dict[str, A
         "country": company_data.get("country"),
         "health_score": analysis.get("health_score"),
         "score_band": analysis.get("score_band"),
+        "ratios": analysis.get("ratios"),
         "summary_md": analysis.get("summary_md"),
         "investor_persona_summaries": analysis.get("investor_persona_summaries"),
         "generated_at": generated_at,

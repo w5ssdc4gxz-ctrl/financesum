@@ -62,7 +62,7 @@ class _FakeGeminiTextPipelineClientNoFallback:
 
 
 def test_spotlight_endpoint_uses_text_pipeline_when_file_upload_disabled(tmp_path, monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("SPOTLIGHT_FILE_PIPELINE_MAX_UPLOAD_BYTES", "0")
     get_settings.cache_clear()
 
@@ -109,7 +109,7 @@ def test_spotlight_endpoint_uses_text_pipeline_when_file_upload_disabled(tmp_pat
 
 
 def test_spotlight_text_pipeline_tolerates_missing_pass3_fallback_field(tmp_path, monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("SPOTLIGHT_FILE_PIPELINE_MAX_UPLOAD_BYTES", "0")
     get_settings.cache_clear()
 
