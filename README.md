@@ -9,7 +9,7 @@ A comprehensive web application that fetches, analyzes, and summarizes quarterly
 - **Automated Analysis**: Extract and normalize income statements, balance sheets, and cash flow statements
 - **Financial Ratios**: Calculate 16+ financial ratios automatically
 - **Health Scoring**: Composite health score (0-100) with weighted components
-- **AI-Powered Summaries**: Generate investment memos using Gemini AI
+- **AI-Powered Summaries**: Generate investment memos using OpenAI GPT-5.2
 - **Investor Personas**: Simulate how 10 famous investors would view the company
 - **Compare Mode**: Side-by-side comparison of multiple companies
 - **Export**: Download analysis as PDF/Word/Markdown
@@ -19,7 +19,7 @@ A comprehensive web application that fetches, analyzes, and summarizes quarterly
 - **Frontend**: Next.js 14, TypeScript, Tailwind CSS
 - **Backend**: FastAPI (Python), Celery for background tasks
 - **Database**: Supabase (PostgreSQL + Storage)
-- **AI**: Google Gemini 2.5 Flash Lite
+- **AI**: OpenAI GPT-5.2
 - **Queue**: Redis
 
 ## Getting Started
@@ -42,7 +42,7 @@ A comprehensive web application that fetches, analyzes, and summarizes quarterly
 2. **Configure environment variables**
    ```bash
    cp .env.example .env
-   # Edit .env with your Supabase and Gemini API credentials (and Stripe if using billing)
+   # Edit .env with your Supabase and OpenAI API credentials (and Stripe if using billing)
    ```
 
    Update `frontend/.env.local` as well (see `frontend/.env.local.example`). By default the app expects real Supabase OAuth (`NEXT_PUBLIC_AUTH_MODE=supabase`).  

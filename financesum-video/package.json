@@ -1,0 +1,29 @@
+{
+  "name": "financesum-video",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "studio": "remotion studio src/index.ts",
+    "render": "remotion render src/index.ts FinanceSumPromo out/financesum-promo.mp4",
+    "build": "remotion render src/index.ts FinanceSumPromo out/financesum-promo.mp4 --codec h264",
+    "render:walkthrough": "remotion render src/index.ts FinanceSumWalkthrough out/financesum-walkthrough.mp4",
+    "build:walkthrough": "remotion render src/index.ts FinanceSumWalkthrough out/financesum-walkthrough.mp4 --codec h264"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@remotion/cli": "^4.0.419",
+    "@remotion/google-fonts": "^4.0.419",
+    "@remotion/paths": "^4.0.419",
+    "@remotion/transitions": "^4.0.419",
+    "@types/react": "^19.2.13",
+    "@types/react-dom": "^19.2.3",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "remotion": "^4.0.419",
+    "typescript": "^5.9.3",
+    "zod": "^3.22.3"
+  }
+}

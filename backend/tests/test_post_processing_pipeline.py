@@ -241,7 +241,9 @@ class TestFinalWordBandReenforcement:
         bridged_wc = _total_words(bridged)
         # The bridge function should have trimmed health body to fit since we're at upper
         # OR the word count should still be reasonable
-        assert "frames the thesis" in bridged, "Bridge should be present"
+        assert (
+            "next thing investors need to underwrite" in bridged
+        ), "Bridge should be present"
 
         # Re-enforce word band
         result = filings_api._ensure_final_strict_word_band(
@@ -324,7 +326,9 @@ class TestHealthBridge:
         result = filings_api._ensure_health_to_exec_bridge(memo, target_length=target)
 
         # Bridge must be present
-        assert "frames the thesis" in result, "Bridge sentence was not added"
+        assert (
+            "next thing investors need to underwrite" in result
+        ), "Bridge sentence was not added"
 
         # Health section should have been trimmed
         result_health = filings_api._extract_markdown_section_body(
@@ -363,7 +367,9 @@ class TestHealthBridge:
         result = filings_api._ensure_health_to_exec_bridge(memo, target_length=target)
 
         # Bridge must be present
-        assert "frames the thesis" in result, "Bridge sentence was not added"
+        assert (
+            "next thing investors need to underwrite" in result
+        ), "Bridge sentence was not added"
 
         # Original sentences should still be there (no trimming needed)
         result_health = filings_api._extract_markdown_section_body(

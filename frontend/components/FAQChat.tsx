@@ -122,43 +122,43 @@ export function FAQChat() {
   }, [selectedQuestion, displayedAnswer, isLoading]);
 
   return (
-    <section className="py-16 md:py-24 bg-gradient-to-b from-secondary/30 to-white">
+    <section className="py-16 md:py-24 bg-white dark:bg-zinc-950 border-b border-zinc-200 dark:border-zinc-800">
       <div className="container-tight">
         {/* Section Header */}
         <motion.div
-          initial={{ opacity: 0, y: 30 }}
+          initial={{ opacity: 0, y: 10 }}
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true }}
-          transition={{ duration: 0.8, ease: [0.25, 0.46, 0.45, 0.94] }}
-          className="text-center mb-12"
+          transition={{ duration: 0.8, ease: [0.25, 1, 0.5, 1] }}
+          className="text-center mb-16"
         >
-          <span className="text-sm font-medium text-[#0015ff] uppercase tracking-wider mb-4 block">
+          <span className="text-xs font-bold tracking-widest text-zinc-400 uppercase mb-4 block">
             Got Questions?
           </span>
-          <h2 className="text-4xl sm:text-5xl md:text-6xl font-bold tracking-tight text-foreground mb-6 font-serif italic">
+          <h2 className="text-5xl md:text-7xl font-black tracking-tighter text-black dark:text-white mb-6 uppercase">
             We have answers
           </h2>
-          <p className="text-lg text-muted-foreground max-w-2xl mx-auto">
+          <p className="text-lg text-zinc-500 font-medium max-w-2xl mx-auto">
             Click on any question below to see how FinanceSum can help you.
           </p>
         </motion.div>
 
         {/* Chat Window */}
         <motion.div
-          initial={{ opacity: 0, y: 40 }}
+          initial={{ opacity: 0, y: 20 }}
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true }}
-          transition={{ duration: 0.8, delay: 0.2, ease: [0.25, 0.46, 0.45, 0.94] }}
-          className="relative max-w-3xl mx-auto mb-10"
+          transition={{ duration: 0.8, delay: 0.2, ease: [0.25, 1, 0.5, 1] }}
+          className="relative max-w-3xl mx-auto mb-16"
         >
           {/* Chat Container */}
-          <div className="bg-white/80 backdrop-blur-xl rounded-3xl shadow-elevated border border-gray-100 overflow-hidden">
+          <div className="bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 shadow-sm overflow-hidden">
             {/* Chat Header */}
-            <div className="px-6 py-4 border-b border-gray-100 bg-white/50">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-gradient-to-br from-[#0015ff] to-[#7c3aed] flex items-center justify-center">
+            <div className="px-6 py-5 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-900">
+              <div className="flex items-center gap-4">
+                <div className="w-10 h-10 bg-black dark:bg-white flex items-center justify-center">
                   <svg
-                    className="w-5 h-5 text-white"
+                    className="w-5 h-5 text-white dark:text-black"
                     fill="none"
                     viewBox="0 0 24 24"
                     stroke="currentColor"
@@ -172,12 +172,12 @@ export function FAQChat() {
                   </svg>
                 </div>
                 <div>
-                  <h3 className="font-semibold text-foreground">FinanceSum Assistant</h3>
-                  <p className="text-xs text-muted-foreground">Always here to help</p>
+                  <h3 className="text-sm font-bold tracking-widest uppercase text-black dark:text-white">FinanceSum Assistant</h3>
+                  <p className="text-xs text-zinc-500 font-medium">Always here to help</p>
                 </div>
-                <div className="ml-auto flex items-center gap-1.5">
-                  <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
-                  <span className="text-xs text-muted-foreground">Online</span>
+                <div className="ml-auto flex items-center gap-2">
+                  <span className="w-1.5 h-1.5 bg-black dark:bg-white animate-pulse" />
+                  <span className="text-xs font-bold tracking-widest uppercase text-zinc-500">Online</span>
                 </div>
               </div>
             </div>
@@ -185,7 +185,7 @@ export function FAQChat() {
             {/* Chat Messages Area */}
             <div
               ref={chatContainerRef}
-              className="h-[320px] overflow-y-auto px-6 py-6 space-y-4 scroll-smooth"
+              className="h-[320px] overflow-y-auto px-6 py-8 space-y-6 scroll-smooth bg-white dark:bg-zinc-950"
             >
               {/* Initial state - prompt to select a question */}
               {!selectedQuestion && (
@@ -194,8 +194,8 @@ export function FAQChat() {
                   animate={{ opacity: 1, y: 0 }}
                   className="flex justify-start"
                 >
-                  <div className="bg-gray-100 text-foreground rounded-2xl rounded-tl-md px-5 py-3.5 max-w-[85%]">
-                    <p className="text-[15px] leading-relaxed">
+                  <div className="bg-zinc-100 dark:bg-zinc-900 text-black dark:text-white border border-zinc-200 dark:border-zinc-800 px-6 py-4 max-w-[85%]">
+                    <p className="text-sm font-medium leading-relaxed">
                       Hi there! I&apos;m here to answer your questions about FinanceSum. Click any
                       question below to get started.
                     </p>
@@ -208,14 +208,14 @@ export function FAQChat() {
                 {selectedQuestion && (
                   <motion.div
                     key={`question-${selectedQuestion.id}`}
-                    initial={{ opacity: 0, y: 20, scale: 0.95 }}
-                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: -10 }}
-                    transition={{ duration: 0.3, ease: [0.25, 0.46, 0.45, 0.94] }}
+                    transition={{ duration: 0.2 }}
                     className="flex justify-end"
                   >
-                    <div className="bg-[#0015ff] text-white rounded-2xl rounded-tr-md px-5 py-3.5 max-w-[85%] shadow-lg">
-                      <p className="text-[15px] leading-relaxed">{selectedQuestion.question}</p>
+                    <div className="bg-black dark:bg-white text-white dark:text-black px-6 py-4 max-w-[85%] shadow-sm border border-black dark:border-white">
+                      <p className="text-sm font-bold leading-relaxed">{selectedQuestion.question}</p>
                     </div>
                   </motion.div>
                 )}
@@ -231,7 +231,7 @@ export function FAQChat() {
                     transition={{ duration: 0.2 }}
                     className="flex justify-start"
                   >
-                    <div className="bg-gray-100 rounded-2xl rounded-tl-md">
+                    <div className="bg-zinc-100 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800">
                       <TypingDots />
                     </div>
                   </motion.div>
@@ -247,12 +247,12 @@ export function FAQChat() {
                     transition={{ duration: 0.2 }}
                     className="flex justify-start"
                   >
-                    <div className="bg-gray-100 text-foreground rounded-2xl rounded-tl-md px-5 py-3.5 max-w-[85%]">
-                      <p className="text-[15px] leading-relaxed">
+                    <div className="bg-zinc-100 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-black dark:text-white px-6 py-4 max-w-[85%]">
+                      <p className="text-sm font-medium leading-relaxed">
                         {displayedAnswer}
                         {isTyping && (
                           <motion.span
-                            className="inline-block w-0.5 h-4 bg-[#0015ff] ml-0.5 align-middle"
+                            className="inline-block w-2 h-4 bg-black dark:bg-white ml-1 align-middle"
                             animate={{ opacity: [1, 0] }}
                             transition={{ duration: 0.5, repeat: Infinity }}
                           />
@@ -268,42 +268,34 @@ export function FAQChat() {
 
         {/* Question Bubbles Grid */}
         <motion.div
-          initial={{ opacity: 0, y: 30 }}
+          initial={{ opacity: 0, y: 20 }}
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true }}
-          transition={{ duration: 0.8, delay: 0.4, ease: [0.25, 0.46, 0.45, 0.94] }}
-          className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 max-w-4xl mx-auto"
+          transition={{ duration: 0.8, delay: 0.4, ease: [0.25, 1, 0.5, 1] }}
+          className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-0 max-w-4xl mx-auto border-t border-l border-zinc-200 dark:border-zinc-800"
         >
           {faqItems.map((item, index) => (
             <motion.button
               key={item.id}
               onClick={() => handleQuestionClick(item)}
               disabled={isLoading || isTyping}
-              initial={{ opacity: 0, y: 20 }}
-              whileInView={{ opacity: 1, y: 0 }}
+              initial={{ opacity: 0 }}
+              whileInView={{ opacity: 1 }}
               viewport={{ once: true }}
               transition={{
                 duration: 0.5,
                 delay: 0.1 * index,
-                ease: [0.25, 0.46, 0.45, 0.94],
               }}
-              whileHover={{
-                y: -4,
-                scale: 1.02,
-                transition: { duration: 0.2 },
-              }}
-              whileTap={{ scale: 0.98 }}
               className={`
-                relative text-left px-5 py-4 rounded-2xl border transition-all duration-200
-                ${
-                  selectedQuestion?.id === item.id
-                    ? "bg-[#0015ff] text-white border-[#0015ff] shadow-lg"
-                    : "bg-white hover:bg-gray-50 border-gray-200 text-foreground shadow-sm hover:shadow-md hover:border-gray-300"
+                relative text-left px-6 py-5 border-r border-b border-zinc-200 dark:border-zinc-800 transition-colors duration-200
+                ${selectedQuestion?.id === item.id
+                  ? "bg-black text-white dark:bg-white dark:text-black"
+                  : "bg-white dark:bg-zinc-950 text-black dark:text-white hover:bg-zinc-100 dark:hover:bg-zinc-900"
                 }
-                ${(isLoading || isTyping) && selectedQuestion?.id !== item.id ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}
+                ${(isLoading || isTyping) && selectedQuestion?.id !== item.id ? "opacity-30 cursor-not-allowed" : "cursor-pointer"}
               `}
             >
-              <span className="text-sm font-medium leading-snug">{item.question}</span>
+              <span className="text-sm font-bold leading-snug tracking-tight">{item.question}</span>
             </motion.button>
           ))}
         </motion.div>

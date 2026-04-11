@@ -142,6 +142,20 @@ ANTI-BOREDOM CONSTRAINTS (mandatory — violations will be rejected):
     These phrases sound sophisticated but communicate nothing.  Replace each
     with a plain-English explanation of the specific business dynamic.
     Test: if a non-finance reader would need to look up your phrase, rewrite it.
+16. SHARP ENDINGS: Every section must end with a sentence that names a specific
+    metric, trigger, threshold, or timeline.  Endings like "if that execution
+    slips," "if that changes," "remains to be seen," or "time will tell" are
+    REJECTED.  Instead end with something like: "Watch [specific metric] — if
+    it drops below [threshold] for [timeframe], the view changes fast."
+17. AHA REQUIREMENT: Each section must contain at least one insight that would
+    surprise a generalist analyst — something non-obvious that only emerges from
+    reading this specific filing.  If your section could have been written from
+    a press release, it lacks an aha insight.  Surface the one thing the filing
+    reveals that the market might be missing.
+18. CONVERSATIONAL CLARITY: Write like a sharp analyst explaining the filing to
+    a smart colleague over coffee — direct, specific, occasionally blunt.  Avoid
+    institutional hedge language ("it is worth noting that…").  If you would
+    not say it out loud, do not write it.
 """
 
 
@@ -150,10 +164,11 @@ ANTI-BOREDOM CONSTRAINTS (mandatory — violations will be rejected):
 # ---------------------------------------------------------------------------
 QUOTE_BEHAVIOR_SPEC: str = """\
 MANAGEMENT QUOTES — HANDLING RULES:
-1. Include 3-8 high-signal direct quotes ONLY if they appear verbatim in the
-   provided filing text or filing-language snippets.  A "high-signal" quote
-   reveals strategy, outlook, risk acknowledgment, or competitive positioning
-   — not boilerplate legal language. Quote management verbatim to support claims.
+1. Include 0-3 high-signal direct quotes ONLY if they appear verbatim in the
+   provided filing text or filing-language snippets. A direct quote earns its
+   place only when it materially clarifies management's strategy, priorities,
+   outlook, or the next operating checkpoint. If a quote does not do that,
+   delete it and use attributed paraphrase instead.
 1a. REJECT BOILERPLATE QUOTES — NEVER quote any of these:
    - Investment classification or maturity policies ("Investments with maturities
      beyond one year may be classified as short-term...")
@@ -162,15 +177,19 @@ MANAGEMENT QUOTES — HANDLING RULES:
    - Accounting standard adoption language ("We adopted ASU...")
    - Risk factor boilerplate repeated across multiple filings unchanged
    - Fair value or carrying value definitions
-   A high-signal quote reveals a DECISION, STRATEGY, RISK ACKNOWLEDGMENT, or
-   COMPETITIVE POSITIONING specific to THIS filing period. If you cannot find
-   such quotes, use paraphrase-with-attribution instead.  Zero quotes is better
-   than boilerplate quotes.
-2. Place quotes where they advance the argument: Executive Summary (1-2 max),
-   MD&A (2-4 max), Risk Factors (0-2 max), Closing Takeaway (0-1).
-   Closing Takeaway MUST include at least one management attribution (quote or
-   paraphrase) when filing snippets are available — it grounds the verdict in
-   management's own credibility.  Never stack quotes back-to-back.
+   - Tax/accounting footnotes such as "federal foreign tax credits," "excess tax
+     benefits," effective tax-rate disclosures, or deferred-tax language
+   - Disclosure-rule, registry, transfer-restriction, anti-takeover, or similar
+     legal/governance boilerplate unless it directly changes strategy or the
+     next 12 months
+   A high-signal quote explains a DECISION, STRATEGY, PRIORITY, or FORWARD
+   DIRECTION specific to THIS filing period. If you cannot find one, use
+   paraphrase-with-attribution instead. Zero quotes is better than boilerplate
+   quotes.
+2. Place quotes only where they genuinely advance the argument. Executive
+   Summary and MD&A are the most natural homes; Risk Factors and Closing should
+   usually rely on attribution unless a direct quote materially sharpens the
+   point. Never stack quotes back-to-back.
 3. Keep each quote ≤25 words.  Introduce it with context ("Management
    acknowledged pricing headwinds, noting that…") rather than bare attribution
    ("The CEO said…").
@@ -178,8 +197,9 @@ MANAGEMENT QUOTES — HANDLING RULES:
    position with attribution — "Management indicated that…,"
    "The company described its strategy as…."  Use at least two such
    paraphrases across the memo.
-5. NEVER FABRICATE QUOTES.  If the filing text does not contain a quotable
-   statement on a topic, use paraphrase-with-attribution instead.
+5. NEVER FABRICATE QUOTES. If the filing text does not contain a quotable
+   strategy/outlook statement on a topic, use paraphrase-with-attribution
+   instead.
 6. After the first use, vary attribution verbs: noted, acknowledged,
    emphasized, highlighted, cautioned, described, characterized, indicated.
    Never repeat the same verb within 200 words.
@@ -293,6 +313,17 @@ COMPANY CONTEXT:
 - Key segments: {key_segments}
 
 THE TASK: In 2-3 paragraphs of flowing prose, accomplish these goals:
+0. DECISION FRAMING: The very first sentence must state the single most
+   important takeaway from this filing — the one thing a portfolio manager
+   needs to know RIGHT NOW.  The reader should understand the verdict within
+   2 sentences before any context or explanation.
+0a. OPENING BLOCK CONTRACT: Within the first 2 sentences, you MUST also state
+   the non-obvious insight from this filing and the single operating proof
+   point investors should watch next. The opening should work like a decision
+   tool, not a scene-setter.
+0b. AHA RULE: State the non-obvious insight as a clear contrast between the old
+   read and the new read from this filing. Make it memorable, but keep it
+   company-specific and grounded in the evidence rather than in slogans.
 1. Open with management's key message or thesis about the company's direction
    — what leadership believes matters most right now.  Ground the reader in
    management's worldview before any numbers.  Then establish what this company
@@ -306,21 +337,26 @@ THE TASK: In 2-3 paragraphs of flowing prose, accomplish these goals:
 5. Use at most 1 anchor figure total — this section is about framing, not
    measurement.  Lead with narrative, not numbers.
 6. End with a forward-looking sentence that naturally raises the question
-   Financial Performance will answer — this handoff IS the golden thread.
-7. MANDATORY: Include at least one verbatim management quote from filing snippets
-   that captures the company's strategic position or outlook. Integrate it with
-   context: "Management [verb] that '[quote],' which [interpretation]."
-   Management's voice MUST appear within the first 3 sentences. If no filing
-   snippets are available, use strong paraphrase with attribution.
+   Financial Performance will answer. Name the single proof point, metric, or
+   operating checkpoint that will answer it — this handoff IS the golden thread.
+7. Use one verbatim management quote ONLY if the filing snippets contain a
+   high-signal statement about strategy, outlook, or what happens next.
+   Integrate it with context: "Management [verb] that '[quote],' which
+   [interpretation]." If the available quotes are legal, tax, or accounting
+   boilerplate, use strong paraphrase with attribution instead. Management's
+   voice MUST appear within the first 3 sentences, but it does NOT have to be
+   a direct quote.
 
 {quote_instruction}
 {budget_instruction}
 """,
     do_rules=[
         "Open with management's stated thesis or priority, not metrics",
+        "Make the first 2 sentences do the main work: takeaway, aha insight, and next proof point",
+        "State the aha as a concrete contrast in the business, not as a vague theme",
         "State what changed in this filing period before drifting into generic finance language",
         "Frame the central tension as a tradeoff — what the company is giving up to get what it wants",
-        "Use one filing quote if snippets are available — within the first 3 sentences",
+        "Use one filing quote only when it adds strategic or forward-looking context; otherwise use attributed paraphrase",
         "Prefer company-specific operating KPIs over generic Revenue/EPS when available",
         "End with a bridge sentence into Financial Performance",
         "Make the reader feel they understand what the company does",
@@ -359,9 +395,12 @@ FINANCIAL DATA:
 {prior_period_delta}
 
 THE TASK: In connected prose, accomplish these goals:
-1. Pick the 2-3 numbers that most directly TEST the Executive Summary's tension.
-   HARD CAP: use at most 3-4 numeric figures in this entire section. Put any
-   remaining numbers in Key Metrics. Quality of interpretation beats quantity.
+1. Pick ONLY the 2-3 numbers that most directly TEST the Executive Summary's tension.
+   HARD CAP: 2-3 numeric figures total. Each figure gets ONE interpretation —
+   do not restate the same insight in different words.  If margin strength is
+   funding investment, say it once; do not rephrase as "cash generation supporting
+   the buildout" or "operating leverage enabling reinvestment."  Remaining metrics
+   belong in Key Metrics.
 2. Prefer company-specific operating KPIs first; use generic financial metrics
    only when they are the real driver of the investment question.
 3. Weave them into a causal argument: each number should answer "so what?" for
@@ -369,7 +408,8 @@ THE TASK: In connected prose, accomplish these goals:
 4. Compare latest period vs. prior comparable period (QoQ for 10-Q, YoY for 10-K)
    where data exists.
 5. End by surfacing an execution or capital-allocation question that MD&A will
-   address.
+   address. The final sentence must name the metric, trigger, threshold, or
+   timeline that would answer it first.
 
 {budget_instruction}
 """,
@@ -377,6 +417,7 @@ THE TASK: In connected prose, accomplish these goals:
         "Start by answering the question the Executive Summary raised",
         "Prefer company-specific KPI findings over generic metrics when they exist",
         "Interpret every number — what does it MEAN for the thesis?",
+        "Keep it tight: 2-3 interpreted metrics, then move on",
         "Use causal language (because, therefore, which implies)",
         "Include period-over-period comparison where data exists",
         "End with a management execution question leading into MD&A",
@@ -423,8 +464,8 @@ THE TASK: In 2-3 connected paragraphs, accomplish these goals:
    why — not what the numbers show.  Only after establishing the strategic
    context should you use metrics as evidence.
 2. Quote or closely paraphrase management's own words about strategy, priorities,
-   or outlook. Use AT LEAST TWO, ideally THREE verbatim quotes if filing snippets
-   are available.  Every claim about management's strategy MUST be supported by
+   or outlook. Use up to TWO verbatim quotes if filing snippets contain genuinely
+   high-signal strategy or outlook language. Every claim about management's strategy MUST be supported by
    a direct quote or explicit paraphrase with attribution.  Use the citation style:
    "Management noted that '[exact quote],' which means [interpretation]" or
    "Management characterized [topic] as [paraphrase], indicating that [implication]."
@@ -439,8 +480,9 @@ THE TASK: In 2-3 connected paragraphs, accomplish these goals:
 6. Use at most 1 anchor figure — this section is about MECHANISM and STRATEGY,
    not data.  Let management's own words carry the argument, not numbers.
 7. End by surfacing what could go wrong with this strategy — a natural bridge
-   into Risk Factors.  This handoff must flow from the strategy discussion,
-   not feel bolted on.
+   into Risk Factors.  The final sentence must name the specific checkpoint,
+   trigger, timeline, or metric that would show the strategy is slipping. This
+   handoff must flow from the strategy discussion, not feel bolted on.
 8. PROMISE VS. DELIVERY: Identify what management guided, promised, or
    prioritized in prior periods.  State whether this filing shows delivery,
    progress, or miss on those commitments.  If no prior guidance is available,
@@ -452,7 +494,7 @@ THE TASK: In 2-3 connected paragraphs, accomplish these goals:
 """,
     do_rules=[
         "Lead FIRST with management's stated strategy or priorities before any numbers",
-        "Include at least two verbatim management quotes if filing snippets available",
+        "Use direct quotes only when they add strategic or forward-looking context; otherwise paraphrase with attribution",
         "Support every strategy claim with a direct quote or explicit attribution",
         "Explain business model mechanics — how money is made and protected",
         "State what management expects, plans, or is prioritizing next",
@@ -479,13 +521,13 @@ THE TASK: In 2-3 connected paragraphs, accomplish these goals:
 _RISK_FACTORS = SectionTemplate(
     name="Risk Factors",
     system_guidance=(
-        "You are identifying the 2-3 risks most LIKELY to actually affect this "
+        "You are identifying the 1-2 risks most LIKELY to actually affect this "
         "company's results in the next 4 quarters. Rank by PROBABILITY first, "
         "then magnitude. A probable risk with moderate impact beats a dramatic "
         "risk with low likelihood. Write clearly — a non-finance reader should "
         "understand each risk in one read. Ground every risk in specific "
-        "evidence from the filing. If only 2 truly company-specific risks "
-        "exist, prefer 2 excellent risks over 3 mediocre ones."
+        "evidence from the filing. Prefer 2 sharply differentiated risks over "
+        "a crowded list. Never write more than 2 risks."
     ),
     user_prompt_template="""\
 Write the Risk Factors section for {company_name}.
@@ -505,9 +547,9 @@ financial data provided elsewhere in the prompt. Never fabricate risks from sect
 headers or page numbers.
 
 SCHEMA (MANDATORY — violations will be rejected):
-Write the exact number of risks required by the section budget. Each risk must follow this format:
+Write the exact number of risks required by the section budget. Keep the section visually clean: each risk must be its own standalone paragraph separated by a blank line. Each risk must follow this format:
 
-**[Risk Name]:** In 2-3 clear sentences, explain what could go wrong, why it
+[Risk Name]: In 2-3 clear sentences, explain what could go wrong, why it
 matters for this company specifically, and what investors should watch for.
 
 Rules:
@@ -536,6 +578,11 @@ FORWARD-LOOKING REQUIREMENT:
 - A risk IS "if [specific customer/supplier/regulator] does X, then [specific P&L impact]."
 - REJECT generic category labels like "cybersecurity risk", "margin risk",
   "qualitative disclosures risk" — name the SPECIFIC exposure unique to this company.
+- Reject filing-structure debris such as "General Instruction," item headers, or
+  other parsing fragments. Those are source artifacts, not investor risks.
+- A named accounting convention only counts as a real risk if the filing ties it
+  to debt, funding, liquidity, customer demand, product rollout, or another
+  consequence that would hit the business first.
 - NO merged risks (do not combine two distinct risks into one entry).
 - NO thematic repetition — each risk must address a COMPLETELY DIFFERENT mechanism,
   impact pathway, and business area.  If two risks could be summarized as "the same
@@ -549,11 +596,21 @@ MATERIALITY RANKING (mandatory — rank by this order):
 2. MAGNITUDE: Name the P&L line items affected.
 3. ASYMMETRY: Why the downside is not already priced in.
 
+PRIORITIZATION REQUIREMENT:
+- Open each risk with WHY IT MATTERS NOW — state the specific timeline or
+  catalyst (e.g., "Q2 2026 regulatory ruling," "contract renewal in October,"
+  "pricing reset at fiscal year-end") before explaining the mechanism.
+- Each risk must pass the "position-size test": would a portfolio manager
+  adjust their position based on this risk alone?  If not, it is too generic.
+- End each risk body with the first metric, operating checkpoint, threshold, or
+  dated catalyst that would show the downside is actually forming.
+
 DISCARD BOILERPLATE LEGAL RISKS:
 - "We may face competition" — unless a specific competitor action is named
 - "Regulatory changes may affect" — unless a specific regulation/proceeding is named with a timeline
 - "We depend on key personnel" — almost never investment-relevant
 - "Cybersecurity threats" — unless a specific incident occurred in this filing period
+- Foreign securities registry, transfer-restriction, anti-takeover, or similar holder-rights boilerplate unless the filing ties it to a live transaction, ruling, or capital-markets event
 - Anything that has been in every filing for 3+ years without materializing
 
 REJECTED RISK NAMES (dressed-up generic — will fail validation):
@@ -610,6 +667,9 @@ FILING GROUNDING (mandatory — validation will reject if missing):
     do_rules=[
         "Name specific, company-relevant risks — not generic categories",
         "Rank risks by probability of actually happening, not dramatic impact",
+        "Prefer 1-2 sharply differentiated risks over a crowded list",
+        "Keep each risk as its own clean paragraph with no stacked labels or inline bolding",
+        "Reject filing-structure debris and low-value legal boilerplate even if it appears in the excerpt",
         "Explain the causal mechanism for each risk",
         "Connect risks to vulnerabilities surfaced in preceding sections",
         "Write naturally — do not use a rigid mechanism/impact/signal template",
@@ -667,14 +727,21 @@ THE TASK:
 5. Include one implication for capital allocation, cash generation, or valuation
    support when the budget allows it.
 6. Make it forward-looking without introducing new facts.
+7. The final sentence must name the single metric, threshold, or dated trigger
+   that would change the stance first.
+8. Justify the verdict with the same drivers already established earlier in the
+   memo. Do not introduce a new generic balance-sheet reason at the end unless
+   that was one of the main analytical drivers above.
 
 {persona_instruction}
 {budget_instruction}
 """,
     do_rules=[
         "Open by connecting back to the central tension",
+        "Make the first sentence read like a decision plus the reason",
         "State a decisive verdict — BUY, HOLD, or SELL",
         "Connect verdict to management's credibility on previous commitments",
+        "Tie the verdict to the same business drivers the memo already established",
         "Name exactly ONE measurable trigger that changes the view",
         "Make the trigger business-specific, not a generic margin recap",
         "Make it forward-looking",
@@ -691,6 +758,7 @@ THE TASK:
         "Do NOT end with meta-sentences like '[Company] matters' or '[Company] remains the proof point' — end with a specific forward-looking claim",
         "Do NOT hedge the verdict with 'suggests', 'indicates', or 'remains to be seen' — be direct",
         "Do NOT restate risks already covered — synthesize into a single clear judgment",
+        "Do NOT justify the verdict with a generic cash-versus-liabilities line unless that balance-sheet tension was central to the earlier analysis",
     ],
     max_numeric_density=1,
     outline_anchor="Verdict (BUY/HOLD/SELL), one-sentence rationale, one trigger",
@@ -749,24 +817,30 @@ THE TASK:
 _KEY_METRICS = SectionTemplate(
     name="Key Metrics",
     system_guidance=(
-        "Produce a scannable NUMERIC data appendix. EVERY line MUST start "
-        "with '→ ' followed by a metric name, colon, and a NUMERIC value. "
-        "NO prose sentences. NO narrative paragraphs. NO explanations. "
-        "ONLY arrow-format data lines."
+        "Produce a scannable numeric appendix with a short 'What Matters:' "
+        "intro block above a deterministic data grid. The intro should prioritize "
+        "which rows matter and why before the raw numbers. The grid itself must use "
+        "pipe-separated numeric rows only."
     ),
     user_prompt_template="""\
 Write the Key Metrics data block for {company_name}.
 
 FORMAT RULES (non-negotiable):
-- EVERY line: → MetricName: NumericValue
-- Examples of CORRECT:
-  → Revenue: $21.7B
-  → Operating Margin: 30.3%
-  → Free Cash Flow: $8.21B | +188.1% QoQ
-  → Current Ratio: 2.9x
-- Examples of INCORRECT (NEVER do this):
-  → The company's Revenue was $21.73B, which is a good sign.
-  → We saw growth in revenue due to demand.
+- Required intro block:
+  What Matters:
+  - short analytical bullet
+  - short analytical bullet
+- Use the bullets to answer: what should the reader watch first, and why?
+- After the intro, output ONLY a numeric data grid using pipe rows.
+- Every grid row: Metric Name | Numeric Value
+- Examples of CORRECT grid rows:
+  Revenue | $21.7B
+  Operating Margin | 30.3%
+  Free Cash Flow | $8.21B | +188.1% QoQ
+  Current Ratio | 2.9x
+- Examples of INCORRECT grid rows:
+  The company's Revenue was $21.73B, which is a good sign.
+  We saw growth in revenue due to demand.
 
 PRE-FORMATTED DATA (use these EXACT values):
 {metrics_lines}
@@ -779,19 +853,24 @@ financial rows.
 {budget_instruction}
 """,
     do_rules=[
-        "Every line: → MetricName: NumericValue (with $, %, x formatting)",
+        "Use 'What Matters:' only for the short intro bullets above the grid",
+        "Use the intro bullets to tell the reader which rows matter most and why",
+        "Make the first bullet the single best row to watch first and what it confirms or breaks",
+        "Make the second bullet explain the next most important operating confirmation or downside buffer",
+        "Write the bullets like a watchlist, not like labels pasted above the grid",
+        "Every data row: MetricName | NumericValue (with $, %, x formatting)",
         "Include period-over-period change where available (e.g., | +5.2% YoY)",
         "Group by category: Profitability, Liquidity, Leverage, Cash Flow",
         "Omit missing metrics — never write N/A or 'not available'",
     ],
     dont_rules=[
-        "Do NOT add any narrative interpretation or prose sentences",
-        "Do NOT write lines without actual numeric values",
+        "Do NOT add narrative paragraphs below the optional 'What Matters:' intro",
+        "Do NOT write data rows without actual numeric values",
         "Do NOT explain what metrics mean — just present the data",
         "Do NOT invent numbers not in the provided data",
     ],
     max_numeric_density=99,
-    outline_anchor="List of available metrics in arrow format",
+    outline_anchor="Optional 'What Matters' bullets plus a pipe-format data grid",
     transition_into="Data appendix — no narrative transition",
     transition_out="Data appendix — no narrative transition",
 )
@@ -919,22 +998,25 @@ def _quote_instruction(ctx: PromptContext) -> str:
             )
         if target and target < 400:
             return (
-                "QUOTES: Include exactly 1 short direct quote (≤25 words) from the "
-                "filing-language snippets provided. COPY it EXACTLY character-by-character and "
-                "place it in Executive Summary unless MD&A is the only natural fit."
+                "QUOTES: You may use at most 1 short direct quote (≤25 words) from the "
+                "filing-language snippets provided, and only if it materially sharpens "
+                "strategy, outlook, or the next operating checkpoint. Otherwise use "
+                "attributed paraphrase."
             )
         if target and target < 1200:
             return (
-                "QUOTES: Include 2-3 short direct quotes (≤25 words each) from the "
-                "filing-language snippets provided. COPY them EXACTLY character-by-character and "
-                "place at least 1 quote in Executive Summary and at least 1 in Management Discussion & Analysis."
+                "QUOTES: Use 0-2 short direct quotes (≤25 words each) from the "
+                "filing-language snippets provided, only when they materially add "
+                "strategy, outlook, or what-happens-next context. If a quote feels "
+                "legal, tax, accounting, or governance-heavy, skip it and paraphrase "
+                "with attribution instead."
             )
         return (
-            "QUOTES: Include 3-5 short direct quotes (≤25 words each) from the "
-            "filing-language snippets provided.  COPY them EXACTLY character-by-character — "
-            "do not change any words or punctuation.  Place at least 1 quote in Executive Summary "
-            "and at least 1 in Management Discussion & Analysis.  Introduce "
-            "each with context, not bare attribution."
+            "QUOTES: Use 0-3 short direct quotes (≤25 words each) from the "
+            "filing-language snippets provided, only when they materially add "
+            "strategy, outlook, or what-happens-next context. COPY any direct quote "
+            "EXACTLY character-by-character, but default to attributed paraphrase "
+            "when the available quote is low-signal."
         )
     return (
         "QUOTES: No filing-language snippets are available.  Paraphrase "
@@ -1052,17 +1134,19 @@ def _identity_block(ctx: PromptContext) -> str:
     """Return the system identity/role framing."""
     if ctx.persona_name:
         return (
-            f"You are a senior equity research analyst writing an institutional "
-            f"investment memo for portfolio managers.  You are filtering the "
-            f"analysis through the priorities of {ctx.persona_name}, but you must "
-            f"NOT mimic catchphrases or produce self-referential manifesto language.  "
-            f"Your goal is actionable, differentiated insight with clear hierarchy "
-            f"and zero repetition."
+            f"You are a senior equity research analyst writing a clear, direct "
+            f"investment memo.  Write like a sharp analyst explaining the filing to "
+            f"a smart colleague — evidence-anchored, occasionally blunt, never stiff "
+            f"or hedging.  You are filtering the analysis through the priorities of "
+            f"{ctx.persona_name}, but you must NOT mimic catchphrases or produce "
+            f"self-referential manifesto language.  Your goal is actionable, "
+            f"differentiated insight with clear hierarchy and zero repetition."
         )
     return (
-        "You are a senior equity research analyst writing an institutional "
-        "investment memo for portfolio managers.  Write in third person, stay "
-        "evidence-anchored, and produce actionable insight with clear hierarchy "
+        "You are a senior equity research analyst writing a clear, direct "
+        "investment memo.  Write like a sharp analyst explaining the filing to "
+        "a smart colleague — third person, evidence-anchored, occasionally blunt, "
+        "never stiff or hedging.  Produce actionable insight with clear hierarchy "
         "and zero repetition."
     )
 

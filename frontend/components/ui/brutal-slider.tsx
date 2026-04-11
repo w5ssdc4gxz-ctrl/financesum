@@ -1,4 +1,4 @@
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useCallback, useRef, useState, useEffect } from 'react';
 import { cn } from '@/lib/utils';
 
 interface BrutalSliderProps {
@@ -25,7 +25,7 @@ export function BrutalSlider({
 
     const percentage = Math.min(100, Math.max(0, ((value - min) / (max - min)) * 100));
 
-    const handleInteraction = (clientX: number) => {
+    const handleInteraction = useCallback((clientX: number) => {
         if (!trackRef.current) return;
         const rect = trackRef.current.getBoundingClientRect();
         const x = Math.max(0, Math.min(clientX - rect.left, rect.width));
@@ -34,7 +34,7 @@ export function BrutalSlider({
         const steppedValue = Math.round(rawValue / step) * step;
         const clampedValue = Math.min(max, Math.max(min, steppedValue));
         onChange(clampedValue);
-    };
+    }, [max, min, onChange, step]);
 
     const handleMouseDown = (e: React.MouseEvent) => {
         setIsDragging(true);
@@ -76,7 +76,7 @@ export function BrutalSlider({
             window.removeEventListener('mouseup', handleMouseUp);
             window.removeEventListener('touchend', handleMouseUp);
         };
-    }, [isDragging, min, max, step, onChange]);
+    }, [handleInteraction, isDragging]);
 
     return (
         <div className={cn("w-full select-none touch-none px-3", className)}>

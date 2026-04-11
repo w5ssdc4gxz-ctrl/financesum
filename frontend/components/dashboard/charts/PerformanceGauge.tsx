@@ -1,6 +1,6 @@
 'use client'
 
-import { memo, useMemo } from 'react'
+import { memo, useId, useMemo } from 'react'
 import { motion } from 'framer-motion'
 import { IconTrendingUp, IconTrendingDown, IconMinus } from '@tabler/icons-react'
 
@@ -55,6 +55,7 @@ const PerformanceGauge = memo(function PerformanceGauge({
   trendDirection = 'neutral',
   colorScheme
 }: PerformanceGaugeProps) {
+  const svgId = useId().replace(/:/g, '')
   const actualColorScheme = colorScheme || getColorSchemeFromValue(value)
   const colors = colorSchemes[actualColorScheme]
 
@@ -70,7 +71,7 @@ const PerformanceGauge = memo(function PerformanceGauge({
   const offset = gaugeCircumference - (progress / 100) * gaugeCircumference
 
   const center = size / 2
-  const gradientId = `gauge-gradient-${Math.random().toString(36).substr(2, 9)}`
+  const gradientId = `gauge-gradient-${svgId}`
 
   const trendIcon = {
     up: IconTrendingUp,
@@ -118,14 +119,14 @@ const PerformanceGauge = memo(function PerformanceGauge({
             cy={center}
             r={radius}
             fill="none"
-            stroke={colors.bgTrack}
+            stroke="currentColor"
             strokeWidth={strokeWidth}
-            strokeOpacity={0.3} // Subtle background
+            strokeOpacity={0.1}
             strokeDasharray={`${gaugeCircumference} ${circumference}`}
             strokeDashoffset={0}
-            strokeLinecap="round"
+            strokeLinecap="square"
             transform={`rotate(${gaugeStart} ${center} ${center})`}
-            className="dark:stroke-gray-800"
+            className="text-black dark:text-white"
           />
 
 
@@ -136,29 +137,17 @@ const PerformanceGauge = memo(function PerformanceGauge({
             cy={center}
             r={radius}
             fill="none"
-            stroke={`url(#${gradientId})`}
+            stroke="currentColor"
             strokeWidth={strokeWidth}
-            strokeLinecap="round"
+            strokeLinecap="square"
             transform={`rotate(${gaugeStart} ${center} ${center})`}
-            filter="url(#shadow)"
+            className="text-black dark:text-white"
             initial={{ strokeDasharray: `0 ${circumference}` }}
             animate={{ strokeDasharray: `${(progress / 100) * gaugeCircumference} ${circumference}` }}
             transition={{ duration: 1.5, delay: 0.3, ease: [0.4, 0, 0.2, 1] }}
           />
 
-          {/* Outer glow ring - simplified */}
-          <motion.circle
-            cx={center}
-            cy={center}
-            r={radius + strokeWidth / 2 + 8}
-            fill="none"
-            stroke={colors.gradient[0]}
-            strokeWidth={1}
-            strokeOpacity={0.1}
-            initial={{ scale: 0.9, opacity: 0 }}
-            animate={{ scale: 1, opacity: 1 }}
-            transition={{ duration: 1, delay: 0.5 }}
-          />
+          {/* Removed Outer glow ring */}
         </svg>
 
         {/* Center content */}
@@ -170,19 +159,18 @@ const PerformanceGauge = memo(function PerformanceGauge({
             className="text-center"
           >
             <motion.div
-              className="text-7xl font-bold tracking-tighter"
-              style={{ color: colors.text }}
+              className="text-7xl font-black tracking-tighter text-black dark:text-white"
               initial={{ scale: 0.5, opacity: 0 }}
               animate={{ scale: 1, opacity: 1 }}
               transition={{ duration: 0.5, delay: 0.2 }}
             >
               {Math.round(progress)}
             </motion.div>
-            <div className="mt-1 text-sm font-medium text-gray-500 dark:text-gray-400">
+            <div className="mt-1 text-sm font-bold uppercase tracking-widest text-zinc-500">
               {label}
             </div>
             {subtitle && (
-              <div className="mt-0.5 text-xs text-gray-400 dark:text-gray-500">
+              <div className="mt-0.5 text-[10px] font-bold uppercase tracking-widest text-zinc-400">
                 {subtitle}
               </div>
             )}

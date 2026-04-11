@@ -1,5 +1,7 @@
 'use client'
 
+/* eslint-disable @next/next/no-img-element -- Logo loop accepts arbitrary image sources and srcSets. */
+
 import { useCallback, useEffect, useMemo, useRef, useState, memo, ReactNode } from 'react';
 import './LogoLoop.css';
 
@@ -63,7 +65,7 @@ const useResizeObserver = (callback: () => void, elements: React.RefObject<HTMLE
     return () => {
       observers.forEach(observer => observer?.disconnect());
     };
-  }, [callback, elements, ...dependencies]);
+  }, [callback, elements, dependencies]);
 };
 
 const useImageLoader = (seqRef: React.RefObject<HTMLUListElement | null>, onLoad: () => void, dependencies: unknown[]) => {
@@ -93,7 +95,7 @@ const useImageLoader = (seqRef: React.RefObject<HTMLUListElement | null>, onLoad
         img.removeEventListener('error', handleImageLoad);
       });
     };
-  }, [onLoad, seqRef, ...dependencies]);
+  }, [onLoad, seqRef, dependencies]);
 };
 
 const useAnimationLoop = (
@@ -236,9 +238,15 @@ export const LogoLoop = memo(
       }
     }, [isVertical]);
 
-    useResizeObserver(updateDimensions, [containerRef, seqRef], [logos, gap, logoHeight, isVertical]);
+    const observedRefs = useMemo(() => [containerRef, seqRef], []);
+    const dimensionDependencies = useMemo(
+      () => [logos, gap, logoHeight, isVertical],
+      [gap, isVertical, logoHeight, logos]
+    );
 
-    useImageLoader(seqRef, updateDimensions, [logos, gap, logoHeight, isVertical]);
+    useResizeObserver(updateDimensions, observedRefs, dimensionDependencies);
+
+    useImageLoader(seqRef, updateDimensions, dimensionDependencies);
 
     useAnimationLoop(trackRef, targetVelocity, seqWidth, seqHeight, isHovered, effectiveHoverSpeed, isVertical);
 

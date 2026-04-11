@@ -124,4 +124,4 @@ def test_long_form_budget_instruction_uses_probability_first_natural_prose_for_r
     assert "NO early-warning" not in risk_instruction
     assert "probability first" in risk_instruction
     assert "natural prose" in risk_instruction
-    assert "4-5 sentences" in risk_instruction
+    assert "2-3 sentences" in risk_instruction

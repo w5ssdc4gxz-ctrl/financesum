@@ -156,7 +156,7 @@ def _scenario_matrix() -> list[SmokeScenario]:
                     "evidence_from_filing": "Management expects AI workflow attach to deepen over the next two quarters.",
                 },
                 {
-                    "risk_name": "Large-Account Expansion Efficiency Risk",
+                    "risk_name": "Seat Expansion Concentration Risk",
                     "mechanism": "Sales capacity can scale faster than high-quality enterprise demand.",
                     "early_warning": "Watch sales efficiency, deal size, and large-account expansion pacing.",
                     "evidence_from_filing": "Seat expansion stayed concentrated inside the largest accounts.",
@@ -186,7 +186,10 @@ def _scenario_matrix() -> list[SmokeScenario]:
             },
             context_excerpt='Management said "we are seeing stronger AI attach inside our largest renewals" while renewal quality remained stable.',
             mda_excerpt='Management noted that "pricing discipline still matters more than low-quality volume" as it prioritized AI workflow attach and installed-base expansion.',
-            risk_factors_excerpt="AI workflow tier, enterprise renewals, RPO conversion, and pricing discipline remain the company-specific risks.",
+            risk_factors_excerpt=(
+                "AI workflow tier, enterprise renewals, RPO conversion, and pricing discipline remain "
+                "the company-specific risks. Seat expansion stayed concentrated inside the largest accounts."
+            ),
             filing_language_snippets='RPO improved, AI workflow attach deepened, and management said "we are seeing stronger AI attach inside our largest renewals."',
             financial_snapshot="Revenue $2.8B. Operating income $0.76B. Operating cash flow $0.82B. Free cash flow $0.63B. Cash balance $1.4B.",
             metrics_rows=(
@@ -1265,7 +1268,19 @@ def _accepted_source_backed_risks_from_prompt(prompt: str) -> list[dict[str, str
             early_warning = "attach rates paid seats pricing usage"
         elif "expansion" in risk_subject or "account" in risk_subject:
             impact_path = "sales efficiency, expansion velocity, or margin absorption"
-            early_warning = "seat expansion deal size efficiency pipeline"
+            early_warning = "seat expansion largest accounts deal size"
+            risks.append(
+                {
+                    "risk_name": clean_name,
+                    "mechanism": (
+                        "seat expansion stays concentrated inside the largest accounts "
+                        "instead of broadening across the installed base"
+                    ),
+                    "early_warning": early_warning,
+                    "impact_path": impact_path,
+                }
+            )
+            continue
         risks.append(
             {
                 "risk_name": clean_name,
@@ -1370,6 +1385,25 @@ def _trim_to_target(text: str, target_words: int, *, allowed_overage: int = 2) -
     """Trim text to approximately target_words by removing trailing content."""
     if count_words(text) <= target_words + max(0, int(allowed_overage)):
         return text
+    if "\n\n" in text:
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text.strip()) if part.strip()]
+        while (
+            len(paragraphs) > 1
+            and count_words("\n\n".join(paragraphs)) > target_words + max(0, int(allowed_overage))
+        ):
+            last_paragraph = paragraphs[-1]
+            last_sentences = re.split(r"(?<=[.!?])\s+", last_paragraph)
+            if len(last_sentences) > 1:
+                last_sentences.pop()
+                paragraphs[-1] = " ".join(last_sentences).strip()
+            else:
+                paragraphs.pop()
+        result = "\n\n".join(paragraphs).strip()
+        if count_words(result) <= target_words + max(1, int(allowed_overage)):
+            return result
+        words = result.split()
+        result = " ".join(words[:target_words]).rstrip(",.;:- ") + "."
+        return result
     # Sentence-level trimming
     sentences = re.split(r"(?<=[.!?])\s+", text.strip())
     while len(sentences) > 1 and count_words(" ".join(sentences)) > target_words + max(0, int(allowed_overage)):
@@ -1527,7 +1561,11 @@ def _candidate_risks_from_prompt(prompt: str) -> list[dict[str, str]]:
 
 
 def _render_risk_section(prompt: str, target_words: int) -> str:
-    count_match = re.search(r"Write exactly (\d+) risks\.", prompt)
+    count_match = re.search(
+        r"Write (?:exactly|up to)\s+(\d+)\s+risks?\b",
+        prompt,
+        re.IGNORECASE,
+    )
     target_count = int(count_match.group(1)) if count_match else 3
     anchors = _anchor_terms_from_prompt(prompt, section_name="Risk Factors")
     risks = _candidate_risks_from_prompt(prompt)[:target_count]
@@ -1560,9 +1598,10 @@ def _render_risk_section(prompt: str, target_words: int) -> str:
             warning_tail: str,
             warning_budget: int,
             minimum_mechanism_words: int,
+            allowed_overage: int | None = None,
         ) -> str:
             static_words = count_words(
-                f"**{risk['risk_name']}**: {filing_prefix} . {impact_sentence} Early-warning signal: , {warning_tail}."
+                f"{risk['risk_name']}: {filing_prefix} . {impact_sentence} Early-warning signal: , {warning_tail}."
             )
             mechanism_budget = max(
                 minimum_mechanism_words,
@@ -1570,32 +1609,57 @@ def _render_risk_section(prompt: str, target_words: int) -> str:
             )
             mech_short = _truncate_words(mech, mechanism_budget)
             warning_short = _truncate_words(early_warning, warning_budget)
+            trim_overage = (
+                int(allowed_overage)
+                if allowed_overage is not None
+                else (14 if per_risk_target < 80 else 8)
+            )
             return _trim_to_target(
-                f"**{risk['risk_name']}**: {filing_prefix} {mech_short}. "
+                f"{risk['risk_name']}: {filing_prefix} {mech_short}. "
                 f"{impact_sentence} Early-warning signal: {warning_short}, {warning_tail}."
                 .replace("  ", " ")
                 .strip(),
                 per_risk_target,
-                allowed_overage=4,
+                allowed_overage=trim_overage,
             )
 
         if per_risk_target < 30:
-            risk_anchor = " ".join(str(risk["risk_name"] or "").split()[:2]).strip()
-            if risk_anchor and risk_anchor.lower() not in mech.lower():
-                mech = f"{risk_anchor} {mech}".strip()
-            impact_phrase = "revenue or cash flow can soften before results reset"
-            warning_budget = 3
-            short_mech = re.sub(r"^if\s+", "", mech, flags=re.IGNORECASE).strip()
-            static_words = count_words(
-                f"**{risk['risk_name']}**: If, {impact_phrase}. Early-warning signal:"
-            )
-            mechanism_budget = max(7, per_risk_target - static_words - warning_budget)
-            mech_short = _truncate_words(short_mech, mechanism_budget)
-            warning_short = _truncate_words(early_warning, warning_budget)
-            body = (
-                f"**{risk['risk_name']}**: If {mech_short}, {impact_phrase}. "
-                f"Early-warning signal: {warning_short}."
-            )
+            risk_name_lower = str(risk["risk_name"] or "").lower()
+            if "seat expansion" in risk_name_lower or "account" in risk_name_lower:
+                body = (
+                    f"{risk['risk_name']}: If seat expansion stays concentrated in the largest accounts, "
+                    "sales efficiency and margin absorption can weaken. "
+                    "Early-warning signal: deal size and broader expansion."
+                )
+            elif "attach" in risk_name_lower or "monetization" in risk_name_lower:
+                body = (
+                    f"{risk['risk_name']}: If AI attach deepens slower than management expects, "
+                    "paid-seat monetization and cash conversion can disappoint. "
+                    "Early-warning signal: attach rates and paid seats."
+                )
+            elif "renewal" in risk_name_lower or "conversion" in risk_name_lower:
+                body = (
+                    f"{risk['risk_name']}: If large renewals slip or convert later, "
+                    "revenue visibility and cash flow can weaken. "
+                    "Early-warning signal: RPO conversion and discounting."
+                )
+            else:
+                risk_anchor = " ".join(str(risk["risk_name"] or "").split()[:2]).strip()
+                if risk_anchor and risk_anchor.lower() not in mech.lower():
+                    mech = f"{risk_anchor} {mech}".strip()
+                impact_phrase = "revenue or cash flow can soften before results reset"
+                warning_budget = 3
+                short_mech = re.sub(r"^if\s+", "", mech, flags=re.IGNORECASE).strip()
+                static_words = count_words(
+                    f"{risk['risk_name']}: If, {impact_phrase}. Early-warning signal:"
+                )
+                mechanism_budget = max(7, per_risk_target - static_words - warning_budget)
+                mech_short = _truncate_words(short_mech, mechanism_budget)
+                warning_short = _truncate_words(early_warning, warning_budget)
+                body = (
+                    f"{risk['risk_name']}: If {mech_short}, {impact_phrase}. "
+                    f"Early-warning signal: {warning_short}."
+                )
             entries.append(body)
             continue
         if per_risk_target < 52:
@@ -1652,39 +1716,11 @@ def _render_risk_section(prompt: str, target_words: int) -> str:
             )
             entries.append(body)
             continue
-        mechanism_load = count_words(risk["risk_name"]) + count_words(risk["mechanism"])
-        if (per_risk_target >= 75 and mechanism_load <= 22) or (
-            mechanism_load <= 16 and per_risk_target >= 65
-        ):
-            sentence_two = (
-                f"That matters because pressure in {impact_path} would likely hit revenue quality, margin absorption, cash generation, or liquidity before the thesis fully breaks, especially if management already committed cost against that view while fixed costs stay in place."
-            )
-            sentence_three = (
-                f"Early-warning signal: {early_warning}, and investors should watch whether that pressure starts surfacing in bookings, margins, or cash conversion before the income statement fully reflects it and before management can reset guidance cleanly."
-            )
-        elif per_risk_target < 65 or mechanism_load >= 26:
-            sentence_two = (
-                f"That matters because pressure in {impact_path} would hit margins, cash generation, or liquidity before the thesis fully breaks and forces harder pricing or capital-allocation choices."
-            )
-            sentence_three = (
-                f"Early-warning signal: {early_warning}; watch for that before reported results."
-            )
-        else:
-            sentence_two = (
-                f"That matters because pressure in {impact_path} would likely hit revenue quality, margins, cash generation, or liquidity before the thesis fully breaks, especially if management is already leaning on the current mix or capital plan while fixed costs stay committed."
-            )
-            sentence_three = (
-                f"Early-warning signal: {early_warning}, and investors should watch whether that pressure shows up before reported results fully absorb it and before management can reset guidance cleanly."
-            )
-        filing_prefix = "The filing discloses that " if per_risk_target >= 35 else ""
-        body = f"**{risk['risk_name']}**: {filing_prefix}{mech}. {sentence_two} {sentence_three}"
-        if per_risk_target >= 95:
-            body = _expand_to_budget(
-                "Risk Factors",
-                body,
-                per_risk_target,
-                [anchor, second],
-            )
+        body = (
+            f"{risk['risk_name']}: The filing discloses that {mech}. "
+            f"That would pressure {impact_path} before reported results fully reflect it, especially if management has already committed spend and capacity against the current demand plan and cannot slow that buildout quickly without disrupting delivery. "
+            f"An early-warning signal is {early_warning}, and investors should watch whether bookings conversion, utilization, monetization, or cash conversion soften before management resets guidance and before headline results fully reprice the story clearly."
+        )
         entries.append(body)
     return "\n\n".join(entries)
 
@@ -1893,7 +1929,7 @@ def _section_body(section_name: str, prompt: str) -> str:
                 f"- {risk['risk_name']}: {risk['mechanism']} Early warning: {risk['early_warning']}"
                 for risk in _DEFAULT_SCENARIO.company_specific_risks[:3]
             )
-            + "\n\nWrite exactly 3 risks.\n\n"
+            + "\n\nWrite exactly 2 risks.\n\n"
         )
     company_terms_block = "\n- ".join(_DEFAULT_SCENARIO.company_terms)
     period_insights_block = "\n- ".join(_DEFAULT_SCENARIO.period_specific_insights[:2])
@@ -2009,9 +2045,13 @@ def build_smoke_report(
             allow_padding=False,
             dedupe=True,
         )
-        normalized_summary = filings_api._canonicalize_key_metrics_section(
+        normalized_summary = filings_api._canonicalize_key_metrics_section_compat(
             normalized_summary,
             metrics_lines,
+            max_words=filings_api._key_metrics_contract_max_words(
+                target_length=int(target_length),
+                include_health_rating=True,
+            ),
         )
         current_counts = _extract_section_counts(
             normalized_summary,
@@ -2040,6 +2080,35 @@ def build_smoke_report(
                 section_name,
                 replacement_body,
             )
+        key_metrics_body = (
+            filings_api._extract_markdown_section_body(
+                normalized_summary,
+                "Key Metrics",
+            )
+            or ""
+        )
+        key_metrics_upper = int(
+            filings_api._key_metrics_contract_max_words(
+                target_length=int(target_length),
+                include_health_rating=True,
+            )
+            or 0
+        )
+        if (
+            key_metrics_body
+            and key_metrics_upper > 0
+            and filings_api._count_words(key_metrics_body) > key_metrics_upper
+        ):
+            trimmed_key_metrics = filings_api._trim_appendix_preserving_rows(
+                key_metrics_body,
+                int(key_metrics_upper),
+            )
+            if trimmed_key_metrics and trimmed_key_metrics != key_metrics_body:
+                normalized_summary = filings_api._replace_markdown_section_body(
+                    normalized_summary,
+                    "Key Metrics",
+                    trimmed_key_metrics,
+                )
         result.summary_text = normalized_summary
 
     validation = validate_summary(

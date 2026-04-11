@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from app.services.repetition_guard import RepetitionReport, check_repetition, detect_cross_section_dollar_figures
-from app.services.risk_evidence import assess_risk_overlap
+from app.services.risk_evidence import assess_risk_overlap, is_filing_structure_line
 from app.services.summary_budget_controller import (
     CANONICAL_SECTION_ORDER,
     describe_sentence_range,
@@ -23,9 +23,23 @@ from app.services.word_surgery import clean_ending, count_words
 _SECTION_PATTERN = re.compile(r"##\s+(.+?)\s*\n(.*?)(?=\n##\s+|\Z)", re.DOTALL)
 _HEADING_PATTERN = re.compile(r"^\s*##\s+(.+?)\s*$", re.MULTILINE)
 _END_PUNCT_RE = re.compile(r'[.!?](?:["\')\]]+)?$')
-_RISK_ITEM_RE = re.compile(
-    r"\*\*(?P<name>[^*:\n]{2,120}?):?\*\*\s*:?\s*(?P<body>.+?)(?=(?:\s+\*\*[^*]+?\*\*\s*:?)|\Z)",
+_RISK_LABEL_PATTERN = r"(?:\[[^\]\n]{2,120}\]|[A-Z0-9][^:\n*]{1,120})"
+_RISK_HEADER_RE = re.compile(
+    rf"^(?:\*\*)?(?P<name>{_RISK_LABEL_PATTERN})(?:\*\*\s*:|:\s*\*\*|:)\s*(?P<body>.*)$",
     re.DOTALL,
+)
+_LEGACY_BOLD_RISK_HEADER_RE = re.compile(
+    r"^\*\*(?P<name>[^*\n]{2,140}?)\*\*\s*(?P<body>.+)$",
+    re.DOTALL,
+)
+_RISK_INLINE_HEADER_RE = re.compile(
+    r"\s+(?=\*\*(?:\[[^\]\n]{2,120}\]|[^:\n*]{2,120})(?:\*\*\s*:|:\s*\*\*)\s+)",
+)
+_RISK_SENTENCE_BOUNDARY_HEADER_RE = re.compile(
+    rf"(?<=[.!?])\s+(?=(?:\*\*)?(?:\[[^\]\n]{{2,120}}\]|[A-Z0-9][^:\n]{{1,120}}?)(?:\*\*\s*:|:\s*\*\*|:)\s+)",
+)
+_RISK_EMBEDDED_HEADER_RE = re.compile(
+    rf"(?<=[.!?])\s+(?=(?:\*\*)?(?:\[[^\]\n]{{2,120}}\]|[A-Z0-9][^:\n]{{1,120}})(?:\*\*\s*:|:\s*\*\*|:)\s+)",
 )
 _GENERIC_RISK_NAME_RE = re.compile(
     r"\b("
@@ -63,6 +77,28 @@ _GENERIC_RISK_NAME_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_LOW_SIGNAL_LEGAL_RISK_RE = re.compile(
+    r"\b("
+    r"foreign securities registry|registry of foreign securities|transfer restrictions?|"
+    r"restrictions on transfer|anti[- ]takeover|certificate of incorporation|"
+    r"exclusive[- ]forum|forum[- ]selection|holder rights?"
+    r")\b",
+    re.IGNORECASE,
+)
+_FILING_STRUCTURE_RISK_RE = re.compile(
+    r"\b("
+    r"general instructions?|item\s+\d+[a-z]?|part\s+[ivx]+|"
+    r"risk factors?|forward[- ]looking statements?"
+    r")\b",
+    re.IGNORECASE,
+)
+_LIVE_LEGAL_EVENT_RE = re.compile(
+    r"\b("
+    r"acquisition|bid|capital raise|deadline|enforcement|exchange offer|investigation|"
+    r"litigation|merger|offering|refinancing|ruling|take[- ]private|tender offer|transaction"
+    r")\b",
+    re.IGNORECASE,
+)
 # Catch risk names that are purely financial-metric-derived with no company nouns.
 # Only matches when ALL significant words are financial terms.
 # Deliberately excludes "working" and "timing" (used in legitimate fallback names
@@ -78,12 +114,74 @@ _METRIC_ONLY_RISK_WORDS = frozenset({
 })
 
 
+def _extract_structured_risk_items(body: str) -> List[tuple[str, str]]:
+    def _is_non_risk_label(name: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
+        return normalized in {
+            "early warning",
+            "early warning signal",
+            "early warning signals",
+            "indicator",
+            "indicators",
+            "signal",
+            "signals",
+            "trigger",
+            "triggers",
+            "watch",
+            "watch for",
+        }
+
+    normalized = str(body or "").replace("\u00a0", " ").strip()
+    if not normalized:
+        return []
+    items: List[tuple[str, str]] = []
+    def _append_item(name: str, body_text: str) -> None:
+        if not name or not body_text:
+            return
+        if _is_non_risk_label(name):
+            if items:
+                prior_name, prior_body = items[-1]
+                merged_body = f"{prior_body} {name}: {body_text}".strip()
+                items[-1] = (prior_name, merged_body)
+            return
+        items.append((name, body_text))
+
+    for paragraph in re.split(r"\n\s*\n+", normalized):
+        match = _RISK_HEADER_RE.match(str(paragraph or "").strip()) or _LEGACY_BOLD_RISK_HEADER_RE.match(
+            str(paragraph or "").strip()
+        )
+        if not match:
+            continue
+        name = str(match.group("name") or "").strip().strip("[]")
+        body_text = " ".join(str(match.group("body") or "").split()).strip()
+        _append_item(name, body_text)
+    if items:
+        if len(items) > 1 or not _RISK_EMBEDDED_HEADER_RE.search(items[0][1]):
+            return items
+        items = []
+
+    normalized = _RISK_SENTENCE_BOUNDARY_HEADER_RE.sub("\n\n", normalized)
+    normalized = _RISK_INLINE_HEADER_RE.sub("\n\n", normalized)
+    for paragraph in re.split(r"\n\s*\n+", normalized):
+        match = _RISK_HEADER_RE.match(str(paragraph or "").strip()) or _LEGACY_BOLD_RISK_HEADER_RE.match(
+            str(paragraph or "").strip()
+        )
+        if not match:
+            continue
+        name = str(match.group("name") or "").strip().strip("[]")
+        body_text = " ".join(str(match.group("body") or "").split()).strip()
+        _append_item(name, body_text)
+    return items
+
+
 def _is_metric_only_risk_name(name: str) -> bool:
     """True when every significant word in the risk name is a financial term."""
     words = re.findall(r"[a-z]+", name.lower())
     if len(words) < 3:
         return False
     return all(w in _METRIC_ONLY_RISK_WORDS for w in words)
+
+
 _MECHANISM_RE = re.compile(
     r"\b(because|driven by|if|unless|leads to|results in|pressure|compress|dilute|erode|funding|liquidity|working capital|pricing|churn|renewal|mix shift|substitution|execution slip)\b",
     re.IGNORECASE,
@@ -192,7 +290,18 @@ _SECTION_MEMORY_PROMISE_RE = re.compile(
     r"\b(delivered|on track|missed|new commitment|commitment|commitments|credibility|proof point|watchpoint)\b",
     re.IGNORECASE,
 )
-_EXPLICIT_STANCE_RE = re.compile(r"\b(buy|hold|sell)\b", re.IGNORECASE)
+_EXPLICIT_STANCE_SIGNAL_RE = re.compile(
+    r"(?ix)"
+    r"(?:"
+    r"\b(?:i|we)\s+(?:would\s+)?(?P<personal>buy|hold|sell)\b"
+    r"|"
+    r"\b(?P<labelled>buy|hold|sell)\s+(?:rating|recommendation|stance)\b"
+    r"|"
+    r"\b(?:rating|recommendation|stance)\b[\s:]{0,12}(?:is\s+)?(?:a\s+)?(?P<named>buy|hold|sell)\b"
+    r"|"
+    r"(?:^|(?<=[.!?]))\s*(?P<lead>buy|hold|sell)\b(?=\s+(?:is\b|for\b|because\b|the\b|[A-Z]))"
+    r")"
+)
 _HEALTH_NEGATIVE_RE = re.compile(
     r"\b(pressure|strained|weak(?:ening)?|deteriorat(?:e|es|ing|ion)|funding risk|liquidity risk|refinancing|leverage pressure|balance-sheet pressure)\b",
     re.IGNORECASE,
@@ -234,6 +343,22 @@ class PostProcessResult:
     violations: List[str] = field(default_factory=list)
     retries: int = 0
     validation_report: Optional[SummaryValidationReport] = None
+
+
+def _extract_explicit_stance_tokens(text: str) -> List[str]:
+    tokens: List[str] = []
+    for match in _EXPLICIT_STANCE_SIGNAL_RE.finditer(str(text or "")):
+        token = next(
+            (
+                str(value).lower()
+                for value in match.groupdict().values()
+                if str(value or "").strip()
+            ),
+            "",
+        )
+        if token:
+            tokens.append(token)
+    return tokens
 
 
 def _required_sections(include_health_rating: bool) -> List[str]:
@@ -429,6 +554,8 @@ _SELF_REFERENCE_RE = re.compile(
     r"|[Tt]he Key Metrics (?:below |above |section )?show"
     r"|[Tt]hese [\w\s]* (?:are|is) tracked in"
     r"|[Aa]s the [\w\s]+ section (?:shows|details|explores|covers)"
+    r"|(?:the )?more useful read[- ]through belongs in the [\w\s]+"
+    r"|belongs in the (?:Executive Summary|Financial Performance|Management Discussion|MD&A|Risk Factors|Closing Takeaway)"
     r")",
     re.IGNORECASE,
 )
@@ -437,6 +564,46 @@ _SELF_REFERENCE_RE = re.compile(
 def _detect_self_references(text: str) -> List[str]:
     """Return self-referential meta-language phrases found in *text*."""
     return [m.group(0) for m in _SELF_REFERENCE_RE.finditer(text or "")]
+
+
+# ---------------------------------------------------------------------------
+# Instruction leakage detection — catches LLM echoing prompt directives
+# ---------------------------------------------------------------------------
+
+_INSTRUCTION_LEAKAGE_RE = re.compile(
+    r"(?:"
+    r"[Tt]he (?:Executive Summary|Financial Performance|Management Discussion|MD&A|Risk Factors|Closing Takeaway|Key Metrics|Financial Health Rating) should (?:frame|focus on|focus|open|lead with|identify|establish|address|cover|explore|test|resolve|prioritize|synthesize|use|include|mention|sound like|read like|feel like)"
+    r"|(?:the )?more useful read[- ]through belongs in the (?:Executive Summary|Financial Performance|Management Discussion|MD&A|Risk Factors|Closing Takeaway)"
+    r"|belongs in the (?:Executive Summary|Financial Performance|Management Discussion|MD&A|Risk Factors|Closing Takeaway)"
+    r"|MANDATORY\s*:"
+    r"|violations will be rejected"
+    r"|SECTION WORD BUDGET"
+    r"|BODY WORD BUDGET"
+    r"|ANTI-BOREDOM CONSTRAINTS"
+    r"|STYLE CONTRACT\s*:"
+    r"|SECTION FOCUS\s*:"
+    r"|REPAIR INSTRUCTION\s*:"
+    r"|AHA INSIGHT TO PROTECT"
+    r"|AHA INSIGHT \(MUST SURFACE"
+    r"|CENTRAL TENSION\s*:"
+    r"|VALIDATED MEMO THREAD"
+    r"|QUOTE (?:POLICY|MANDATE)\s*:"
+    r"|EDITORIAL ANCHOR RULES\s*:"
+    r"|DEPTH MOVES\s*:"
+    r"|BANNED OVERLAP\s*:"
+    r"|FORBIDDEN OPENINGS\s*:"
+    r"|USER INSTRUCTION FOR THIS SECTION"
+    r"|(?:per|as per|following) the (?:instructions?|guidelines?|prompt|template)"
+    r"|(?:as instructed|per the guidelines)"
+    r"|will fail validation"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _detect_instruction_leakage(text: str) -> List[str]:
+    """Return instruction-leakage phrases found in *text*."""
+    return [m.group(0) for m in _INSTRUCTION_LEAKAGE_RE.finditer(text or "")]
 
 
 def _validate_risk_factors(
@@ -458,7 +625,19 @@ def _validate_risk_factors(
 
     shape = get_risk_factors_shape(risk_budget_words)
     expected_count = int(shape.risk_count or 0)
-    items = list(_RISK_ITEM_RE.finditer(body))
+    items = _extract_structured_risk_items(body)
+    raw_risk_paragraph_count = sum(
+        1
+        for paragraph in re.split(r"\n\s*\n+", str(body or "").strip())
+        if _RISK_HEADER_RE.match(str(paragraph or "").strip())
+    )
+    if len(items) > 1 and len(items) > raw_risk_paragraph_count:
+        return len(items), [
+            (
+                "risk_schema",
+                "Risk Factors must separate each risk into its own paragraph with a blank line between entries.",
+            )
+        ]
     # At borderline budgets where per-risk allocation is tight (<65 words),
     # generating expected_count - 1 risks is a recoverable shortfall.
     # Continue to quality-check the risks that ARE present rather than
@@ -487,9 +666,7 @@ def _validate_risk_factors(
     _risk_body_tokens: list[str] = []
     failures: list[tuple[str, str]] = []
 
-    for item in items:
-        name = (item.group("name") or "").strip()
-        body_text = (item.group("body") or "").strip()
+    for name, body_text in items:
         canon_name = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
         if canon_name in seen_names:
             failures.append(("risk_schema", "Risk Factors contain duplicate risk names. Use distinct, non-overlapping drivers."))
@@ -522,6 +699,12 @@ def _validate_risk_factors(
         _risk_name_tokens.append(name)
         _risk_body_tokens.append(body_text)
 
+        if is_filing_structure_line(name) or _FILING_STRUCTURE_RISK_RE.search(name):
+            failures.append((
+                "risk_specificity",
+                f"Risk name '{name}' is filing-structure debris, not a business risk. Replace it with a concrete filing exposure.",
+            ))
+            continue
         if _GENERIC_RISK_NAME_RE.search(name):
             failures.append((
                 "risk_specificity",
@@ -540,6 +723,15 @@ def _validate_risk_factors(
                 "risk_specificity",
                 f"Risk name '{name}' is built from financial metrics, not a business event. "
                 f"Name a specific product, segment, customer, geography, or regulation at risk.",
+            ))
+        legal_context = " ".join(part for part in (name, body_text) if part)
+        if _LOW_SIGNAL_LEGAL_RISK_RE.search(name) and not (
+            _LIVE_LEGAL_EVENT_RE.search(legal_context)
+            or _TRANSMISSION_RE.search(legal_context)
+        ):
+            failures.append((
+                "risk_specificity",
+                f"Risk name '{name}' is legal boilerplate, not a decision-relevant business risk. Replace it with an earnings-linked filing exposure.",
             ))
         sentence_count = _sentence_count(body_text)
         if not (
@@ -672,10 +864,7 @@ def _validate_stance_location_and_consistency(
     if not closing_body:
         return failures
 
-    closing_tokens = [
-        (match.group(1) or "").lower()
-        for match in _EXPLICIT_STANCE_RE.finditer(closing_body)
-    ]
+    closing_tokens = _extract_explicit_stance_tokens(closing_body)
     distinct_closing_tokens = list(dict.fromkeys(closing_tokens))
     if len(set(distinct_closing_tokens)) > 1:
         failures.append(
@@ -693,10 +882,7 @@ def _validate_stance_location_and_consistency(
     for section_name, body in sections.items():
         if section_name == "Closing Takeaway":
             continue
-        stance_tokens = [
-            (match.group(1) or "").lower()
-            for match in _EXPLICIT_STANCE_RE.finditer(str(body or ""))
-        ]
+        stance_tokens = _extract_explicit_stance_tokens(str(body or ""))
         if not stance_tokens:
             continue
         failures.append(
@@ -730,10 +916,7 @@ def _validate_health_closing_alignment(
     closing_body = str(sections.get("Closing Takeaway") or "").strip()
     if not health_body or not closing_body:
         return None
-    closing_tokens = [
-        (match.group(1) or "").lower()
-        for match in _EXPLICIT_STANCE_RE.finditer(closing_body)
-    ]
+    closing_tokens = _extract_explicit_stance_tokens(closing_body)
     if not closing_tokens:
         return None
     stance = closing_tokens[-1]
@@ -771,6 +954,9 @@ def validate_summary(
     company_name: str = "",
 ) -> SummaryValidationReport:
     working_text = str(text or "").strip()
+    # Keep validation aligned with the canonical word counter used by the route and
+    # contract diagnostics. Markdown markers and punctuation can inflate split()
+    # counts and create false "passes" or false overflows.
     total_words = count_words(working_text)
     target = int(target_words or 0)
     if total_tolerance_words is not None:
@@ -859,6 +1045,9 @@ def validate_summary(
             upper_budget = budget + tolerance
             if section_name == "Key Metrics":
                 key_metrics_lower_budget = int(lower_budget)
+                key_metrics_budget = int(budget)
+                key_metrics_tolerance = int(tolerance)
+                key_metrics_upper_budget = int(upper_budget)
                 try:
                     from app.api.filings import _key_metrics_contract_word_window
 
@@ -866,9 +1055,21 @@ def validate_summary(
                         target_length=target_words,
                         include_health_rating=include_health_rating,
                     )
+                    key_metrics_budget = max(
+                        int(key_metrics_budget),
+                        int(key_metrics_window.get("expected") or 0),
+                    )
+                    key_metrics_tolerance = max(
+                        int(key_metrics_tolerance),
+                        int(key_metrics_window.get("tolerance") or 0),
+                    )
                     key_metrics_lower_budget = max(
                         int(key_metrics_lower_budget),
                         int(key_metrics_window.get("min_words") or 0),
+                    )
+                    key_metrics_upper_budget = max(
+                        int(key_metrics_upper_budget),
+                        int(key_metrics_window.get("max_words") or 0),
                     )
                 except Exception:
                     pass
@@ -882,25 +1083,32 @@ def validate_summary(
                                 f"{actual_words} words; need ≥{key_metrics_lower_budget}."
                             ),
                             actual_words=actual_words,
-                            budget_words=budget,
+                            budget_words=key_metrics_budget,
                             severity=(
                                 max(0, key_metrics_lower_budget - actual_words)
                                 / max(1, key_metrics_lower_budget)
                             ),
                         )
                     )
-                elif actual_words > upper_budget:
+                elif actual_words > key_metrics_upper_budget:
+                    key_metrics_body = body or ""
+                    guidance_grace = 0
+                    if "What Matters:" in key_metrics_body:
+                        guidance_grace = 8
+                    if actual_words <= key_metrics_upper_budget + guidance_grace:
+                        continue
                     report.section_failures.append(
                         SectionValidationFailure(
                             section_name=section_name,
                             code="section_budget_over",
                             message=(
                                 f"Section balance issue: '{section_name}' is overweight "
-                                f"({actual_words} words; target ~{budget}±{tolerance})."
+                                f"({actual_words} words; target ~{key_metrics_budget}±{key_metrics_tolerance})."
                             ),
                             actual_words=actual_words,
-                            budget_words=budget,
-                            severity=abs(actual_words - budget) / max(1, budget),
+                            budget_words=key_metrics_budget,
+                            severity=abs(actual_words - key_metrics_budget)
+                            / max(1, key_metrics_budget),
                         )
                     )
                 continue
@@ -1024,12 +1232,42 @@ def validate_summary(
             )
         )
 
+    risk_budget_words = int(section_budgets.get("Risk Factors", 0) or 0)
+    risk_body = (sections.get("Risk Factors") or "").strip()
+    hard_risk_failures = {
+        code
+        for code, _message in risk_failures
+        if code in {"risk_schema", "risk_specificity"}
+    }
+    if (
+        target_words <= 1300
+        and risk_count in {1, 2}
+        and not hard_risk_failures
+        and count_words(risk_body) >= max(140, risk_budget_words - 70)
+    ):
+        report.section_failures = [
+            failure
+            for failure in list(report.section_failures or [])
+            if not (
+                str(failure.section_name or "").strip() == "Risk Factors"
+                and str(failure.code or "").strip() == "section_budget_under"
+            )
+        ]
+
     # Detect self-referential meta-language
     self_refs = _detect_self_references(working_text)
     if self_refs:
         report.global_failures.append(
             f"Self-referential structure text detected: {'; '.join(self_refs[:3])}. "
             "Remove all references to the memo's own sections."
+        )
+
+    # Detect instruction leakage (LLM echoing prompt directives)
+    instruction_leaks = _detect_instruction_leakage(working_text)
+    if instruction_leaks:
+        report.global_failures.append(
+            f"Instruction leakage detected: {'; '.join(instruction_leaks[:3])}. "
+            "Remove all prompt/instruction language from the output."
         )
 
     # Management voice validation for MD&A

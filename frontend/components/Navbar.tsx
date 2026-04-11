@@ -16,11 +16,10 @@ export default function Navbar({ variant = 'light' }: NavbarProps) {
 
   return (
     <motion.nav
-      className={`fixed top-0 left-0 right-0 z-50 backdrop-blur-lg border-b ${
-        isDark
-          ? 'bg-[#050015]/80 border-white/10'
-          : 'bg-white/80 border-border'
-      }`}
+      className={`fixed top-0 left-0 right-0 z-50 border-b transition-colors duration-300 ${isDark
+          ? 'bg-black border-zinc-800'
+          : 'bg-white border-zinc-200'
+        }`}
       initial={{ y: -100, opacity: 0 }}
       animate={{ y: 0, opacity: 1 }}
       transition={{ duration: 0.5, ease: "easeOut" }}
@@ -44,21 +43,19 @@ export default function Navbar({ variant = 'light' }: NavbarProps) {
             >
               <Link
                 href="/dashboard"
-                className={`text-sm font-medium transition-colors ${
-                  isDark
+                className={`text-sm font-medium transition-colors ${isDark
                     ? 'text-white/70 hover:text-white'
                     : 'text-muted-foreground hover:text-foreground'
-                }`}
+                  }`}
               >
                 <LetterSwapForward label="Dashboard" />
               </Link>
               <Link
                 href="/billing"
-                className={`text-sm font-medium transition-colors ${
-                  isDark
+                className={`text-sm font-medium transition-colors ${isDark
                     ? 'text-white/70 hover:text-white'
                     : 'text-muted-foreground hover:text-foreground'
-                }`}
+                  }`}
               >
                 <LetterSwapForward label="Billing" />
               </Link>
@@ -73,11 +70,10 @@ export default function Navbar({ variant = 'light' }: NavbarProps) {
             transition={{ delay: 0.3 }}
           >
             {loading ? (
-              <div className={`w-5 h-5 border-2 rounded-full animate-spin ${
-                isDark
+              <div className={`w-5 h-5 border-2 rounded-full animate-spin ${isDark
                   ? 'border-white/20 border-t-white'
                   : 'border-muted-foreground/20 border-t-foreground'
-              }`} />
+                }`} />
             ) : user ? (
               <>
                 <span className={`hidden sm:block text-sm ${isDark ? 'text-white/70' : 'text-muted-foreground'}`}>
@@ -85,11 +81,10 @@ export default function Navbar({ variant = 'light' }: NavbarProps) {
                 </span>
                 <button
                   onClick={signOut}
-                  className={`text-sm font-medium transition-colors ${
-                    isDark
+                  className={`text-sm font-medium transition-colors ${isDark
                       ? 'text-white/70 hover:text-white'
                       : 'text-muted-foreground hover:text-foreground'
-                  }`}
+                    }`}
                 >
                   Sign Out
                 </button>
@@ -98,17 +93,19 @@ export default function Navbar({ variant = 'light' }: NavbarProps) {
               <>
                 <Link
                   href="/signin"
-                  className={`text-sm font-medium transition-colors ${
-                    isDark
+                  className={`text-sm font-medium transition-colors ${isDark
                       ? 'text-white/70 hover:text-white'
                       : 'text-muted-foreground hover:text-foreground'
-                  }`}
+                    }`}
                 >
                   Sign In
                 </Link>
                 <Link
                   href="/signup"
-                  className="inline-flex items-center justify-center px-5 py-2 text-sm font-medium text-white bg-[#0015ff] rounded-full hover:bg-[#0012cc] transition-colors"
+                  className={`inline-flex items-center justify-center px-6 py-2.5 text-xs font-bold tracking-widest uppercase transition-colors border ${isDark
+                      ? 'bg-white text-black border-white hover:bg-zinc-200'
+                      : 'bg-black text-white border-black hover:bg-zinc-800'
+                    }`}
                 >
                   Get Started
                 </Link>

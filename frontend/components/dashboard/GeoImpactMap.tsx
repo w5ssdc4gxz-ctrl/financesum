@@ -1,5 +1,7 @@
 "use client"
 
+/* eslint-disable @next/next/no-img-element -- Map markers can receive arbitrary remote logo URLs. */
+
 import { useMemo, useState } from "react"
 import { ComposableMap, Geographies, Geography, Marker } from "react-simple-maps"
 import type { DashboardMapPoint } from "@/hooks/useDashboardData"

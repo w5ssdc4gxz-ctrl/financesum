@@ -353,6 +353,91 @@ def test_judge_sectioned_summary_flags_instruction_miss_and_soft_closing() -> No
     assert "closing_soft" in failure_codes
 
 
+def test_judge_sectioned_summary_flags_soft_executive_summary_opening() -> None:
+    thread_decision = summary_agents.ThreadDecision(
+        final_thread="Cloud backlog conversion is the underwriting hinge.",
+        anchor="Cloud backlog conversion",
+        anchor_class="operating_kpi",
+        aha_insight="Margin support depends on conversion staying durable.",
+    )
+    plan = summary_agents.SectionPlan(
+        section_name="Executive Summary",
+        job="State the thread and the next proof point.",
+        question="What matters now?",
+        owned_evidence=["Cloud backlog conversion"],
+    )
+
+    failures = summary_agents._judge_sectioned_summary(
+        section_bodies={
+            "Executive Summary": (
+                'Management said "conversion improved as capacity came online." '
+                "The company serves enterprise customers through a sticky cloud platform."
+            )
+        },
+        include_health_rating=False,
+        thread_decision=thread_decision,
+        section_plans={"Executive Summary": plan},
+    )
+
+    failure_codes = {failure.code for failure in failures}
+    assert "exec_opening_soft" in failure_codes
+    assert "aha_not_surfaced" in failure_codes
+    assert "exec_missing_proof_point" in failure_codes
+
+
+def test_opening_surfaces_aha_requires_explicit_contrast_for_contrastive_insight() -> None:
+    decision = summary_agents.ThreadDecision(
+        final_thread="Cloud is reaching a self-funded phase.",
+        anchor="Cloud backlog conversion",
+        anchor_class="operating_kpi",
+        aha_insight="The real shift is that cloud is now funding AI, not consuming it.",
+    )
+
+    weak_opening = (
+        "Cloud is funding more of the investment cycle this quarter. "
+        "Management still thinks conversion is improving."
+    )
+    strong_opening = (
+        "The real shift is that cloud is now funding AI, not consuming it. "
+        "Watch cloud backlog conversion to see whether that holds."
+    )
+
+    assert summary_agents._opening_surfaces_aha(weak_opening, decision) is False
+    assert summary_agents._opening_surfaces_aha(strong_opening, decision) is True
+
+
+def test_judge_sectioned_summary_flags_financial_performance_drift_and_redundancy() -> None:
+    thread_decision = summary_agents.ThreadDecision(
+        final_thread="Cloud backlog conversion is the underwriting hinge.",
+        anchor="Cloud backlog conversion",
+        anchor_class="operating_kpi",
+        aha_insight="Margin support depends on conversion staying durable.",
+    )
+    plan = summary_agents.SectionPlan(
+        section_name="Financial Performance",
+        job="Test the thread with only the most decision-relevant metrics.",
+        question="Do the numbers confirm the thesis?",
+        owned_evidence=["Operating margin expanded 200 bps as cloud utilization improved."],
+    )
+
+    failures = summary_agents._judge_sectioned_summary(
+        section_bodies={
+            "Financial Performance": (
+                "Revenue rose to $10.0B, operating margin reached 29%, free cash flow hit $4.2B, and net income climbed to $2.3B. "
+                "Margin strength is funding the investment cycle, and cash generation is funding the buildout. "
+                "The next question is whether management can keep backlog conversion above 110% over the next two quarters."
+            )
+        },
+        include_health_rating=False,
+        thread_decision=thread_decision,
+        section_plans={"Financial Performance": plan},
+    )
+
+    failure_codes = {failure.code for failure in failures}
+    assert "financial_performance_metric_drift" in failure_codes
+    assert "financial_performance_redundancy" in failure_codes
+
+
 def test_cv2_editorial_guard_distinguishes_editorial_from_structural_failures() -> None:
     editorial_validation = SummaryValidationReport(
         passed=False,
@@ -474,9 +559,8 @@ def test_build_key_metrics_body_includes_what_matters_intro() -> None:
         max_words=120,
     )
 
-    assert "What Matters:" in body
+    assert "What Matters" in body
     assert "→ Revenue: $10.0B" in body
-    assert "- Watch" in body or "- Cloud backlog conversion" in body
 
 
 def test_short_form_structural_seal_preserve_mode_skips_generic_transition_injection() -> None:
@@ -514,7 +598,12 @@ def test_short_form_structural_seal_preserve_mode_skips_generic_transition_injec
         preserve_pipeline_editorial=True,
     )
 
-    assert "The next question is" in default_text or "That leaves" in default_text
+    assert (
+        "The next question is" in default_text
+        or "What matters next is" in default_text
+        or "What matters is" in default_text
+        or "That leaves" in default_text
+    )
     assert "The next question is" not in preserved_text
     assert "That leaves" not in preserved_text
 

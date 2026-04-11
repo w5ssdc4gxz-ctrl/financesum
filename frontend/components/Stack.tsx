@@ -1,3 +1,5 @@
+/* eslint-disable @next/next/no-img-element -- Draggable card art depends on raw img sizing. */
+
 import { motion, useMotionValue, useTransform, PanInfo } from 'framer-motion';
 import { useState, useEffect } from 'react';
 

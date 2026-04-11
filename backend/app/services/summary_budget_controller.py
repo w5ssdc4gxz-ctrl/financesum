@@ -154,16 +154,8 @@ def get_risk_factors_shape(budget_words: int) -> SectionShape:
     """Return the canonical Risk Factors shape for the budget."""
     budget = int(budget_words or 0)
     risk_count = risk_budget_target_count(budget)
-    per_risk_budget = max(1, budget // max(1, risk_count))
-    if per_risk_budget < 90:
-        per_risk_min_sentences = 2
-        per_risk_max_sentences = 3
-    elif per_risk_budget <= 150:
-        per_risk_min_sentences = 3
-        per_risk_max_sentences = 4
-    else:
-        per_risk_min_sentences = 4
-        per_risk_max_sentences = 5
+    per_risk_min_sentences = 2
+    per_risk_max_sentences = 3
     return SectionShape(
         section_name="Risk Factors",
         min_sentences=per_risk_min_sentences * risk_count,
@@ -331,7 +323,7 @@ def get_depth_profile(scale_factor: float) -> dict:
 
 def risk_budget_target_count(risk_budget_words: int) -> int:
     """Return the required number of structured risks for the given budget."""
-    return 2 if int(risk_budget_words or 0) <= int(RISK_FACTORS_TWO_RISK_MAX_BUDGET) else 3
+    return 2
 
 
 def _apply_integer_drift(
@@ -542,7 +534,7 @@ def section_budget_tolerance_words(section_name: str, budget_words: int) -> int:
     tighter 3% band.  Key Metrics remains exact because it is validator-driven.
 
     Risk Factors at mid-range budgets (110-250) uses an 8% band because the
-    per-risk word allocation is tight when 3 risks are required and LLMs
+    per-risk word allocation is still tight even with 2 structured risks and LLMs
     frequently undershoot.
     """
     budget_words = max(0, int(budget_words or 0))

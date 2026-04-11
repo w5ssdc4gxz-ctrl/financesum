@@ -24,11 +24,11 @@ const AnalysisTrend = memo(function AnalysisTrend({
         initial={{ opacity: 0, scale: 0.95 }}
         animate={{ opacity: 1, scale: 1 }}
         transition={{ duration: 0.3 }}
-        className="flex h-full min-h-[12rem] items-center justify-center rounded-lg border border-dashed border-gray-300 bg-gray-50 text-sm text-gray-500 dark:border-gray-700 dark:bg-gray-900/50 dark:text-gray-400"
+        className="flex h-full min-h-[12rem] items-center justify-center rounded-none border-2 border-dashed border-black bg-transparent text-sm text-black dark:border-white dark:text-white"
       >
         <div className="text-center">
-          <p className="font-medium">No analysis data yet</p>
-          <p className="mt-1 text-xs text-gray-400">Run analyses to see trends here</p>
+          <p className="font-bold uppercase tracking-widest">No analysis data yet</p>
+          <p className="mt-1 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Run analyses to see trends here</p>
         </div>
       </motion.div>
     )
@@ -59,11 +59,11 @@ const AnalysisTrend = memo(function AnalysisTrend({
               if (!active || !payload?.length) return null
               const point = payload[0]
               return (
-                <div className="rounded-lg border border-gray-200 bg-white px-3 py-2 shadow-lg dark:border-gray-800 dark:bg-gray-950">
-                  <p className="text-xs font-medium text-gray-600 dark:text-gray-400">
+                <div className="rounded-none border border-black bg-white px-3 py-2 shadow-[4px_4px_0_0_#000] dark:border-white dark:bg-zinc-950 dark:shadow-[4px_4px_0_0_#fff]">
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">
                     {point.payload.label}
                   </p>
-                  <p className="mt-1 text-sm font-semibold text-gray-900 dark:text-gray-50">
+                  <p className="mt-1 text-sm font-black tracking-tighter text-black dark:text-white">
                     {point.value} {(point.value as number) === 1 ? 'analysis' : 'analyses'}
                   </p>
                 </div>
@@ -72,10 +72,10 @@ const AnalysisTrend = memo(function AnalysisTrend({
           />
           <Bar
             dataKey="value"
-            radius={[4, 4, 0, 0]}
+            radius={[0, 0, 0, 0]}
             maxBarSize={40}
           >
-             {data.map((entry, index) => (
+            {data.map((entry, index) => (
               <Cell key={`cell-${index}`} fill={color} />
             ))}
           </Bar>

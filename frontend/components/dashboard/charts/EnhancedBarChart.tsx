@@ -46,12 +46,12 @@ const EnhancedBarChart = memo(function EnhancedBarChart({
         initial={{ opacity: 0, scale: 0.95 }}
         animate={{ opacity: 1, scale: 1 }}
         transition={{ duration: 0.3 }}
-        className="flex items-center justify-center rounded-lg border border-dashed border-gray-300 bg-gray-50 text-sm text-gray-500 dark:border-gray-700 dark:bg-gray-900/50 dark:text-gray-400"
+        className="flex items-center justify-center rounded-none border-2 border-dashed border-black bg-transparent text-sm text-black dark:border-white dark:text-white"
         style={{ height }}
       >
         <div className="text-center">
-          <p className="font-medium">No data available</p>
-          <p className="mt-1 text-xs text-gray-400">Data will appear here once available</p>
+          <p className="font-bold uppercase tracking-widest">No data available</p>
+          <p className="mt-1 text-[10px] font-bold uppercase tracking-widest text-zinc-500">Data will appear here once available</p>
         </div>
       </motion.div>
     )
@@ -67,7 +67,7 @@ const EnhancedBarChart = memo(function EnhancedBarChart({
       className="h-full w-full"
     >
       {title && (
-        <h4 className="mb-4 text-sm font-semibold text-gray-900 dark:text-gray-50">
+        <h4 className="mb-4 text-sm font-bold uppercase tracking-widest text-black dark:text-white">
           {title}
         </h4>
       )}
@@ -140,26 +140,26 @@ const EnhancedBarChart = memo(function EnhancedBarChart({
                 <motion.div
                   initial={{ opacity: 0, scale: 0.9 }}
                   animate={{ opacity: 1, scale: 1 }}
-                  className="rounded-lg border border-gray-200 bg-white px-4 py-3 shadow-xl dark:border-gray-800 dark:bg-gray-950"
+                  className="rounded-none border border-black bg-white px-4 py-3 shadow-[4px_4px_0_0_#000] dark:border-white dark:bg-zinc-950 dark:shadow-[4px_4px_0_0_#fff]"
                 >
                   <div className="flex items-center gap-2">
                     {data.ticker && (
-                      <div className="h-8 w-8 flex-shrink-0 rounded-full bg-gray-50 p-1 dark:bg-gray-900">
-                         <CompanyLogo ticker={data.ticker} className="h-full w-full" />
+                      <div className="h-8 w-8 flex-shrink-0 rounded-none border border-black bg-white p-1 dark:border-white dark:bg-black">
+                        <CompanyLogo ticker={data.ticker} className="h-full w-full" />
                       </div>
                     )}
                     <div>
-                      <p className="font-semibold text-gray-900 dark:text-gray-50">
+                      <p className="font-black tracking-tight text-black dark:text-white">
                         {data.name}
                       </p>
                       {data.ticker && (
-                        <p className="text-xs text-gray-500 dark:text-gray-400">
+                        <p className="text-[10px] font-bold uppercase tracking-widest text-zinc-500">
                           {data.ticker}
                         </p>
                       )}
                     </div>
                   </div>
-                  <p className="mt-2 text-lg font-bold" style={{ color: data.color || colorScheme[0] }}>
+                  <p className="mt-2 text-lg font-black tracking-tighter" style={{ color: data.color || colorScheme[0] }}>
                     {valueFormatter(data.value)}
                   </p>
                 </motion.div>
@@ -169,7 +169,7 @@ const EnhancedBarChart = memo(function EnhancedBarChart({
 
           <Bar
             dataKey="value"
-            radius={[0, 8, 8, 0]}
+            radius={[0, 0, 0, 0]}
             filter="url(#barShadow)"
             animationDuration={1000}
             animationEasing="ease-out"

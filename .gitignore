@@ -24,13 +24,24 @@ wheels/
 .installed.cfg
 *.egg
 
-# Environment variables
+# Environment variables and local secrets
 .env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-frontend/.env.local
+.env.*
+**/.env
+**/.env.*
+*.env
+*.env.*
+*.backup
+debug_*.txt
+*.pid
+!.env.example
+!.env.*.example
+!**/.env.example
+!**/.env.*.example
+!*.env.example
+!*.env.*.example
+!**/*.env.example
+!**/*.env.*.example
 .financesum_backend.pid
 .financesum_frontend.pid
 
@@ -62,6 +73,21 @@ yarn-error.log*
 .gcloud/
 .opencode/
 .opencode.json
+.agent/
+.agents/
+.claude/
+.continue/
+.crush/
+.cursor/
+.factory/
+.junie/
+.kiro/
+.qoder/
+.trae/
+.windsurf/
+.zencoder/
+*-dump.json
+svg finance icons/
 
 # Testing
 coverage/

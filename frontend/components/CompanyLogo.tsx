@@ -1,5 +1,7 @@
 'use client'
 
+/* eslint-disable @next/next/no-img-element -- Backend logo proxy needs raw img error fallback. */
+
 import { useState } from 'react'
 import { cn } from '@/lib/utils'
 

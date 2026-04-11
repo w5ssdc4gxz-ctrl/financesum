@@ -6,7 +6,7 @@ Only **3 services** and **6 environment variables**:
 
 ### Services:
 1. **Supabase** - Database & Storage (free tier)
-2. **Gemini** - AI analysis (free tier)  
+2. **OpenAI** - AI analysis
 3. **EODHD** - Financial data (demo key or free tier)
 
 ### Environment Variables:
@@ -15,7 +15,7 @@ Only **3 services** and **6 environment variables**:
 SUPABASE_URL=...
 SUPABASE_ANON_KEY=...
 SUPABASE_SERVICE_ROLE_KEY=...
-GEMINI_API_KEY=...
+OPENAI_API_KEY=...
 EODHD_API_KEY=demo
 NEXT_PUBLIC_SUPABASE_URL=... (same as SUPABASE_URL)
 NEXT_PUBLIC_SUPABASE_ANON_KEY=... (same as SUPABASE_ANON_KEY)
@@ -29,8 +29,8 @@ SUPABASE_URL=https://xxxxx.supabase.co
 SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 
-# Get from https://aistudio.google.com/app/apikey
-GEMINI_API_KEY=AIzaSyC...
+# Get from OpenAI
+OPENAI_API_KEY=sk-...
 
 # Use "demo" or get from https://eodhd.com
 EODHD_API_KEY=demo
@@ -84,12 +84,12 @@ One API call to `https://eodhd.com/api/fundamentals/AAPL.US?api_token=demo` retu
 
 **Development/Testing (FREE):**
 - Supabase: Free tier
-- Gemini: Free tier (60 requests/min)
+- OpenAI: Pay-per-use
 - EODHD: Demo key (for AAPL, TSLA, AMZN, VTI)
 
 **Production (Cheap):**
 - Supabase: Free tier or $25/month
-- Gemini: Free tier or pay-per-use (very cheap)
+- OpenAI: Pay-per-use
 - EODHD: $19.99/month (unlimited calls, all stocks)
 
 **Total: ~$45/month for full production**
@@ -105,14 +105,12 @@ Store in Supabase (already parsed!)
     ↓
 Calculate ratios
     ↓
-Gemini generates analysis
+OpenAI generates analysis
     ↓
 Show results
 ```
 
 No PDF parsing, no OCR, no headaches! 🎉
-
-
 
 
 

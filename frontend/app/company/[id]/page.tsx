@@ -1,5 +1,7 @@
 'use client'
 
+/* eslint-disable @next/next/no-img-element -- Dynamic company logos use raw img fallbacks. */
+
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
 import ReactMarkdown from 'react-markdown'
@@ -59,7 +61,7 @@ type HealthRatingFormState = {
 
 type SummaryPreferenceFormState = {
   mode: SummaryMode
-  investorFocus: string
+  sectionInstructions: Record<string, string>
   focusAreas: string[]
   tone: SummaryTone
   detailLevel: SummaryDetailLevel
@@ -73,7 +75,7 @@ type SummaryPreferenceFormState = {
 
 type SummaryPreferenceSnapshot = {
   mode: SummaryMode
-  investorFocus?: string
+  sectionInstructions?: Record<string, string>
   focusAreas?: string[]
   tone?: SummaryTone
   detailLevel?: SummaryDetailLevel
@@ -87,6 +89,7 @@ type SummaryErrorModalState = {
   isOpen: boolean
   title: string
   message: string
+  tips: string[]
   showExtensionTip: boolean
 }
 
@@ -110,6 +113,22 @@ type ChartDataPeriod = {
   operating_margin?: number | null
   net_margin?: number | null
   gross_margin?: number | null
+  gross_profit?: number | null
+  operating_cash_flow?: number | null
+  capex?: number | null
+  total_debt?: number | null
+  cash_and_equivalents?: number | null
+  total_assets?: number | null
+  eps_diluted?: number | null
+  roe?: number | null
+  roa?: number | null
+  debt_to_equity?: number | null
+  current_ratio?: number | null
+  quick_ratio?: number | null
+  inventory_turnover?: number | null
+  days_sales_outstanding?: number | null
+  fcf_margin?: number | null
+  [key: string]: number | null | undefined
 }
 
 type ChartData = {
@@ -125,6 +144,10 @@ type FilingSummary = {
   metadata: SummaryPreferenceSnapshot
   generatedAt: string
   companyCountry?: string | null
+  degraded?: boolean
+  degradedReason?: string | null
+  warnings?: string[]
+  contractWarnings?: string[]
   healthRating?: number
   healthComponents?: HealthComponentScores
   healthComponentWeights?: Partial<Record<keyof HealthComponentScores, number>>  // Dynamic weights from user settings
@@ -212,11 +235,328 @@ const healthRatingDefaults: HealthRatingFormState = {
   displayStyle: 'score_plus_grade',
 }
 
-const DEFAULT_TARGET_LENGTH_WORDS = 650
+const SUMMARY_EXPORT_IGNORE_SELECTOR = '[data-export-ignore="true"]'
+
+const SUMMARY_CHART_METRICS: Array<{ key: keyof ChartDataPeriod; label: string; kind: 'currency' | 'percent' }> = [
+  { key: 'revenue', label: 'Revenue', kind: 'currency' },
+  { key: 'operating_income', label: 'Operating Income', kind: 'currency' },
+  { key: 'net_income', label: 'Net Income', kind: 'currency' },
+  { key: 'free_cash_flow', label: 'Free Cash Flow', kind: 'currency' },
+  { key: 'gross_margin', label: 'Gross Margin', kind: 'percent' },
+  { key: 'operating_margin', label: 'Operating Margin', kind: 'percent' },
+  { key: 'net_margin', label: 'Net Margin', kind: 'percent' },
+]
+
+const formatCompactCurrency = (value: number) => {
+  const abs = Math.abs(value)
+  if (abs >= 1_000_000_000) return `$${(value / 1_000_000_000).toFixed(2)}B`
+  if (abs >= 1_000_000) return `$${(value / 1_000_000).toFixed(1)}M`
+  if (abs >= 1_000) return `$${(value / 1_000).toFixed(1)}K`
+  return `$${value.toFixed(0)}`
+}
+
+const formatPercentMetric = (value: number) => {
+  const normalized = Math.abs(value) <= 1.2 ? value * 100 : value
+  return `${normalized.toFixed(1)}%`
+}
+
+const toFiniteNumber = (value: unknown): number | null => {
+  if (typeof value !== 'number') return null
+  if (!Number.isFinite(value)) return null
+  return value
+}
+
+const normalizePercentRatioValue = (value: number | null | undefined): number | null => {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  return Math.abs(value) > 1.2 ? value / 100 : value
+}
+
+const hasNumericValues = (value: Record<string, unknown> | null | undefined) =>
+  !!value && Object.values(value).some((entry) => typeof entry === 'number' && Number.isFinite(entry))
+
+type LegacyStoredAnalysisSnapshot = StoredAnalysisSnapshot & {
+  filing_id?: string | null
+  filing_type?: string | null
+  filing_date?: string | null
+  chart_data?: ChartData | null
+  financial_ratios?: Record<string, number | null> | null
+  summary_md?: string | null
+  summary?: string | null
+  selected_persona?: string | null
+}
+
+const getDerivedSummaryFilingId = (analysisId: string | null | undefined) => {
+  if (!analysisId || !analysisId.startsWith('summary-')) return null
+  const derived = analysisId.slice('summary-'.length).trim()
+  return derived || null
+}
+
+const normalizeStoredAnalysisSnapshot = (
+  snapshot: StoredAnalysisSnapshot | null,
+  analysisId: string | null | undefined,
+): StoredAnalysisSnapshot | null => {
+  if (!snapshot) return null
+  const legacy = snapshot as LegacyStoredAnalysisSnapshot
+  const inferredSource = (analysisId && analysisId.startsWith('summary-')) ? 'summary' : 'analysis'
+  return {
+    ...snapshot,
+    summaryMd: snapshot.summaryMd ?? legacy.summary_md ?? legacy.summary ?? null,
+    filingId: snapshot.filingId ?? legacy.filing_id ?? getDerivedSummaryFilingId(analysisId),
+    filingType: snapshot.filingType ?? legacy.filing_type ?? null,
+    filingDate: snapshot.filingDate ?? legacy.filing_date ?? null,
+    selectedPersona: snapshot.selectedPersona ?? legacy.selected_persona ?? null,
+    chartData: snapshot.chartData ?? legacy.chart_data ?? null,
+    ratios: snapshot.ratios ?? legacy.financial_ratios ?? null,
+    source: snapshot.source ?? inferredSource,
+  }
+}
+
+const snapshotWasNormalized = (
+  snapshot: StoredAnalysisSnapshot,
+  normalized: StoredAnalysisSnapshot,
+) =>
+  snapshot.summaryMd !== normalized.summaryMd ||
+  snapshot.filingId !== normalized.filingId ||
+  snapshot.filingType !== normalized.filingType ||
+  snapshot.filingDate !== normalized.filingDate ||
+  snapshot.selectedPersona !== normalized.selectedPersona ||
+  snapshot.chartData !== normalized.chartData ||
+  snapshot.ratios !== normalized.ratios ||
+  snapshot.source !== normalized.source
+
+const buildRatiosFromChartData = (
+  chartData: ChartData | null | undefined,
+): Record<string, number | null> | null => {
+  const current = chartData?.current_period
+  if (!current) return null
+
+  const resolved: Record<string, number | null> = {
+    gross_margin: normalizePercentRatioValue(toFiniteNumber(current.gross_margin)),
+    operating_margin: normalizePercentRatioValue(toFiniteNumber(current.operating_margin)),
+    net_margin: normalizePercentRatioValue(toFiniteNumber(current.net_margin)),
+    roe: normalizePercentRatioValue(toFiniteNumber(current.roe)),
+    roa: normalizePercentRatioValue(toFiniteNumber(current.roa)),
+    current_ratio: toFiniteNumber(current.current_ratio),
+    quick_ratio: toFiniteNumber(current.quick_ratio),
+    debt_to_equity: toFiniteNumber(current.debt_to_equity),
+    inventory_turnover: toFiniteNumber(current.inventory_turnover),
+    dso: toFiniteNumber(current.days_sales_outstanding),
+  }
+
+  return hasNumericValues(resolved) ? resolved : null
+}
+
+const buildFallbackChartDataFromCalculatedMetrics = (
+  calculatedMetrics: Record<string, unknown> | null | undefined,
+  filingType?: string | null,
+): ChartData | null => {
+  if (!calculatedMetrics) return null
+
+  const currentPeriod: ChartData['current_period'] = {
+    revenue: toFiniteNumber(calculatedMetrics.revenue),
+    operating_income: toFiniteNumber(calculatedMetrics.operating_income),
+    net_income: toFiniteNumber(calculatedMetrics.net_income),
+    free_cash_flow: toFiniteNumber(calculatedMetrics.free_cash_flow),
+    gross_margin: toFiniteNumber(calculatedMetrics.gross_margin),
+    operating_margin: toFiniteNumber(calculatedMetrics.operating_margin),
+    net_margin: toFiniteNumber(calculatedMetrics.net_margin),
+    gross_profit: toFiniteNumber(calculatedMetrics.gross_profit),
+    operating_cash_flow: toFiniteNumber(calculatedMetrics.operating_cash_flow),
+    capex: toFiniteNumber(calculatedMetrics.capital_expenditures),
+    total_debt: toFiniteNumber(calculatedMetrics.total_debt),
+    cash_and_equivalents: toFiniteNumber(calculatedMetrics.cash),
+    total_assets: toFiniteNumber(calculatedMetrics.total_assets),
+    eps_diluted: toFiniteNumber(calculatedMetrics.diluted_eps),
+    roe: toFiniteNumber(calculatedMetrics.roe),
+    roa: toFiniteNumber(calculatedMetrics.roa),
+    debt_to_equity: toFiniteNumber(calculatedMetrics.debt_to_equity),
+    current_ratio: toFiniteNumber(calculatedMetrics.current_ratio),
+    quick_ratio: toFiniteNumber(calculatedMetrics.quick_ratio),
+    inventory_turnover: toFiniteNumber(calculatedMetrics.inventory_turnover),
+    days_sales_outstanding: toFiniteNumber(calculatedMetrics.days_sales_outstanding ?? calculatedMetrics.dso),
+    fcf_margin: toFiniteNumber(calculatedMetrics.fcf_margin),
+  }
+
+  if (!hasNumericValues(currentPeriod as Record<string, unknown>)) return null
+
+  const isQuarterly = String(filingType || '').toUpperCase().includes('10-Q')
+  return {
+    current_period: currentPeriod,
+    prior_period: null,
+    period_type: isQuarterly ? 'quarterly' : 'annual',
+    current_label: isQuarterly ? 'Current Quarter' : 'Current Year',
+    prior_label: isQuarterly ? 'Prior Quarter' : 'Prior Year',
+  }
+}
+
+const buildRatiosFromCalculatedMetrics = (
+  calculatedMetrics: Record<string, unknown> | null | undefined,
+  chartData: ChartData | null | undefined,
+): Record<string, number | null> | null => {
+  const fromChartData = buildRatiosFromChartData(chartData) ?? {}
+  const merged: Record<string, number | null> = {
+    ...fromChartData,
+    net_debt_to_ebitda: toFiniteNumber(calculatedMetrics?.net_debt_to_ebitda),
+    interest_coverage: toFiniteNumber(calculatedMetrics?.interest_coverage),
+  }
+  return hasNumericValues(merged) ? merged : null
+}
+
+const buildSummaryChartAppendix = (summary: FilingSummary) => {
+  const chartData = summary.chartData
+  if (!chartData?.current_period) return ''
+
+  const currentLabel = chartData.current_label || 'Current'
+  const priorLabel = chartData.prior_label || 'Prior'
+  const lines = SUMMARY_CHART_METRICS.flatMap(({ key, label, kind }) => {
+    const current = chartData.current_period[key]
+    if (typeof current !== 'number' || !Number.isFinite(current)) return []
+
+    const prior = chartData.prior_period?.[key]
+    const formatter = kind === 'currency' ? formatCompactCurrency : formatPercentMetric
+    const currentText = formatter(current)
+    const priorText =
+      typeof prior === 'number' && Number.isFinite(prior)
+        ? `${formatter(prior)} (${priorLabel})`
+        : 'N/A'
+
+    return [`- ${label}: ${currentText} (${currentLabel}) | ${priorText}`]
+  })
+
+  if (lines.length === 0) return ''
+  return `Chart Snapshot\n${lines.join('\n')}`
+}
+
+const writeTextToClipboard = async (value: string) => {
+  try {
+    await navigator.clipboard.writeText(value)
+    return
+  } catch (_err) {
+    const textarea = document.createElement('textarea')
+    textarea.value = value
+    textarea.style.position = 'fixed'
+    textarea.style.left = '-9999px'
+    textarea.style.top = '0'
+    document.body.appendChild(textarea)
+    textarea.focus()
+    textarea.select()
+    document.execCommand('copy')
+    document.body.removeChild(textarea)
+  }
+}
+
+const downloadBlob = (blob: Blob, filename: string) => {
+  const url = window.URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  window.URL.revokeObjectURL(url)
+}
+
+const stripCrossOriginImagesForExport = (doc: Document, origin: string) => {
+  doc.querySelectorAll('img').forEach((img) => {
+    const src = (img.getAttribute('src') || '').trim()
+    if (!src) return
+    if (src.startsWith('data:') || src.startsWith('blob:')) return
+    try {
+      const parsed = new URL(src, origin)
+      if (parsed.origin !== origin) {
+        img.remove()
+      }
+    } catch (_err) {
+      img.remove()
+    }
+  })
+}
+
+const captureSummaryElement = async (element: HTMLElement, scale = 2) => {
+  const { default: html2canvas } = await import('html2canvas')
+  const currentOrigin = window.location.origin
+  const boundedScale = Math.max(1, Math.min(2, scale))
+  const area = Math.max(1, element.scrollWidth * element.scrollHeight)
+  const maxPixels = 24_000_000
+  const safeScale = Math.min(boundedScale, Math.sqrt(maxPixels / area))
+  return html2canvas(element, {
+    backgroundColor: '#ffffff',
+    scale: Math.max(1, safeScale),
+    useCORS: true,
+    logging: false,
+    onclone: (doc) => {
+      doc.querySelectorAll(SUMMARY_EXPORT_IGNORE_SELECTOR).forEach((node) => node.remove())
+      stripCrossOriginImagesForExport(doc, currentOrigin)
+    },
+  })
+}
+
+const exportSummaryElementToPdf = async (element: HTMLElement, filename: string) => {
+  const scales = [2, 1.5, 1.25, 1]
+  let canvas: HTMLCanvasElement | null = null
+  let lastCaptureError: unknown = null
+  for (const scale of scales) {
+    try {
+      canvas = await captureSummaryElement(element, scale)
+      break
+    } catch (error) {
+      lastCaptureError = error
+    }
+  }
+  if (!canvas) {
+    throw (lastCaptureError ?? new Error('Unable to capture summary for PDF export'))
+  }
+
+  const { jsPDF } = await import('jspdf')
+  const pdf = new jsPDF({
+    orientation: 'portrait',
+    unit: 'pt',
+    format: 'letter',
+    compress: true,
+  })
+
+  const margin = 36
+  const pageWidth = pdf.internal.pageSize.getWidth()
+  const pageHeight = pdf.internal.pageSize.getHeight()
+  const usableWidth = pageWidth - margin * 2
+  const usableHeight = pageHeight - margin * 2
+  const pageCanvasHeight = Math.max(1, Math.floor((usableHeight * canvas.width) / usableWidth))
+
+  let sourceY = 0
+  let pageIndex = 0
+  while (sourceY < canvas.height) {
+    const sliceHeight = Math.min(pageCanvasHeight, canvas.height - sourceY)
+    const pageCanvas = document.createElement('canvas')
+    pageCanvas.width = canvas.width
+    pageCanvas.height = sliceHeight
+
+    const context = pageCanvas.getContext('2d')
+    if (!context) {
+      throw new Error('Failed to create canvas context for PDF export')
+    }
+
+    context.drawImage(canvas, 0, sourceY, canvas.width, sliceHeight, 0, 0, canvas.width, sliceHeight)
+    const pageImage = pageCanvas.toDataURL('image/png')
+    const imageHeight = (sliceHeight * usableWidth) / canvas.width
+
+    if (pageIndex > 0) {
+      pdf.addPage()
+    }
+
+    pdf.addImage(pageImage, 'PNG', margin, margin, usableWidth, imageHeight, undefined, 'FAST')
+    sourceY += sliceHeight
+    pageIndex += 1
+  }
+
+  const blob = pdf.output('blob')
+  downloadBlob(blob, filename)
+}
+
+const DEFAULT_TARGET_LENGTH_WORDS = 1000
 
 const createDefaultSummaryPreferences = (): SummaryPreferenceFormState => ({
   mode: 'custom',
-  investorFocus: '',
+  sectionInstructions: {},
   focusAreas: ['Financial performance', 'Risk factors'],
   tone: 'objective',
   detailLevel: 'balanced',
@@ -230,12 +570,23 @@ const createDefaultSummaryPreferences = (): SummaryPreferenceFormState => ({
 
 const clampTargetLength = (value: number | null | undefined) => {
   const numericValue = typeof value === 'number' && Number.isFinite(value) ? value : DEFAULT_TARGET_LENGTH_WORDS
-  return Math.max(1, Math.min(3000, Math.round(numericValue)))
+  return Math.max(300, Math.min(3000, Math.round(numericValue)))
+}
+
+const normalizeSectionInstructions = (instructions: Record<string, string>) => {
+  const normalized = Object.fromEntries(
+    Object.entries(instructions)
+      .map(([key, value]) => [key, typeof value === 'string' ? value.trim() : ''])
+      .filter(([, value]) => Boolean(value))
+  ) as Record<string, string>
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined
 }
 
 const buildPreferencePayload = (prefs: SummaryPreferenceFormState): FilingSummaryPreferencesPayload | undefined => {
   // Determine if health score should be enabled (either via granular setting or wizard toggle)
   const isHealthEnabled = prefs.healthRating.enabled || prefs.includeHealthScore;
+  const sectionInstructions = normalizeSectionInstructions(prefs.sectionInstructions)
 
   const buildHealthRating = () =>
     isHealthEnabled
@@ -249,33 +600,28 @@ const buildPreferencePayload = (prefs: SummaryPreferenceFormState): FilingSummar
       }
       : undefined
 
-  // Inject Persona Prompt if selected
-  let personaPrompt = "";
-  if (prefs.selectedPersona) {
-    const persona = INVESTOR_PERSONAS.find(p => p.id === prefs.selectedPersona);
-    if (persona) {
-      personaPrompt = `\n\n${persona.prompt}\n\nIMPORTANT: Adopt the persona of ${persona.name} completely. Use their tone, philosophy, and focus areas. Your analysis MUST sound like it was written by ${persona.name}.`;
-    }
-  }
-
-  const finalInvestorFocus = (prefs.investorFocus.trim() + personaPrompt).trim();
-
   return {
     mode: 'custom',
-    investor_focus: finalInvestorFocus || undefined,
+    section_instructions: sectionInstructions,
+    investor_focus: sectionInstructions
+      ? Object.values(sectionInstructions).join('\n\n')
+      : undefined,
+    persona_id: prefs.selectedPersona || undefined,
     focus_areas: prefs.focusAreas.length ? prefs.focusAreas : undefined,
     tone: prefs.tone,
     detail_level: prefs.detailLevel,
     output_style: prefs.outputStyle,
     target_length: clampTargetLength(prefs.targetLength),
+    complexity: prefs.complexity,
     health_rating: buildHealthRating(),
   }
 }
 
 const snapshotPreferences = (prefs: SummaryPreferenceFormState): SummaryPreferenceSnapshot => {
+  const sectionInstructions = normalizeSectionInstructions(prefs.sectionInstructions)
   return {
     mode: 'custom',
-    investorFocus: prefs.investorFocus.trim() || undefined,
+    sectionInstructions,
     focusAreas: prefs.focusAreas.length ? [...prefs.focusAreas] : undefined,
     tone: prefs.tone,
     detailLevel: prefs.detailLevel,
@@ -308,7 +654,14 @@ const isHealthDisplayValue = (value: string | undefined): value is HealthDisplay
 
 const sanitizeStoredPreferences = (stored: StoredSummaryPreferences): SummaryPreferenceFormState => ({
   mode: 'custom',
-  investorFocus: stored.investorFocus ?? '',
+  sectionInstructions: normalizeSectionInstructions(
+    (
+      (stored as Record<string, unknown>).sectionInstructions &&
+      typeof (stored as Record<string, unknown>).sectionInstructions === 'object'
+        ? (stored as Record<string, unknown>).sectionInstructions
+        : {}
+    ) as Record<string, string>
+  ) ?? {},
   focusAreas: Array.isArray(stored.focusAreas) ? stored.focusAreas : [],
   tone: isSummaryToneValue(stored.tone) ? stored.tone : 'objective',
   detailLevel: isSummaryDetailValue(stored.detailLevel) ? stored.detailLevel : 'balanced',
@@ -335,30 +688,6 @@ const sanitizeStoredPreferences = (stored: StoredSummaryPreferences): SummaryPre
   selectedPersona: (stored as any).selectedPersona ?? null,
 })
 
-const extractHealthRating = (summaryText: string) => {
-  if (!summaryText) {
-    return { score: null as number | null }
-  }
-  const normalized = summaryText.replace(/\*/g, '')
-  const ratingRegex = /financial health rating[^0-9]{0,80}(\d{1,3})(?:\s*\/\s*100)?(?:\s*\(([A-F][+-]?)\))?/i
-  const match = normalized.match(ratingRegex)
-  if (match) {
-    const score = Number(match[1])
-    const letter = match[2] ?? null
-    if (Number.isFinite(score)) {
-      return { score, letter }
-    }
-  }
-  const fallback = normalized.match(/(\d{1,2}|100)\s*(?:\/\s*100)?\s*(?:points|score|rating)/i)
-  if (fallback) {
-    const score = Number(fallback[1])
-    if (Number.isFinite(score)) {
-      return { score, letter: null }
-    }
-  }
-  return { score: null as number | null }
-}
-
 const emitDashboardSync = () => {
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new Event('financesum-dashboard-sync'))
@@ -381,6 +710,13 @@ const parseNumericScore = (value: unknown): number | null => {
     return Number.isFinite(parsed) ? parsed : null
   }
   return null
+}
+
+const normalizeValidatedHealthScore = (value: unknown): number | null => {
+  const parsed = parseNumericScore(value)
+  if (parsed == null) return null
+  if (parsed < 0 || parsed > 100) return null
+  return parsed
 }
 
 const getFilingColor = (type?: string) => {
@@ -406,6 +742,8 @@ export default function CompanyPage() {
   const [selectedPersonas, setSelectedPersonas] = useState<string[]>([])
   const [currentAnalysisId, setCurrentAnalysisId] = useState<string | null>(analysisIdParam ?? null)
   const [localAnalysisSnapshot, setLocalAnalysisSnapshot] = useState<StoredAnalysisSnapshot | null>(null)
+  const [analysisFallbackChartData, setAnalysisFallbackChartData] = useState<ChartData | null>(null)
+  const [analysisFallbackRatios, setAnalysisFallbackRatios] = useState<Record<string, number | null> | null>(null)
   const [loadingSummaries, setLoadingSummaries] = useState<Record<string, boolean>>({})
   const [activeSummaryProgressFilingId, setActiveSummaryProgressFilingId] = useState<string | null>(null)
   const [summaryProgress, setSummaryProgress] = useState<Record<string, SummaryProgressPayload>>({})
@@ -414,6 +752,7 @@ export default function CompanyPage() {
     isOpen: false,
     title: '',
     message: '',
+    tips: [],
     showExtensionTip: false,
   })
 
@@ -428,6 +767,9 @@ export default function CompanyPage() {
   const [copiedAnalysis, setCopiedAnalysis] = useState(false)
   const [exportingAnalysis, setExportingAnalysis] = useState<null | 'pdf' | 'docx'>(null)
   const summaryCardRef = useRef<HTMLDivElement | null>(null)
+  const summaryExportRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const inFlightSummaryRequestsRef = useRef<Set<string>>(new Set())
+  const analysisExportRef = useRef<HTMLDivElement | null>(null)
   const preferencesHydratedRef = useRef(false)
   const isSummaryGenerating = selectedFilingForSummary ? !!loadingSummaries[selectedFilingForSummary] : false
   const queryClient = useQueryClient()
@@ -437,9 +779,251 @@ export default function CompanyPage() {
   const fallbackTicker = searchParams?.get('ticker') ?? undefined
   const isLocalAnalysisId = currentAnalysisId?.startsWith('summary-') ?? false
 
+  const setSummaryExportRef = useCallback((filingId: string, node: HTMLDivElement | null) => {
+    if (node) {
+      summaryExportRefs.current[filingId] = node
+      return
+    }
+    delete summaryExportRefs.current[filingId]
+  }, [])
+
   const openSummaryError = useCallback((error: any, fallbackMessage: string) => {
-    const responseMessage = error?.response?.data?.detail
-    const message = String(responseMessage || error?.message || fallbackMessage || 'Failed to generate summary')
+    const responseDetail = error?.response?.data?.detail
+    const failureCode = responseDetail?.failure_code || error?.response?.data?.failure_code
+    const targetLength = responseDetail?.target_length
+    const actualWordCount = Number(responseDetail?.actual_word_count)
+    const missingRequirements = (Array.isArray(responseDetail?.missing_requirements)
+      ? responseDetail.missing_requirements
+      : []).filter((item: unknown) => !/^_\w+:/.test(String(item || '')))
+    const diagnosticMissingRequirements = Array.isArray(responseDetail?.diagnostic_missing_requirements)
+      ? responseDetail.diagnostic_missing_requirements
+      : []
+    const sectionFailures = Array.isArray(responseDetail?.section_failures)
+      ? responseDetail.section_failures
+      : []
+    const targetBand =
+      responseDetail?.target_band && typeof responseDetail.target_band === 'object'
+        ? responseDetail.target_band
+        : null
+    const contractScope = String(responseDetail?.contract_scope || '').trim()
+    const hasKeyMetricsIssue = missingRequirements.some((item: unknown) => String(item || '').toLowerCase().includes('key metrics'))
+    const hasQuoteIssue = missingRequirements.some((item: unknown) => String(item || '').toLowerCase().includes('quote'))
+    const hasWordBandIssue = missingRequirements.some((item: unknown) => String(item || '').toLowerCase().includes('word-count band violation'))
+
+    let message = ''
+    let tips: string[] = []
+    if (failureCode === 'SUMMARY_ONE_SHOT_CONTRACT_FAILED') {
+      const isMicro = contractScope === 'micro_exact'
+      const bandLine =
+        targetBand &&
+        Number.isFinite(Number(targetBand.lower)) &&
+        Number.isFinite(Number(targetBand.upper))
+          ? `Required final band: ${Math.round(Number(targetBand.lower))}-${Math.round(Number(targetBand.upper))} words.`
+          : ''
+      const actualLine = Number.isFinite(actualWordCount)
+        ? `Actual summary length: ${Math.round(actualWordCount)} words.`
+        : ''
+      const bandTolerance =
+        targetBand &&
+        Number.isFinite(Number(targetBand.lower)) &&
+        Number.isFinite(Number(targetBand.upper)) &&
+        Number.isFinite(Number(targetLength))
+          ? Math.max(
+              Math.abs(Math.round(Number(targetLength)) - Math.round(Number(targetBand.lower))),
+              Math.abs(Math.round(Number(targetBand.upper)) - Math.round(Number(targetLength))),
+            )
+          : 20
+      const fatalBlock = missingRequirements.length
+        ? `\n\nFatal requirements not met:\n- ${missingRequirements.slice(0, 6).join('\n- ')}`
+        : ''
+      const diagnosticBlock = diagnosticMissingRequirements.length
+        ? `\n\nDiagnostics:\n- ${diagnosticMissingRequirements.slice(0, 6).join('\n- ')}`
+        : ''
+      const baseLine = isMicro
+        ? (targetLength
+            ? `Unable to satisfy the exact ${targetLength}-word one-shot summary contract.`
+            : 'Unable to satisfy the exact one-shot summary contract.')
+        : (targetLength
+            ? `Unable to satisfy the one-shot summary contract within ${bandTolerance} words of the ${targetLength}-word target without retries.`
+            : 'Unable to satisfy the one-shot summary contract without retries.')
+      message = [baseLine, actualLine, bandLine].filter(Boolean).join(' ') + fatalBlock + diagnosticBlock
+      tips = [
+        'Retry once in case the generation pass had a temporary model hiccup.',
+        'If it keeps failing, lower the target length slightly and try again.',
+      ]
+    } else if (failureCode === 'SUMMARY_CONTRACT_FAILED') {
+      const backendDetail = String(responseDetail?.detail || '').trim()
+      const contractLine = backendDetail.startsWith('Unable to satisfy')
+        ? backendDetail
+        : targetLength
+          ? `Unable to satisfy ${targetLength}-word narrative+quote contract from current filing evidence.`
+          : 'Unable to satisfy strict long-form narrative+quote contract from current filing evidence.'
+      const requirementsBlock = missingRequirements.length
+        ? `\n\nRequirements not met:\n- ${missingRequirements.slice(0, 6).join('\n- ')}`
+        : ''
+      message = `${contractLine}${requirementsBlock}`
+      tips = [
+        Number.isFinite(Number(targetLength)) && Number(targetLength) > 0
+          ? `Try a shorter target length than ${Math.round(Number(targetLength))} words so the contract has less evidence to satisfy.`
+          : 'Try a shorter target length so the contract has less evidence to satisfy.',
+        hasQuoteIssue
+          ? 'If quotes are missing, try a filing with richer management commentary, usually a 10-K or annual filing.'
+          : 'Try a filing with richer management commentary if this one is sparse or heavily numeric.',
+        hasKeyMetricsIssue
+          ? 'If Key Metrics is underweight, use a filing with fuller financial statements or reduce the requested length.'
+          : hasWordBandIssue
+            ? 'If only the word band is failing, trim the target slightly and retry instead of refreshing the page.'
+            : 'A refresh usually will not fix this one because it is a strict evidence/length contract failure.',
+      ]
+    } else if (failureCode === 'SUMMARY_SECTION_BALANCE_FAILED') {
+      const sectionBlock = sectionFailures.length
+        ? `\n\nFinal validation still failed:\n- ${sectionFailures
+            .slice(0, 6)
+            .map((item: any) => String(item?.message || item || '').trim())
+            .filter(Boolean)
+            .join('\n- ')}`
+        : ''
+      message = [
+        targetLength
+          ? `The ${targetLength}-word Continuous V2 summary got close, but final section-balance validation still failed.`
+          : 'The Continuous V2 summary got close, but final section-balance validation still failed.',
+        sectionBlock,
+      ].join('')
+      tips = [
+        'Retry once in case a neighboring repair path lands cleanly on the next pass.',
+        'If Risk Factors and Key Metrics keep failing together, lower the target length slightly and retry.',
+        'If it still repeats, try a filing with richer management commentary and fuller statement detail.',
+      ]
+    } else if (failureCode === 'SUMMARY_CONTRACT_TIMEOUT') {
+      const timeoutLine = targetLength
+        ? `The explicit ${targetLength}-word summary target could not be satisfied before the timeout fallback finished.`
+        : 'The explicit summary target could not be satisfied before the timeout fallback finished.'
+      const requirementsBlock = missingRequirements.length
+        ? `\n\nStill unresolved:\n- ${missingRequirements.slice(0, 4).join('\n- ')}`
+        : ''
+      message = `${timeoutLine}${requirementsBlock}`
+      tips = [
+        'Retry once in case the timeout was transient.',
+        'If it happens again, lower the target length and retry.',
+      ]
+    } else if (failureCode === 'INSUFFICIENT_NUMERIC_KEY_METRICS') {
+      const numericRowCount = Number(responseDetail?.numeric_row_count)
+      const issueText = String(responseDetail?.issue || '').trim()
+      const countLine = Number.isFinite(numericRowCount)
+        ? `Detected numeric rows: ${Math.round(numericRowCount)}.`
+        : ''
+      message = [
+        'The filing does not contain enough numeric evidence to build a strict Key Metrics section for this summary target.',
+        countLine,
+        issueText,
+        'Try a shorter target length or a filing with richer financial statement data.',
+      ].filter(Boolean).join(' ')
+      tips = [
+        'Choose a shorter target length for this filing.',
+        'Or switch to a filing with fuller statement data, often a 10-K or annual report.',
+      ]
+    } else if (failureCode === 'SUMMARY_BUDGET_EXCEEDED') {
+      const cap = Number(responseDetail?.budget_cap_usd)
+      const estimatedMin = Number(responseDetail?.estimated_min_cost_usd)
+      const projected = Number(responseDetail?.projected_cost_usd)
+      const actualCost = Number(responseDetail?.actual_cost_usd)
+      const hasActualCost = Number.isFinite(actualCost)
+      const hasProjectedCost = Number.isFinite(projected)
+      const hasEstimatedMin = Number.isFinite(estimatedMin)
+      const stage = String(responseDetail?.stage || '').toLowerCase()
+      const guidance = String(responseDetail?.guidance || '').trim()
+      const suggestedTargetLength = Number(responseDetail?.suggested_target_length)
+      const attemptedAdjustments = Array.isArray(responseDetail?.budget_adjustments_attempted)
+        ? responseDetail.budget_adjustments_attempted
+            .map((item: unknown) => String(item || '').trim())
+            .filter(Boolean)
+        : []
+      const capLabel = Number.isFinite(cap) ? `$${cap.toFixed(2)}` : '$0.10'
+      const stageLine = stage.includes('rewrite')
+        ? 'The request exceeded budget during the rewrite pass.'
+        : stage.includes('generation')
+          ? 'The request exceeded budget during summary generation.'
+          : stage.includes('preflight')
+            ? 'The request is over budget before generation starts (preflight estimate).'
+            : 'The request exceeded the strict summary budget cap.'
+      const estimateSource = hasActualCost
+        ? `Actual cost reached $${actualCost.toFixed(3)}.`
+        : hasProjectedCost
+          ? `Projected cost is $${projected.toFixed(3)}.`
+          : hasEstimatedMin
+            ? `Estimated minimum cost is $${estimatedMin.toFixed(3)}.`
+            : ''
+      const runtimeClarifier =
+        Number.isFinite(cap) &&
+        hasEstimatedMin &&
+        estimatedMin < cap &&
+        (hasActualCost || hasProjectedCost)
+          ? 'Minimum-path estimate was below cap, but runtime generation/rewrite cost exceeded the cap.'
+          : ''
+      const adjustmentLabels = attemptedAdjustments
+        .map((code: string) => {
+          if (code === 'context_trimmed' || code === 'context_trimmed_token_budget' || code === 'context_trimmed_preflight_cost') {
+            return 'trimmed filing context'
+          }
+          if (code === 'context_trimmed_data_window') {
+            return 'trimmed non-core filing data window'
+          }
+          if (code === 'context_trimmed_after_research_skipped') {
+            return 'trimmed filing context again after skipping research'
+          }
+          if (code === 'context_trimmed_after_non_core_drops') {
+            return 'trimmed filing context again after non-core reductions'
+          }
+          if (code === 'research_compressed') {
+            return 'compressed Agent-1 research'
+          }
+          if (code === 'research_skipped') {
+            return 'skipped Agent-1 research'
+          }
+          if (code === 'spotlight_context_dropped') {
+            return 'dropped spotlight context'
+          }
+          if (code === 'filing_snippets_reduced') {
+            return 'reduced filing quote snippets'
+          }
+          if (code === 'filing_snippets_dropped') {
+            return 'dropped filing quote snippets'
+          }
+          if (code === 'risk_factors_excerpt_reduced') {
+            return 'reduced risk-factors appendix'
+          }
+          if (code === 'risk_factors_excerpt_dropped') {
+            return 'dropped risk-factors appendix'
+          }
+          return ''
+        })
+        .filter(Boolean)
+      const attemptedLine = adjustmentLabels.length
+        ? `Backend already attempted: ${Array.from(new Set(adjustmentLabels)).join(', ')}.`
+        : ''
+      const suggestedLine =
+        Number.isFinite(suggestedTargetLength) && suggestedTargetLength > 0
+          ? `Suggested target length: ~${Math.round(suggestedTargetLength)} words.`
+          : ''
+      const guidanceLine = guidance || 'Try a shorter target length or reduce context size, then retry.'
+      message = `${stageLine} Strict cap: ${capLabel}.${estimateSource ? ` ${estimateSource}` : ''}\n\n${runtimeClarifier}${runtimeClarifier && (attemptedLine || suggestedLine || guidanceLine) ? '\n' : ''}${attemptedLine}${attemptedLine && (suggestedLine || guidanceLine) ? '\n' : ''}${suggestedLine}${suggestedLine && guidanceLine ? '\n' : ''}${guidanceLine}`
+      tips = [
+        'Reduce the requested length or simplify the request, then retry.',
+        'If available, use the suggested target length shown in the error.',
+      ]
+    } else {
+      if (typeof responseDetail === 'string') {
+        message = responseDetail
+      } else if (responseDetail && typeof responseDetail === 'object') {
+        try {
+          message = JSON.stringify(responseDetail, null, 2)
+        } catch {
+          message = fallbackMessage || 'Failed to generate summary'
+        }
+      } else {
+        message = String(error?.message || fallbackMessage || 'Failed to generate summary')
+      }
+    }
     const status = error?.response?.status
     const code = String(error?.code || '')
     const raw = `${String(error?.message || '')} ${String(error?.toString?.() || '')}`.toLowerCase()
@@ -452,10 +1036,20 @@ export default function CompanyPage() {
         raw.includes('err_blocked_by_client') ||
         raw.includes('net::err_'))
 
+    if (!tips.length) {
+      tips = looksLikeNetworkOrClientBlock
+        ? [
+            'Retry once (temporary network/API hiccups happen).',
+            'Hard refresh the page, then try again.',
+          ]
+        : ['Retry once and, if it repeats, adjust the request before trying again.']
+    }
+
     setSummaryErrorModal({
       isOpen: true,
       title: 'Couldn’t generate summary',
       message,
+      tips,
       showExtensionTip: looksLikeNetworkOrClientBlock,
     })
   }, [])
@@ -494,14 +1088,87 @@ export default function CompanyPage() {
   }, [analysisIdParam, currentAnalysisId])
 
   useEffect(() => {
-    if (!currentAnalysisId || !isLocalAnalysisId || !userId) {
+    if (!currentAnalysisId || !userId) {
       setLocalAnalysisSnapshot(null)
       return
     }
     const history = DashboardStorage.loadAnalysisHistory(userId)
     const snapshot = history.find(item => item.analysisId === currentAnalysisId) ?? null
-    setLocalAnalysisSnapshot(snapshot)
-  }, [currentAnalysisId, isLocalAnalysisId, userId])
+    const normalizedSnapshot = normalizeStoredAnalysisSnapshot(snapshot, currentAnalysisId)
+    setLocalAnalysisSnapshot(normalizedSnapshot)
+
+    if (snapshot && normalizedSnapshot && snapshotWasNormalized(snapshot, normalizedSnapshot)) {
+      DashboardStorage.upsertAnalysisSnapshot(normalizedSnapshot, userId)
+      emitDashboardSync()
+    }
+  }, [currentAnalysisId, userId])
+
+  useEffect(() => {
+    setAnalysisFallbackChartData(null)
+    setAnalysisFallbackRatios(null)
+
+    if (!isLocalAnalysisId) return
+    if (!localAnalysisSnapshot) return
+    const fallbackFilingId =
+      localAnalysisSnapshot?.filingId ??
+      getDerivedSummaryFilingId(currentAnalysisId)
+    if (!fallbackFilingId) return
+
+    const snapshotHasChartData = hasNumericValues(
+      (localAnalysisSnapshot.chartData?.current_period as Record<string, unknown> | undefined) ?? undefined,
+    )
+    const snapshotHasRatios = hasNumericValues(
+      (localAnalysisSnapshot.ratios as Record<string, unknown> | undefined) ?? undefined,
+    )
+
+    if (snapshotHasChartData || snapshotHasRatios) return
+
+    let cancelled = false
+    const filingId = String(fallbackFilingId)
+    void (async () => {
+      try {
+        const response = await filingsApi.getFilingHealth(filingId)
+        if (cancelled) return
+
+        const calculatedMetrics =
+          response?.data?.calculated_metrics && typeof response.data.calculated_metrics === 'object'
+            ? (response.data.calculated_metrics as Record<string, unknown>)
+            : null
+        if (!calculatedMetrics) return
+
+        const fallbackChartData = buildFallbackChartDataFromCalculatedMetrics(
+          calculatedMetrics,
+          localAnalysisSnapshot.filingType,
+        )
+        const fallbackRatios = buildRatiosFromCalculatedMetrics(calculatedMetrics, fallbackChartData)
+
+        if (!fallbackChartData && !fallbackRatios) return
+        if (cancelled) return
+
+        setAnalysisFallbackChartData(fallbackChartData)
+        setAnalysisFallbackRatios(fallbackRatios)
+
+        if (userId) {
+          DashboardStorage.upsertAnalysisSnapshot(
+            {
+              ...localAnalysisSnapshot,
+              filingId,
+              chartData: fallbackChartData ?? localAnalysisSnapshot.chartData ?? null,
+              ratios: fallbackRatios ?? localAnalysisSnapshot.ratios ?? null,
+            },
+            userId,
+          )
+          emitDashboardSync()
+        }
+      } catch (error) {
+        console.warn('Unable to hydrate chart fallback for snapshot analysis.', error)
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [isLocalAnalysisId, localAnalysisSnapshot, currentAnalysisId, userId])
 
   useEffect(() => {
     if (typeof window === 'undefined') return
@@ -537,8 +1204,7 @@ export default function CompanyPage() {
       return trimmed
     }
 
-    const proxyBase = (process.env.NEXT_PUBLIC_API_PROXY_BASE ?? '/api/backend').trim()
-    const normalizedProxyBase = (proxyBase || '/api/backend').replace(/\/+$/, '')
+    const normalizedProxyBase = '/api/backend'
     const normalizedPath = trimmed.startsWith('/') ? trimmed : `/${trimmed}`
 
     return `${normalizedProxyBase}${normalizedPath}`
@@ -558,6 +1224,11 @@ export default function CompanyPage() {
     preferences?: FilingSummaryPreferencesPayload,
     metadata?: SummaryPreferenceSnapshot,
   ) => {
+    if (inFlightSummaryRequestsRef.current.has(filingId)) {
+      return
+    }
+    inFlightSummaryRequestsRef.current.add(filingId)
+
     setActiveSummaryProgressFilingId(filingId)
     setLoadingSummaries(prev => ({ ...prev, [filingId]: true }))
     setSummaryProgress(prev => ({
@@ -600,8 +1271,10 @@ export default function CompanyPage() {
     // Start polling loop
     pollProgress()
 
-    try {
-      const response = await filingsApi.summarizeFiling(filingId, preferences)
+    const persistSummaryResponse = (
+      response: any,
+      responseMetadata?: SummaryPreferenceSnapshot,
+    ) => {
       if (isMountedRef.current) {
         setSummaryProgress(prev => ({
           ...prev,
@@ -610,28 +1283,31 @@ export default function CompanyPage() {
       }
 
       // Extract health rating if present
-      let healthRating: number | undefined;
-      let healthComponents: HealthComponentScores | undefined;
+      let healthRating: number | undefined
+      let healthComponents: HealthComponentScores | undefined
 
       if (response.data.health_score !== undefined) {
-        healthRating = response.data.health_score;
-      } else {
-        const extracted = extractHealthRating(response.data.summary);
-        if (extracted.score !== null) {
-          healthRating = extracted.score;
-        }
+        healthRating = normalizeValidatedHealthScore(response.data.health_score) ?? undefined
       }
 
       if (response.data.health_components) {
-        healthComponents = response.data.health_components;
+        healthComponents = response.data.health_components
       }
 
       // Capture dynamic weights, descriptions, and metrics from user settings
-      const healthComponentWeights = response.data.health_component_weights;
-      const healthComponentDescriptions = response.data.health_component_descriptions;
-      const healthComponentMetrics = response.data.health_component_metrics;
+      const healthComponentWeights = response.data.health_component_weights
+      const healthComponentDescriptions = response.data.health_component_descriptions
+      const healthComponentMetrics = response.data.health_component_metrics
       const companyCountry = response.data.company_country ?? null
       const chartData = response.data.chart_data ?? null
+      const degraded = Boolean(response.data.degraded)
+      const degradedReason = typeof response.data.degraded_reason === 'string' ? response.data.degraded_reason : null
+      const warnings = Array.isArray(response.data.warnings)
+        ? response.data.warnings.map((item: unknown) => String(item))
+        : []
+      const contractWarnings = Array.isArray(response.data.contract_warnings)
+        ? response.data.contract_warnings.map((item: unknown) => String(item))
+        : []
 
       if (isMountedRef.current) {
         const generatedAt = new Date().toISOString()
@@ -639,9 +1315,13 @@ export default function CompanyPage() {
           ...prev,
           [filingId]: {
             content: response.data.summary,
-            metadata: metadata ?? { mode: 'custom' },
+            metadata: responseMetadata ?? metadata ?? { mode: 'custom' },
             generatedAt,
             companyCountry,
+            degraded,
+            degradedReason,
+            warnings,
+            contractWarnings,
             healthRating,
             healthComponents,
             healthComponentWeights,
@@ -650,13 +1330,32 @@ export default function CompanyPage() {
             chartData,
           },
         }))
+        if (userId) {
+          DashboardStorage.appendSummaryEvent(
+            {
+              eventId: `summary:${filingId}:${generatedAt}`,
+              generatedAt,
+              kind: 'summary',
+              filingId,
+              companyId: company?.id ?? null,
+            },
+            userId,
+          )
+          setTimeout(emitDashboardSync, 2000)
+        }
       }
+    }
+
+    try {
+      const response = await filingsApi.summarizeFiling(filingId, preferences)
+      persistSummaryResponse(response, metadata)
     } catch (error: any) {
       if (isMountedRef.current) {
         openSummaryError(error, 'Failed to generate summary')
       }
     } finally {
       isPolling = false
+      inFlightSummaryRequestsRef.current.delete(filingId)
       // Add a small delay to let the user see the completion state if needed
       if (isMountedRef.current) {
         setTimeout(() => {
@@ -681,8 +1380,7 @@ export default function CompanyPage() {
     const filing = filings?.find((item: any) => item.id === filingId)
 
     const generatedAt = new Date().toISOString()
-    // Prioritize API-provided healthRating over text extraction
-    const healthScore = summary.healthRating ?? extractHealthRating(summary.content).score
+    const healthScore = normalizeValidatedHealthScore(summary.healthRating)
     const ratingInfo = typeof healthScore === 'number' ? scoreToRating(healthScore) : null
 
     DashboardStorage.upsertAnalysisSnapshot({
@@ -706,7 +1404,9 @@ export default function CompanyPage() {
       filingDate: filing?.filing_date ?? null,
       source: 'summary',
       selectedPersona: summary.metadata?.selectedPersona ?? null,
-    } as any, userId)
+      chartData: summary.chartData ?? null,
+      ratios: null,
+    }, userId)
     setDashboardSavedSummaries(prev => ({ ...prev, [filingId]: true }))
     emitDashboardSync()
     setShowSavedPopup(true)
@@ -728,43 +1428,22 @@ export default function CompanyPage() {
     const summary = filingSummaries[filingId]
     if (!summary?.content) return
 
-    try {
-      await navigator.clipboard.writeText(summary.content)
-    } catch (error) {
-      const textarea = document.createElement('textarea')
-      textarea.value = summary.content
-      textarea.style.position = 'fixed'
-      textarea.style.left = '-9999px'
-      textarea.style.top = '0'
-      document.body.appendChild(textarea)
-      textarea.focus()
-      textarea.select()
-      document.execCommand('copy')
-      document.body.removeChild(textarea)
-    }
+    const chartAppendix = buildSummaryChartAppendix(summary)
+    const clipboardText = chartAppendix
+      ? `${summary.content.trim()}\n\n${chartAppendix}`
+      : summary.content
+
+    await writeTextToClipboard(clipboardText)
 
     setCopiedSummaries(prev => ({ ...prev, [filingId]: true }))
     window.setTimeout(() => clearCopiedFlag(filingId), 1500)
   }
 
   const handleCopyAnalysis = async () => {
-    const content = (analysisToDisplay as any)?.summary_md || (analysisToDisplay as any)?.summaryMd || (analysisToDisplay as any)?.content || ''
+    const content = analysisContent
     if (!content) return
 
-    try {
-      await navigator.clipboard.writeText(content)
-    } catch (error) {
-      const textarea = document.createElement('textarea')
-      textarea.value = content
-      textarea.style.position = 'fixed'
-      textarea.style.left = '-9999px'
-      textarea.style.top = '0'
-      document.body.appendChild(textarea)
-      textarea.focus()
-      textarea.select()
-      document.execCommand('copy')
-      document.body.removeChild(textarea)
-    }
+    await writeTextToClipboard(content)
 
     setCopiedAnalysis(true)
     window.setTimeout(clearCopiedAnalysisFlag, 1500)
@@ -792,9 +1471,22 @@ export default function CompanyPage() {
       [companyLabel, filingType, filingDate, 'brief'].filter(Boolean).join('_')
     )
     const filename = `${baseName}.${format === 'pdf' ? 'pdf' : 'docx'}`
+    let clientPdfCaptureError: unknown = null
 
     setExportingSummaries(prev => ({ ...prev, [filingId]: format }))
     try {
+      const exportNode = summaryExportRefs.current[filingId]
+      if (format === 'pdf' && exportNode) {
+        try {
+          await exportSummaryElementToPdf(exportNode, filename)
+          return
+        } catch (captureError) {
+          clientPdfCaptureError = captureError
+          // Continue to backend export fallback so users still get a file.
+          console.warn('Client PDF capture failed; falling back to backend export.', captureError)
+        }
+      }
+
       const response = await filingsApi.exportSummary(filingId, {
         format,
         title: `${companyLabel} ${filingType} Brief`,
@@ -805,16 +1497,15 @@ export default function CompanyPage() {
       })
 
       const blob = response.data as Blob
-      const url = window.URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = filename
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      window.URL.revokeObjectURL(url)
+      downloadBlob(blob, filename)
     } catch (error: any) {
-      const message = error?.response?.data?.detail ?? 'Failed to export summary'
+      const captureMessage =
+        clientPdfCaptureError instanceof Error ? clientPdfCaptureError.message : undefined
+      const message =
+        error?.response?.data?.detail ||
+        error?.message ||
+        captureMessage ||
+        'Failed to export summary'
       alert(message)
     } finally {
       setExportingSummaries(prev => {
@@ -826,7 +1517,7 @@ export default function CompanyPage() {
   }
 
   const handleExportAnalysis = async (format: 'pdf' | 'docx') => {
-    const content = (analysisToDisplay as any)?.summary_md || (analysisToDisplay as any)?.summaryMd || (analysisToDisplay as any)?.content || ''
+    const content = analysisContent
     if (!content) return
 
     const analysisIdentifier = String((analysisToDisplay as any)?.id ?? currentAnalysisId ?? '')
@@ -863,10 +1554,22 @@ export default function CompanyPage() {
         : [companyLabel, 'analysis', inferredGeneratedAt].filter(Boolean).join('_')
     )
     const filename = `${baseName}.${format === 'pdf' ? 'pdf' : 'docx'}`
+    let clientPdfCaptureError: unknown = null
 
     setExportingAnalysis(format)
 
     try {
+      if (format === 'pdf' && analysisExportRef.current) {
+        try {
+          await exportSummaryElementToPdf(analysisExportRef.current, filename)
+          return
+        } catch (captureError) {
+          clientPdfCaptureError = captureError
+          // Fall back to backend export so the user still gets a file.
+          console.warn('Client analysis PDF capture failed; falling back to backend export.', captureError)
+        }
+      }
+
       const response = isSummarySnapshot
         ? await filingsApi.exportSummary(localAnalysisSnapshot?.filingId || analysisIdentifier.replace('summary-', ''), {
           format,
@@ -889,16 +1592,15 @@ export default function CompanyPage() {
         })
 
       const blob = response.data as Blob
-      const url = window.URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = filename
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      window.URL.revokeObjectURL(url)
+      downloadBlob(blob, filename)
     } catch (error: any) {
-      const message = error?.response?.data?.detail ?? 'Failed to export analysis'
+      const captureMessage =
+        clientPdfCaptureError instanceof Error ? clientPdfCaptureError.message : undefined
+      const message =
+        error?.response?.data?.detail ||
+        error?.message ||
+        captureMessage ||
+        'Failed to export analysis'
       alert(message)
     } finally {
       setExportingAnalysis(null)
@@ -1056,7 +1758,8 @@ export default function CompanyPage() {
       const personaSignals = mapPersonaSignals(analysis.investor_persona_summaries)
       const rawSummary = analysis.summary_md ?? analysis.summaryMd ?? null
       const healthScore =
-        parseNumericScore(analysis.health_score) ?? parseNumericScore(analysis.healthScore)
+        normalizeValidatedHealthScore(analysis.health_score)
+        ?? normalizeValidatedHealthScore(analysis.healthScore)
       const generatedAt =
         analysis.analysis_date ||
         analysis.analysis_datetime ||
@@ -1087,9 +1790,22 @@ export default function CompanyPage() {
           analysis.filing_date ??
           analysis.filingDate ??
           null,
+        selectedPersona: analysis.selected_persona ?? analysis.selectedPersona ?? null,
+        chartData: analysis.chart_data ?? analysis.chartData ?? null,
+        ratios: analysis.ratios ?? analysis.financial_ratios ?? null,
         source: 'analysis',
       }, userId)
-      emitDashboardSync()
+      DashboardStorage.appendSummaryEvent(
+        {
+          eventId: `analysis:${String(identifier)}`,
+          generatedAt,
+          kind: 'analysis',
+          analysisId: String(identifier),
+          companyId: company.id,
+        },
+        userId,
+      )
+      setTimeout(emitDashboardSync, 2000)
     },
     [company, userId],
   )
@@ -1118,6 +1834,19 @@ export default function CompanyPage() {
     }),
     onSuccess: async (response) => {
       setCurrentAnalysisId(response.data.analysis_id)
+      if (userId && response.data.analysis_id) {
+        DashboardStorage.appendSummaryEvent(
+          {
+            eventId: `analysis:${response.data.analysis_id}`,
+            generatedAt: new Date().toISOString(),
+            kind: 'analysis',
+            analysisId: response.data.analysis_id,
+            companyId: companyId ?? null,
+          },
+          userId,
+        )
+        setTimeout(emitDashboardSync, 2000)
+      }
       await refetchAnalyses()
       const message = response?.data?.message ?? 'Analysis completed!'
       alert(message)
@@ -1145,50 +1874,104 @@ export default function CompanyPage() {
     return analyses[0]
   }, [analyses])
 
+  const analysisFromListMatch = useMemo(() => {
+    if (!currentAnalysisId || !analyses?.length) return null
+    return analyses.find((analysis: any) => String(analysis?.id || '') === String(currentAnalysisId)) ?? null
+  }, [analyses, currentAnalysisId])
+
   const analysisFromSnapshot = useMemo(() => {
     if (!localAnalysisSnapshot) return null
     return {
       id: localAnalysisSnapshot.analysisId,
-      summary_md: localAnalysisSnapshot.summaryMd ?? localAnalysisSnapshot.summaryPreview ?? null,
+      summary_md: localAnalysisSnapshot.summaryMd ?? null,
       investor_persona_summaries: null,
+      ratios: localAnalysisSnapshot.ratios ?? null,
+      chart_data: localAnalysisSnapshot.chartData ?? null,
+      selected_persona: localAnalysisSnapshot.selectedPersona ?? null,
     }
   }, [localAnalysisSnapshot])
 
   const analysisToDisplay = useMemo(() => {
-    if (currentAnalysis) return currentAnalysis
-    if (analysisFromSnapshot) return analysisFromSnapshot
+    if (currentAnalysisId) {
+      if (!isLocalAnalysisId && currentAnalysis) return currentAnalysis
+      if (analysisFromSnapshot) return analysisFromSnapshot
+      if (!isLocalAnalysisId && analysisFromListMatch) return analysisFromListMatch
+      return null
+    }
     return latestAnalysis
-  }, [currentAnalysis, analysisFromSnapshot, latestAnalysis])
+  }, [
+    currentAnalysisId,
+    isLocalAnalysisId,
+    currentAnalysis,
+    analysisFromSnapshot,
+    analysisFromListMatch,
+    latestAnalysis,
+  ])
+
+  const analysisContent = useMemo(
+    () =>
+      (analysisToDisplay as any)?.summary_md ||
+      (analysisToDisplay as any)?.summaryMd ||
+      (analysisToDisplay as any)?.content ||
+      '',
+    [analysisToDisplay],
+  )
+
+  const analysisChartData = useMemo(
+    () =>
+      ((analysisToDisplay as any)?.chart_data ||
+        (analysisToDisplay as any)?.chartData ||
+        localAnalysisSnapshot?.chartData ||
+        analysisFallbackChartData) as ChartData | null | undefined,
+    [analysisToDisplay, localAnalysisSnapshot, analysisFallbackChartData],
+  )
+
+  const analysisRatios = useMemo(() => {
+    const explicitRatios =
+      ((analysisToDisplay as any)?.financial_ratios ||
+        (analysisToDisplay as any)?.ratios ||
+        localAnalysisSnapshot?.ratios ||
+        analysisFallbackRatios) as Record<string, number | null> | null | undefined
+    if (explicitRatios && hasNumericValues(explicitRatios as Record<string, unknown>)) {
+      return explicitRatios
+    }
+    return buildRatiosFromChartData(analysisChartData)
+  }, [analysisToDisplay, localAnalysisSnapshot, analysisFallbackRatios, analysisChartData])
+
+  const analysisPersona = useMemo(() => {
+    const personaId =
+      ((analysisToDisplay as any)?.selected_persona ||
+        (analysisToDisplay as any)?.selectedPersona ||
+        localAnalysisSnapshot?.selectedPersona) as string | null | undefined
+    if (!personaId) return null
+    return INVESTOR_PERSONAS.find((persona) => persona.id === personaId) ?? null
+  }, [analysisToDisplay, localAnalysisSnapshot])
 
   // Get the most recent health display data - prefer from filing summaries (has user preferences) over base analysis
   const currentHealthDisplay = useMemo(() => {
-    const hasHealthData = (summary: FilingSummary | undefined) =>
-      !!summary && (summary.healthComponents || summary.healthRating != null)
-
     // 1) Prefer the currently selected filing (if it already has a generated summary)
     const selectedSummary = selectedFilingForSummary
       ? filingSummaries[selectedFilingForSummary]
       : undefined
-    if (hasHealthData(selectedSummary)) {
+    if (selectedSummary) {
       return {
-        score: selectedSummary!.healthRating ?? latestAnalysis?.health_score,
-        components: selectedSummary!.healthComponents ?? latestAnalysis?.health_components,
-        weights: selectedSummary!.healthComponentWeights,
-        descriptions: selectedSummary!.healthComponentDescriptions,
-        metrics: selectedSummary!.healthComponentMetrics,
+        score: normalizeValidatedHealthScore(selectedSummary.healthRating),
+        components: selectedSummary.healthComponents,
+        weights: selectedSummary.healthComponentWeights,
+        descriptions: selectedSummary.healthComponentDescriptions,
+        metrics: selectedSummary.healthComponentMetrics,
       }
     }
 
     // 2) Otherwise, use the most recently generated summary (by timestamp)
     let newest: FilingSummary | null = null
     for (const [, summary] of Object.entries(filingSummaries)) {
-      if (!hasHealthData(summary)) continue
       if (!newest || summary.generatedAt > newest.generatedAt) newest = summary
     }
     if (newest) {
       return {
-        score: newest.healthRating ?? latestAnalysis?.health_score,
-        components: newest.healthComponents ?? latestAnalysis?.health_components,
+        score: normalizeValidatedHealthScore(newest.healthRating),
+        components: newest.healthComponents,
         weights: newest.healthComponentWeights,
         descriptions: newest.healthComponentDescriptions,
         metrics: newest.healthComponentMetrics,
@@ -1197,7 +1980,7 @@ export default function CompanyPage() {
 
     // Fall back to latestAnalysis data
     return {
-      score: latestAnalysis?.health_score,
+      score: normalizeValidatedHealthScore(latestAnalysis?.health_score),
       components: latestAnalysis?.health_components,
       weights: undefined,
       descriptions: undefined,
@@ -1238,7 +2021,7 @@ export default function CompanyPage() {
   )
 
   const handleManualDashboardUpdate = useCallback(() => {
-    const candidate = currentAnalysis ?? latestAnalysis ?? analysisFromSnapshot
+    const candidate = currentAnalysis ?? analysisFromSnapshot ?? latestAnalysis
     if (!candidate) {
       alert('Run or open an analysis before updating the dashboard.')
       return
@@ -1339,8 +2122,9 @@ export default function CompanyPage() {
           <div className="mt-5 space-y-2 text-sm">
             <p className="font-bold">Try this:</p>
             <ul className="list-disc pl-5 space-y-1 text-zinc-800 dark:text-zinc-200">
-              <li>Retry once (temporary network/API hiccups happen).</li>
-              <li>Hard refresh the page, then try again.</li>
+              {summaryErrorModal.tips.map((tip) => (
+                <li key={tip}>{tip}</li>
+              ))}
               {summaryErrorModal.showExtensionTip ? (
                 <li>
                   If you have browser extensions that inject into pages or block requests (e.g. Savier, ad blockers),
@@ -1496,6 +2280,10 @@ export default function CompanyPage() {
                         onGenerate={requestSummaryWithPreferences}
                         isGenerating={isSummaryGenerating}
                       />
+                      <p className="text-xs text-zinc-600 dark:text-zinc-400 leading-relaxed">
+                        Length targets are soft by default. If strict contract mode is not enabled, summaries return the
+                        best full draft with warnings instead of hard-failing.
+                      </p>
                     </div>
                   </div>
 
@@ -1514,6 +2302,7 @@ export default function CompanyPage() {
                           {Object.entries(filingSummaries).map(([fid, summary], idx) => {
                             const filing = filings?.find((item: any) => item.id === fid)
                             const filingColor = getFilingColor(filing?.filing_type)
+                            const summaryHealthScore = normalizeValidatedHealthScore(summary.healthRating)
                             
                             return (
                               <motion.div
@@ -1524,7 +2313,11 @@ export default function CompanyPage() {
                                 transition={{ duration: 0.4, delay: idx * 0.08 }}
                                 className="group"
                               >
-                                <div className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-0 shadow-[6px_6px_0px_0px_rgba(0,0,0,1)] dark:shadow-[6px_6px_0px_0px_rgba(255,255,255,1)] overflow-hidden transition-all duration-300 group-hover:shadow-[8px_8px_0px_0px_rgba(0,0,0,1)] dark:group-hover:shadow-[8px_8px_0px_0px_rgba(255,255,255,1)] group-hover:-translate-y-1">
+                                <div
+                                  ref={(node) => setSummaryExportRef(fid, node)}
+                                  data-summary-export-root="true"
+                                  className="bg-white dark:bg-zinc-900 border-2 border-black dark:border-white p-0 shadow-[6px_6px_0px_0px_rgba(0,0,0,1)] dark:shadow-[6px_6px_0px_0px_rgba(255,255,255,1)] overflow-hidden transition-all duration-300 group-hover:shadow-[8px_8px_0px_0px_rgba(0,0,0,1)] dark:group-hover:shadow-[8px_8px_0px_0px_rgba(255,255,255,1)] group-hover:-translate-y-1"
+                                >
                                   {/* Card Header with Type Color */}
                                   <div className={cn("h-2 w-full", filingColor)} />
                                   
@@ -1536,10 +2329,10 @@ export default function CompanyPage() {
                                             {filing?.filing_type || 'Unknown'}
                                           </div>
                                           <h4 className="font-black uppercase text-xl">AI Financial Brief</h4>
-                                          {summary.healthRating && (
+                                          {summaryHealthScore != null && (
                                             <HealthScoreBadge
-                                              score={summary.healthRating}
-                                              band={scoreToRating(summary.healthRating).label}
+                                              score={summaryHealthScore}
+                                              band={scoreToRating(summaryHealthScore).label}
                                               size="sm"
                                               componentScores={summary.healthComponents}
                                               componentWeights={summary.healthComponentWeights}
@@ -1559,7 +2352,7 @@ export default function CompanyPage() {
                                         </div>
                                       </div>
                                       
-                                      <div className="flex flex-wrap gap-2 justify-end">
+                                      <div className="flex flex-wrap gap-2 justify-end" data-export-ignore="true">
                                         <BrutalButton
                                           onClick={() => handleAddSummaryToDashboard(fid)}
                                           disabled={dashboardSavedSummaries[fid]}
@@ -1594,13 +2387,26 @@ export default function CompanyPage() {
                                     </div>
 
                                     <div className="prose dark:prose-invert max-w-none">
+                                      {(summary.degraded || (summary.contractWarnings?.length ?? 0) > 0) && (
+                                        <div className="mb-4 border-2 border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 not-prose">
+                                          <p className="font-semibold">
+                                            {summary.degradedReason === 'timeout'
+                                              ? 'Summary completed with timeout fallback.'
+                                              : 'Summary completed (soft target mode).'}
+                                          </p>
+                                          {(summary.contractWarnings?.length ?? 0) > 0 && (
+                                            <p className="mt-1">
+                                              Soft-target warnings: {summary.contractWarnings?.slice(0, 3).join(' | ')}
+                                            </p>
+                                          )}
+                                        </div>
+                                      )}
                                       <EnhancedSummary
                                         content={summary.content}
                                         persona={summary.metadata?.selectedPersona ? INVESTOR_PERSONAS.find(p => p.id === summary.metadata.selectedPersona) : null}
                                         chartData={summary.chartData}
-                                        filingId={fid}
                                         healthData={{
-                                          score: summary.healthRating,
+                                          score: summaryHealthScore ?? undefined,
                                           components: summary.healthComponents,
                                           weights: summary.healthComponentWeights,
                                           descriptions: summary.healthComponentDescriptions,
@@ -1700,7 +2506,7 @@ export default function CompanyPage() {
                       Financial Analysis
                     </h2>
                     {analysisToDisplay && (
-                      <div className="flex flex-wrap gap-2 justify-end">
+                      <div className="flex flex-wrap gap-2 justify-end" data-export-ignore="true">
                         <BrutalButton
                           onClick={handleManualDashboardUpdate}
                           variant="outline-rounded"
@@ -1710,21 +2516,21 @@ export default function CompanyPage() {
                         </BrutalButton>
                         <BrutalButton
                           onClick={handleCopyAnalysis}
-                          disabled={!(analysisToDisplay.summary_md || analysisToDisplay.content)}
+                          disabled={!analysisContent}
                           className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-yellow-300 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)] disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           {copiedAnalysis ? 'Copied' : 'Copy'}
                         </BrutalButton>
                         <BrutalButton
                           onClick={() => handleExportAnalysis('pdf')}
-                          disabled={!(analysisToDisplay.summary_md || analysisToDisplay.content) || !!exportingAnalysis}
+                          disabled={!analysisContent || !!exportingAnalysis}
                           className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-blue-300 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)] disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           {exportingAnalysis === 'pdf' ? 'Exporting...' : 'Export PDF'}
                         </BrutalButton>
                         <BrutalButton
                           onClick={() => handleExportAnalysis('docx')}
-                          disabled={!(analysisToDisplay.summary_md || analysisToDisplay.content) || !!exportingAnalysis}
+                          disabled={!analysisContent || !!exportingAnalysis}
                           className="px-3 py-1 text-xs font-bold uppercase border-2 border-black dark:border-white bg-blue-300 text-black shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] dark:shadow-[2px_2px_0px_0px_rgba(255,255,255,1)] hover:translate-y-[-1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,1)] disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           {exportingAnalysis === 'docx' ? 'Exporting...' : 'Export Word'}
@@ -1739,20 +2545,28 @@ export default function CompanyPage() {
                       <p className="text-sm text-gray-400 mt-2">Run an analysis from the Overview tab to see insights.</p>
                     </div>
                   ) : (
-                    <div className="space-y-8">
+                    <div ref={analysisExportRef} className="space-y-8">
                       {/* Financial Charts */}
-                      {analysisToDisplay.financial_ratios && (
-                        <FinancialCharts ratios={analysisToDisplay.financial_ratios} />
+                      {analysisRatios && (
+                        <FinancialCharts ratios={analysisRatios} />
                       )}
 
                       {/* Analysis Content */}
                       <div className="border-t-2 border-gray-100 dark:border-gray-800 pt-8">
-                        <ReactMarkdown
-                          className="max-w-none text-base leading-relaxed font-mono space-y-2"
-                          components={summaryMarkdownComponents as any}
-                        >
-                          {analysisToDisplay.summary_md || analysisToDisplay.content || ''}
-                        </ReactMarkdown>
+                        {analysisChartData?.current_period ? (
+                          <EnhancedSummary
+                            content={analysisContent}
+                            persona={analysisPersona}
+                            chartData={analysisChartData}
+                          />
+                        ) : (
+                          <ReactMarkdown
+                            className="max-w-none text-base leading-relaxed font-mono space-y-2"
+                            components={summaryMarkdownComponents as any}
+                          >
+                            {analysisContent}
+                          </ReactMarkdown>
+                        )}
                       </div>
                     </div>
                   )}

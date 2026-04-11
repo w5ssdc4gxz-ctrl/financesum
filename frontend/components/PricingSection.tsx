@@ -38,204 +38,98 @@ function PricingCard({
   onCta,
 }: PricingCardProps) {
   const ref = useRef<HTMLDivElement>(null)
-  const [isHovered, setIsHovered] = useState(false)
-
-  const mouseX = useMotionValue(0)
-  const mouseY = useMotionValue(0)
-
-  const springConfig = { damping: 25, stiffness: 300 }
-  const xSpring = useSpring(mouseX, springConfig)
-  const ySpring = useSpring(mouseY, springConfig)
-
-  const rotateX = useTransform(ySpring, [-0.5, 0.5], [8, -8])
-  const rotateY = useTransform(xSpring, [-0.5, 0.5], [-8, 8])
-
-  const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!ref.current) return
-    const rect = ref.current.getBoundingClientRect()
-    const centerX = rect.left + rect.width / 2
-    const centerY = rect.top + rect.height / 2
-    mouseX.set((e.clientX - centerX) / rect.width)
-    mouseY.set((e.clientY - centerY) / rect.height)
-  }
-
-  const handleMouseLeave = () => {
-    setIsHovered(false)
-    mouseX.set(0)
-    mouseY.set(0)
-  }
 
   return (
     <motion.div
       ref={ref}
-      initial={{ opacity: 0, y: 40 }}
+      initial={{ opacity: 0, y: 30 }}
       whileInView={{ opacity: 1, y: 0 }}
-      viewport={{ once: true, amount: 0.3 }}
-      transition={{ duration: 0.7, delay, ease: [0.25, 0.46, 0.45, 0.94] }}
-      onMouseMove={handleMouseMove}
-      onMouseEnter={() => setIsHovered(true)}
-      onMouseLeave={handleMouseLeave}
-      style={{
-        perspective: 1000,
-      }}
-      className="relative"
-    >
-      <motion.div
-        style={{
-          rotateX: isHovered ? rotateX : 0,
-          rotateY: isHovered ? rotateY : 0,
-          transformStyle: 'preserve-3d',
-        }}
-        animate={{
-          scale: isHovered ? 1.02 : 1,
-        }}
-        transition={{ duration: 0.2 }}
-        className={`relative h-full rounded-3xl p-8 ${
-          highlighted
-            ? 'bg-gradient-to-br from-[#0015ff] via-[#4338ca] to-[#7c3aed] text-white shadow-2xl'
-            : 'bg-white border border-border shadow-card'
+      viewport={{ once: true, margin: "100px" }}
+      transition={{ duration: 0.6, delay, ease: [0.25, 1, 0.5, 1] }}
+      className={`relative h-full flex flex-col p-10 border transition-all duration-300 ${highlighted
+        ? 'bg-black border-black text-white dark:bg-white dark:border-white dark:text-black shadow-lg'
+        : 'bg-white border-zinc-200 text-black hover:border-zinc-300 dark:bg-zinc-950 dark:border-zinc-800 dark:text-white dark:hover:border-zinc-700 shadow-sm'
         }`}
-      >
-        {/* Animated gradient border for highlighted card */}
-        {highlighted && (
-          <div className="absolute inset-0 rounded-3xl overflow-hidden pointer-events-none" aria-hidden="true">
-            <motion.div
-              className="absolute inset-0 opacity-30"
-              animate={{
-                background: [
-                  'radial-gradient(circle at 0% 0%, rgba(255,255,255,0.3) 0%, transparent 50%)',
-                  'radial-gradient(circle at 100% 0%, rgba(255,255,255,0.3) 0%, transparent 50%)',
-                  'radial-gradient(circle at 100% 100%, rgba(255,255,255,0.3) 0%, transparent 50%)',
-                  'radial-gradient(circle at 0% 100%, rgba(255,255,255,0.3) 0%, transparent 50%)',
-                  'radial-gradient(circle at 0% 0%, rgba(255,255,255,0.3) 0%, transparent 50%)',
-                ],
-              }}
-              transition={{ duration: 8, repeat: Infinity, ease: 'linear' }}
-            />
-          </div>
-        )}
+    >
+      {/* Badge */}
+      {badge && (
+        <div className="absolute -top-3 left-8 select-none z-20">
+          <span className={`inline-flex items-center px-4 py-1.5 text-xs tracking-widest uppercase font-bold border ${highlighted
+            ? 'bg-white border-black text-black dark:bg-black dark:border-white dark:text-white'
+            : 'bg-black border-black text-white dark:bg-white dark:border-white dark:text-black'
+            }`}>
+            {badge}
+          </span>
+        </div>
+      )}
 
-        {/* Badge */}
-        {badge && (
-          <motion.div
-            initial={{ opacity: 0, scale: 0.8, y: -10 }}
-            whileInView={{ opacity: 1, scale: 1, y: 0 }}
-            viewport={{ once: true }}
-            transition={{ duration: 0.5, delay: delay + 0.2 }}
-            className="absolute -top-4 left-1/2 -translate-x-1/2"
-          >
-            <span className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full bg-gradient-to-r from-amber-400 to-orange-500 text-white text-sm font-semibold shadow-lg">
-              <Sparkles className="w-3.5 h-3.5" />
-              {badge}
-            </span>
-          </motion.div>
-        )}
-
-        {/* Content */}
-        <div className="relative z-10">
-          {/* Icon */}
-          <motion.div
-            initial={{ scale: 0 }}
-            whileInView={{ scale: 1 }}
-            viewport={{ once: true }}
-            transition={{
-              duration: 0.5,
-              delay: delay + 0.1,
-              type: 'spring',
-              stiffness: 200,
-            }}
-            className={`inline-flex items-center justify-center w-14 h-14 rounded-2xl mb-6 ${
-              highlighted
-                ? 'bg-white/20 text-white'
-                : 'bg-secondary text-[#0015ff]'
-            }`}
-          >
-            {icon}
-          </motion.div>
-
-          {/* Title */}
-          <h3 className={`text-xl font-bold mb-2 ${
-            highlighted ? 'text-white' : 'text-foreground'
-          }`}>
+      {/* Content */}
+      <div className="relative z-10 flex-grow flex flex-col">
+        {/* Header Section */}
+        <div className="mb-10">
+          <h3 className={`text-2xl font-bold tracking-tight mb-4 ${highlighted ? 'text-white dark:text-black' : 'text-black dark:text-white'
+            }`}>
             {title}
           </h3>
 
-          {/* Price */}
-          <div className="mb-4">
-            <span className={`text-5xl font-bold tracking-tight ${
-              highlighted ? 'text-white' : 'text-foreground'
-            }`}>
+          <div className="flex items-baseline">
+            <span className={`text-5xl font-black tracking-tighter ${highlighted ? 'text-white dark:text-black' : 'text-black dark:text-white'
+              }`}>
               {price}
             </span>
-            <span className={`text-lg ml-1 ${
-              highlighted ? 'text-white/70' : 'text-muted-foreground'
-            }`}>
+            <span className={`text-sm font-medium ml-2 ${highlighted ? 'text-zinc-400 dark:text-zinc-600' : 'text-zinc-500'
+              }`}>
               {period}
             </span>
           </div>
 
-          {/* Description */}
-          <p className={`text-base mb-8 ${
-            highlighted ? 'text-white/80' : 'text-muted-foreground'
-          }`}>
+          <p className={`mt-6 text-sm font-medium leading-relaxed ${highlighted ? 'text-zinc-300 dark:text-zinc-700' : 'text-zinc-600 dark:text-zinc-400'
+            }`}>
             {description}
           </p>
-
-          {/* Features */}
-          <ul className="space-y-4 mb-8">
-            {features.map((feature, index) => (
-              <motion.li
-                key={feature}
-                initial={{ opacity: 0, x: -20 }}
-                whileInView={{ opacity: 1, x: 0 }}
-                viewport={{ once: true }}
-                transition={{ duration: 0.4, delay: delay + 0.3 + index * 0.1 }}
-                className="flex items-start gap-3"
-              >
-                <div className={`flex-shrink-0 w-5 h-5 rounded-full flex items-center justify-center mt-0.5 ${
-                  highlighted
-                    ? 'bg-white/20 text-white'
-                    : 'bg-[#0015ff]/10 text-[#0015ff]'
-                }`}>
-                  <Check className="w-3 h-3" strokeWidth={3} />
-                </div>
-                <span className={highlighted ? 'text-white/90' : 'text-muted-foreground'}>
-                  {feature}
-                </span>
-              </motion.li>
-            ))}
-          </ul>
-
-          {/* CTA Button */}
-          <motion.button
-            onClick={onCta}
-            whileHover={{ scale: 1.02 }}
-            whileTap={{ scale: 0.98 }}
-            className={`w-full py-4 px-6 rounded-xl font-semibold text-base transition-all duration-200 ${
-              highlighted
-                ? 'bg-white text-[#0015ff] hover:bg-white/90 shadow-lg'
-                : 'bg-[#0015ff] text-white hover:bg-[#0012cc] shadow-md hover:shadow-lg'
-            }`}
-          >
-            {ctaText}
-          </motion.button>
         </div>
 
-        {/* Subtle shine effect on hover */}
-        <motion.div
-          className="absolute inset-0 rounded-3xl pointer-events-none"
-          animate={{
-            opacity: isHovered ? 1 : 0,
-          }}
-          transition={{ duration: 0.3 }}
-          style={{
-            background: highlighted
-              ? 'linear-gradient(135deg, rgba(255,255,255,0.1) 0%, transparent 50%, transparent 100%)'
-              : 'linear-gradient(135deg, rgba(0,21,255,0.03) 0%, transparent 50%, transparent 100%)',
-          }}
-        />
-      </motion.div>
+        {/* Divider */}
+        <div className={`h-[1px] w-full mb-8 ${highlighted ? 'bg-white/20 dark:bg-black/20' : 'bg-black/10 dark:bg-white/10'
+          }`} />
+
+        {/* Features */}
+        <ul className="space-y-5 mb-12 flex-grow">
+          {features.map((feature, index) => (
+            <motion.li
+              key={feature}
+              initial={{ opacity: 0, y: 10 }}
+              whileInView={{ opacity: 1, y: 0 }}
+              viewport={{ once: true }}
+              transition={{ duration: 0.4, delay: delay + 0.2 + index * 0.05 }}
+              className="flex items-start gap-4"
+            >
+              <div className={`flex-shrink-0 mt-1 ${highlighted ? 'text-white dark:text-black' : 'text-black dark:text-white'
+                }`}>
+                <Check className="w-4 h-4" strokeWidth={3} />
+              </div>
+              <span className={`text-sm font-medium ${highlighted ? 'text-zinc-200 dark:text-zinc-800' : 'text-zinc-700 dark:text-zinc-300'
+                }`}>
+                {feature}
+              </span>
+            </motion.li>
+          ))}
+        </ul>
+
+        {/* CTA Button */}
+        <button
+          onClick={onCta}
+          className={`w-full py-4 px-6 text-sm font-bold tracking-widest uppercase transition-colors duration-200 border ${highlighted
+            ? 'bg-white border-white text-black hover:bg-zinc-200 hover:border-zinc-200 dark:bg-black dark:border-black dark:text-white dark:hover:bg-zinc-800 dark:hover:border-zinc-800'
+            : 'bg-black border-black text-white hover:bg-zinc-800 hover:border-zinc-800 dark:bg-white dark:border-white dark:text-black dark:hover:bg-zinc-200 dark:hover:border-zinc-200'
+            }`}
+        >
+          {ctaText}
+        </button>
+      </div>
     </motion.div>
+
+
   )
 }
 
@@ -414,63 +308,64 @@ export default function PricingSection() {
   ]
 
   return (
-    <section className="py-24 md:py-32 bg-secondary/30 overflow-hidden">
+    <section className="py-24 md:py-32 bg-white dark:bg-zinc-950 border-t border-zinc-200 dark:border-zinc-800 overflow-hidden">
       <div className="container-wide">
         {/* Section Header */}
         <motion.div
-          initial={{ opacity: 0, y: 30 }}
+          initial={{ opacity: 0, y: 20 }}
           whileInView={{ opacity: 1, y: 0 }}
-          viewport={{ once: true }}
-          transition={{ duration: 0.8, ease: [0.25, 0.46, 0.45, 0.94] }}
-          className="text-center mb-16"
+          viewport={{ once: true, margin: "100px" }}
+          transition={{ duration: 0.8, ease: [0.25, 1, 0.5, 1] }}
+          className="text-center mb-20"
         >
-          <span className="text-sm font-medium text-[#0015ff] uppercase tracking-wider mb-4 block">
-            Simple Pricing
+          <span className="text-xs font-bold tracking-widest text-zinc-400 uppercase mb-4 block">
+            Pricing Options
           </span>
-          <h2 className="text-4xl sm:text-5xl md:text-6xl font-bold tracking-tight text-foreground mb-6 font-serif italic">
-            Choose your plan
+          <h2 className="text-5xl md:text-7xl font-black tracking-tighter text-black dark:text-white mb-6 uppercase">
+            Invest in clarity
           </h2>
-          <p className="text-lg text-muted-foreground max-w-2xl mx-auto">
-            Start free and scale as you grow. No hidden fees, cancel anytime.
+          <p className="text-lg text-zinc-500 font-medium max-w-xl mx-auto">
+            Transparent plans designed for independent analysts and enterprise teams. Secure, simple, scalable.
           </p>
         </motion.div>
 
-        {/* Pricing Cards */}
-        <div className="grid md:grid-cols-3 gap-8 max-w-6xl mx-auto">
+        {/* Pricing Cards Grid */}
+        <div className="grid md:grid-cols-3 gap-0 max-w-6xl mx-auto border-t border-l border-zinc-200 dark:border-zinc-800">
           {plans.map((plan, index) => (
-            <PricingCard
-              key={plan.title}
-              {...plan}
-              delay={index * 0.15}
-            />
+            <div key={plan.title} className="border-r border-b border-zinc-200 dark:border-zinc-800 relative group">
+              <PricingCard
+                {...plan}
+                delay={index * 0.15}
+              />
+            </div>
           ))}
         </div>
 
-        {/* Trust badges */}
+        {/* Trust badges - Flat Minimalist Style */}
         <motion.div
-          initial={{ opacity: 0, y: 20 }}
+          initial={{ opacity: 0, y: 10 }}
           whileInView={{ opacity: 1, y: 0 }}
-          viewport={{ once: true }}
-          transition={{ duration: 0.6, delay: 0.5 }}
-          className="flex flex-wrap items-center justify-center gap-8 mt-16 text-muted-foreground"
+          viewport={{ once: true, margin: "100px" }}
+          transition={{ duration: 0.6, delay: 0.4 }}
+          className="flex flex-wrap items-center justify-center gap-12 mt-20"
         >
-          <div className="flex items-center gap-2">
-            <svg className="w-5 h-5 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+          <div className="flex items-center gap-3 grayscale opacity-60">
+            <svg className="w-4 h-4 text-black dark:text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
             </svg>
-            <span className="text-sm font-medium">SSL Secured</span>
+            <span className="text-xs font-bold tracking-widest uppercase text-black dark:text-white">SSL Secured</span>
           </div>
-          <div className="flex items-center gap-2">
-            <svg className="w-5 h-5 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+          <div className="flex items-center gap-3 grayscale opacity-60">
+            <svg className="w-4 h-4 text-black dark:text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
             </svg>
-            <span className="text-sm font-medium">SOC 2 Compliant</span>
+            <span className="text-xs font-bold tracking-widest uppercase text-black dark:text-white">SOC 2 Compliant</span>
           </div>
-          <div className="flex items-center gap-2">
-            <svg className="w-5 h-5 text-green-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
+          <div className="flex items-center gap-3 grayscale opacity-60">
+            <svg className="w-4 h-4 text-black dark:text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M3 10h18M7 15h1m4 0h1m-7 4h12a3 3 0 003-3V8a3 3 0 00-3-3H6a3 3 0 00-3 3v8a3 3 0 003 3z" />
             </svg>
-            <span className="text-sm font-medium">Cancel Anytime</span>
+            <span className="text-xs font-bold tracking-widest uppercase text-black dark:text-white">Cancel Anytime</span>
           </div>
         </motion.div>
       </div>

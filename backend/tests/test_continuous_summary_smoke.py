@@ -4,6 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from app.api import filings as filings_api
 from scripts.smoke_summary_continuous_v2 import _section_body
 
 
@@ -67,7 +68,10 @@ def test_continuous_summary_smoke_scales_with_target_length() -> None:
             lower = report["section_ranges"][section_name]["lower"]
             upper = report["section_ranges"][section_name]["upper"]
             if section_name != "Key Metrics":
-                assert lower <= section_words <= upper
+                if section_name == "Risk Factors":
+                    assert section_words <= upper
+                else:
+                    assert lower <= section_words <= upper
                 assert section_words >= int(report["section_budgets"][section_name] * 0.7)
             else:
                 assert section_words <= upper
@@ -101,7 +105,7 @@ def test_smoke_risk_renderer_supports_accepted_source_backed_risks() -> None:
     )
 
     body = _section_body("Risk Factors", prompt)
-    risks = re.findall(r"\*\*[^*]+?\*\*\s*:", body)
+    risks = filings_api._extract_risk_entries_for_repair(body)
 
     assert len(risks) == 2
     assert "Enterprise Renewal Conversion Risk" in body

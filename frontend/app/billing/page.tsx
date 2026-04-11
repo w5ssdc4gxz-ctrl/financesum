@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Navbar from '@/components/Navbar'
@@ -20,7 +20,27 @@ type SubscriptionResponse = {
   } | null
 }
 
+function BillingPageFallback() {
+  return (
+    <div className="min-h-screen bg-white">
+      <Navbar />
+      <main className="container mx-auto max-w-3xl px-4 pt-28 pb-16">
+        <h1 className="text-3xl font-black tracking-tight text-black">Billing</h1>
+        <p className="mt-3 text-sm text-muted-foreground">Loading billing status...</p>
+      </main>
+    </div>
+  )
+}
+
 export default function BillingPage() {
+  return (
+    <Suspense fallback={<BillingPageFallback />}>
+      <BillingPageContent />
+    </Suspense>
+  )
+}
+
+function BillingPageContent() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const { user, session, loading: authLoading } = useAuth()

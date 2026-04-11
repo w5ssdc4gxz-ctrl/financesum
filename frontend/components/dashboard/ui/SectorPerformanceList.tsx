@@ -31,12 +31,12 @@ export function SectorPerformanceList({
 }: SectorPerformanceListProps) {
   // Sort by avgScore desc (Highest health first) or count? 
   // Let's keep the order passed in (which is likely count) but visualize score clearly.
-  
+
   return (
     <div className={cn('space-y-4', className)}>
       {data.map((item, index) => {
         const healthColor = getHealthColor(item.avgScore)
-        
+
         return (
           <motion.div
             key={item.name}
@@ -55,14 +55,14 @@ export function SectorPerformanceList({
                   {item.count} {item.count === 1 ? 'company' : 'companies'}
                 </p>
               </div>
-              
+
               {/* Health Score Badge */}
               <div className="flex flex-col items-end">
-                <div 
+                <div
                   className="flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold"
-                  style={{ 
-                    backgroundColor: `${healthColor}20`, 
-                    color: healthColor 
+                  style={{
+                    backgroundColor: `${healthColor}20`,
+                    color: healthColor
                   }}
                 >
                   <span>{item.avgScore}</span>
@@ -74,13 +74,13 @@ export function SectorPerformanceList({
 
             {/* Health Bar */}
             <div className="mb-3 relative h-1.5 w-full rounded-full bg-gray-200 dark:bg-gray-800 overflow-hidden">
-               <motion.div
-                  initial={{ width: 0 }}
-                  animate={{ width: `${item.avgScore}%` }}
-                  transition={{ duration: 1, ease: "easeOut", delay: index * 0.1 }}
-                  className="h-full rounded-full"
-                  style={{ backgroundColor: healthColor }}
-                />
+              <motion.div
+                initial={{ width: 0 }}
+                animate={{ width: `${item.avgScore}%` }}
+                transition={{ duration: 1, ease: "easeOut", delay: index * 0.1 }}
+                className="h-full rounded-full"
+                style={{ backgroundColor: healthColor }}
+              />
             </div>
 
             {/* Top Companies Logos */}
@@ -100,9 +100,9 @@ export function SectorPerformanceList({
                     </motion.div>
                   ))}
                   {item.topTickers.length > 5 && (
-                     <div className="flex h-6 w-6 items-center justify-center rounded-full ring-2 ring-white dark:ring-gray-950 bg-gray-100 dark:bg-gray-800 text-[8px] font-bold text-gray-500 z-0">
-                        +{item.topTickers.length - 5}
-                     </div>
+                    <div className="flex h-6 w-6 items-center justify-center rounded-full ring-2 ring-white dark:ring-gray-950 bg-gray-100 dark:bg-gray-800 text-[8px] font-bold text-gray-500 z-0">
+                      +{item.topTickers.length - 5}
+                    </div>
                   )}
                 </div>
               </div>

@@ -19,6 +19,40 @@ interface DonutKPIChartProps {
   currentLabel: string
 }
 
+interface DonutTooltipProps {
+  active?: boolean
+  payload?: any[]
+  formatValue: (value: number) => string
+  formatPct: (value: number) => string
+}
+
+function DonutTooltip({ active, payload, formatValue, formatPct }: DonutTooltipProps) {
+  if (!active || !payload?.length) return null
+  const seg = payload[0]?.payload
+  if (!seg) return null
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, scale: 0.9 }}
+      animate={{ opacity: 1, scale: 1 }}
+      className="bg-white/95 dark:bg-gray-900/95 backdrop-blur-sm px-3 py-2 rounded-xl shadow-xl border border-gray-200/50 dark:border-gray-700/50"
+    >
+      <div className="flex items-center gap-2 mb-1">
+        <div
+          className="w-3 h-3 rounded-full"
+          style={{ backgroundColor: seg.color }}
+        />
+        <p className="text-xs font-semibold text-gray-900 dark:text-gray-100">
+          {seg.label}
+        </p>
+      </div>
+      <p className="text-sm font-bold tabular-nums text-gray-700 dark:text-gray-300">
+        {formatValue(seg.value)} • {formatPct(seg.value)}
+      </p>
+    </motion.div>
+  )
+}
+
 /**
  * DonutKPIChart - Premium donut chart for segment breakdowns
  * 
@@ -106,34 +140,6 @@ export function DonutKPIChart({
     )
   }
 
-  // Custom tooltip
-  const CustomTooltip = ({ active, payload }: any) => {
-    if (!active || !payload?.length) return null
-    const seg = payload[0]?.payload
-    if (!seg) return null
-    
-    return (
-      <motion.div
-        initial={{ opacity: 0, scale: 0.9 }}
-        animate={{ opacity: 1, scale: 1 }}
-        className="bg-white/95 dark:bg-gray-900/95 backdrop-blur-sm px-3 py-2 rounded-xl shadow-xl border border-gray-200/50 dark:border-gray-700/50"
-      >
-        <div className="flex items-center gap-2 mb-1">
-          <div 
-            className="w-3 h-3 rounded-full" 
-            style={{ backgroundColor: seg.color }}
-          />
-          <p className="text-xs font-semibold text-gray-900 dark:text-gray-100">
-            {seg.label}
-          </p>
-        </div>
-        <p className="text-sm font-bold tabular-nums text-gray-700 dark:text-gray-300">
-          {formatValue(seg.value)} • {formatPct(seg.value)}
-        </p>
-      </motion.div>
-    )
-  }
-
   return (
     <motion.div
       initial={{ opacity: 0, y: 20, scale: 0.98 }}
@@ -194,7 +200,7 @@ export function DonutKPIChart({
             <div className="relative w-36 h-36">
               <ResponsiveContainer width="100%" height="100%">
                 <PieChart>
-                  <Tooltip content={<CustomTooltip />} />
+                  <Tooltip content={<DonutTooltip formatValue={formatValue} formatPct={formatPct} />} />
                   <Pie
                     data={segments}
                     cx="50%"
