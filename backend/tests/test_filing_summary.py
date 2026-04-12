@@ -18930,7 +18930,7 @@ def test_post_final_quality_rewrite_runs_at_most_once(monkeypatch):
         local_cache.fallback_filing_summaries.pop(filing_id, None)
 
 
-def test_soft_retry_helper_replays_explicit_short_target_without_target_length(
+def test_soft_retry_helper_preserves_explicit_short_target_shape(
     monkeypatch,
 ) -> None:
     attempts: list[dict[str, object]] = []
@@ -18994,11 +18994,12 @@ def test_soft_retry_helper_replays_explicit_short_target_without_target_length(
     assert response is not None
     payload = json.loads(response.body)
     assert len(attempts) == 2
-    assert attempts[0]["target_length"] is None
-    assert attempts[0]["mode"] == "default"
+    assert attempts[0]["target_length"] == 1000
+    assert attempts[0]["mode"] == "custom"
     assert attempts[0]["strict_contract"] is False
     assert attempts[0]["health_enabled"] is True
-    assert attempts[1]["target_length"] is None
+    assert attempts[1]["target_length"] == 1000
+    assert attempts[1]["mode"] == "custom"
     assert attempts[1]["health_enabled"] is False
     assert payload.get("degraded") is True
     assert payload.get("degraded_reason") == "contract_miss"
@@ -19006,11 +19007,15 @@ def test_soft_retry_helper_replays_explicit_short_target_without_target_length(
     assert payload.get("summary_meta", {}).get("requested_target_length") == 1000
     assert payload.get("summary_meta", {}).get("soft_target_retry_used") is True
     assert (
+        payload.get("summary_meta", {}).get("soft_target_retry_preserved_target")
+        is True
+    )
+    assert (
         payload.get("summary_meta", {}).get("soft_target_retry_disabled_health_rating")
         is True
     )
     contract_warnings = payload.get("contract_warnings") or []
-    assert any("closest stable summary" in str(item).lower() for item in contract_warnings)
+    assert any("generated sectioned memo" in str(item).lower() for item in contract_warnings)
 
 
 def test_soft_retry_allows_mixed_editorial_risk_specificity_short_target_miss() -> None:
@@ -19034,6 +19039,48 @@ def test_soft_retry_allows_mixed_editorial_risk_specificity_short_target_miss() 
             explicit_target_requested=True,
         )
         is True
+    )
+
+
+def test_explicit_short_target_degraded_response_can_warn_on_risk_specificity() -> None:
+    summary = (
+        "## Executive Summary\n"
+        "A complete section.\n\n"
+        "## Financial Performance\n"
+        "A complete section.\n\n"
+        "## Key Metrics\n"
+        "| Metric | Value |\n"
+        "| --- | ---: |\n"
+        "| Revenue | 1 |\n"
+        "| Operating income | 1 |\n"
+        "| Net income | 1 |\n"
+        "| Cash | 1 |\n"
+        "| Debt | 1 |\n\n"
+        "## Management Discussion & Analysis\n"
+        "A complete section.\n\n"
+        "## Risk Factors\n"
+        "**DOJ Search Distribution Remedy Framework:** A complete risk.\n\n"
+        "## Closing Takeaway\n"
+        "HOLD is the stance."
+    )
+    missing = [
+        "Risk Factors under 'DOJ Search distribution remedy framework' are not grounded in a named filing exposure. Reuse a concrete product, customer, regulation, geography, or operating term from the filing excerpt.",
+        "Numbers discipline: Financial Performance is too numeric (8 numeric tokens). Keep only the 3-5 most decision-relevant figures in prose and move the rest to Key Metrics.",
+    ]
+
+    assert filings_api._select_non_degradable_contract_requirements(
+        summary_text=summary,
+        missing_requirements=missing,
+        include_health_rating=False,
+    )
+    assert (
+        filings_api._select_non_degradable_contract_requirements(
+            summary_text=summary,
+            missing_requirements=missing,
+            include_health_rating=False,
+            allow_risk_specificity_warning=True,
+        )
+        == []
     )
 
 

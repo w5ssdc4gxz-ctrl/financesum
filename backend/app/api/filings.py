@@ -13,6 +13,7 @@ import re
 import string
 import time
 import traceback
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, date
 from difflib import SequenceMatcher
@@ -156,6 +157,10 @@ from app.services.summary_post_processor import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+_SUMMARY_SOFT_TARGET_RETRY_ACTIVE: ContextVar[bool] = ContextVar(
+    "summary_soft_target_retry_active",
+    default=False,
+)
 
 # Backward-compat module alias for older tests/mocks.
 
@@ -16476,6 +16481,7 @@ def _select_non_degradable_contract_requirements(
     summary_text: str,
     missing_requirements: Optional[List[str]],
     include_health_rating: bool,
+    allow_risk_specificity_warning: bool = False,
 ) -> List[str]:
     items = [
         str(item) for item in (missing_requirements or []) if str(item or "").strip()
@@ -16511,9 +16517,11 @@ def _select_non_degradable_contract_requirements(
         seen.add(normalized)
         fatal.append(item)
 
+    risk_specificity_snippets = (
+        "risk factors lack filing grounding",
+    )
     risk_schema_snippets = (
         "risk factors are not in the required format",
-        "risk factors lack filing grounding",
     )
     hard_fail_snippets = (
         "instruction leak detected",
@@ -16525,8 +16533,14 @@ def _select_non_degradable_contract_requirements(
         normalized = " ".join(str(item or "").split()).strip().lower()
         if not normalized:
             continue
+        if allow_risk_specificity_warning and (
+            _is_risk_specificity_requirement(normalized)
+            or any(snippet in normalized for snippet in risk_specificity_snippets)
+        ):
+            continue
         if (
             _is_risk_specificity_requirement(normalized)
+            or any(snippet in normalized for snippet in risk_specificity_snippets)
             or any(snippet in normalized for snippet in risk_schema_snippets)
             or any(snippet in normalized for snippet in hard_fail_snippets)
         ):
@@ -17050,9 +17064,9 @@ def _should_soft_retry_explicit_short_target(
     )
 
     # Do not silently downgrade missing filing evidence, quote grounding failures,
-    # or malformed risk schemas. Risk specificity/editorial misses can be retried
-    # by dropping the exact target; the returned payload remains degraded and keeps
-    # the original contract warnings visible.
+    # or malformed risk schemas. Risk specificity/editorial misses can be returned
+    # in soft-target mode when the generated sectioned memo is otherwise usable;
+    # the returned payload remains degraded and keeps the contract warnings visible.
     if (
         issue_flags.get("quote_grounding_issue")
         or issue_flags.get("quote_evidence_gap")
@@ -17069,6 +17083,7 @@ def _decorate_soft_target_retry_payload(
     requested_target_length: int,
     original_detail: Any,
     disabled_health_rating: bool,
+    preserved_target: bool = False,
 ) -> Dict[str, Any]:
     result = dict(payload or {})
     result["degraded"] = True
@@ -17076,10 +17091,17 @@ def _decorate_soft_target_retry_payload(
     if not existing_reason or existing_reason == "soft_target":
         result["degraded_reason"] = "contract_miss"
 
-    warning = (
-        f"Exact {int(requested_target_length)}-word target could not be satisfied from "
-        "this filing. Returned the closest stable summary instead."
-    )
+    if preserved_target:
+        warning = (
+            f"Exact {int(requested_target_length)}-word contract could not be fully "
+            "satisfied from this filing. Returned the generated sectioned memo with "
+            "contract warnings."
+        )
+    else:
+        warning = (
+            f"Exact {int(requested_target_length)}-word target could not be satisfied from "
+            "this filing. Returned the closest stable summary instead."
+        )
     if disabled_health_rating:
         warning += " Health rating was disabled on the fallback pass."
 
@@ -17116,6 +17138,7 @@ def _decorate_soft_target_retry_payload(
     )
     summary_meta["requested_target_length"] = int(requested_target_length)
     summary_meta["soft_target_retry_used"] = True
+    summary_meta["soft_target_retry_preserved_target"] = bool(preserved_target)
     summary_meta["soft_target_retry_disabled_health_rating"] = bool(
         disabled_health_rating
     )
@@ -17141,14 +17164,16 @@ def _try_soft_retry_for_explicit_short_target(
     ):
         return None
 
+    if _SUMMARY_SOFT_TARGET_RETRY_ACTIVE.get(False):
+        return None
+
     base_preferences = (
         preferences.model_copy(deep=True)
         if preferences is not None
         else FilingSummaryPreferences()
     )
-    base_preferences.mode = "default"
     base_preferences.strict_contract = False
-    base_preferences.target_length = None
+    base_preferences.target_length = int(target_length or 0)
 
     fallback_variants = [(base_preferences, False)]
     if (
@@ -17164,6 +17189,7 @@ def _try_soft_retry_for_explicit_short_target(
         fallback_variants.append((health_disabled_preferences, True))
 
     for fallback_preferences, disabled_health_rating in fallback_variants:
+        retry_token = _SUMMARY_SOFT_TARGET_RETRY_ACTIVE.set(True)
         try:
             fallback_response = generate_filing_summary(
                 filing_id=filing_id,
@@ -17172,6 +17198,8 @@ def _try_soft_retry_for_explicit_short_target(
             )
         except HTTPException:
             continue
+        finally:
+            _SUMMARY_SOFT_TARGET_RETRY_ACTIVE.reset(retry_token)
 
         summary_response_parser = globals().get("_summary_response_to_payload")
         if callable(summary_response_parser):
@@ -17208,6 +17236,7 @@ def _try_soft_retry_for_explicit_short_target(
             requested_target_length=int(target_length or 0),
             original_detail=detail,
             disabled_health_rating=disabled_health_rating,
+            preserved_target=True,
         )
         return JSONResponse(content=jsonable_encoder(recovered_payload))
 
@@ -32338,10 +32367,21 @@ def generate_filing_summary(
         for extra in (exc_detail_str, exc_guidance):
             if extra and extra not in all_warnings:
                 all_warnings.append(extra)
+        allow_risk_specificity_warning = bool(
+            target_length
+            and explicit_target_requested
+            and _is_short_mid_precision_target(target_length)
+            and _should_soft_retry_explicit_short_target(
+                detail=detail,
+                target_length=target_length,
+                explicit_target_requested=explicit_target_requested,
+            )
+        )
         non_degradable_requirements = _select_non_degradable_contract_requirements(
             summary_text=best_text,
             missing_requirements=exc_missing + exc_diagnostic,
             include_health_rating=include_health_rating,
+            allow_risk_specificity_warning=allow_risk_specificity_warning,
         )
         if non_degradable_requirements:
             logger.warning(
@@ -39687,19 +39727,20 @@ FLOW AND QUALITY RULES:
 
     except HTTPException as http_exc:
         if http_exc.status_code == 422:
-            soft_retry_response = _try_soft_retry_for_explicit_short_target(
-                filing_id=str(filing_id),
-                preferences=preferences,
-                user=user,
-                detail=http_exc.detail,
-                explicit_target_requested=explicit_target_requested,
-                target_length=target_length,
-            )
-            if soft_retry_response is not None:
-                return soft_retry_response
             degraded = _contract_422_to_degraded_response(http_exc.detail)
             if degraded is not None:
                 return degraded
+            if not _SUMMARY_SOFT_TARGET_RETRY_ACTIVE.get(False):
+                soft_retry_response = _try_soft_retry_for_explicit_short_target(
+                    filing_id=str(filing_id),
+                    preferences=preferences,
+                    user=user,
+                    detail=http_exc.detail,
+                    explicit_target_requested=explicit_target_requested,
+                    target_length=target_length,
+                )
+                if soft_retry_response is not None:
+                    return soft_retry_response
         raise
     except SummarySectionBalanceError as exc:
         # For short-mid precision targets, section-balance misses are expected
