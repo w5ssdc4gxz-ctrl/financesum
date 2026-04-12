@@ -3,6 +3,7 @@ const { PHASE_DEVELOPMENT_SERVER } = require('next/constants')
 
 const baseConfig = {
   reactStrictMode: true,
+  poweredByHeader: false,
 }
 
 const securityHeaders = [
@@ -69,7 +70,6 @@ module.exports = (phase) => {
     },
   }
 }
-
 
 
 
