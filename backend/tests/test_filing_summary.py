@@ -19013,6 +19013,51 @@ def test_soft_retry_helper_replays_explicit_short_target_without_target_length(
     assert any("closest stable summary" in str(item).lower() for item in contract_warnings)
 
 
+def test_soft_retry_allows_mixed_editorial_risk_specificity_short_target_miss() -> None:
+    detail = {
+        "detail": "Unable to satisfy strict short-form word-count contract after bounded retries.",
+        "failure_code": "SUMMARY_CONTRACT_FAILED",
+        "target_length": 1000,
+        "missing_requirements": [
+            "Risk Factors under 'DOJ Search distribution remedy framework' are not grounded in a named filing exposure. Reuse a concrete product, customer, regulation, geography, or operating term from the filing excerpt.",
+            "Numbers discipline: Financial Performance is too numeric (8 numeric tokens). Keep only the 3-5 most decision-relevant figures in prose and move the rest to Key Metrics.",
+            "Management Discussion & Analysis should end with a conceptual handoff into Risk Factors so the memo progresses naturally without explicit section-name boilerplate.",
+            "Closing Takeaway must state exactly one explicit stance (BUY, HOLD, or SELL). Add one clear recommendation sentence.",
+            "Final word-count band violation: expected 960-1040, got split=974, stripped=938.",
+        ],
+    }
+
+    assert (
+        filings_api._should_soft_retry_explicit_short_target(
+            detail=detail,
+            target_length=1000,
+            explicit_target_requested=True,
+        )
+        is True
+    )
+
+
+def test_soft_retry_still_blocks_quote_grounding_short_target_miss() -> None:
+    detail = {
+        "detail": "Unable to satisfy strict summary contract after bounded retries.",
+        "failure_code": "SUMMARY_CONTRACT_FAILED",
+        "target_length": 1000,
+        "missing_requirements": [
+            "Quoted phrase is not grounded in filing text: fabricated management quote.",
+            "Final word-count band violation: expected 960-1040, got split=974, stripped=938.",
+        ],
+    }
+
+    assert (
+        filings_api._should_soft_retry_explicit_short_target(
+            detail=detail,
+            target_length=1000,
+            explicit_target_requested=True,
+        )
+        is False
+    )
+
+
 def test_summary_endpoint_returns_soft_retry_payload_on_explicit_short_target_422(
     monkeypatch,
 ) -> None:

@@ -17049,12 +17049,14 @@ def _should_soft_retry_explicit_short_target(
         missing_requirements + diagnostic_requirements
     )
 
-    # Do not silently downgrade hard evidence/grounding failures. The soft retry
-    # is reserved for bounded structural/word-band misses on explicit short targets.
+    # Do not silently downgrade missing filing evidence, quote grounding failures,
+    # or malformed risk schemas. Risk specificity/editorial misses can be retried
+    # by dropping the exact target; the returned payload remains degraded and keeps
+    # the original contract warnings visible.
     if (
         issue_flags.get("quote_grounding_issue")
         or issue_flags.get("quote_evidence_gap")
-        or _has_hard_risk_issue(issue_flags)
+        or issue_flags.get("risk_schema_issue")
     ):
         return False
 
