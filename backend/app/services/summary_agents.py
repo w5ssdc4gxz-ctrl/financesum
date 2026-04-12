@@ -584,7 +584,7 @@ _ARCHETYPE_CONFIG: Dict[str, Dict[str, Any]] = {
         "focus_areas": (
             "which operating terms in the filing actually explain demand and margin behavior",
             "whether management expectations are being met",
-            "which concrete exposures could change the current view",
+            "which concrete exposures could change the underwriting case",
         ),
         "default_terms": (
             "operating mix",
@@ -1042,64 +1042,12 @@ _AHA_SIGNAL_RE = re.compile(
     r"what matters now|the market is still underwriting|this means|that means|implies that)\b",
     re.IGNORECASE,
 )
-_EXEC_DECISION_OPENING_RE = re.compile(
-    r"\b(the key|the main|the real|the takeaway|this filing|the story|the case|"
-    r"comes down to|depends on|turns on|hinges on|matters because|the filing makes clear)\b",
-    re.IGNORECASE,
-)
-_WATCHPOINT_RE = re.compile(
-    r"\b(proof point|watch|watchpoint|checkpoint|trigger|threshold|metric|"
-    r"operating checkpoint|must stay true|breaks the thesis)\b",
-    re.IGNORECASE,
-)
-_TIMELINE_RE = re.compile(
-    r"\b(next|within the next|over the next|this quarter|next quarter|next two quarters|"
-    r"next year|12 months|q[1-4]|fy\d{2}|month|months|quarter|quarters|year|years)\b",
-    re.IGNORECASE,
-)
 _HEDGE_RE = re.compile(
     r"\b(may|might|could|arguably|perhaps|somewhat|appears to|seems to|potentially)\b",
     re.IGNORECASE,
 )
 _AWKWARD_LINKER_RE = re.compile(
     r"\b(furthermore|moreover|additionally|therefore|consequently|accordingly)\b",
-    re.IGNORECASE,
-)
-_ANALYST_FOG_RE = re.compile(
-    r"\b(underwriting thread|underwriting case|underwriting setup|capital absorption|"
-    r"visibility inflection|monetization runway|earnings power translation|"
-    r"balance sheet optionality|forward visibility constraints|cash drag)\b",
-    re.IGNORECASE,
-)
-_FINANCIAL_PERFORMANCE_REINVESTMENT_ECHO_RE = re.compile(
-    r"\b("
-    r"margin strength (?:is )?fund(?:ing|s) (?:the )?(?:investment|reinvestment|buildout)|"
-    r"cash generation (?:is )?fund(?:ing|s) (?:the )?(?:investment|reinvestment|buildout)|"
-    r"free cash flow (?:is )?fund(?:ing|s) (?:the )?(?:investment|reinvestment|buildout)|"
-    r"operating leverage (?:is )?(?:enabling|funding|supporting) (?:the )?(?:investment|reinvestment|buildout)|"
-    r"self[- ]fund(?:ed|ing) (?:investment|reinvestment|buildout)"
-    r")\b",
-    re.IGNORECASE,
-)
-_FINANCIAL_PERFORMANCE_METRIC_PATTERNS: Dict[str, re.Pattern[str]] = {
-    "revenue": re.compile(r"\brevenue\b", re.IGNORECASE),
-    "margin": re.compile(r"\b(?:gross|operating|net|ebitda|fcf)\s+margin\b", re.IGNORECASE),
-    "cash_flow": re.compile(r"\b(?:free\s+cash\s+flow|operating\s+cash\s+flow|fcf|ocf|cash conversion)\b", re.IGNORECASE),
-    "profitability": re.compile(r"\b(?:operating income|net income|gross profit|ebitda)\b", re.IGNORECASE),
-    "operating_kpi": re.compile(r"\b(?:backlog|bookings|renewal|utilization|conversion|attach|capacity)\b", re.IGNORECASE),
-}
-_RISK_PRIORITY_NEAR_TERM_EVENT_RE = re.compile(
-    r"\b(inquiry|investigation|enforcement|settlement|hearing|trial|ruling|deadline|ban|"
-    r"subpoena|audit finding|regulatory remedy|consent decree|non-renewal|contract renewal)\b",
-    re.IGNORECASE,
-)
-_RISK_PRIORITY_COMPLIANCE_RE = re.compile(
-    r"\b(anti-corruption|supplier code|code of conduct|ethics policy|policy violation|"
-    r"bribery|sanctions compliance|labor standards|compliance policy)\b",
-    re.IGNORECASE,
-)
-_RISK_PRIORITY_PRICED_IN_RE = re.compile(
-    r"\b(priced in|already expected|already reflected|well known|widely understood)\b",
     re.IGNORECASE,
 )
 _REPEATED_LEADIN_STEMS = (
@@ -1136,12 +1084,6 @@ _SECTIONED_EDITORIAL_FAILURE_CODES = frozenset({
     "repeated_clause_family",
     "section_overlap",
     "instruction_miss",
-    "exec_opening_soft",
-    "aha_not_surfaced",
-    "exec_missing_proof_point",
-    "financial_performance_metric_drift",
-    "financial_performance_redundancy",
-    "soft_section_ending",
     "risk_not_actionable",
     "closing_soft",
     "tone_drift",
@@ -1748,75 +1690,29 @@ def _risk_priority_profile(
     )
     has_trigger = bool(_RISK_PRIORITY_TRIGGER_RE.search(risk_blob))
     has_transmission = bool(_TRANSMISSION_RE.search(risk_blob))
-    filing_backed_blob = " ".join(
-        part
-        for part in (
-            str(risk.risk_name or "").strip(),
-            str(risk.evidence_from_filing or "").strip(),
-            str(risk.source_quote or "").strip(),
-        )
-        if part
-    )
-    has_near_term_event = bool(
-        _RISK_PRIORITY_NEAR_TERM_EVENT_RE.search(filing_backed_blob)
-    )
-    is_generic_compliance = bool(_RISK_PRIORITY_COMPLIANCE_RE.search(risk_blob))
-    is_already_priced = bool(_RISK_PRIORITY_PRICED_IN_RE.search(risk_blob))
     source_section = str(risk.source_section or "").strip() or "Risk Factors"
 
-    probability_score = 0
-    magnitude_score = 0
-    asymmetry_score = 0
-
-    if management_echo:
-        probability_score += 5
-    if has_trigger:
-        probability_score += 4
-    if has_near_term_event:
-        probability_score += 3
-    if source_section in {"Risk Factors", "Risk"}:
-        probability_score += 2
-
-    if has_transmission:
-        magnitude_score += 4
-    if anchor_count >= 2:
-        magnitude_score += 2
-
-    if not is_already_priced:
-        asymmetry_score += 2
-    if has_near_term_event:
-        asymmetry_score += 1
-
     score = int(base_score) + int(management_echo_score)
-    score += int(probability_score * 3)
-    score += int(magnitude_score * 2)
-    score += int(asymmetry_score)
     if management_echo and source_section in {"Risk Factors", "Risk"}:
         score += 4
+    if has_trigger:
+        score += 4
+    if has_transmission:
+        score += 3
     if anchor_count >= 2:
         score += 2
     if _GENERIC_AGENT_RISK_NAME_RE.search(str(risk.risk_name or "")):
         score -= 6
     if _RISK_PRIORITY_LOW_SIGNAL_RE.search(risk_blob) and anchor_count <= 1 and not management_echo:
         score -= 7
-    if is_generic_compliance and not has_near_term_event:
-        probability_score -= 4
-        asymmetry_score -= 2
-        score -= 12
 
     return {
         "risk": risk,
         "score": int(score),
-        "probability_score": int(probability_score),
-        "magnitude_score": int(magnitude_score),
-        "asymmetry_score": int(asymmetry_score),
         "anchor_count": int(anchor_count),
         "management_echo": bool(management_echo),
         "has_trigger": bool(has_trigger),
         "has_transmission": bool(has_transmission),
-        "has_near_term_event": bool(has_near_term_event),
-        "is_generic_compliance": bool(is_generic_compliance),
-        "is_already_priced": bool(is_already_priced),
         "source_section": source_section,
     }
 
@@ -1860,15 +1756,10 @@ def _accepted_company_risks(analysis: FilingAnalysis) -> List[CompanyRisk]:
 
     scored.sort(
         key=lambda item: (
-            -int(item.get("probability_score", 0) or 0),
-            -int(item.get("magnitude_score", 0) or 0),
-            -int(item.get("asymmetry_score", 0) or 0),
             -int(item.get("score", 0) or 0),
             not bool(item.get("management_echo")),
             not bool(item.get("has_trigger")),
-            not bool(item.get("has_near_term_event")),
             not bool(item.get("has_transmission")),
-            bool(item.get("is_generic_compliance")),
             -int(item.get("anchor_count", 0) or 0),
             str(getattr(item.get("risk"), "risk_name", "") or "").lower(),
             str(item.get("source_section") or "").lower(),
@@ -2000,7 +1891,7 @@ def _build_narrative_blueprint(
         "Executive Summary": SectionBlueprint(
             section_name="Executive Summary",
             section_job="State the company-specific thread once: management's message, how the company makes money, and what changed this filing period.",
-            section_question="What is management really saying in this filing, and why does it matter for this company right now?",
+            section_question="What is management really saying in this filing, and why does it create the underwriting thread for this company right now?",
             primary_evidence=exec_primary,
             secondary_evidence=_pick(
                 list(filing_analysis.evidence_map.get("Financial Performance") or []), 2
@@ -2380,7 +2271,7 @@ def _build_thread_candidates(
         risk = filing_analysis.company_specific_risks[0]
         _append(
             "company_specific_risk",
-            f"{risk.risk_name} is the downside path that would change the current view if {risk.mechanism}",
+            f"{risk.risk_name} is the downside path that can break the underwriting case if {risk.mechanism}",
             [risk.source_quote or risk.evidence_from_filing],
         )
     if investor_focus:
@@ -2388,72 +2279,6 @@ def _build_thread_candidates(
     for area in list(focus_areas or [])[:2]:
         _append("focus_area", area, [area])
     return candidates
-
-
-def _select_aha_insight(
-    filing_analysis: FilingAnalysis,
-    *,
-    fallback_text: str,
-) -> str:
-    contrast_re = re.compile(
-        r"\b("
-        r"now|no longer|not just|not merely|rather than|instead of|shift|shifted|"
-        r"inflect(?:ed|ion|s)?|turned?|moved?|fund(?:ing|s)|self[- ]fund(?:ed|ing)|"
-        r"validate(?:d|s)|from\b.+\bto"
-        r")\b",
-        re.IGNORECASE,
-    )
-    implication_re = re.compile(
-        r"\b("
-        r"because|which means|that means|therefore|so that|this matters|"
-        r"changes the story|funds?|monetiz|conversion|margin|cash flow|"
-        r"reinvestment|pricing|mix|utilization|renewal|backlog"
-        r")\b",
-        re.IGNORECASE,
-    )
-    generic_re = re.compile(
-        r"\b("
-        r"management said|management expects|management noted|the next filing|"
-        r"watch for|improved|continued|remains|stays"
-        r")\b",
-        re.IGNORECASE,
-    )
-    candidates: List[Tuple[int, int, str]] = []
-    source_texts: List[str] = []
-    source_texts.extend([str(item or "").strip() for item in list(filing_analysis.period_specific_insights or [])])
-    source_texts.extend(
-        [
-            str(item.insight or item.change or item.current_value or "").strip()
-            for item in list(filing_analysis.kpi_findings or [])
-            if str(item.insight or item.change or item.current_value or "").strip()
-        ]
-    )
-    source_texts.extend(
-        [
-            str(filing_analysis.management_strategy_summary or "").strip(),
-            str(filing_analysis.tension_evidence or "").strip(),
-            str(filing_analysis.central_tension or "").strip(),
-            str(fallback_text or "").strip(),
-        ]
-    )
-    for idx, raw in enumerate(source_texts):
-        candidate = re.sub(r"\s+", " ", str(raw or "").strip()).strip()
-        if not candidate or candidate.endswith("?"):
-            continue
-        score = 0
-        if contrast_re.search(candidate):
-            score += 5
-        if implication_re.search(candidate):
-            score += 3
-        if re.search(r"\b(than|not|instead|while)\b", candidate, re.IGNORECASE):
-            score += 2
-        if generic_re.search(candidate):
-            score -= 1
-        score += min(2, max(0, len(re.findall(r"[a-zA-Z]{4,}", candidate)) // 8))
-        candidates.append((score, -idx, candidate))
-    if candidates:
-        return max(candidates)[2]
-    return str(fallback_text or "").strip()
 
 
 def _fallback_thread_decision(
@@ -2484,9 +2309,10 @@ def _fallback_thread_decision(
             f"The key question is whether {company_name} can turn {anchor} into durable economics "
             "without losing execution discipline."
         )
-    aha_insight = _select_aha_insight(
-        filing_analysis,
-        fallback_text=fallback_text,
+    aha_insight = (
+        str((filing_analysis.period_specific_insights or [""])[0] or "").strip()
+        or str(filing_analysis.management_strategy_summary or "").strip()
+        or fallback_text
     )
     return ThreadDecision(
         final_thread=fallback_text,
@@ -2533,9 +2359,10 @@ def _arbitrate_thread(
             )
         )
         winner = accepted_candidates[0]
-        aha_insight = _select_aha_insight(
-            filing_analysis,
-            fallback_text=winner.candidate_text,
+        aha_insight = (
+            str((filing_analysis.period_specific_insights or [""])[0] or "").strip()
+            or str(filing_analysis.management_strategy_summary or "").strip()
+            or winner.candidate_text
         )
         return ThreadDecision(
             final_thread=winner.candidate_text,
@@ -2640,7 +2467,7 @@ def _build_instruction_checks(
 
 
 def _tone_mode_for_preferences(tone: str, section_name: str) -> str:
-    base = "Write like a premium analyst note: sharp, plain-English, evidence-led, and slightly conversational without slang."
+    base = "Write like a premium analyst note: sharp, plain-English, and evidence-led."
     if tone == "bullish":
         return base + " Sound constructive with conviction, but never promotional."
     if tone == "bearish":
@@ -2649,7 +2476,7 @@ def _tone_mode_for_preferences(tone: str, section_name: str) -> str:
         return base + " Sound constructive but disciplined about what still has to prove out."
     if section_name == "Risk Factors":
         return base + " In risks, prioritize decision-useful downside language over filing boilerplate."
-    return base + " Sound direct, investor-facing, and easy to parse."
+    return base + " Sound institutional, direct, and easy to parse."
 
 
 def _readability_mode_for_preferences(
@@ -3358,7 +3185,7 @@ AGENT_2_SYSTEM_PROMPT = (
     "not a financial number.\n\n"
     "RISK MATERIALITY FILTER (CRITICAL): Most SEC filings list 20-50 risk factors as "
     "legal boilerplate. Your job is NOT to summarize those disclosures. Instead, identify "
-    "the 1-2 risks that a portfolio manager would ACTUALLY worry about — risks where: "
+    "the 2-3 risks that a portfolio manager would ACTUALLY worry about — risks where: "
     "(a) there is a credible, near-term triggering mechanism (not hypothetical), "
     "(b) the financial impact would be material (>5% revenue or >200bps margin), and "
     "(c) the risk is ASYMMETRIC — it could get much worse but the upside is already priced. "
@@ -3554,7 +3381,7 @@ YOUR TASK:
 
 13. DECISIVE WATCH METRICS:
    Name 2-3 metrics or operating checkpoints investors should watch next, and
-   explain why each one would change the current view. Prefer company-model
+   explain why each one would change the underwriting case. Prefer company-model
    KPIs, guidance checkpoints, or management execution proof points over generic
    headline figures.
 
@@ -4759,9 +4586,8 @@ def _build_agent_3_system_prompt(
         f"- Management quotes are pre-verified from the filing — use them verbatim.\n"
         f"- Period-specific insights explain where the business stands now, what changed this period, and what management thinks happens next. Use them.\n"
         f"- Follow the evidence map: put the right data in the right section.\n"
-        f"- Direct quotes are optional and quality-gated. Use at most {quote_policy['max_total']} total direct quotes, "
-        f"and only when they materially sharpen strategy, outlook, or the next operating checkpoint.\n"
-        f"- If a direct quote feels legal, tax, accounting, governance, or otherwise low-signal, skip it and use attributed paraphrase instead.\n"
+        f"- Quote budget for this memo: {quote_policy['min_total']}-{quote_policy['max_total']} total direct quotes, "
+        f"with Executive Summary minimum {quote_policy['exec_min']} and MD&A minimum {quote_policy['mdna_min']}.\n"
         f"- RISK FACTORS must quote or clearly attribute the company's own risk disclosure language. Integrate it naturally, for example: "
         f"'As the filing notes, \"[quote from risk factors],\" which highlights [mechanism].' "
         f"BANNED: 'macroeconomic uncertainty', 'competitive pressure' without naming the SPECIFIC factor.\n"
@@ -4864,7 +4690,9 @@ def _build_source_backed_risk_section_body(
             body += "."
         if watch_text:
             body += f" {watch_text.rstrip('.') }."
-        lines.append(f"{risk.risk_name}: {body}")
+        lines.append(
+            f"**{risk.risk_name}:** {body}"
+        )
     return "\n\n".join(lines)
 
 
@@ -5021,12 +4849,12 @@ def _quote_policy_for_target_length(target_length: Optional[int]) -> Dict[str, i
     """Budget-aware quote contract for sectioned outputs."""
     target = int(target_length or 0)
     if target <= 0:
-        return {"min_total": 0, "max_total": 3, "exec_min": 0, "mdna_min": 0}
+        return {"min_total": 3, "max_total": 5, "exec_min": 1, "mdna_min": 1}
     if target < 400:
-        return {"min_total": 0, "max_total": 1, "exec_min": 0, "mdna_min": 0}
+        return {"min_total": 1, "max_total": 1, "exec_min": 1, "mdna_min": 0}
     if target < 1200:
-        return {"min_total": 0, "max_total": 2, "exec_min": 0, "mdna_min": 0}
-    return {"min_total": 0, "max_total": 3, "exec_min": 0, "mdna_min": 0}
+        return {"min_total": 2, "max_total": 3, "exec_min": 1, "mdna_min": 1}
+    return {"min_total": 3, "max_total": 5, "exec_min": 1, "mdna_min": 1}
 
 
 def _section_kpi_limit(section_name: str) -> int:
@@ -5220,6 +5048,12 @@ def _build_metrics_highlights(
 ) -> List[str]:
     highlights: List[str] = []
     seen: Set[str] = set()
+    if not (
+        list(analysis.decisive_watch_metrics or [])
+        or list(analysis.management_expectations or [])
+        or list(analysis.period_specific_insights or [])
+    ):
+        return highlights
 
     def _add(text: str) -> None:
         cleaned = re.sub(r"\s+", " ", str(text or "").strip())
@@ -5231,23 +5065,6 @@ def _build_metrics_highlights(
             return
         seen.add(key)
         highlights.append(cleaned + ".")
-
-    contrastive_insight = next(
-        (
-            str(item or "").strip()
-            for item in list(analysis.period_specific_insights or [])
-            if re.search(
-                r"\b(real shift|not just|rather than|instead of|no longer|self[- ]fund(?:ed|ing)|from\b.+\bto)\b",
-                str(item or ""),
-                re.IGNORECASE,
-            )
-        ),
-        "",
-    )
-    if contrastive_insight:
-        _add(contrastive_insight)
-        if len(highlights) >= int(limit):
-            return highlights[:limit]
 
     watch_metrics = list(analysis.decisive_watch_metrics or [])
     for watch_metric in watch_metrics:
@@ -5264,17 +5081,9 @@ def _build_metrics_highlights(
             None,
         )
         if match is not None:
-            insight_text = str(match.insight or "").strip()
-            change_text = str(match.change or "").strip()
-            value_text = str(match.current_value or "").strip()
-            if insight_text and change_text:
-                sentence = f"{match.kpi_name} ({change_text}): {insight_text}"
-            elif insight_text:
-                sentence = f"{match.kpi_name}: {insight_text}"
-            elif change_text and value_text:
-                sentence = f"{match.kpi_name} at {value_text} ({change_text}) — watch for continuation"
-            else:
-                sentence = f"Watch {match.kpi_name}: {change_text or value_text or 'monitor for this filing period'}"
+            sentence = (
+                f"Watch {match.kpi_name}: {match.insight or match.change or match.current_value}"
+            )
         else:
             expectation = next(
                 (
@@ -5291,19 +5100,19 @@ def _build_metrics_highlights(
             if expectation is not None:
                 sentence = f"Watch {expectation.topic}: {expectation.expectation}"
             else:
-                sentence = f"Watch {watch_metric}: this is the clearest operating line to watch in the filing."
+                sentence = f"Watch {watch_metric}: it is the decisive operating checkpoint for this filing."
         _add(sentence)
         if len(highlights) >= int(limit):
             return highlights[:limit]
 
-    for finding in list(analysis.kpi_findings or []):
-        if len(highlights) >= int(limit):
-            break
-        insight = str(finding.insight or finding.change or finding.current_value or "").strip()
-        if not insight:
-            continue
-        change_context = f" ({finding.change})" if finding.change else ""
-        _add(f"{finding.kpi_name}{change_context}: {insight}")
+    if highlights:
+        for finding in list(analysis.kpi_findings or []):
+            if len(highlights) >= int(limit):
+                break
+            insight = str(finding.insight or finding.change or finding.current_value or "").strip()
+            if not insight:
+                continue
+            _add(f"{finding.kpi_name} matters because {insight}")
 
     for expectation in list(analysis.management_expectations or []):
         if len(highlights) >= int(limit):
@@ -5317,85 +5126,7 @@ def _build_metrics_highlights(
             break
         _add(insight)
 
-    if len(highlights) < int(limit):
-        fallback_candidates = [
-            str(analysis.central_tension or "").strip(),
-            str(analysis.management_strategy_summary or "").strip(),
-        ]
-        for candidate in fallback_candidates:
-            if len(highlights) >= int(limit):
-                break
-            if candidate:
-                _add(candidate)
-
     return highlights[:limit]
-
-
-def _fallback_metrics_intro_from_rows(
-    metric_lines: Sequence[str],
-    *,
-    limit: int = 3,
-) -> List[str]:
-    labels: List[str] = []
-    seen: Set[str] = set()
-    for raw_line in metric_lines:
-        stripped = str(raw_line or "").strip()
-        if not stripped or stripped in {"DATA_GRID_START", "DATA_GRID_END"}:
-            continue
-        label = ""
-        if "|" in stripped:
-            label = str(stripped.split("|", 1)[0] or "").strip()
-        elif stripped.startswith("→") and ":" in stripped:
-            label = str(stripped.lstrip("→").split(":", 1)[0] or "").strip()
-        label = label.strip(":- ")
-        if not label:
-            continue
-        key = re.sub(r"[^a-z0-9]+", " ", label.lower()).strip()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        labels.append(label)
-
-    if not labels:
-        return []
-
-    label_keys = {re.sub(r"[^a-z0-9]+", " ", label.lower()).strip() for label in labels}
-    company_specific = [
-        label
-        for label in labels
-        if re.search(
-            r"\b(arr|arpu|attach|backlog|bookings|capacity|churn|conversion|cohort|deployments?|"
-            r"inference|monetized usage|nrr|nr[rt]|paid[- ]seat|pipeline|renewals?|retention|rpo|"
-            r"seat expansion|shipments?|take rate|traffic acquisition|utilization)\b",
-            label,
-            re.IGNORECASE,
-        )
-    ]
-    bullets: List[str] = []
-    if company_specific:
-        bullets.append(
-            f"Watch {company_specific[0]} first; it tells you fastest whether the filing's main claim is turning into operating results."
-        )
-    if {"operating margin", "free cash flow"} <= label_keys:
-        bullets.append(
-            "Read operating margin with free cash flow to see whether the business is staying self-funded through its next move."
-        )
-    if (
-        {"cash", "current ratio"} & label_keys
-        or {"net debt", "total debt"} & label_keys
-    ):
-        bullets.append(
-            "Treat the liquidity and leverage rows as the downside buffer, not the main thesis."
-        )
-    if len(bullets) < 2:
-        bullets.append(
-            f"Watch {labels[0]} first; it is the clearest early sign that the filing story is turning into operating results."
-        )
-    if len(bullets) < 2 and len(labels) > 1:
-        bullets.append(
-            f"Use {labels[1]} as the next confirmation that the current improvement is becoming durable, not just quarter-end timing."
-        )
-    return bullets[: max(1, int(limit))]
 
 
 def _build_key_metrics_body(
@@ -5422,8 +5153,6 @@ def _build_key_metrics_body(
         return ""
 
     highlight_lines = _build_metrics_highlights(analysis, limit=4)
-    if not highlight_lines:
-        highlight_lines = _fallback_metrics_intro_from_rows(ordered_lines, limit=3)
     if highlight_lines:
         while highlight_lines:
             intro_block = "What Matters:\n" + "\n".join(
@@ -5461,22 +5190,6 @@ def _normalize_section_body(section_name: str, raw_text: str) -> str:
             text = re.sub(r"^\s*#.+$", "", text, flags=re.MULTILINE).strip()
         if text == prior:
             break
-    # Strip obvious instruction leakage headings that should never appear in output
-    for leak_heading in (
-        "BODY WORD BUDGET:", "SECTION WORD BUDGET:", "MANDATORY:",
-        "ANTI-BOREDOM CONSTRAINTS", "STYLE CONTRACT:", "SECTION FOCUS:",
-        "AHA INSIGHT TO PROTECT:", "AHA INSIGHT (MUST SURFACE",
-        "CENTRAL TENSION:", "VALIDATED MEMO THREAD:",
-        "QUOTE POLICY:", "QUOTE MANDATE:", "EDITORIAL ANCHOR RULES:",
-        "DEPTH MOVES:", "REPAIR INSTRUCTION:", "BANNED OVERLAP:",
-        "FORBIDDEN OPENINGS:", "SECTION INSTRUCTION CHECKS:",
-    ):
-        text = re.sub(
-            rf"^\s*{re.escape(leak_heading)}[^\n]*$",
-            "",
-            text,
-            flags=re.MULTILINE | re.IGNORECASE,
-        ).strip()
     return text.strip()
 
 
@@ -5539,23 +5252,9 @@ def _fallback_key_metrics_from_kpis(analysis: FilingAnalysis) -> str:
 
 
 _END_PUNCT_RE = re.compile(r'[.!?](?:["\')\]]+)?$')
-_RISK_LABEL_PATTERN = r"(?:\[[^\]\n]{2,120}\]|[A-Z0-9][^:\n*]{1,120})"
-_RISK_HEADER_RE = re.compile(
-    rf"^(?:\*\*)?(?P<name>{_RISK_LABEL_PATTERN})(?:\*\*\s*:|:\s*\*\*|:)\s*(?P<body>.*)$",
+_RISK_ITEM_RE = re.compile(
+    r"\*\*(?P<name>[^*:\n]{2,120}?):?\*\*\s*:?\s*(?P<body>.+?)(?=(?:\s+\*\*[^*]+?\*\*\s*:?)|\Z)",
     re.DOTALL,
-)
-_LEGACY_BOLD_RISK_HEADER_RE = re.compile(
-    r"^\*\*(?P<name>[^*\n]{2,140}?)\*\*\s*(?P<body>.+)$",
-    re.DOTALL,
-)
-_RISK_INLINE_HEADER_RE = re.compile(
-    r"\s+(?=\*\*(?:\[[^\]\n]{2,120}\]|[^:\n*]{2,120})(?:\*\*\s*:|:\s*\*\*)\s+)",
-)
-_RISK_SENTENCE_BOUNDARY_HEADER_RE = re.compile(
-    rf"(?<=[.!?])\s+(?=(?:\*\*)?(?:\[[^\]\n]{{2,120}}\]|[A-Z0-9][^:\n]{{1,120}}?)(?:\*\*\s*:|:\s*\*\*|:)\s+)",
-)
-_RISK_EMBEDDED_HEADER_RE = re.compile(
-    rf"(?<=[.!?])\s+(?=(?:\*\*)?(?:\[[^\]\n]{{2,120}}\]|[A-Z0-9][^:\n]{{1,120}})(?:\*\*\s*:|:\s*\*\*|:)\s+)",
 )
 _MECHANISM_RE = re.compile(
     r"\b(because|driven by|if|unless|leads to|results in|pressure|compress|dilute|erode|funding|liquidity|working capital|pricing|churn|renewal|mix shift|substitution|execution slip)\b",
@@ -5596,66 +5295,6 @@ _TRIGGER_RE = re.compile(
     r"\b(trigger|watch|must stay true|breaks the thesis|would change|needs to|if\b|unless\b)\b",
     re.IGNORECASE,
 )
-
-
-def _extract_structured_risk_items(text: str) -> List[Tuple[str, str]]:
-    def _is_non_risk_label(name: str) -> bool:
-        normalized = re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
-        return normalized in {
-            "early warning",
-            "early warning signal",
-            "early warning signals",
-            "indicator",
-            "indicators",
-            "signal",
-            "signals",
-            "trigger",
-            "triggers",
-            "watch",
-            "watch for",
-        }
-
-    normalized = str(text or "").replace("\u00a0", " ").strip()
-    if not normalized:
-        return []
-    items: List[Tuple[str, str]] = []
-    def _append_item(name: str, body: str) -> None:
-        if not name or not body:
-            return
-        if _is_non_risk_label(name):
-            if items:
-                prior_name, prior_body = items[-1]
-                merged_body = f"{prior_body} {name}: {body}".strip()
-                items[-1] = (prior_name, merged_body)
-            return
-        items.append((name, body))
-
-    for paragraph in re.split(r"\n\s*\n+", normalized):
-        match = _RISK_HEADER_RE.match(str(paragraph or "").strip()) or _LEGACY_BOLD_RISK_HEADER_RE.match(
-            str(paragraph or "").strip()
-        )
-        if not match:
-            continue
-        name = str(match.group("name") or "").strip().strip("[]")
-        body = " ".join(str(match.group("body") or "").split()).strip()
-        _append_item(name, body)
-    if items:
-        if len(items) > 1 or not _RISK_EMBEDDED_HEADER_RE.search(items[0][1]):
-            return items
-        items = []
-
-    normalized = _RISK_SENTENCE_BOUNDARY_HEADER_RE.sub("\n\n", normalized)
-    normalized = _RISK_INLINE_HEADER_RE.sub("\n\n", normalized)
-    for paragraph in re.split(r"\n\s*\n+", normalized):
-        match = _RISK_HEADER_RE.match(str(paragraph or "").strip()) or _LEGACY_BOLD_RISK_HEADER_RE.match(
-            str(paragraph or "").strip()
-        )
-        if not match:
-            continue
-        name = str(match.group("name") or "").strip().strip("[]")
-        body = " ".join(str(match.group("body") or "").split()).strip()
-        _append_item(name, body)
-    return items
 
 
 def _sentence_count(text: str) -> int:
@@ -5719,7 +5358,7 @@ def _validate_risk_local_contract(
 ) -> List[str]:
     failures: List[str] = []
     shape = get_risk_factors_shape(budget)
-    items = _extract_structured_risk_items(text or "")
+    items = list(_RISK_ITEM_RE.finditer(text or ""))
     expected_count = int(shape.risk_count or 0)
     accepted_risks = _accepted_company_risks(analysis) if analysis else []
     required_count = int(expected_count)
@@ -5737,11 +5376,13 @@ def _validate_risk_local_contract(
         return failures
     per_risk_target = max(18, budget // max(1, expected_count or required_count))
     per_risk_tolerance = max(8, int(round(per_risk_target * 0.12)))
-    min_body_words = max(18, min(80, per_risk_target - per_risk_tolerance))
+    min_body_words = max(18, per_risk_target - per_risk_tolerance)
     if required_count < expected_count:
         min_body_words = max(18, int(round(min_body_words * 0.7)))
     prior_risks: List[Tuple[str, str]] = []
-    for risk_name, body in items:
+    for item in items:
+        risk_name = (item.group("name") or "").strip()
+        body = (item.group("body") or "").strip()
         if accepted_names and risk_name.lower() not in accepted_names:
             failures.append(
                 f"Risk '{risk_name}' is not one of the accepted source-backed risk names."
@@ -6184,120 +5825,6 @@ def _body_uses_owned_evidence(body: str, plan: SectionPlan) -> bool:
     return False
 
 
-def _section_sentences(text: str, *, limit: Optional[int] = None) -> List[str]:
-    sentences = [
-        sentence.strip()
-        for sentence in re.split(r"(?<=[.!?])\s+", str(text or "").strip())
-        if sentence.strip()
-    ]
-    if limit is not None:
-        return sentences[: max(0, int(limit))]
-    return sentences
-
-
-def _meaningful_token_overlap(left: str, right: str) -> int:
-    stopwords = {
-        "that",
-        "this",
-        "with",
-        "from",
-        "into",
-        "over",
-        "under",
-        "while",
-        "where",
-        "which",
-        "their",
-        "there",
-        "management",
-        "company",
-        "because",
-        "through",
-    }
-    left_tokens = {
-        token
-        for token in re.findall(r"[a-z][a-z0-9-]{3,}", str(left or "").lower())
-        if token not in stopwords
-    }
-    right_tokens = {
-        token
-        for token in re.findall(r"[a-z][a-z0-9-]{3,}", str(right or "").lower())
-        if token not in stopwords
-    }
-    return len(left_tokens & right_tokens)
-
-
-def _opening_surfaces_aha(body: str, decision: ThreadDecision) -> bool:
-    opening = " ".join(_section_sentences(body, limit=2))
-    aha_text = str(decision.aha_insight or "").strip()
-    if not opening or not aha_text:
-        return True
-    if _AHA_SIGNAL_RE.search(opening):
-        return True
-    overlap = _meaningful_token_overlap(opening, aha_text)
-    if re.search(
-        r"\b(real shift|not just|rather than|instead of|no longer|self[- ]fund(?:ed|ing)|from\b.+\bto)\b",
-        aha_text,
-        re.IGNORECASE,
-    ):
-        return overlap >= 3 and bool(
-            re.search(
-                r"\b(real shift|not just|rather than|instead of|no longer|self[- ]fund(?:ed|ing)|from\b.+\bto)\b",
-                opening,
-                re.IGNORECASE,
-            )
-        )
-    return overlap >= 2
-
-
-def _opening_has_decision_block(body: str) -> bool:
-    opening = " ".join(_section_sentences(body, limit=2))
-    if not opening:
-        return False
-    has_decision_language = bool(_EXEC_DECISION_OPENING_RE.search(opening))
-    has_implication = bool(_AHA_SIGNAL_RE.search(opening)) or "means" in opening.lower()
-    return has_decision_language or has_implication
-
-
-def _opening_names_next_proof_point(body: str) -> bool:
-    opening = " ".join(_section_sentences(body, limit=2))
-    if not opening:
-        return False
-    return bool(_WATCHPOINT_RE.search(opening))
-
-
-def _final_sentence_has_concrete_trigger(
-    body: str,
-    *,
-    require_numeric: bool = False,
-) -> bool:
-    sentences = _section_sentences(body)
-    if not sentences:
-        return False
-    final_sentence = sentences[-1]
-    has_trigger_language = bool(_WATCHPOINT_RE.search(final_sentence)) or bool(
-        _TRIGGER_RE.search(final_sentence)
-    )
-    has_timing = bool(_TIMELINE_RE.search(final_sentence))
-    has_threshold = bool(re.search(r"\d|above|below|at least|less than|more than", final_sentence, re.IGNORECASE))
-    if require_numeric:
-        return has_trigger_language and (has_threshold or has_timing)
-    return (has_trigger_language and (has_threshold or has_timing)) or (has_timing and has_threshold)
-
-
-def _financial_performance_metric_classes(body: str) -> Set[str]:
-    return {
-        name
-        for name, pattern in _FINANCIAL_PERFORMANCE_METRIC_PATTERNS.items()
-        if pattern.search(body or "")
-    }
-
-
-def _financial_performance_has_repeated_interpretation(body: str) -> bool:
-    matches = _FINANCIAL_PERFORMANCE_REINVESTMENT_ECHO_RE.findall(body or "")
-    return len(matches) > 1
-
-
 def _instruction_check_failed(check: InstructionCheck, body: str) -> bool:
     lowered = str(body or "").lower()
     target = str(check.target or "").lower()
@@ -6417,34 +5944,6 @@ def _judge_sectioned_summary(
         body = str(section_bodies.get(section_name) or "").strip()
         if not body:
             continue
-        if section_name == "Executive Summary":
-            if not _opening_has_decision_block(body):
-                failures.append(
-                    EditorialFailure(
-                        section_name=section_name,
-                        code="exec_opening_soft",
-                        message="Executive Summary should use the first 2 sentences as a decision block, not a soft scene-setting opening.",
-                        severity=2.8,
-                    )
-                )
-            if not _opening_surfaces_aha(body, thread_decision):
-                failures.append(
-                    EditorialFailure(
-                        section_name=section_name,
-                        code="aha_not_surfaced",
-                        message="Executive Summary does not surface the memo's non-obvious insight early enough.",
-                        severity=2.9,
-                    )
-                )
-            if not _opening_names_next_proof_point(body):
-                failures.append(
-                    EditorialFailure(
-                        section_name=section_name,
-                        code="exec_missing_proof_point",
-                        message="Executive Summary should name the single proof point investors should watch next within the opening block.",
-                        severity=2.5,
-                    )
-                )
         if section_name in {"Management Discussion & Analysis", "Closing Takeaway"}:
             if not _body_mentions_thread_anchor(body, thread_decision):
                 failures.append(
@@ -6474,44 +5973,6 @@ def _judge_sectioned_summary(
                         severity=2.8,
                     )
                 )
-        if section_name == "Financial Performance":
-            metric_classes = _financial_performance_metric_classes(body)
-            if len(metric_classes) > 3:
-                failures.append(
-                    EditorialFailure(
-                        section_name=section_name,
-                        code="financial_performance_metric_drift",
-                        message="Financial Performance is trying to carry too many primary metrics. Keep it to 2-3 interpreted drivers.",
-                        severity=2.4,
-                    )
-                )
-            if _financial_performance_has_repeated_interpretation(body):
-                failures.append(
-                    EditorialFailure(
-                        section_name=section_name,
-                        code="financial_performance_redundancy",
-                        message="Financial Performance repeats the same reinvestment-or-funding idea in different words instead of advancing the analysis.",
-                        severity=2.6,
-                    )
-                )
-            if not _final_sentence_has_concrete_trigger(body):
-                failures.append(
-                    EditorialFailure(
-                        section_name=section_name,
-                        code="soft_section_ending",
-                        message="Financial Performance should end on the specific metric, threshold, or timeline that hands the question into management execution.",
-                        severity=1.9,
-                    )
-                )
-        if section_name == "Management Discussion & Analysis" and not _final_sentence_has_concrete_trigger(body):
-            failures.append(
-                EditorialFailure(
-                    section_name=section_name,
-                    code="soft_section_ending",
-                    message="Management Discussion & Analysis should end on the checkpoint, trigger, or timeline that would show management's plan is slipping.",
-                    severity=2.0,
-                )
-            )
         if section_name == "Risk Factors":
             if not _EARLY_WARNING_RE.search(body) or not re.search(
                 r"\b(now|currently|over the next|within the next|near[- ]term|this filing|position size|priced in)\b",
@@ -6526,15 +5987,6 @@ def _judge_sectioned_summary(
                         severity=2.4,
                     )
                 )
-            if not _final_sentence_has_concrete_trigger(body):
-                failures.append(
-                    EditorialFailure(
-                        section_name=section_name,
-                        code="soft_section_ending",
-                        message="Risk Factors should end on the first metric, checkpoint, or dated catalyst that would show the downside is forming.",
-                        severity=2.1,
-                    )
-                )
         if section_name == "Closing Takeaway":
             if not _AHA_SIGNAL_RE.search(body) or not _TRIGGER_RE.search(body):
                 failures.append(
@@ -6545,19 +5997,9 @@ def _judge_sectioned_summary(
                         severity=2.7,
                     )
                 )
-            if not _final_sentence_has_concrete_trigger(body, require_numeric=True):
-                failures.append(
-                    EditorialFailure(
-                        section_name=section_name,
-                        code="soft_section_ending",
-                        message="Closing Takeaway should end on a measurable trigger or dated threshold, not a generic cliffhanger.",
-                        severity=2.7,
-                    )
-                )
         avg_sentence_length = _average_sentence_length(body)
         hedge_count = len(_HEDGE_RE.findall(body))
         awkward_count = len(_AWKWARD_LINKER_RE.findall(body))
-        analyst_fog_count = len(_ANALYST_FOG_RE.findall(body))
         if avg_sentence_length > 30 or awkward_count > 1:
             failures.append(
                 EditorialFailure(
@@ -6574,15 +6016,6 @@ def _judge_sectioned_summary(
                     code="tone_drift",
                     message="The prose is over-hedged and loses the intended premium analyst-note confidence.",
                     severity=1.6,
-                )
-            )
-        if analyst_fog_count > 0:
-            failures.append(
-                EditorialFailure(
-                    section_name=section_name,
-                    code="tone_drift",
-                    message="The prose uses analyst-fog phrases instead of plain investor-facing language.",
-                    severity=1.8,
                 )
             )
 
@@ -6857,7 +6290,7 @@ def _build_section_prompt(
         "STYLE CONTRACT:\n"
         f"- Tone mode: {section_plan.tone_mode}\n"
         f"- Readability mode: {section_plan.readability_mode}\n"
-        "- Keep prose clear, direct, and conversational — like a sharp analyst explaining over coffee. Evidence-first, occasionally blunt, never stiff or hedging.\n"
+        "- Keep prose in premium analyst-note form: crisp, plain-English, and evidence-first.\n"
         "- Do not convert the section into bullets even if the global output style is mixed.\n\n"
     )
     if section_name != "Closing Takeaway":
@@ -6913,7 +6346,7 @@ def _build_section_prompt(
             f"RISK FACTORS CONTRACT:\n"
             f"- Write up to {required_risks} risks from the accepted source-backed set below.\n"
             f"- Each risk should land around {per_risk_target} words (allowed variance ±{per_risk_tolerance}).\n"
-            f"- Format each as Risk Name: followed by "
+            f"- Format each as **Risk Name:** followed by "
             f"{describe_sentence_range(int(shape.per_risk_min_sentences or 2), int(shape.per_risk_max_sentences or 3))}.\n"
             f"- Rank risks by probability first, then magnitude.\n"
             f"- Each risk must explain what could go wrong, why it matters for this company, and what investors should watch.\n"
@@ -6938,7 +6371,7 @@ def _build_section_prompt(
             section_contract += "- Include one measurable trigger.\n\n"
         else:
             section_contract += (
-                "- Include the verdict, one 'what must stay true' trigger, one 'what breaks the thesis' trigger, "
+                "- Include the underwriting conclusion, one 'what must stay true' trigger, one 'what breaks the thesis' trigger, "
                 "and one implication for capital allocation, cash generation, or valuation support.\n\n"
             )
 
@@ -6956,36 +6389,24 @@ def _build_section_prompt(
             "- Use no more than one anchor figure if target length is under 800 words; otherwise cap at two.\n"
             "- Never open with a templated metric sentence like 'Revenue of X produced Y'. Start with the thesis or the real surprise.\n"
             "- End with a subtle handoff to the operating proof the quarter must show; do not say 'the next section'.\n"
-            "- QUOTE RULE: Use one verbatim management quote within the first 3 sentences only if it directly supports strategy, outlook, or what happens next; otherwise use attributed paraphrase.\n"
-            "- OPENING CONTRACT: Within the first 2 sentences, state the main takeaway, the non-obvious report insight, and the single proof point investors should watch next.\n"
+            "- QUOTE MANDATE: Include at least one verbatim management quote within the first 3 sentences to set the company's voice immediately.\n"
             "- SURPRISE LEAD: If the filing contains a genuine surprise (deviation from "
             "guidance, inflection point, new disclosure), lead with it. Do not bury the "
             "lede under a generic company description.\n"
             "- ANALYTICAL STANCE: State what the filing MEANS for the investment case, "
-            "not just what it SAYS. A paraphrase is not analysis.\n"
-            "- DECISION FRAMING: Open the very first sentence with the single most important "
-            "takeaway. The reader should know the verdict within 2 sentences.\n"
-            "- AHA INSIGHT: The filing's non-obvious insight (from AHA INSIGHT above) "
-            "must appear explicitly in the first 2 paragraphs, not buried at the end.\n\n"
+            "not just what it SAYS. A paraphrase is not analysis.\n\n"
         )
     elif section_name == "Financial Performance":
         section_focus_instruction = (
             "SECTION FOCUS:\n"
             "- Use the 1-2 metrics that best test the thesis, prioritizing company-specific KPI findings.\n"
             "- Use the decisive watch metrics block below to choose the 1-2 metrics that matter most.\n"
-            "- Use generic financial metrics only when they are the true driver of the current view.\n"
+            "- Use generic financial metrics only when they are the true driver of the underwriting call.\n"
             "- Explicitly say whether the numbers confirm or challenge management's expectations or commitments.\n"
-            "- Tell the reader what changed in those metrics and why that changes the current read.\n"
+            "- Tell the reader what changed in those metrics and why that changes the underwriting read.\n"
             "- Prefer metrics tied to specific products, segments, customer cohorts, geographies, or programs named in the filing.\n"
-            "- HARD CAP: Keep this section to 2-3 interpreted metrics. If you need a fourth figure, move it to Key Metrics.\n"
-            "- REDUNDANCY CUT: Never restate the same point in different words. If margin strength "
-            "is funding investment, say it once — do not rephrase as 'cash generation supporting buildout' "
-            "or 'operating leverage enabling reinvestment.' Each metric gets ONE interpretation.\n"
-            "- METRICS CAP: If you have written interpretations for 3 metrics, stop. Additional metrics "
-            "belong in Key Metrics, not here.\n"
             "- No strategy recap and no long management monologue here.\n"
-            "- End with a subtle shift toward the management decision or execution question this performance now raises.\n"
-            "- FINAL SENTENCE CONTRACT: Name the metric, threshold, checkpoint, or timeline that will answer that question first.\n\n"
+            "- End with a subtle shift toward the management decision or execution question this performance now raises.\n\n"
         )
     elif section_name == "Management Discussion & Analysis":
         bets_block = ""
@@ -7007,7 +6428,7 @@ def _build_section_prompt(
             "- Say what management thinks is likely to happen next, using the expectations block below.\n"
             "- Assess whether management delivered on prior promises or guidance, using the promise scorecard items below.\n"
             "- Every strategy claim must be supported by a direct quote or clear management attribution.\n"
-            "- Use direct quotes only when they add strategic or forward-looking context and fit the quality-gated quote allowance; otherwise use clear management attribution.\n"
+            "- Use direct quotes only within the budget-aware quote allowance; otherwise use clear management attribution.\n"
             "- Do not open with revenue, operating income, or a cash-flow recap.\n"
             "- This section owns mechanism, intent, and credibility; it is not a second Financial Performance section.\n"
             "- CREDIBILITY JUDGMENT: Explicitly assess whether management's strategy "
@@ -7017,7 +6438,6 @@ def _build_section_prompt(
             "management's strategy. What would change if the market fully understood "
             "this filing?\n"
             "- CITATION MANDATE: Every claim about management's strategy must include a direct quote or attributed paraphrase: 'Management noted that \"[quote]\"' or 'Management characterized [topic] as [paraphrase].'\n"
-            "- FINAL SENTENCE CONTRACT: End on the trigger, metric, or dated checkpoint that would first show the strategy is slipping.\n"
             f"{bets_block}"
             f"{guidance_block}"
             f"{promise_block}\n"
@@ -7036,7 +6456,8 @@ def _build_section_prompt(
             "- Reuse the company terms below inside risk names and mechanisms so the risks are unmistakably filing-specific.\n"
             "- Tie each risk to a concrete product, segment, geography, customer class, regulation, supply/input, or funding mechanism.\n"
             "- Do not re-summarize the quarter or reuse the same explanatory paragraph from earlier sections.\n"
-            "- CITATION MANDATE: Each risk body must include close filing attribution and may use a direct quote only if it sharpens a concrete business exposure. Paraphrase is preferred to legal boilerplate.\n"
+            "- CITATION MANDATE: Each risk body must include at least one direct quote or close paraphrase from the filing's "
+            "risk factors section, integrated naturally into the prose (for example: 'As the filing notes, \"[quote],\" which highlights [mechanism].').\n"
             "- MATERIALITY FILTER: Write ONLY risks that would make a portfolio manager "
             "change their position size. If a risk has appeared in every filing for years "
             "without triggering, it is not a real risk.\n"
@@ -7044,14 +6465,7 @@ def _build_section_prompt(
             "and plausible timeline. 'If regulatory environment changes' is too vague. "
             "'The DOJ antitrust trial ruling expected Q2 2026 could mandate structural remedies' is specific.\n"
             "- ASYMMETRY TEST: Prioritize risks where the downside is larger than what is "
-            "currently priced in. Skip symmetric or already-known risks.\n"
-            "- DE-PRIORITIZE GENERIC COMPLIANCE: Supplier-code, anti-corruption, code-of-conduct, transfer-restriction, foreign-registry, or anti-takeover risks should stay below real operating risks unless the filing ties them to a near-term investigation, ruling, deadline, transaction, or enforcement path.\n"
-            "- TIMELINE REQUIREMENT: Each risk must state a specific timeline or catalyst — "
-            "'within the next 2 quarters,' 'if the Q3 contract renewal fails,' 'before the "
-            "fiscal year-end pricing reset.' Risks without timelines are too abstract.\n"
-            "- P&L IMPACT: Each risk must name the specific P&L line item affected and an "
-            "approximate magnitude or direction. 'Could pressure margins' is too vague. "
-            "'Could compress gross margin by 100-200bp if [trigger]' is specific.\n\n"
+            "currently priced in. Skip symmetric or already-known risks.\n\n"
         )
     elif section_name == "Closing Takeaway":
         ct_promise_block = ""
@@ -7067,8 +6481,6 @@ def _build_section_prompt(
             "- Use one decisive watch metric or operating checkpoint in the must-stay-true / thesis-break framing.\n"
             "- Make the must-hold and thesis-break triggers specific to this company's operating model.\n"
             "- Resolve the memo thread with credibility and proof points, not another performance recap.\n"
-            "- Do not justify the verdict with a generic cash-versus-liabilities line unless that balance-sheet tension was a real driver of the memo above.\n"
-            "- FINAL SENTENCE CONTRACT: End with the single measurable trigger that changes the stance first.\n"
             f"{ct_promise_block}\n"
         )
 
@@ -7086,17 +6498,14 @@ def _build_section_prompt(
         f"CENTRAL TENSION:\n{filing_analysis.central_tension}\n\n"
         f"VALIDATED MEMO THREAD:\n{thread_decision.final_thread}\n\n"
         f"THREAD ANCHOR CLASS:\n{thread_decision.anchor_class} — anchor: {thread_decision.anchor}\n\n"
-        f"AHA INSIGHT (MUST SURFACE IN OUTPUT):\n"
-        f"{thread_decision.aha_insight}\n"
-        f"This is the non-obvious thing the filing reveals. Weave it into the most "
-        f"relevant section — it must appear as an explicit claim in the output prose, "
-        f"not just implied. The reader should think 'I would not have known that.'\n\n"
+        f"AHA INSIGHT TO PROTECT:\n{thread_decision.aha_insight}\n\n"
         f"SECTION JOB:\n{section_plan.job}\n\n"
         f"SECTION QUESTION TO ANSWER:\n{section_plan.question}\n\n"
         f"QUOTE POLICY:\n"
-        f"- Direct quotes are optional and quality-gated for this memo. Use at most {quote_policy['max_total']} total direct quote(s).\n"
-        f"- Only keep a direct quote if it materially sharpens strategy, outlook, or the next operating checkpoint.\n"
-        f"- If a quote feels legal, tax, accounting, governance, or otherwise low-signal, delete it and use management attribution instead.\n\n"
+        f"- Budget-aware quote range for this memo: {quote_policy['min_total']}-{quote_policy['max_total']} total direct quote(s).\n"
+        f"- Executive Summary quote minimum: {quote_policy['exec_min']}.\n"
+        f"- MD&A quote minimum: {quote_policy['mdna_min']}.\n"
+        f"- If direct-quote budget is exhausted, use management attribution instead of fabricating a quote.\n\n"
         f"PRIOR SECTION BRIDGE CONTEXT:\n{prior_block}\n\n"
         f"USED CLAIMS TO AVOID RESTATING:\n{used_claims_block}\n\n"
         f"EARLIER SECTION MEMORY:\n{section_memory_block}\n\n"
@@ -7830,11 +7239,11 @@ def _surgical_word_count_rewrite(
 
 
 def _validate_key_metrics_section(summary_text: str, metrics_lines: str) -> str:
-    """Validate and fix the Key Metrics section to ensure deterministic numeric rows.
+    """Validate and fix the Key Metrics section to ensure arrow-format lines.
 
-    If >50% of content lines are prose (not matching the accepted numeric row formats), replaces
+    If >50% of content lines are prose (not matching arrow format), replaces
     the entire section body with the raw metrics_lines data.
-    Otherwise, keeps valid numeric rows and drops prose lines.
+    Otherwise, keeps valid arrow lines and drops prose lines.
     """
     import re as _re
 
@@ -7860,11 +7269,7 @@ def _validate_key_metrics_section(summary_text: str, metrics_lines: str) -> str:
     intro_consumed = 0
     raw_lines = [line for line in body.split("\n")]
     non_empty = [line.strip() for line in raw_lines if line.strip()]
-    if non_empty and re.match(
-        r"^what matters(?:\s+this filing period)?:?\s*$",
-        non_empty[0],
-        re.IGNORECASE,
-    ):
+    if non_empty and re.match(r"^what matters:?\s*$", non_empty[0], re.IGNORECASE):
         intro_lines.append("What Matters:")
         consumed_non_empty = 1
         bullet_count = 0
@@ -7873,11 +7278,7 @@ def _validate_key_metrics_section(summary_text: str, metrics_lines: str) -> str:
             if not stripped:
                 intro_consumed += 1
                 continue
-            if consumed_non_empty == 1 and re.match(
-                r"^what matters(?:\s+this filing period)?:?\s*$",
-                stripped,
-                re.IGNORECASE,
-            ):
+            if consumed_non_empty == 1 and re.match(r"^what matters:?\s*$", stripped, re.IGNORECASE):
                 intro_consumed += 1
                 continue
             bullet_match = re.match(r"^(?:[-*•])\s+(.+)$", stripped)
@@ -7897,7 +7298,6 @@ def _validate_key_metrics_section(summary_text: str, metrics_lines: str) -> str:
 
     # Parse lines and validate
     arrow_pattern = _re.compile(r'^→\s*[^:]+:\s*[\$\d\-\+\(]')
-    grid_pattern = _re.compile(r"^[^|]{2,80}\|\s*[^|]*\d")
     lines = [line for line in body.split('\n') if line.strip()]
 
     if not lines and intro_lines:
@@ -7915,31 +7315,10 @@ def _validate_key_metrics_section(summary_text: str, metrics_lines: str) -> str:
         stripped = line.strip()
         if not stripped:
             continue
-        if stripped.upper() in {"DATA_GRID_START", "DATA_GRID_END"}:
-            valid_lines.append(stripped)
-        elif arrow_pattern.match(stripped) or grid_pattern.match(stripped):
+        if arrow_pattern.match(stripped):
             valid_lines.append(stripped)
         else:
             prose_count += 1
-
-    if not intro_lines and prose_count > 0:
-        prose_lines = [
-            line.strip()
-            for line in lines
-            if line.strip()
-            and line.strip().upper() not in {"DATA_GRID_START", "DATA_GRID_END"}
-            and not arrow_pattern.match(line.strip())
-            and not grid_pattern.match(line.strip())
-        ]
-        synthesized: List[str] = []
-        for raw in prose_lines[:4]:
-            cleaned = re.sub(r"\s+", " ", raw).strip().rstrip(".")
-            if not cleaned or len(cleaned.split()) < 5:
-                continue
-            synthesized.append(f"- {cleaned}.")
-        if synthesized:
-            intro_lines = ["What Matters:", *synthesized[:4]]
-            prose_count = max(0, prose_count - len(synthesized))
 
     total_content_lines = len(valid_lines) + prose_count
 
@@ -7950,13 +7329,6 @@ def _validate_key_metrics_section(summary_text: str, metrics_lines: str) -> str:
     if prose_count > total_content_lines * 0.5:
         if metrics_lines and metrics_lines.strip() and metrics_lines.strip() != "(None)":
             replacement_body = metrics_lines.strip()
-            if not intro_lines:
-                fallback_intro = _fallback_metrics_intro_from_rows(
-                    [line.strip() for line in replacement_body.splitlines() if line.strip()],
-                    limit=3,
-                )
-                if fallback_intro:
-                    intro_lines = ["What Matters:", *[f"- {item}" for item in fallback_intro]]
         elif valid_lines:
             replacement_body = '\n'.join(valid_lines)
         else:
@@ -7965,10 +7337,6 @@ def _validate_key_metrics_section(summary_text: str, metrics_lines: str) -> str:
         # Keep only valid arrow lines
         if valid_lines:
             replacement_body = '\n'.join(valid_lines)
-            if not intro_lines:
-                fallback_intro = _fallback_metrics_intro_from_rows(valid_lines, limit=3)
-                if fallback_intro:
-                    intro_lines = ["What Matters:", *[f"- {item}" for item in fallback_intro]]
         else:
             return summary_text
 

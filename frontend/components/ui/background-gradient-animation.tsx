@@ -34,11 +34,11 @@ export const BackgroundGradientAnimation = ({
   containerClassName?: string;
 }) => {
   const interactiveRef = useRef<HTMLDivElement>(null);
-  const positionRef = useRef({ x: 0, y: 0 });
 
+  const [curX, setCurX] = useState(0);
+  const [curY, setCurY] = useState(0);
   const [tgX, setTgX] = useState(0);
   const [tgY, setTgY] = useState(0);
-
   useEffect(() => {
     document.body.style.setProperty(
       "--gradient-background-start",
@@ -56,46 +56,22 @@ export const BackgroundGradientAnimation = ({
     document.body.style.setProperty("--pointer-color", pointerColor);
     document.body.style.setProperty("--size", size);
     document.body.style.setProperty("--blending-value", blendingValue);
-  }, [
-    blendingValue,
-    fifthColor,
-    firstColor,
-    fourthColor,
-    gradientBackgroundEnd,
-    gradientBackgroundStart,
-    pointerColor,
-    secondColor,
-    size,
-    thirdColor,
-  ]);
+  }, []);
 
   useEffect(() => {
-    if (!interactive) {
-      return;
-    }
-
-    let animationId: number;
-
     function move() {
-      const nextX = positionRef.current.x + (tgX - positionRef.current.x) / 20;
-      const nextY = positionRef.current.y + (tgY - positionRef.current.y) / 20;
-      positionRef.current = { x: nextX, y: nextY };
-
-      if (interactiveRef.current) {
-        interactiveRef.current.style.transform = `translate(${Math.round(
-          nextX
-        )}px, ${Math.round(nextY)}px)`;
+      if (!interactiveRef.current) {
+        return;
       }
-
-      animationId = requestAnimationFrame(move);
+      setCurX(curX + (tgX - curX) / 20);
+      setCurY(curY + (tgY - curY) / 20);
+      interactiveRef.current.style.transform = `translate(${Math.round(
+        curX
+      )}px, ${Math.round(curY)}px)`;
     }
 
     move();
-
-    return () => {
-      cancelAnimationFrame(animationId);
-    };
-  }, [interactive, tgX, tgY]);
+  }, [tgX, tgY]);
 
   const handleMouseMove = (event: React.MouseEvent<HTMLDivElement>) => {
     if (interactiveRef.current) {

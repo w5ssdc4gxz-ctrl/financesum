@@ -194,11 +194,10 @@ function SlideTransition({ children, direction }: SlideTransitionProps) {
     const elRef = useRef<HTMLDivElement>(null);
 
     useLayoutEffect(() => {
-        const element = elRef.current;
-        if (!element) return;
+        if (!elRef.current) return;
 
         // Initial state for entering element
-        gsap.fromTo(element,
+        gsap.fromTo(elRef.current,
             {
                 x: direction > 0 ? '100%' : '-100%',
                 opacity: 0
@@ -213,9 +212,9 @@ function SlideTransition({ children, direction }: SlideTransitionProps) {
 
         return () => {
             // Cleanup if needed, though GSAP handles overwrites well
-            gsap.killTweensOf(element);
+            if (elRef.current) gsap.killTweensOf(elRef.current);
         };
-    }, [direction]);
+    }, []); // Empty dependency array to run only on mount (key change)
 
     return (
         <div ref={elRef} className="w-full">

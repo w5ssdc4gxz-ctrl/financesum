@@ -1,4 +1,4 @@
-import { useEffect, useRef, RefObject, useState, DependencyList } from 'react';
+import { useEffect, useRef, RefObject, useState } from 'react';
 import { gsap } from 'gsap';
 
 interface UseScrollAnimationOptions {
@@ -57,7 +57,7 @@ export function useScrollAnimation<T extends HTMLElement>(
 // Hook for GSAP scroll animations
 export function useGSAPScroll<T extends HTMLElement>(
   animation: (element: HTMLElement) => void,
-  deps: DependencyList = []
+  deps: any[] = []
 ): RefObject<T> {
   const elementRef = useRef<T>(null);
 
@@ -82,7 +82,7 @@ export function useGSAPScroll<T extends HTMLElement>(
     return () => {
       observer.disconnect();
     };
-  }, [animation, deps]);
+  }, deps);
 
   return elementRef;
 }
@@ -255,3 +255,4 @@ export function useInView<T extends HTMLElement>(
 
   return [elementRef, isInView];
 }
+

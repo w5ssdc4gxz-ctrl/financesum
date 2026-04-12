@@ -152,9 +152,8 @@ export default function DashboardContent({
 
   // Prepare analysis trend data
   // Prefer backend-provided summary activity so removals from dashboard don't reduce the counts.
-  const summaryActivity = stats?.summary_activity
   const analysisTrendData = useMemo(() => {
-    const activity = Array.isArray(summaryActivity) ? summaryActivity : null
+    const activity = Array.isArray(stats?.summary_activity) ? stats.summary_activity : null
     if (activity && activity.length) {
       const parseActivityDate = (value: any) => {
         if (typeof value === 'string') {
@@ -178,37 +177,29 @@ export default function DashboardContent({
       })
     }
 
-    // Fallback: count from current history ONLY if backend activity data is completely missing
+    // Fallback: count from current history
     const dailyCounts: Record<string, number> = {}
     history.forEach((item: any) => {
       const dateStr = item.generatedAt ?? item.generated_at
       if (!dateStr) return
-
-      let date = new Date(dateStr)
-      if (Number.isNaN(date.getTime())) {
-        // If it's a relative time like "48m ago" or unparseable, just use today
-        date = new Date()
-      }
-
+      const date = new Date(dateStr)
       const key = `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`
       dailyCounts[key] = (dailyCounts[key] ?? 0) + 1
     })
-
-    // Fill in last 8 days to ensure the chart always looks populated
-    const fallbackSorted: { date: Date; label: string; value: number }[] = []
-    const today = new Date()
-    for (let i = 7; i >= 0; i--) {
-      const d = new Date(today)
-      d.setDate(today.getDate() - i)
-      const key = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`
-      fallbackSorted.push({
-        date: d,
-        label: d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
-        value: dailyCounts[key] || 0,
+    const sorted = Object.entries(dailyCounts)
+      .map(([key, value]) => {
+        const [year, month, day] = key.split('-').map(Number)
+        const date = new Date(year, month - 1, day)
+        return {
+          date,
+          label: date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+          value,
+        }
       })
-    }
-    return fallbackSorted
-  }, [history, summaryActivity])
+      .sort((a, b) => a.date.getTime() - b.date.getTime())
+      .slice(-8)
+    return sorted
+  }, [history, stats?.summary_activity])
 
   // Prepare sector data
   const { sectorBarData, sectorDonutData, sectorPerformanceData } = useMemo(() => {
@@ -371,11 +362,11 @@ export default function DashboardContent({
   return (
     <div className="w-full">
       {/* Header */}
-      <div className="mb-10 p-8 lg:p-10 bg-white dark:bg-zinc-950 border border-black dark:border-white">
+      <div className="mb-8">
         <motion.h1
           initial={{ opacity: 0, y: -10 }}
           animate={{ opacity: 1, y: 0 }}
-          className="text-4xl lg:text-5xl font-black uppercase tracking-tighter text-black dark:text-white"
+          className="text-3xl font-bold text-gray-900 dark:text-gray-50"
         >
           Dashboard
         </motion.h1>
@@ -383,26 +374,26 @@ export default function DashboardContent({
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ delay: 0.1 }}
-          className="mt-4 text-sm font-bold tracking-widest uppercase text-zinc-500 dark:text-zinc-400"
+          className="mt-1 text-sm text-gray-600 dark:text-gray-400"
         >
           {hasAnalyses ? 'Track your portfolio insights and analysis trends' : 'Get started by analyzing your first company'}
         </motion.p>
       </div>
 
       {hasAnalyses ? (
-        <div className="space-y-10">
+        <div className="space-y-6">
           {/* Company Search - Always Visible */}
           <motion.div
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
-            className="relative z-20 rounded-none border border-black dark:border-white bg-white dark:bg-zinc-950 p-8 lg:p-10"
+            className="relative z-20 rounded-lg border border-blue-200 bg-gradient-to-br from-blue-50 via-white to-indigo-50 p-6 shadow-sm dark:border-blue-900 dark:from-blue-950/30 dark:via-gray-950 dark:to-indigo-950/30"
           >
-            <h3 className="mb-6 flex items-center gap-2 text-sm font-bold uppercase tracking-widest text-black dark:text-white">
-              <IconSparkles className="h-5 w-5 text-black dark:text-white" />
+            <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-gray-900 dark:text-gray-50">
+              <IconSparkles className="h-4 w-4 text-blue-600 dark:text-blue-400" />
               Analyze New Company
             </h3>
             <CompanySearch onSelectCompany={handleSelectCompany} />
-            <p className="mt-5 text-xs font-bold tracking-widest uppercase text-zinc-500 dark:text-zinc-400">
+            <p className="mt-3 text-xs text-gray-600 dark:text-gray-400">
               Search by company name or ticker symbol to create a new analysis
             </p>
           </motion.div>
@@ -414,11 +405,11 @@ export default function DashboardContent({
             whileInView={{ opacity: 1, y: 0 }}
             viewport={{ once: true, margin: "-50px" }}
             transition={{ delay: 0.05, duration: 0.5 }}
-            className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4 scroll-mt-8"
+            className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4 scroll-mt-8"
           >
             <StatCard
               title="Total Summaries"
-              value={Math.max(stats?.total_summaries || 0, history.length) || 0}
+              value={(stats?.total_summaries ?? history.length) || 0}
               icon={<IconSparkles className="h-5 w-5" />}
               description={
                 history[0] && (history[0].generatedAt ?? history[0].generated_at)
@@ -447,16 +438,16 @@ export default function DashboardContent({
           </motion.div>
 
           {/* Performance & Map Row */}
-          <div className="grid grid-cols-1 gap-8 lg:grid-cols-3">
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
             {/* Performance Gauge */}
             <motion.div
               initial={{ opacity: 0, y: 20 }}
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true, margin: "-50px" }}
               transition={{ duration: 0.5 }}
-              className="rounded-none border border-black dark:border-white bg-white dark:bg-zinc-950 p-8"
+              className="rounded-lg border border-gray-200 bg-gradient-to-br from-white via-blue-50/30 to-indigo-50/50 p-6 shadow-sm dark:border-gray-800 dark:from-gray-950 dark:via-blue-950/10 dark:to-indigo-950/20"
             >
-              <h3 className="mb-4 text-center text-sm font-bold uppercase tracking-widest text-black dark:text-white">
+              <h3 className="mb-4 text-center text-sm font-semibold text-gray-700 dark:text-gray-300">
                 Portfolio Health
               </h3>
               <PerformanceGauge
@@ -474,10 +465,10 @@ export default function DashboardContent({
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true, margin: "-50px" }}
               transition={{ delay: 0.1, duration: 0.5 }}
-              className="rounded-none border border-black dark:border-white bg-white dark:bg-zinc-950 p-8 lg:col-span-2 scroll-mt-8"
+              className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950 lg:col-span-2 scroll-mt-8"
             >
-              <h3 className="mb-4 flex items-center gap-2 text-sm font-bold uppercase tracking-widest text-black dark:text-white">
-                <IconMapPin className="h-4 w-4 text-black dark:text-white" />
+              <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-gray-900 dark:text-gray-50">
+                <IconMapPin className="h-4 w-4 text-blue-600 dark:text-blue-400" />
                 Global Coverage
               </h3>
               <InteractiveWorldMap data={mapData} height={280} />
@@ -485,19 +476,19 @@ export default function DashboardContent({
           </div>
 
           {/* Charts Row - Activity, Heatmap */}
-          <div id="activity" className="grid grid-cols-1 gap-8 lg:grid-cols-2 scroll-mt-8">
+          <div id="activity" className="grid grid-cols-1 gap-6 lg:grid-cols-2 scroll-mt-8">
             <motion.div
               initial={{ opacity: 0, y: 20 }}
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true, margin: "-50px" }}
               transition={{ duration: 0.5 }}
-              className="rounded-none border border-black dark:border-white bg-white dark:bg-zinc-950 p-8"
+              className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950"
             >
-              <h3 className="mb-2 flex items-center gap-2 text-sm font-bold uppercase tracking-widest text-black dark:text-white">
-                <IconActivity className="h-4 w-4 text-black dark:text-white" />
+              <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold text-gray-900 dark:text-gray-50">
+                <IconActivity className="h-4 w-4 text-blue-600 dark:text-blue-400" />
                 Analysis Activity
               </h3>
-              <p className="mb-4 text-xs font-bold uppercase tracking-widest text-zinc-500 dark:text-zinc-400">Last 8 days</p>
+              <p className="mb-4 text-xs text-gray-600 dark:text-gray-400">Last 8 days</p>
               <div className="h-[300px]">
                 <AnalysisTrend data={analysisTrendData} />
               </div>
@@ -508,13 +499,13 @@ export default function DashboardContent({
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true, margin: "-50px" }}
               transition={{ delay: 0.05, duration: 0.5 }}
-              className="flex flex-col justify-between rounded-none border border-black dark:border-white bg-white dark:bg-zinc-950 p-8"
+              className="flex flex-col justify-between rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950"
             >
               <div>
-                <h3 className="mb-2 text-sm font-bold uppercase tracking-widest text-black dark:text-white">
+                <h3 className="mb-2 text-sm font-semibold text-gray-900 dark:text-gray-50">
                   Activity Calendar
                 </h3>
-                <p className="mb-4 text-xs font-bold uppercase tracking-widest text-zinc-500 dark:text-zinc-400">
+                <p className="mb-4 text-xs text-gray-600 dark:text-gray-400">
                   12-week analysis frequency
                 </p>
               </div>
@@ -523,16 +514,16 @@ export default function DashboardContent({
           </div>
 
           {/* Sectors & Companies Row */}
-          <div className="grid grid-cols-1 gap-8 lg:grid-cols-3">
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
             {/* Sector Distribution */}
             <motion.div
               initial={{ opacity: 0, y: 20 }}
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true, margin: "-50px" }}
               transition={{ duration: 0.5 }}
-              className="rounded-none border border-black dark:border-white bg-white dark:bg-zinc-950 p-8"
+              className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950"
             >
-              <h3 className="mb-4 text-sm font-bold uppercase tracking-widest text-black dark:text-white">
+              <h3 className="mb-4 text-sm font-semibold text-gray-900 dark:text-gray-50">
                 Sector Distribution
               </h3>
               <div className="flex justify-center">
@@ -546,9 +537,9 @@ export default function DashboardContent({
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true, margin: "-50px" }}
               transition={{ delay: 0.05, duration: 0.5 }}
-              className="rounded-none border border-black dark:border-white bg-white dark:bg-zinc-950 p-8"
+              className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950"
             >
-              <h3 className="mb-4 text-sm font-bold uppercase tracking-widest text-black dark:text-white">
+              <h3 className="mb-4 text-sm font-semibold text-gray-900 dark:text-gray-50">
                 Sector Insights
               </h3>
               {sectorPerformanceData.length > 0 ? (
@@ -567,10 +558,10 @@ export default function DashboardContent({
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true, margin: "-50px" }}
               transition={{ delay: 0.1, duration: 0.5 }}
-              className="rounded-none border border-black dark:border-white bg-white dark:bg-zinc-950 p-8 scroll-mt-8"
+              className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950 scroll-mt-8"
             >
-              <h3 className="mb-4 flex items-center gap-2 text-sm font-bold uppercase tracking-widest text-black dark:text-white">
-                <IconChartBar className="h-4 w-4 text-black dark:text-white" />
+              <h3 className="mb-4 flex items-center gap-2 text-sm font-semibold text-gray-900 dark:text-gray-50">
+                <IconChartBar className="h-4 w-4 text-blue-600 dark:text-blue-400" />
                 Top Companies
               </h3>
               {topCompaniesData.length > 0 ? (
@@ -594,10 +585,10 @@ export default function DashboardContent({
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true, margin: "-50px" }}
               transition={{ duration: 0.5 }}
-              className="rounded-none border border-black dark:border-white bg-white dark:bg-zinc-950 p-8"
+              className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950"
             >
-              <h3 className="mb-6 text-sm font-bold uppercase tracking-widest text-black dark:text-white">Recent Analyses</h3>
-              <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+              <h3 className="mb-4 text-lg font-semibold text-gray-900 dark:text-gray-50">Recent Analyses</h3>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                 {recentAnalyses.map((analysis: any, idx: number) => {
                   const healthScore = analysis.healthScore ?? analysis.health_score
                   const analysisRating = scoreToRating(healthScore)
@@ -610,43 +601,46 @@ export default function DashboardContent({
                       viewport={{ once: true, margin: "-20px" }}
                       transition={{ delay: idx * 0.05, duration: 0.4 }}
                       onClick={() => handleOpenBrief(analysis)}
-                      className="group flex flex-col cursor-pointer rounded-none border border-black dark:border-white bg-white p-4 transition-all hover:bg-black hover:text-white dark:bg-zinc-950 dark:hover:bg-white dark:hover:text-black"
+                      className="group cursor-pointer rounded-lg border border-gray-200 bg-gray-50 p-4 transition-all hover:border-blue-300 hover:bg-blue-50 hover:shadow-sm dark:border-gray-800 dark:bg-gray-900 dark:hover:border-blue-800 dark:hover:bg-blue-950/30"
                     >
                       <div className="flex items-start justify-between">
                         {/* Company Logo */}
-                        <div className="mr-3 h-10 w-10 flex-shrink-0 overflow-hidden rounded-none border border-black dark:border-white bg-white p-1">
+                        <div className="mr-3 h-10 w-10 flex-shrink-0 overflow-hidden rounded-full bg-white p-1 shadow-sm dark:bg-gray-800">
                           <CompanyLogo ticker={analysis.ticker} className="h-full w-full" />
                         </div>
                         <div className="flex-1 min-w-0">
-                          <p className="truncate text-sm font-black uppercase tracking-tight group-hover:text-white dark:group-hover:text-black">
+                          <p className="truncate text-sm font-semibold text-gray-900 dark:text-gray-50">
                             {analysis.ticker}
                           </p>
-                          <p className="mt-0.5 truncate text-xs font-medium uppercase tracking-widest text-zinc-500 group-hover:text-zinc-400 dark:group-hover:text-zinc-500">
+                          <p className="mt-0.5 truncate text-xs text-gray-600 dark:text-gray-400">
                             {analysis.companyName || analysis.company_name || analysis.name}
                           </p>
                           {formatFilingMeta(analysis) && (
-                            <p className="mt-2 text-[10px] font-bold uppercase tracking-widest text-zinc-400 group-hover:text-zinc-300 dark:group-hover:text-zinc-600">
+                            <p className="mt-1 text-xs text-gray-500 dark:text-gray-500">
                               {formatFilingMeta(analysis)}
                             </p>
                           )}
-                          <p className="mt-1 text-[10px] font-bold uppercase tracking-widest text-zinc-400 group-hover:text-zinc-300 dark:group-hover:text-zinc-600">
+                          <p className="mt-2 text-xs text-gray-500 dark:text-gray-500">
                             {relativeTime(generatedAt)}
                           </p>
                         </div>
                         <div className="ml-3 flex-shrink-0">
-                          <div className="flex flex-col items-center gap-1 border border-black dark:border-white p-1">
-                            <div className="flex h-8 w-8 items-center justify-center bg-transparent group-hover:bg-white dark:group-hover:bg-black">
-                              <span className="text-sm font-black tracking-tighter" style={{ color: getSentimentColor(analysisRating.sentiment) }}>
+                          <div className="flex flex-col items-center gap-1">
+                            <div
+                              className="flex h-12 w-12 items-center justify-center rounded-lg"
+                              style={{ backgroundColor: getSentimentColor(analysisRating.sentiment) + '20' }}
+                            >
+                              <span className="text-lg font-bold" style={{ color: getSentimentColor(analysisRating.sentiment) }}>
                                 {typeof healthScore === 'number' ? Math.round(healthScore) : '—'}
                               </span>
                             </div>
-                            <span className="text-[9px] font-bold uppercase tracking-widest" style={{ color: getSentimentColor(analysisRating.sentiment) }}>
+                            <span className="text-[10px] font-medium" style={{ color: getSentimentColor(analysisRating.sentiment) }}>
                               {analysisRating.label}
                             </span>
                           </div>
                         </div>
                       </div>
-                      <div className="mt-auto pt-6 flex flex-wrap gap-2">
+                      <div className="mt-4 flex flex-wrap gap-2">
                         <button
                           type="button"
                           onClick={(event) => {
@@ -655,23 +649,23 @@ export default function DashboardContent({
                             const target = buildCompanyRoute(companyId, analysis.ticker, analysis.analysisId ?? analysis.analysis_id)
                             if (target) router.push(target)
                           }}
-                          className="rounded-none border border-black dark:border-white px-3 py-2 text-[10px] font-bold uppercase tracking-widest transition group-hover:bg-white group-hover:text-black dark:group-hover:bg-black dark:group-hover:text-white hover:opacity-75"
+                          className="rounded-md border border-emerald-200 px-3 py-1 text-xs font-semibold text-emerald-600 transition hover:bg-emerald-50 dark:border-emerald-800 dark:text-emerald-200 dark:hover:bg-emerald-950/40"
                         >
                           Open analysis
                         </button>
                         <button
                           type="button"
                           onClick={(event) => handleAnalyzeAgain(analysis, event)}
-                          className="rounded-none border border-black dark:border-white px-3 py-2 text-[10px] font-bold uppercase tracking-widest transition group-hover:bg-white group-hover:text-black dark:group-hover:bg-black dark:group-hover:text-white hover:opacity-75"
+                          className="rounded-md border border-blue-200 px-3 py-1 text-xs font-semibold text-blue-600 transition hover:bg-blue-50 dark:border-blue-800 dark:text-blue-300 dark:hover:bg-blue-950/40"
                         >
-                          Run again
+                          Run new analysis
                         </button>
                         <button
                           type="button"
                           onClick={(event) => handleRemoveSnapshot(analysis, event)}
-                          className="rounded-none border border-red-500 px-3 py-2 text-[10px] font-bold uppercase tracking-widest text-red-500 transition hover:bg-red-500 hover:text-white dark:hover:bg-red-500 dark:hover:text-white"
+                          className="rounded-md border border-red-200 px-3 py-1 text-xs font-semibold text-red-500 transition hover:bg-red-50 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950/40"
                         >
-                          Remove
+                          Remove from dashboard
                         </button>
                       </div>
                     </motion.div>
@@ -689,18 +683,21 @@ export default function DashboardContent({
             animate={{ opacity: 1, scale: 1 }}
             className="max-w-md text-center"
           >
-            <div className="mx-auto mb-6 flex h-24 w-24 items-center justify-center rounded-none border-2 border-dashed border-black bg-white shadow-[4px_4px_0_0_#000] dark:border-white dark:bg-black dark:shadow-[4px_4px_0_0_#fff]">
-              <IconFileAnalytics className="h-12 w-12 text-black dark:text-white" strokeWidth={1} />
+            <div className="mx-auto mb-6 flex h-24 w-24 items-center justify-center rounded-full bg-blue-100 dark:bg-blue-950">
+              <IconFileAnalytics className="h-12 w-12 text-blue-600 dark:text-blue-400" />
             </div>
-            <p className="mb-8 text-sm font-bold uppercase tracking-widest text-zinc-500">
+            <h2 className="mb-2 text-2xl font-bold text-gray-900 dark:text-gray-50">
+              Welcome to FinanceSum
+            </h2>
+            <p className="mb-8 text-gray-600 dark:text-gray-400">
               Start analyzing companies to see your portfolio insights, trends, and global coverage here.
             </p>
-            <div className="rounded-none border border-black dark:border-white bg-white p-8 dark:bg-zinc-950">
-              <h3 className="mb-6 text-sm font-bold uppercase tracking-widest text-black dark:text-white">
+            <div className="rounded-lg border border-gray-200 bg-white p-6 shadow-sm dark:border-gray-800 dark:bg-gray-950">
+              <h3 className="mb-4 text-sm font-semibold text-gray-900 dark:text-gray-50">
                 Analyze Your First Company
               </h3>
               <CompanySearch onSelectCompany={handleSelectCompany} />
-              <p className="mt-5 text-xs font-bold tracking-widest uppercase text-zinc-500 dark:text-zinc-400">
+              <p className="mt-3 text-xs text-gray-500 dark:text-gray-400">
                 Search by company name or ticker symbol
               </p>
             </div>

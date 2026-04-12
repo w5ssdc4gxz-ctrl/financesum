@@ -4,7 +4,6 @@ import { useCallback, useEffect, useMemo, useState } from "react"
 import DashboardStorage, {
   StoredAnalysisSnapshot,
   StoredCompany,
-  StoredSummaryEvent,
   StoredSummaryPreferences,
 } from "@/lib/dashboard-storage"
 import { useAuth } from "@/contexts/AuthContext"
@@ -15,7 +14,7 @@ import { analysisApi, dashboardApi } from "@/lib/api-client"
 
 const DEFAULT_PREFERENCES: StoredSummaryPreferences = {
   mode: "default",
-  sectionInstructions: {},
+  investorFocus: "",
   focusAreas: [],
   tone: "objective",
   detailLevel: "balanced",
@@ -114,9 +113,6 @@ const normalizeHistoryEntry = (entry: any): StoredAnalysisSnapshot | null => {
     filingId: entry.filing_id ?? entry.filingId ?? null,
     filingType: entry.filing_type ?? entry.filingType ?? null,
     filingDate: parseDateValue(entry.filing_date ?? entry.filingDate),
-    selectedPersona: entry.selected_persona ?? entry.selectedPersona ?? null,
-    chartData: entry.chart_data ?? entry.chartData ?? null,
-    ratios: entry.ratios ?? entry.financial_ratios ?? null,
     source: entry.source ?? 'analysis',
   }
 }
@@ -151,28 +147,7 @@ const mergeHistorySnapshots = (
   if (!incoming.length) return current
   const byId = new Map<string, StoredAnalysisSnapshot>()
   current.forEach((item) => byId.set(item.analysisId ?? item.id, item))
-  incoming.forEach((item) => {
-    const key = item.analysisId ?? item.id
-    const existing = byId.get(key)
-    if (!existing) {
-      byId.set(key, item)
-      return
-    }
-    byId.set(key, {
-      ...existing,
-      ...item,
-      // Preserve richer local snapshot payload when the server overview omits it.
-      summaryMd: item.summaryMd ?? existing.summaryMd ?? null,
-      summaryPreview: item.summaryPreview ?? existing.summaryPreview ?? null,
-      chartData: item.chartData ?? existing.chartData ?? null,
-      ratios: item.ratios ?? existing.ratios ?? null,
-      selectedPersona: item.selectedPersona ?? existing.selectedPersona ?? null,
-      source:
-        item.source ??
-        existing.source ??
-        (String(item.analysisId || "").startsWith("summary-") ? "summary" : "analysis"),
-    })
-  })
+  incoming.forEach((item) => byId.set(item.analysisId ?? item.id, item))
   return Array.from(byId.values()).sort((a, b) => getTimestamp(b.generatedAt) - getTimestamp(a.generatedAt))
 }
 
@@ -184,92 +159,26 @@ const mergeCompanies = (current: StoredCompany[], incoming: StoredCompany[]): St
   return Array.from(byId.values())
 }
 
-const formatLocalDate = (value: Date) => {
-  const year = value.getFullYear()
-  const month = String(value.getMonth() + 1).padStart(2, "0")
-  const day = String(value.getDate()).padStart(2, "0")
-  return `${year}-${month}-${day}`
-}
-
-const buildLocalSummaryActivity = (
-  events: StoredSummaryEvent[],
-  days: number = 8,
-) => {
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
-  const counts = new Map<string, number>()
-
-  events.forEach((event) => {
-    const parsed = new Date(event.generatedAt)
-    if (Number.isNaN(parsed.getTime())) return
-    const dateKey = formatLocalDate(parsed)
-    counts.set(dateKey, (counts.get(dateKey) ?? 0) + 1)
-  })
-
-  const rows: Array<{ date: string; count: number }> = []
-  for (let index = days - 1; index >= 0; index -= 1) {
-    const pointDate = new Date(today)
-    pointDate.setDate(today.getDate() - index)
-    const date = formatLocalDate(pointDate)
-    rows.push({
-      date,
-      count: counts.get(date) ?? 0,
-    })
-  }
-  return rows
-}
-
-const mergeSummaryActivity = (
-  serverActivity: any[] | null,
-  localActivity: Array<{ date: string; count: number }>,
-) => {
-  if (!serverActivity || !serverActivity.length) {
-    return localActivity
-  }
-
-  const localByDate = new Map(
-    localActivity.map((row) => [String(row.date), Number(row.count) || 0]),
-  )
-
-  return serverActivity.map((row: any) => {
-    const date = String(row?.date ?? "")
-    const serverCount = Number(row?.count) || 0
-    const localCount = localByDate.get(date) ?? 0
-    return {
-      date,
-      count: Math.max(serverCount, localCount),
-    }
-  })
-}
-
 export function useDashboardData() {
   const { user } = useAuth()
   const [history, setHistory] = useState<StoredAnalysisSnapshot[]>([])
-  const [summaryEvents, setSummaryEvents] = useState<StoredSummaryEvent[]>([])
   const [companies, setCompanies] = useState<StoredCompany[]>([])
   const [preferences, setPreferences] = useState<StoredSummaryPreferences>(DEFAULT_PREFERENCES)
   const [serverStats, setServerStats] = useState<any>(null)
-  const [overviewRefreshTick, setOverviewRefreshTick] = useState(0)
   const userId = user?.id ?? null
 
   useEffect(() => {
     setServerStats(null)
   }, [userId])
 
-  const requestOverviewRefresh = useCallback(() => {
-    setOverviewRefreshTick((value) => value + 1)
-  }, [])
-
   const syncFromStorage = useCallback(() => {
     if (!userId) {
       setHistory([])
-      setSummaryEvents([])
       setCompanies([])
       setPreferences(DEFAULT_PREFERENCES)
       return
     }
     setHistory(DashboardStorage.loadAnalysisHistory(userId))
-    setSummaryEvents(DashboardStorage.loadSummaryEvents(userId))
     setCompanies(DashboardStorage.loadRecentCompanies(userId))
     const storedPrefs = DashboardStorage.loadSummaryPreferences(userId)
     if (storedPrefs) {
@@ -285,38 +194,23 @@ export function useDashboardData() {
     setHistory(DashboardStorage.loadAnalysisHistory(userId))
     try {
       await analysisApi.deleteAnalysis(analysisId)
-      requestOverviewRefresh()
     } catch (error) {
       console.error("Failed to delete analysis from backend", error)
     }
-  }, [requestOverviewRefresh, userId])
+  }, [userId])
 
   useEffect(() => {
     if (typeof window === "undefined") return
     syncFromStorage()
-
-    const handleStorage = () => {
-      syncFromStorage()
-      requestOverviewRefresh()
-    }
-    const handleFocus = () => {
-      syncFromStorage()
-      requestOverviewRefresh()
-    }
-    const handleDashboardSync = () => {
-      syncFromStorage()
-      requestOverviewRefresh()
-    }
-
-    window.addEventListener("storage", handleStorage)
-    window.addEventListener("focus", handleFocus)
-    window.addEventListener("financesum-dashboard-sync", handleDashboardSync)
+    window.addEventListener("storage", syncFromStorage)
+    window.addEventListener("focus", syncFromStorage)
+    window.addEventListener("financesum-dashboard-sync", syncFromStorage as EventListener)
     return () => {
-      window.removeEventListener("storage", handleStorage)
-      window.removeEventListener("focus", handleFocus)
-      window.removeEventListener("financesum-dashboard-sync", handleDashboardSync)
+      window.removeEventListener("storage", syncFromStorage)
+      window.removeEventListener("focus", syncFromStorage)
+      window.removeEventListener("financesum-dashboard-sync", syncFromStorage as EventListener)
     }
-  }, [requestOverviewRefresh, syncFromStorage])
+  }, [syncFromStorage])
 
   useEffect(() => {
     if (typeof window === "undefined") return
@@ -370,26 +264,12 @@ export function useDashboardData() {
     return () => {
       cancelled = true
     }
-  }, [overviewRefreshTick, userId])
+  }, [userId])
 
   const primaryAnalysis = history.length ? history[0] : null
   const personaSignals = primaryAnalysis?.personaSignals ?? []
 
   const stats = useMemo(() => {
-    const localSummaryActivity = buildLocalSummaryActivity(summaryEvents)
-    const localSummaryTotal = summaryEvents.length
-    const serverSummaryActivity = Array.isArray(serverStats?.summary_activity)
-      ? serverStats.summary_activity
-      : null
-    const localActivityHasAny = localSummaryActivity.some((row) => (Number(row.count) || 0) > 0)
-    const serverActivityHasAny = Array.isArray(serverSummaryActivity)
-      ? serverSummaryActivity.some((row: any) => (Number(row?.count) || 0) > 0)
-      : false
-    const mergedSummaryActivity =
-      localActivityHasAny || serverActivityHasAny
-        ? mergeSummaryActivity(serverSummaryActivity, localSummaryActivity)
-        : undefined
-
     if (!history.length) {
       return {
         analysisCount: 0,
@@ -399,11 +279,8 @@ export function useDashboardData() {
         bestCompany: null as StoredAnalysisSnapshot | null,
         sectors: [] as Array<{ label: string; value: number }>,
         countries: [] as Array<{ label: string; value: number }>,
-        total_summaries:
-          typeof serverStats?.total_summaries === "number"
-            ? Math.max(serverStats.total_summaries, localSummaryTotal)
-            : localSummaryTotal,
-        summary_activity: mergedSummaryActivity ?? undefined,
+        total_summaries: typeof serverStats?.total_summaries === "number" ? serverStats.total_summaries : 0,
+        summary_activity: Array.isArray(serverStats?.summary_activity) ? serverStats.summary_activity : undefined,
       }
     }
     let scoredCount = 0
@@ -445,12 +322,10 @@ export function useDashboardData() {
       ...localStats,
       // Server-provided, append-only counters for dashboard activity.
       total_summaries:
-        typeof serverStats?.total_summaries === "number"
-          ? Math.max(serverStats.total_summaries, localSummaryTotal, localStats.analysisCount)
-          : Math.max(localSummaryTotal, localStats.analysisCount),
-      summary_activity: mergedSummaryActivity ?? undefined,
+        typeof serverStats?.total_summaries === "number" ? serverStats.total_summaries : localStats.analysisCount,
+      summary_activity: Array.isArray(serverStats?.summary_activity) ? serverStats.summary_activity : undefined,
     }
-  }, [history, serverStats, summaryEvents])
+  }, [history, serverStats])
 
   const mapPoints = useMemo(() => {
     return history
@@ -475,12 +350,7 @@ export function useDashboardData() {
       .filter((point): point is DashboardMapPoint => Boolean(point))
   }, [history])
 
-  const hasAnalyses = history.length > 0 || (stats?.total_summaries ?? 0) > 0
-
-  const refreshDashboardData = useCallback(() => {
-    syncFromStorage()
-    requestOverviewRefresh()
-  }, [requestOverviewRefresh, syncFromStorage])
+  const hasAnalyses = history.length > 0
 
   return {
     history,
@@ -491,7 +361,7 @@ export function useDashboardData() {
     personaSignals,
     mapPoints,
     hasAnalyses,
-    refresh: refreshDashboardData,
+    refresh: syncFromStorage,
     removeHistoryEntry,
   }
 }

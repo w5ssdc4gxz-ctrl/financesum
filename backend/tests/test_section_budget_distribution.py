@@ -266,9 +266,9 @@ def test_long_form_section_shapes_scale_with_2999_word_budgets() -> None:
     assert health_shape.preferred_paragraphs == 2
 
     assert budgets["Risk Factors"] == 550
-    assert risk_shape.risk_count == 2
-    assert risk_shape.per_risk_min_sentences == 2
-    assert risk_shape.per_risk_max_sentences == 3
+    assert risk_shape.risk_count == 3
+    assert risk_shape.per_risk_min_sentences == 4
+    assert risk_shape.per_risk_max_sentences == 5
     assert risk_shape.requires_early_warning_signal is False
 
     assert budgets["Closing Takeaway"] == 406

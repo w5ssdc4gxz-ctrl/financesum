@@ -56,7 +56,6 @@ const isCloudConsoleBackend =
 
 // Keep proxy timeout slightly below Cloud Run's max request timeout (60m).
 const PROXY_REQUEST_TIMEOUT_MS = 59 * 60 * 1000
-const SUMMARY_FALLBACK_RETRY_MAX_ATTEMPT_MS = 60 * 1000
 
 // Cloud Run summary generation can exceed the default undici headers timeout (~300s).
 // Disable undici's internal request timers and rely on the explicit AbortController below.
@@ -108,11 +107,6 @@ type SummaryRetryPlan = {
   bodies: string[]
   explicitTargetLocked: boolean
   explicitTargetValue: number | null
-}
-
-type SummaryAttemptResult = {
-  response: any
-  elapsedMs: number
 }
 
 const buildSummaryRetryPlan = (requestBodyText: string): SummaryRetryPlan => {
@@ -251,9 +245,8 @@ async function proxy(request: NextRequest, context: { params: Promise<Params> })
         summaryForwardHeaders.set('content-type', 'application/json')
       }
 
-      const callSummaryEndpoint = async (bodyText: string): Promise<SummaryAttemptResult> => {
-        const startedAt = Date.now()
-        const response = await undiciFetch(targetUrl, {
+      const callSummaryEndpoint = async (bodyText: string) =>
+        undiciFetch(targetUrl, {
           method: request.method,
           headers: summaryForwardHeaders,
           body: bodyText,
@@ -261,14 +254,8 @@ async function proxy(request: NextRequest, context: { params: Promise<Params> })
           dispatcher: longRunningProxyDispatcher,
           signal: controller.signal,
         } as any)
-        return {
-          response,
-          elapsedMs: Date.now() - startedAt,
-        }
-      }
 
-      const firstAttempt = await callSummaryEndpoint(requestBodyText)
-      const firstResponse = firstAttempt.response
+      const firstResponse = await callSummaryEndpoint(requestBodyText)
       const firstResponseHeaders = responseHeadersForClient(firstResponse)
       const firstResponseText = await firstResponse.text()
 
@@ -285,30 +272,15 @@ async function proxy(request: NextRequest, context: { params: Promise<Params> })
         !failureCode || SUMMARY_RETRYABLE_422_CODES.has(failureCode)
       const retryPlan = buildSummaryRetryPlan(requestBodyText)
       const hasFallbackPlan = retryPlan.bodies.length > 0
-      const firstAttemptEligibleForRetries =
-        firstAttempt.elapsedMs <= SUMMARY_FALLBACK_RETRY_MAX_ATTEMPT_MS
       let lastFailure = {
         status: firstResponse.status,
         text: firstResponseText,
         headers: firstResponseHeaders,
       }
 
-      if (shouldRetry422 && hasFallbackPlan && !firstAttemptEligibleForRetries) {
-        lastFailure.headers.set('x-financesum-summary-fallback-attempted', '0')
-        lastFailure.headers.set(
-          'x-financesum-summary-fallback-skipped-reason',
-          'initial-attempt-too-slow',
-        )
-        lastFailure.headers.set(
-          'x-financesum-summary-initial-attempt-ms',
-          String(firstAttempt.elapsedMs),
-        )
-      }
-
-      if (shouldRetry422 && hasFallbackPlan && firstAttemptEligibleForRetries) {
+      if (shouldRetry422 && hasFallbackPlan) {
         for (const retryBody of retryPlan.bodies) {
-          const retryAttempt = await callSummaryEndpoint(retryBody)
-          const retryResponse = retryAttempt.response
+          const retryResponse = await callSummaryEndpoint(retryBody)
           const retryHeaders = responseHeadersForClient(retryResponse)
           const retryText = await retryResponse.text()
           if (retryResponse.status < 400) {
@@ -337,37 +309,10 @@ async function proxy(request: NextRequest, context: { params: Promise<Params> })
               headers: retryHeaders,
             })
           }
-
-          if (retryResponse.status === 401 || retryResponse.status === 403) {
-            lastFailure.headers.set('x-financesum-summary-fallback-attempted', '1')
-            lastFailure.headers.set(
-              'x-financesum-summary-fallback-skipped-reason',
-              'retry-auth-expired',
-            )
-            lastFailure.headers.set(
-              'x-financesum-summary-retry-auth-status',
-              String(retryResponse.status),
-            )
-            break
-          }
-
           lastFailure = {
             status: retryResponse.status,
             text: retryText,
             headers: retryHeaders,
-          }
-
-          if (retryAttempt.elapsedMs > SUMMARY_FALLBACK_RETRY_MAX_ATTEMPT_MS) {
-            lastFailure.headers.set('x-financesum-summary-fallback-attempted', '1')
-            lastFailure.headers.set(
-              'x-financesum-summary-fallback-skipped-reason',
-              'retry-attempt-too-slow',
-            )
-            lastFailure.headers.set(
-              'x-financesum-summary-retry-attempt-ms',
-              String(retryAttempt.elapsedMs),
-            )
-            break
           }
         }
       }

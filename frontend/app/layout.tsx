@@ -5,7 +5,6 @@ import './globals.css'
 import { AuthProvider } from '@/contexts/AuthContext'
 import { QueryProvider } from '@/components/QueryProvider'
 import { ThemeProvider } from '@/components/theme-provider'
-import PostHogClientProvider from '@/components/PostHogProvider'
 
 const geistSans = localFont({
   src: [
@@ -72,20 +71,18 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body className={`${geistSans.variable} ${geistMono.variable} ${flaviotte.variable} ${playfair.variable} font-sans antialiased`}>
-        <PostHogClientProvider>
-          <AuthProvider>
-            <QueryProvider>
-              <ThemeProvider
-                attribute="class"
-                defaultTheme="light"
-                enableSystem
-                disableTransitionOnChange
-              >
-                {children}
-              </ThemeProvider>
-            </QueryProvider>
-          </AuthProvider>
-        </PostHogClientProvider>
+        <AuthProvider>
+          <QueryProvider>
+            <ThemeProvider
+              attribute="class"
+              defaultTheme="light"
+              enableSystem
+              disableTransitionOnChange
+            >
+              {children}
+            </ThemeProvider>
+          </QueryProvider>
+        </AuthProvider>
       </body>
     </html>
   )

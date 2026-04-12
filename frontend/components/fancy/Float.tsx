@@ -1,6 +1,6 @@
 "use client"
 
-import { useRef, useState, useEffect, useMemo, ReactNode } from "react"
+import { useRef, useState, useEffect, ReactNode } from "react"
 import { motion, useMotionValue, useSpring, useTransform } from "framer-motion"
 import { cn } from "@/lib/utils"
 
@@ -16,8 +16,6 @@ interface FloatProps {
   autoFloat?: boolean
 }
 
-const DEFAULT_FLOAT_AMPLITUDE: [number, number, number] = [10, 30, 30]
-
 export default function Float({
   children,
   className,
@@ -25,7 +23,7 @@ export default function Float({
   perspective = 1000,
   scale = 1.05,
   speed = 0.5,
-  amplitude = DEFAULT_FLOAT_AMPLITUDE,
+  amplitude = [10, 30, 30],
   timeOffset = 0,
   autoFloat = true,
 }: FloatProps) {
@@ -48,13 +46,9 @@ export default function Float({
   const ySpring = useSpring(mouseY, springConfig)
 
   // Normalize rotationRange to array format
-  const rotRange = useMemo(
-    () =>
-      Array.isArray(rotationRange)
-        ? rotationRange
-        : [rotationRange, rotationRange, rotationRange * 0.5],
-    [rotationRange]
-  )
+  const rotRange = Array.isArray(rotationRange)
+    ? rotationRange
+    : [rotationRange, rotationRange, rotationRange * 0.5]
 
   const mouseRotateX = useTransform(ySpring, [-0.5, 0.5], [rotRange[0], -rotRange[0]])
   const mouseRotateY = useTransform(xSpring, [-0.5, 0.5], [-rotRange[1], rotRange[1]])

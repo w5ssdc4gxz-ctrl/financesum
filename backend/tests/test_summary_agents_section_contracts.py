@@ -23,14 +23,20 @@ def test_long_form_health_local_contract_accepts_expanded_sentence_band() -> Non
     assert failures == []
 
 
-def test_long_form_risk_local_contract_accepts_three_sentence_risks() -> None:
+def test_long_form_risk_local_contract_accepts_four_sentence_risks() -> None:
     text = (
         "**Cloud Capacity Bottlenecks:** If cloud capacity, backlog conversion, and utilization ramp fall out of sync because data-center deployments land later than committed customer demand, contracted workloads take longer to convert into recognized revenue and the company ends up carrying expensive infrastructure before usage catches up. "
         "That timing mismatch can pressure cloud revenue recognition, gross margin absorption, operating margin, and free cash flow because servers, networking, support staffing, and power commitments are already in place before bookings fully translate into billable, high-utilization workloads at the expected pace. "
+        "The financial risk gets worse if management has to relieve backlog with discounts, service credits, or unusually fast provisioning promises that lift cost-to-serve just as capital intensity is climbing across the cloud platform and investors are underwriting better returns on incremental capacity. "
         "An early-warning signal is rising backlog, weaker utilization, slower bookings conversion, or repeated commentary that cloud capacity remains the binding constraint on delivery.\n\n"
         "**Search Compute Monetization:** If search monetization fails to keep pace with higher AI serving costs, each additional query can become less profitable even while overall usage, engagement, and product adoption look healthy on the surface. "
         "That mechanism can compress operating margin and reduce free cash flow because the company is spending more on inference, ranking, and model orchestration before it has proven that advertiser pricing, monetized clicks, and usage mix are scaling fast enough to cover the added compute burden. "
-        "An early-warning signal is higher cost-per-query, softer monetization in search, or a weaker uplift in monetized clicks and pricing despite heavier compute intensity."
+        "The downside becomes larger if product changes improve engagement but fail to improve advertiser ROI, because management would then be funding more expensive search experiences without getting the monetization lift needed to protect margins, cash generation, or valuation support. "
+        "An early-warning signal is higher cost-per-query, softer monetization in search, or a weaker uplift in monetized clicks and pricing despite heavier compute intensity.\n\n"
+        "**Partner Traffic Mix Shift:** If traffic acquisition cost and retention trends move against the company because distribution partners gain bargaining power or usage shifts toward more expensive channels, the ads engine loses part of the funding cushion that currently supports reinvestment. "
+        "That can weaken revenue mix, operating margin, and balance-sheet flexibility at the same time the company is trying to scale new workloads, because higher partner payments and lower retention would redirect cash away from internally funded cloud and product investment. "
+        "The impact is more severe if management has to protect volume by accepting lower unit economics in core ad surfaces, since that would combine traffic-acquisition-cost pressure with weaker monetization and force tougher capital-allocation tradeoffs across the broader platform. "
+        "An early-warning signal is faster traffic-acquisition-cost growth, lower partner retention, weaker ROI in key channels, or a sustained rise in partner concessions."
     )
 
     analysis = summary_agents.FilingAnalysis(
@@ -57,14 +63,23 @@ def test_long_form_risk_local_contract_accepts_three_sentence_risks() -> None:
                 source_section="Risk Factors",
                 source_quote="search monetization and AI serving costs remain a key issue",
             ),
+            summary_agents.CompanyRisk(
+                risk_name="Partner Traffic Mix Shift",
+                mechanism="If traffic acquisition cost and retention trends move against the company because distribution partners gain bargaining power or usage shifts toward more expensive channels, the ads engine loses part of the funding cushion that currently supports reinvestment.",
+                early_warning="An early-warning signal is faster traffic-acquisition-cost growth, lower partner retention, weaker ROI in key channels, or a sustained rise in partner concessions.",
+                evidence_from_filing="Risk Factors: partner traffic mix remains a key issue.",
+                source_section="Risk Factors",
+                source_quote="partner traffic mix remains a key issue",
+            ),
         ],
         evidence_map={
             "Risk Factors": [
                 "Risk Factors: cloud capacity and backlog conversion remain a key issue.",
                 "Risk Factors: search monetization and AI serving costs remain a key issue.",
+                "Risk Factors: partner traffic mix remains a key issue.",
             ]
         },
-        company_terms=["cloud capacity", "search monetization"],
+        company_terms=["cloud capacity", "search monetization", "partner traffic"],
     )
 
     failures = summary_agents._validate_risk_local_contract(
@@ -79,11 +94,13 @@ def test_long_form_risk_local_contract_accepts_three_sentence_risks() -> None:
 def test_risk_local_contract_allows_fewer_risks_when_only_fewer_are_accepted() -> None:
     text = (
         "**Cloud Capacity Bottlenecks:** If cloud capacity and backlog conversion fall out of sync, contracted workloads take longer to convert into recognized revenue and the company carries expensive infrastructure before utilization catches up. "
-        "That timing mismatch can pressure cloud revenue, margin absorption, and free cash flow because servers, networking, and power commitments are already in place before usage fully ramps across committed regions and customer cohorts. "
-        "An early-warning signal is rising backlog, weaker utilization, or repeated commentary that capacity remains the binding constraint across major deployments.\n\n"
+        "That timing mismatch can pressure cloud revenue, margin absorption, and free cash flow because servers, networking, and power commitments are already in place before usage fully ramps. "
+        "The downside grows if delivery commitments have to be met with discounts or service credits, because that would erode the economics management is trying to protect during the buildout. "
+        "An early-warning signal is rising backlog, weaker utilization, or repeated commentary that capacity remains the binding constraint.\n\n"
         "**Search Compute Monetization:** If search monetization fails to keep pace with higher AI serving costs, each additional query can become less profitable even while engagement appears healthy. "
-        "That can compress operating margin and reduce free cash flow because the company is spending more on inference before it has proven advertiser pricing and monetized usage are scaling fast enough to cover the added compute burden across the search surface. "
-        "An early-warning signal is softer monetization in search or a weaker uplift in monetized clicks despite heavier compute intensity and higher serving load."
+        "That can compress operating margin and reduce free cash flow because the company is spending more on inference before it has proven advertiser pricing and monetized usage are scaling fast enough to cover the added compute burden. "
+        "The risk grows if engagement improves without a matching uplift in advertiser ROI, because the company would be funding a more expensive product without earning the monetization needed to support returns. "
+        "An early-warning signal is softer monetization in search or a weaker uplift in monetized clicks despite heavier compute intensity."
     )
 
     analysis = summary_agents.FilingAnalysis(
@@ -131,12 +148,15 @@ def test_risk_local_contract_allows_fewer_risks_when_only_fewer_are_accepted() -
 
 def test_risk_local_contract_rejects_filing_fragment_name_when_no_accepted_risks() -> None:
     text = (
-        "**General Instruction:** If delivery timing slips, revenue conversion can slow before costs reset. "
+        "**Actual Execution:** If delivery timing slips, revenue conversion can slow before costs reset. "
         "That can pressure operating margin and free cash flow because the company is still carrying the investment base while monetization lags. "
         "An early-warning signal is weaker backlog conversion or renewed commentary about deployment delays.\n\n"
         "**Export Controls / Shipment Risk:** If export controls tighten, shipment timing can slip and backlog conversion can move right before cost plans reset. "
         "That can pressure revenue timing and margin absorption because inventory and support costs are already committed ahead of delivery. "
-        "An early-warning signal is delayed export-license approvals or weaker shipment commentary."
+        "An early-warning signal is delayed export-license approvals or weaker shipment commentary.\n\n"
+        "**Data-Center Capacity Ramp Risk:** If capacity ramps land later than expected, enterprise workload deployment can slip before demand converts into monetized usage. "
+        "That can weaken revenue timing and free cash flow because infrastructure spend arrives before utilization catches up. "
+        "An early-warning signal is slower utilization ramp or larger implementation backlogs."
     )
 
     failures = summary_agents._validate_risk_local_contract(
@@ -171,7 +191,12 @@ def test_risk_local_contract_rejects_semantic_overlap_before_final_validation() 
         "enterprise rollout can slip and revenue conversion weakens before cost plans "
         "adjust. That can pressure operating margin and cash flow because product and "
         "sales investment land before the rollout catches up. An early-warning signal "
-        "is slower agency review milestones or more explicit remedy commentary."
+        "is slower agency review milestones or more explicit remedy commentary.\n\n"
+        "**Export Controls / Shipment Risk:** If export controls tighten, shipments to "
+        "certain markets can move right and backlog conversion slows before capacity "
+        "plans can reset. That can pressure revenue timing and margin absorption because "
+        "inventory and support costs are already committed. An early-warning signal is "
+        "longer customs holds or delayed export-license approvals."
     )
 
     failures = summary_agents._validate_risk_local_contract(
@@ -323,7 +348,7 @@ def test_build_section_prompt_includes_company_specific_kpis_period_insights_and
     assert "PROMISE SCORECARD ITEMS TO USE" in prompt
     assert "on_track" in prompt
     assert 'AVAILABLE QUOTES:\n- "we are seeing stronger expansion inside our largest customers"' in prompt
-    assert "Direct quotes are optional and quality-gated for this memo. Use at most 2 total direct quote(s)." in prompt
+    assert "Budget-aware quote range for this memo: 2-3 total direct quote(s)." in prompt
     assert "The same anchor or theme can appear in at most two narrative sections" in prompt
     assert "Favor subtle handoffs over explicit 'the next section' phrasing." in prompt
 
@@ -715,71 +740,6 @@ def test_accepted_company_risks_prioritize_management_echoed_material_risks() ->
     assert accepted_names[-1] == "Anti-Corruption Policy Violation Risk"
 
 
-def test_accepted_company_risks_deprioritize_generic_supplier_code_risk_without_near_term_event() -> None:
-    analysis = summary_agents.FilingAnalysis(
-        central_tension="",
-        tension_evidence="",
-        kpi_findings=[],
-        period_specific_insights=[],
-        management_quotes=[],
-        management_strategy_summary=(
-            "Management is prioritizing power availability and backlog conversion before taking on additional ramps."
-        ),
-        company_specific_risks=[
-            summary_agents.CompanyRisk(
-                risk_name="Supplier Code of Conduct Risk",
-                mechanism=(
-                    "If suppliers fail to meet the code of conduct, remediation work and sourcing reviews can increase."
-                ),
-                early_warning="An early-warning signal is additional supplier reviews.",
-                evidence_from_filing=(
-                    "Risk Factors: suppliers are expected to follow the company's supplier code of conduct."
-                ),
-                source_section="Risk Factors",
-                source_quote="suppliers are expected to follow the company's supplier code of conduct.",
-            ),
-            summary_agents.CompanyRisk(
-                risk_name="Power Availability Capacity Ramp Risk",
-                mechanism=(
-                    "If power availability or data-center construction slips, capacity comes online later and backlog conversion stretches before utilization catches up."
-                ),
-                early_warning=(
-                    "An early-warning signal is slower power-availability milestones or backlog conversion."
-                ),
-                evidence_from_filing=(
-                    "Risk Factors: delays in power availability and data-center construction could defer capacity coming online and slow backlog conversion."
-                ),
-                source_section="Risk Factors",
-                source_quote=(
-                    "delays in power availability and data-center construction could defer capacity coming online and slow backlog conversion."
-                ),
-            ),
-        ],
-        evidence_map={},
-        company_terms=[
-            "supplier code of conduct",
-            "power availability",
-            "data-center construction",
-            "backlog conversion",
-        ],
-        management_expectations=[
-            summary_agents.ManagementExpectation(
-                topic="backlog conversion",
-                expectation="Management expects backlog conversion to improve over the next two quarters.",
-                timeframe="next two quarters",
-                evidence="Management expects backlog conversion to improve over the next two quarters.",
-            )
-        ],
-    )
-
-    accepted = summary_agents._accepted_company_risks(analysis)
-
-    assert [risk.risk_name for risk in accepted][:2] == [
-        "Power Availability Capacity Ramp Risk",
-        "Supplier Code of Conduct Risk",
-    ]
-
-
 def test_build_section_prompt_risk_factors_uses_source_backed_quotes() -> None:
     accepted_risk = summary_agents.CompanyRisk(
         risk_name="Backlog Shipment Conversion Risk",
@@ -844,7 +804,7 @@ def test_build_section_prompt_risk_factors_uses_source_backed_quotes() -> None:
     assert "Backlog conversion may slow if customer fab readiness slips." in prompt
     assert "Management expects backlog conversion to improve next quarter." not in prompt
     assert "do not synthesize new ones" in prompt.lower()
-    assert "Write up to 2 risks" in prompt
+    assert "Write up to 3 risks" in prompt
     assert "1 accepted source-backed risk(s) are currently available" in prompt
 
 
@@ -1116,13 +1076,10 @@ def test_build_key_metrics_body_prepends_company_specific_kpis_before_generic_me
     )
 
     lines = body.splitlines()
-    assert lines[0] == "What Matters:"
-    assert "Annual Recurring Revenue" in body
-    assert "Net Revenue Retention" in body
-    assert "→ Annual Recurring Revenue: $2.3B | +18% YoY" in body
-    assert "→ Net Revenue Retention: 114% | +200 bps YoY" in body
-    assert "→ Revenue: $1.8B" in body
-    assert "→ Operating Margin: 21.4%" in body
+    assert lines[0] == "→ Annual Recurring Revenue: $2.3B | +18% YoY"
+    assert lines[1] == "→ Net Revenue Retention: 114% | +200 bps YoY"
+    assert lines[2] == "→ Revenue: $1.8B"
+    assert lines[3] == "→ Operating Margin: 21.4%"
 
 
 def test_build_key_metrics_body_dedupes_duplicate_labels_and_respects_budget() -> None:
@@ -1157,69 +1114,6 @@ def test_build_key_metrics_body_dedupes_duplicate_labels_and_respects_budget() -
 
     assert body.count("→ Free Cash Flow:") == 1
     assert summary_agents.count_words(body) <= 55
-
-
-def test_build_key_metrics_body_falls_back_to_kpi_highlights_when_watchlists_are_empty() -> None:
-    analysis = summary_agents.FilingAnalysis(
-        central_tension="Cloud backlog is starting to fund the AI cycle instead of just absorbing it.",
-        tension_evidence="",
-        kpi_findings=[
-            summary_agents.KPIFinding(
-                kpi_name="Cloud Backlog",
-                current_value="$14.0B",
-                change="+22% YoY",
-                insight="Backlog is now creating visibility into future earnings rather than just future capex.",
-            ),
-            summary_agents.KPIFinding(
-                kpi_name="Operating Margin",
-                current_value="31%",
-                change="+120 bps YoY",
-                insight="Margins are still holding even as AI investment rises.",
-            ),
-        ],
-        period_specific_insights=[],
-        management_quotes=[],
-        management_strategy_summary="Management is keeping monetization ahead of buildout.",
-        company_specific_risks=[],
-        evidence_map={},
-    )
-
-    body = summary_agents._build_key_metrics_body(
-        metrics_lines="→ Revenue: $12.0B\n→ Free Cash Flow: $4.0B",
-        analysis=analysis,
-    )
-
-    assert body.startswith("What Matters:\n")
-    assert "Cloud Backlog" in body
-    assert "DATA_GRID_START" not in body
-    assert "→ Revenue: $12.0B" in body
-
-
-def test_build_key_metrics_body_falls_back_to_metric_guidance_when_analysis_is_sparse() -> None:
-    analysis = summary_agents.FilingAnalysis(
-        central_tension="",
-        tension_evidence="",
-        kpi_findings=[],
-        period_specific_insights=[],
-        management_quotes=[],
-        management_strategy_summary="",
-        company_specific_risks=[],
-        evidence_map={},
-    )
-
-    body = summary_agents._build_key_metrics_body(
-        metrics_lines=(
-            "→ Operating Margin: 31%\n"
-            "→ Free Cash Flow: $4.0B\n"
-            "→ Current Ratio: 1.8x\n"
-            "→ Net Debt: $1.2B"
-        ),
-        analysis=analysis,
-    )
-
-    assert body.startswith("What Matters:\n")
-    assert "self-funded" in body or "Liquidity and leverage rows" in body
-    assert "→ Operating Margin: 31%" in body
 
 
 def test_regression_business_model_specific_kpis_survive_in_key_metrics_body() -> None:
@@ -1314,52 +1208,3 @@ def test_risk_fallback_only_triggers_on_zero_accepted_risks() -> None:
     # Old code: len(accepted) < required_risks → would trigger fallback
     # New code: len(accepted) == 0 → does NOT trigger fallback
     assert not (required_risks > 0 and len(accepted) == 0)
-
-
-def test_select_aha_insight_prefers_contrastive_non_obvious_statement() -> None:
-    analysis = summary_agents.FilingAnalysis(
-        central_tension="Can cloud investment stay self-funded?",
-        tension_evidence="Margin durability still matters.",
-        kpi_findings=[],
-        period_specific_insights=[
-            "Cloud backlog conversion improved this quarter.",
-            "The real shift is that cloud is now funding AI, not consuming it.",
-        ],
-        management_quotes=[],
-        management_strategy_summary="Management expects conversion to keep improving.",
-        company_specific_risks=[],
-        evidence_map={},
-    )
-
-    aha = summary_agents._select_aha_insight(
-        analysis,
-        fallback_text="Cloud remains central to the story.",
-    )
-
-    assert aha == "The real shift is that cloud is now funding AI, not consuming it."
-
-
-def test_validate_key_metrics_section_preserves_intro_and_data_grid() -> None:
-    metrics_lines = (
-        "DATA_GRID_START\n"
-        "Revenue | $10.0B\n"
-        "Operating Margin | 25.0%\n"
-        "Free Cash Flow | $4.2B\n"
-        "Current Ratio | 1.8x\n"
-        "Net Debt | $1.1B\n"
-        "DATA_GRID_END"
-    )
-    summary = (
-        "## Key Metrics\n"
-        "What Matters:\n"
-        "- Backlog conversion is funding the next AI leg.\n"
-        "- Margin durability shows whether the buildout stays self-funded.\n\n"
-        f"{metrics_lines}\n"
-    )
-
-    validated = summary_agents._validate_key_metrics_section(summary, metrics_lines)
-
-    assert "What Matters:" in validated
-    assert "- Backlog conversion is funding the next AI leg." in validated
-    assert "DATA_GRID_START" in validated
-    assert "Revenue | $10.0B" in validated

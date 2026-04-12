@@ -378,20 +378,7 @@ _LOW_SIGNAL_RISK_RE = re.compile(
     r"\b("
     r"general economic|macroeconomic|geopolitical|competition(?: from)?|competitive pressure|"
     r"cybersecurity|cyber threats?|climate change|weather events?|foreign currency|"
-    r"interest rates?|key personnel|regulatory environment|compliance with laws|"
-    r"general instructions?"
-    r")\b",
-    re.IGNORECASE,
-)
-_ACCOUNTING_HEDGE_RISK_RE = re.compile(
-    r"\b(fair value hedges?|cash flow hedges?|hedge effectiveness)\b",
-    re.IGNORECASE,
-)
-_HEDGE_BUSINESS_LINK_RE = re.compile(
-    r"\b("
-    r"cross[- ]currency swaps?|debt portfolio|debt service|fixed[- ]rate debt|"
-    r"floating[- ]rate debt|funding|interest expense|interest rate swaps?|"
-    r"liquidity|refinancing"
+    r"interest rates?|key personnel|regulatory environment|compliance with laws"
     r")\b",
     re.IGNORECASE,
 )
@@ -553,8 +540,6 @@ def is_filing_structure_line(text: str) -> bool:
         return True
     if re.match(r"^conversion\s+risk$", cleaned, re.IGNORECASE):
         return True
-    if re.match(r"^general instructions?(?:\s*:)?$", cleaned, re.IGNORECASE):
-        return True
     if re.match(r"^item\s+\d+[a-z]?\.?\s*(?:[-:–—]\s*)?.*$", cleaned, re.IGNORECASE):
         return True
     if re.match(r"^[A-Z][A-Z0-9 &/().,-]{2,}\s+\d{1,4}\s*$", cleaned):
@@ -684,26 +669,6 @@ def score_risk_evidence_candidate(
         score -= 3
     if looks_boilerplate_risk_body(evidence_blob):
         score -= 6
-    if _ACCOUNTING_HEDGE_RISK_RE.search(
-        " ".join(
-            part
-            for part in (
-                str(candidate.risk_name or "").strip(),
-                evidence_blob,
-            )
-            if part
-        )
-    ) and not _HEDGE_BUSINESS_LINK_RE.search(
-        " ".join(
-            part
-            for part in (
-                str(candidate.risk_name or "").strip(),
-                evidence_blob,
-            )
-            if part
-        )
-    ):
-        score -= 10
     return int(score)
 
 

@@ -19,40 +19,40 @@ const navLinks = [
     {
         label: 'Overview',
         href: '/dashboard#overview',
-        icon: <IconChartHistogram className="h-5 w-5 shrink-0" />,
+        icon: <IconChartHistogram className="h-5 w-5 shrink-0 text-slate-600" />,
     },
     {
         label: 'Coverage',
         href: '/dashboard#coverage',
-        icon: <IconWorld className="h-5 w-5 shrink-0" />,
+        icon: <IconWorld className="h-5 w-5 shrink-0 text-slate-600" />,
     },
     {
         label: 'Activity',
         href: '/dashboard#activity',
-        icon: <IconActivity className="h-5 w-5 shrink-0" />,
+        icon: <IconActivity className="h-5 w-5 shrink-0 text-slate-600" />,
     },
     {
         label: 'Top Companies',
         href: '/dashboard#companies',
-        icon: <IconBuilding className="h-5 w-5 shrink-0" />,
+        icon: <IconBuilding className="h-5 w-5 shrink-0 text-slate-600" />,
     },
     {
         label: 'Settings',
         href: '/dashboard/settings',
-        icon: <IconSettings className="h-5 w-5 shrink-0" />,
+        icon: <IconSettings className="h-5 w-5 shrink-0 text-slate-600" />,
     },
 ]
 
 const SidebarLogo = ({ open }: { open: boolean }) => {
     return (
         <Link href="/dashboard" className="flex items-center gap-2 py-1">
-            <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center bg-black dark:bg-white text-white dark:text-black">
+            <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-indigo-600 text-white">
                 <IconBrandTabler className="h-5 w-5" />
             </div>
             <motion.span
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
-                className="whitespace-pre text-lg font-bold tracking-tight text-black dark:text-white"
+                className="whitespace-pre text-lg font-semibold text-neutral-900 dark:text-white"
             >
                 FinanceSum
             </motion.span>
@@ -82,7 +82,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
     if (!user) return null
 
     return (
-        <div className="h-screen w-full overflow-hidden bg-white text-black dark:bg-zinc-950 dark:text-white flex">
+        <div className="h-screen w-full overflow-hidden bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-50 flex">
             <Sidebar open={sidebarOpen} setOpen={setSidebarOpen}>
                 <SidebarBody className="justify-between gap-10">
                     <div className="flex flex-col flex-1 overflow-y-auto overflow-x-hidden">
@@ -94,7 +94,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                                     link={{
                                         ...link,
                                         icon: (
-                                            <div className="h-6 w-6 flex-shrink-0 text-black dark:text-white group-hover/sidebar:text-white dark:group-hover/sidebar:text-black">
+                                            <div className="h-6 w-6 flex-shrink-0 text-neutral-500 dark:text-neutral-400">
                                                 {link.icon}
                                             </div>
                                         ),
@@ -109,7 +109,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
                                 label: user?.user_metadata?.full_name ?? user?.email ?? 'Investor',
                                 href: '/dashboard/settings',
                                 icon: (
-                                    <div className="flex h-8 w-8 items-center justify-center border border-black dark:border-white bg-white text-black dark:bg-black dark:text-white text-xs font-bold uppercase tracking-wider group-hover/sidebar:bg-black group-hover/sidebar:text-white dark:group-hover/sidebar:bg-white dark:group-hover/sidebar:text-black">
+                                    <div className="flex h-8 w-8 items-center justify-center rounded-full bg-indigo-600 text-xs font-bold text-white">
                                         {(user?.user_metadata?.full_name ?? user?.email ?? 'FS').slice(0, 2).toUpperCase()}
                                     </div>
                                 ),

@@ -1,34 +1,15 @@
 import axios, { AxiosHeaders } from 'axios'
 import { supabase } from '@/lib/supabase'
 
-const normalizeApiBase = (value?: string | null) => {
-  const trimmed = String(value || '').trim()
-  if (!trimmed) return ''
-  return trimmed.replace(/\/+$/, '')
-}
+// Absolute backend URL (used for generating links outside the proxy)
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+const API_PROXY_BASE = (process.env.NEXT_PUBLIC_API_PROXY_BASE ?? '/api/backend').trim()
+const API_CLIENT_BASE_URL = API_PROXY_BASE.length > 0 ? API_PROXY_BASE : API_URL
 
-const resolveApiBase = () => {
-  const configuredProxyBase = normalizeApiBase(process.env.NEXT_PUBLIC_API_PROXY_BASE)
-  if (configuredProxyBase) {
-    return configuredProxyBase
-  }
-
-  if (process.env.NEXT_PUBLIC_API_PROXY_BASE === '') {
-    const directApiBase = normalizeApiBase(process.env.NEXT_PUBLIC_API_URL)
-    if (directApiBase) {
-      return directApiBase
-    }
-  }
-
-  return '/api/backend'
-}
-
-const API_PROXY_BASE = resolveApiBase()
+export const API_BASE_URL = API_URL
 
 export const apiClient = axios.create({
-  // Default to same-origin proxy routing. Local dev can opt out by setting
-  // NEXT_PUBLIC_API_PROXY_BASE="" alongside NEXT_PUBLIC_API_URL.
-  baseURL: API_PROXY_BASE,
+  baseURL: API_CLIENT_BASE_URL,
   headers: {
     'Content-Type': 'application/json',
   },
@@ -120,15 +101,12 @@ apiClient.interceptors.response.use(
 export type FilingSummaryPreferencesPayload = {
   mode?: 'default' | 'custom'
   investor_focus?: string
-  persona_id?: string
   focus_areas?: string[]
   tone?: string
   detail_level?: string
   output_style?: string
   target_length?: number
   complexity?: string
-  section_weight_overrides?: Record<string, number>
-  section_instructions?: Record<string, string>
   health_rating?: {
     enabled?: boolean
     framework?: string
@@ -213,11 +191,13 @@ export const filingsApi = {
   getSummaryProgress: (filingId: string) =>
     apiClient.get(`/api/v1/filings/${filingId}/progress`),
 
-  getFilingHealth: (filingId: string) =>
-    apiClient.get(`/api/v1/filings/${filingId}/health`),
-
   exportSummary: (filingId: string, payload: SummaryExportPayload) =>
     apiClient.post(`/api/v1/filings/${filingId}/summary/export`, payload, { responseType: 'blob' }),
+
+  getSpotlightKpi: (filingId: string, opts?: { refresh?: boolean }) =>
+    apiClient.get(`/api/v1/filings/${filingId}/spotlight`, {
+      params: opts?.refresh ? { refresh: true } : undefined,
+    }),
 }
 
 // Analysis API

@@ -48,25 +48,27 @@ function ThemeCard({
     return (
         <motion.button
             onClick={onClick}
-            className={`group relative w-full text-left p-5 rounded-none border transition-all duration-200 ${isSelected
-                    ? "border-black bg-black text-white dark:border-white dark:bg-white dark:text-black shadow-[4px_4px_0_0_#000] dark:shadow-[4px_4px_0_0_#fff]"
-                    : "border-black dark:border-white bg-white dark:bg-zinc-950 text-black dark:text-white hover:bg-zinc-100 dark:hover:bg-zinc-900"
-                }`}
+            className={`group relative w-full text-left p-5 rounded-2xl border-2 transition-all duration-200 ${
+                isSelected
+                    ? "border-foreground bg-foreground/[0.03]"
+                    : "border-transparent bg-muted/50 hover:bg-muted hover:border-border"
+            }`}
             whileTap={{ scale: 0.98 }}
             layout
         >
             <div className="flex items-start justify-between gap-4">
                 <div className="flex items-start gap-4">
                     {/* Icon */}
-                    <div className={`flex-shrink-0 w-10 h-10 rounded-none border border-black dark:border-white flex items-center justify-center transition-colors ${isSelected ? "bg-white text-black dark:bg-black dark:text-white" : "bg-zinc-100 text-zinc-500 dark:bg-zinc-900"
-                        }`}>
-                        <Icon size={20} strokeWidth={1} />
+                    <div className={`flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center transition-colors ${
+                        isSelected ? "bg-foreground text-background" : "bg-muted-foreground/10 text-muted-foreground"
+                    }`}>
+                        <Icon size={20} strokeWidth={1.5} />
                     </div>
-
+                    
                     {/* Text */}
                     <div>
-                        <div className="font-bold uppercase tracking-widest">{label}</div>
-                        <div className={`text-xs uppercase tracking-widest mt-0.5 ${isSelected ? 'text-zinc-400 dark:text-zinc-600' : 'text-zinc-500 dark:text-zinc-400'}`}>{description}</div>
+                        <div className="font-semibold text-foreground">{label}</div>
+                        <div className="text-sm text-muted-foreground mt-0.5">{description}</div>
                     </div>
                 </div>
 
@@ -78,9 +80,9 @@ function ThemeCard({
                             animate={{ scale: 1, opacity: 1 }}
                             exit={{ scale: 0, opacity: 0 }}
                             transition={{ type: "spring", stiffness: 500, damping: 30 }}
-                            className="flex-shrink-0 w-6 h-6 rounded-none bg-white flex items-center justify-center border border-black dark:bg-black dark:border-white"
+                            className="flex-shrink-0 w-6 h-6 rounded-full bg-foreground flex items-center justify-center"
                         >
-                            <IconCheck size={14} className="text-black dark:text-white" strokeWidth={3} />
+                            <IconCheck size={14} className="text-background" strokeWidth={3} />
                         </motion.div>
                     )}
                 </AnimatePresence>
@@ -147,11 +149,11 @@ export default function SettingsPage() {
 
     useEffect(() => {
         if (activeTab !== "billing" || !session?.access_token) return
-        const sessionId = typeof window !== "undefined"
-            ? window.localStorage.getItem(CHECKOUT_SESSION_STORAGE_KEY)
+        const sessionId = typeof window !== "undefined" 
+            ? window.localStorage.getItem(CHECKOUT_SESSION_STORAGE_KEY) 
             : null
         if (!sessionId) return
-
+        
         let cancelled = false
         const sync = async () => {
             try {
@@ -233,8 +235,8 @@ export default function SettingsPage() {
                     className="flex items-center justify-between mb-12"
                 >
                     <div>
-                        <h1 className="text-4xl font-black uppercase tracking-tighter text-black dark:text-white">Settings</h1>
-                        <p className="mt-2 text-sm font-bold tracking-widest uppercase text-zinc-500 dark:text-zinc-400">Manage your preferences</p>
+                        <h1 className="text-2xl font-bold text-foreground">Settings</h1>
+                        <p className="text-muted-foreground mt-1">Manage your preferences</p>
                     </div>
                     <Button
                         color="ghost"
@@ -242,10 +244,10 @@ export default function SettingsPage() {
                             await signOut()
                             router.push("/")
                         }}
-                        className="rounded-none border-2 border-transparent hover:border-black dark:hover:border-white text-zinc-500 hover:text-black dark:hover:text-white font-bold uppercase tracking-widest"
+                        className="text-muted-foreground hover:text-foreground"
                     >
-                        <IconLogout size={18} strokeWidth={2} />
-                        <span className="ml-2 mt-0.5">Log out</span>
+                        <IconLogout size={18} />
+                        <span className="ml-2">Log out</span>
                     </Button>
                 </motion.div>
 
@@ -254,26 +256,27 @@ export default function SettingsPage() {
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ delay: 0.05 }}
-                    className="flex gap-1 p-1 bg-white dark:bg-zinc-950 border border-black dark:border-white rounded-none mb-8 w-fit shadow-[4px_4px_0_0_#000] dark:shadow-[4px_4px_0_0_#fff]"
+                    className="flex gap-1 p-1 bg-muted/50 rounded-xl mb-8 w-fit"
                 >
                     {tabs.map((tab) => (
                         <button
                             key={tab.id}
                             onClick={() => setActiveTab(tab.id)}
-                            className={`relative px-4 py-2 rounded-none text-xs font-bold uppercase tracking-widest transition-colors ${activeTab === tab.id
-                                    ? "text-white dark:text-black"
-                                    : "text-zinc-500 hover:text-black dark:hover:text-white"
-                                }`}
+                            className={`relative px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                                activeTab === tab.id
+                                    ? "text-foreground"
+                                    : "text-muted-foreground hover:text-foreground"
+                            }`}
                         >
                             {activeTab === tab.id && (
                                 <motion.div
                                     layoutId="activeSettingsTab"
-                                    className="absolute inset-0 bg-black dark:bg-white rounded-none"
+                                    className="absolute inset-0 bg-background rounded-lg shadow-sm"
                                     transition={{ type: "spring", stiffness: 400, damping: 30 }}
                                 />
                             )}
                             <span className="relative z-10 flex items-center gap-2">
-                                <tab.icon size={16} strokeWidth={2} />
+                                <tab.icon size={16} />
                                 {tab.label}
                             </span>
                         </button>
@@ -291,8 +294,8 @@ export default function SettingsPage() {
                             transition={{ duration: 0.2 }}
                         >
                             <div className="mb-6">
-                                <h2 className="text-sm font-bold uppercase tracking-widest text-black dark:text-white">Theme</h2>
-                                <p className="text-xs font-bold uppercase tracking-widest text-zinc-500 mt-1">
+                                <h2 className="text-lg font-semibold text-foreground">Theme</h2>
+                                <p className="text-sm text-muted-foreground mt-1">
                                     Choose how FinanceSum looks on your device
                                 </p>
                             </div>
@@ -333,26 +336,26 @@ export default function SettingsPage() {
                             className="space-y-6"
                         >
                             {/* Plan Card */}
-                            <div className="p-6 rounded-none border border-black dark:border-white bg-white dark:bg-zinc-950">
+                            <div className="p-6 rounded-2xl border border-border bg-card">
                                 {usageLoading ? (
-                                    <div className="text-zinc-500 font-bold uppercase tracking-widest text-xs">Loading…</div>
+                                    <div className="text-muted-foreground text-sm">Loading…</div>
                                 ) : (
                                     <div className="space-y-6">
                                         {/* Plan Header */}
                                         <div className="flex items-start justify-between">
                                             <div>
-                                                <div className="text-xs font-bold uppercase tracking-widest text-zinc-500">Current plan</div>
-                                                <div className="text-2xl font-black uppercase tracking-tighter text-black dark:text-white mt-1">
+                                                <div className="text-sm text-muted-foreground">Current plan</div>
+                                                <div className="text-2xl font-bold text-foreground mt-1">
                                                     {isProPlan ? "Pro" : "Free"}
                                                 </div>
                                             </div>
                                             {!isProPlan && (
-                                                <span className="text-[10px] px-2.5 py-1 rounded-none border border-black dark:border-white bg-amber-400 text-black font-bold uppercase tracking-widest">
+                                                <span className="text-xs px-2.5 py-1 rounded-full bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 font-medium">
                                                     Trial
                                                 </span>
                                             )}
                                             {isProPlan && (
-                                                <span className="text-[10px] px-2.5 py-1 rounded-none border border-black dark:border-white bg-emerald-400 text-black font-bold uppercase tracking-widest">
+                                                <span className="text-xs px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400 font-medium">
                                                     Active
                                                 </span>
                                             )}
@@ -360,21 +363,21 @@ export default function SettingsPage() {
 
                                         {/* Usage */}
                                         <div>
-                                            <div className="flex items-center justify-between text-xs font-bold uppercase tracking-widest mb-2">
-                                                <span className="text-zinc-500">Usage this period</span>
-                                                <span className="text-black dark:text-white">
+                                            <div className="flex items-center justify-between text-sm mb-2">
+                                                <span className="text-muted-foreground">Usage this period</span>
+                                                <span className="font-medium text-foreground">
                                                     {usage?.used ?? 0} / {usage?.limit ?? 0}
                                                 </span>
                                             </div>
-                                            <div className="h-4 border border-black dark:border-white bg-white dark:bg-zinc-900 rounded-none overflow-hidden relative">
+                                            <div className="h-2 bg-muted rounded-full overflow-hidden">
                                                 <motion.div
-                                                    className="absolute top-0 bottom-0 left-0 bg-black dark:bg-white"
+                                                    className="h-full bg-foreground rounded-full"
                                                     initial={{ width: 0 }}
                                                     animate={{ width: `${usagePercent}%` }}
                                                     transition={{ duration: 0.5, ease: "easeOut" }}
                                                 />
                                             </div>
-                                            <div className="text-[10px] uppercase font-bold tracking-widest text-zinc-500 mt-2">
+                                            <div className="text-xs text-muted-foreground mt-2">
                                                 {remainingCount} summaries remaining
                                                 {usage?.period_end && isProPlan && (
                                                     <> · Resets {new Date(usage.period_end).toLocaleDateString()}</>
@@ -384,28 +387,30 @@ export default function SettingsPage() {
 
                                         {/* Cancellation notice */}
                                         {isCanceling && (
-                                            <div className="text-sm p-3 rounded-none border border-amber-500 bg-amber-50 text-amber-700 font-bold uppercase tracking-widest dark:bg-amber-950 dark:text-amber-400">
+                                            <div className="text-sm p-3 rounded-lg bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-400 border border-amber-200 dark:border-amber-800">
                                                 Your subscription ends on {cancellationLabel}
                                             </div>
                                         )}
 
                                         {/* Actions */}
                                         <div className="flex gap-3 pt-2">
-                                            <button
+                                            <Button
                                                 onClick={refreshUsage}
+                                                color="ghost"
                                                 disabled={usageLoading}
-                                                className="px-4 py-2 text-xs font-bold uppercase tracking-widest border border-black dark:border-white text-black dark:text-white hover:bg-black hover:text-white dark:hover:bg-white dark:hover:text-black transition-colors rounded-none disabled:opacity-50"
+                                                className="text-sm"
                                             >
                                                 Refresh
-                                            </button>
+                                            </Button>
                                             {isProPlan && (
-                                                <button
+                                                <Button
                                                     onClick={handleOpenStripePortal}
+                                                    color="ghost"
                                                     disabled={cancelLoading}
-                                                    className="px-4 py-2 text-xs font-bold uppercase tracking-widest border border-black dark:border-white text-black dark:text-white hover:bg-black hover:text-white dark:hover:bg-white dark:hover:text-black transition-colors rounded-none disabled:opacity-50"
+                                                    className="text-sm"
                                                 >
                                                     {cancelLoading ? "Opening…" : "Manage subscription"}
-                                                </button>
+                                                </Button>
                                             )}
                                         </div>
                                     </div>
@@ -418,27 +423,27 @@ export default function SettingsPage() {
                                     initial={{ opacity: 0, y: 10 }}
                                     animate={{ opacity: 1, y: 0 }}
                                     transition={{ delay: 0.1 }}
-                                    className="p-6 rounded-none border border-black dark:border-white shadow-[4px_4px_0_0_#000] dark:shadow-[4px_4px_0_0_#fff] bg-black text-white dark:bg-white dark:text-black"
+                                    className="p-6 rounded-2xl bg-foreground text-background"
                                 >
-                                    <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6">
+                                    <div className="flex items-center justify-between gap-6">
                                         <div>
-                                            <div className="font-black uppercase tracking-tighter text-xl">Upgrade to Pro</div>
-                                            <div className="text-xs uppercase tracking-widest text-zinc-400 dark:text-zinc-600 font-bold mt-1">
+                                            <div className="font-semibold text-lg">Upgrade to Pro</div>
+                                            <div className="text-sm opacity-70 mt-1">
                                                 100 summaries/month, priority support, all export formats
                                             </div>
                                         </div>
-                                        <button
+                                        <Button
                                             onClick={handleUpgradeToPro}
                                             disabled={upgradeLoading}
-                                            className="w-full sm:w-auto px-6 py-3 flex items-center justify-center flex-shrink-0 bg-white text-black dark:bg-black dark:text-white hover:bg-zinc-200 dark:hover:bg-zinc-800 font-black uppercase tracking-widest transition-colors rounded-none border-2 border-transparent disabled:opacity-50"
+                                            className="flex-shrink-0 bg-background text-foreground hover:bg-background/90 font-medium"
                                         >
                                             {upgradeLoading ? "Loading…" : (
                                                 <>
                                                     Upgrade
-                                                    <IconArrowRight size={18} strokeWidth={3} className="ml-2" />
+                                                    <IconArrowRight size={16} className="ml-1" />
                                                 </>
                                             )}
-                                        </button>
+                                        </Button>
                                     </div>
                                 </motion.div>
                             )}

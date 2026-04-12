@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useRef, useEffect, useState, useId } from 'react'
+import React, { useRef, useEffect, useState } from 'react'
 import { motion, useSpring, useTransform, useMotionValue } from 'framer-motion'
 import { useGSAP } from '@gsap/react'
 import gsap from 'gsap'
@@ -39,7 +39,6 @@ export function LiquidGauge({
   animated = true,
   glowEnabled = true,
 }: LiquidGaugeProps) {
-  const svgId = useId().replace(/:/g, '')
   const [mounted, setMounted] = useState(false)
   const gaugeRef = useRef<SVGSVGElement>(null)
   
@@ -88,8 +87,8 @@ export function LiquidGauge({
   }
   
   const colors = getColors()
-  const gradientId = `liquidGaugeGradient-${svgId}`
-  const glowId = `liquidGaugeGlow-${svgId}`
+  const gradientId = `liquidGaugeGradient-${Math.random().toString(36).slice(2)}`
+  const glowId = `liquidGaugeGlow-${Math.random().toString(36).slice(2)}`
   
   return (
     <div className={cn('relative inline-flex items-center justify-center', className)}>

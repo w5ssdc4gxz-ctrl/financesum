@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useEffect, useMemo, useId } from 'react'
+import React, { useState, useEffect, useMemo } from 'react'
 import { motion } from 'framer-motion'
 import { ResponsiveContainer, AreaChart, Area, LineChart, Line, XAxis, YAxis, Tooltip } from 'recharts'
 import { cn } from '@/lib/utils'
@@ -19,86 +19,6 @@ interface TrendKPIChartProps {
   currentLabel: string
 }
 
-interface TrendTooltipProps {
-  active?: boolean
-  payload?: any[]
-  trendColor: string
-  unit?: string
-}
-
-function TrendTooltip({ active, payload, trendColor, unit }: TrendTooltipProps) {
-  if (!active || !payload?.length) return null
-  const entry = payload[0]
-  return (
-    <motion.div
-      initial={{ opacity: 0, y: 5 }}
-      animate={{ opacity: 1, y: 0 }}
-      className="bg-white/95 dark:bg-gray-900/95 backdrop-blur-sm px-3 py-2 rounded-lg shadow-xl border border-gray-200/50 dark:border-gray-700/50"
-    >
-      <p className="text-xs font-semibold text-gray-900 dark:text-gray-100">
-        {entry?.payload?.label}
-      </p>
-      <p className="text-sm font-bold tabular-nums" style={{ color: trendColor }}>
-        {formatKpiValue(Number(entry?.value ?? 0), unit)}
-      </p>
-    </motion.div>
-  )
-}
-
-interface TrendDotProps {
-  cx?: number
-  cy?: number
-  index?: number
-  seriesLength: number
-  activeIndex: number | null
-  trendColor: string
-}
-
-function TrendDot({ cx, cy, index = 0, seriesLength, activeIndex, trendColor }: TrendDotProps) {
-  if (cx == null || cy == null) return null
-
-  const isLast = index === seriesLength - 1
-  const isActive = activeIndex === index
-
-  return (
-    <motion.g>
-      {/* Glow ring for last point */}
-      {isLast && (
-        <motion.circle
-          cx={cx}
-          cy={cy}
-          r={8}
-          fill="none"
-          stroke={trendColor}
-          strokeWidth={2}
-          initial={{ scale: 0.5, opacity: 0 }}
-          animate={{
-            scale: [1, 1.5, 1],
-            opacity: [0.5, 0, 0.5],
-          }}
-          transition={{ duration: 2, repeat: Infinity }}
-        />
-      )}
-
-      {/* Main dot */}
-      <motion.circle
-        cx={cx}
-        cy={cy}
-        r={isActive || isLast ? 5 : 3}
-        fill={isLast ? trendColor : '#fff'}
-        stroke={trendColor}
-        strokeWidth={2}
-        initial={{ scale: 0 }}
-        animate={{ scale: 1 }}
-        transition={{ delay: 0.5 + index * 0.1, type: 'spring' }}
-        style={{
-          filter: isLast ? `drop-shadow(0 0 6px ${trendColor})` : undefined,
-        }}
-      />
-    </motion.g>
-  )
-}
-
 /**
  * TrendKPIChart - Premium trend visualization with gradient area
  * 
@@ -112,7 +32,6 @@ export function TrendKPIChart({
   kpi,
   currentLabel,
 }: TrendKPIChartProps) {
-  const svgId = useId().replace(/:/g, '')
   const [mounted, setMounted] = useState(false)
   const [activeIndex, setActiveIndex] = useState<number | null>(null)
   
@@ -145,8 +64,73 @@ export function TrendKPIChart({
   // Determine if trend is up or down
   const trendUp = series.length >= 2 && series[series.length - 1].value >= series[0].value
   const trendColor = trendUp ? '#10B981' : '#EF4444'
-  const trendGradientId = `trendGradient-${svgId}`
-  const trendGlowId = `trendGlow-${svgId}`
+  const trendGradientId = `trendGradient-${Math.random().toString(36).slice(2)}`
+  const trendGlowId = `trendGlow-${Math.random().toString(36).slice(2)}`
+
+  // Custom tooltip
+  const CustomTooltip = ({ active, payload }: any) => {
+    if (!active || !payload?.length) return null
+    const entry = payload[0]
+    return (
+      <motion.div
+        initial={{ opacity: 0, y: 5 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="bg-white/95 dark:bg-gray-900/95 backdrop-blur-sm px-3 py-2 rounded-lg shadow-xl border border-gray-200/50 dark:border-gray-700/50"
+      >
+        <p className="text-xs font-semibold text-gray-900 dark:text-gray-100">
+          {entry?.payload?.label}
+        </p>
+        <p className="text-sm font-bold tabular-nums" style={{ color: trendColor }}>
+          {formatKpiValue(Number(entry?.value ?? 0), kpi.unit)}
+        </p>
+      </motion.div>
+    )
+  }
+
+  // Animated dot component
+  const AnimatedDot = (props: any) => {
+    const { cx, cy, index } = props
+    const isLast = index === series.length - 1
+    const isActive = activeIndex === index
+    
+    return (
+      <motion.g>
+        {/* Glow ring for last point */}
+        {isLast && (
+          <motion.circle
+            cx={cx}
+            cy={cy}
+            r={8}
+            fill="none"
+            stroke={trendColor}
+            strokeWidth={2}
+            initial={{ scale: 0.5, opacity: 0 }}
+            animate={{ 
+              scale: [1, 1.5, 1],
+              opacity: [0.5, 0, 0.5],
+            }}
+            transition={{ duration: 2, repeat: Infinity }}
+          />
+        )}
+        
+        {/* Main dot */}
+        <motion.circle
+          cx={cx}
+          cy={cy}
+          r={isActive || isLast ? 5 : 3}
+          fill={isLast ? trendColor : '#fff'}
+          stroke={trendColor}
+          strokeWidth={2}
+          initial={{ scale: 0 }}
+          animate={{ scale: 1 }}
+          transition={{ delay: 0.5 + index * 0.1, type: 'spring' }}
+          style={{
+            filter: isLast ? `drop-shadow(0 0 6px ${trendColor})` : undefined,
+          }}
+        />
+      </motion.g>
+    )
+  }
 
   return (
     <motion.div
@@ -282,7 +266,7 @@ export function TrendKPIChart({
                   
                   <XAxis dataKey="label" hide />
                   <YAxis hide domain={['auto', 'auto']} />
-                  <Tooltip content={<TrendTooltip trendColor={trendColor} unit={kpi.unit} />} cursor={false} />
+                  <Tooltip content={<CustomTooltip />} cursor={false} />
                   
                   {/* Area fill */}
                   <Area
@@ -300,7 +284,7 @@ export function TrendKPIChart({
                     dataKey="value"
                     stroke={trendColor}
                     strokeWidth={3}
-                    dot={<TrendDot seriesLength={series.length} activeIndex={activeIndex} trendColor={trendColor} />}
+                    dot={<AnimatedDot />}
                     activeDot={{ r: 6, fill: trendColor, stroke: '#fff', strokeWidth: 2 }}
                     isAnimationActive={mounted}
                     animationDuration={1500}

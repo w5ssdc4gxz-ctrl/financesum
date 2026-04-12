@@ -1,6 +1,6 @@
 'use client'
 
-import { Suspense, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
 import Navbar from '@/components/Navbar'
@@ -9,27 +9,7 @@ import { billingApi } from '@/lib/api-client'
 
 const CHECKOUT_SESSION_STORAGE_KEY = 'financesum.checkout.session_id'
 
-function BillingSuccessFallback() {
-  return (
-    <div className="min-h-screen bg-white">
-      <Navbar />
-      <main className="container mx-auto max-w-2xl px-4 pt-28 pb-16">
-        <h1 className="text-3xl font-black tracking-tight text-black">Payment successful</h1>
-        <p className="mt-3 text-sm text-muted-foreground">Finalizing your subscription...</p>
-      </main>
-    </div>
-  )
-}
-
 export default function BillingSuccessPage() {
-  return (
-    <Suspense fallback={<BillingSuccessFallback />}>
-      <BillingSuccessContent />
-    </Suspense>
-  )
-}
-
-function BillingSuccessContent() {
   const router = useRouter()
   const params = useSearchParams()
   const { user, session, loading: authLoading } = useAuth()

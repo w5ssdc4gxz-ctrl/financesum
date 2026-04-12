@@ -1,13 +1,8 @@
 'use client'
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import { User, Session } from '@supabase/supabase-js'
 import { supabase } from '@/lib/supabase'
-import {
-  identifyPostHogUser,
-  resetPostHogUser,
-  trackPostHogEvent,
-} from '@/lib/posthog-client'
 
 interface AuthContextType {
   user: User | null
@@ -99,7 +94,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
   const [session, setSession] = useState<Session | null>(null)
   const [loading, setLoading] = useState(true)
-  const identifiedUserIdRef = useRef<string | null>(null)
   const [demoMode, setDemoMode] = useState<boolean>(
     AUTH_MODE === 'demo' || (SUPABASE_CONFIG_MISMATCH && ALLOW_DEMO_FALLBACK)
   )
@@ -246,46 +240,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(demoUser)
     setSession(null)
     setLoading(false)
-    trackPostHogEvent('auth_demo_session_started', {
-      auth_mode: 'demo',
-      reason: 'fallback_or_manual',
-    })
     return demoUser
   }
 
-  useEffect(() => {
-    if (loading) return
-
-    const currentUserId = user?.id ?? null
-    if (currentUserId) {
-      if (identifiedUserIdRef.current === currentUserId) return
-
-      identifyPostHogUser(currentUserId, {
-        email: user?.email ?? null,
-        auth_mode: resolvedDemoMode ? 'demo' : 'supabase',
-      })
-      trackPostHogEvent('auth_session_active', {
-        auth_mode: resolvedDemoMode ? 'demo' : 'supabase',
-      })
-      identifiedUserIdRef.current = currentUserId
-      return
-    }
-
-    if (identifiedUserIdRef.current !== null) {
-      trackPostHogEvent('auth_session_cleared', {
-        auth_mode: resolvedDemoMode ? 'demo' : 'supabase',
-      })
-      resetPostHogUser()
-      identifiedUserIdRef.current = null
-    }
-  }, [loading, resolvedDemoMode, user?.email, user?.id])
-
   const signInHandler = async () => {
-    trackPostHogEvent('auth_sign_in_started', {
-      auth_mode: resolvedDemoMode ? 'demo' : 'supabase',
-      provider: resolvedDemoMode ? 'demo' : 'google',
-    })
-
     if (resolvedDemoMode) {
       startDemoSession()
       return
@@ -295,9 +253,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const message = `Supabase project mismatch: URL (${SUPABASE_URL_PROJECT_REF ?? 'unknown'}) vs anon key (${SUPABASE_ANON_KEY_REF ?? 'unknown'}). Update your environment variables so they reference the same project.`
       if (ALLOW_DEMO_FALLBACK) {
         startDemoSession()
-        trackPostHogEvent('auth_demo_fallback_triggered', {
-          reason: 'supabase_project_mismatch',
-        })
         throw new Error(`${message} Started a local demo session instead.`)
       }
       throw new Error(message)
@@ -314,9 +269,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!supabaseConfigured || providerDisabled) {
       if (ALLOW_DEMO_FALLBACK) {
         startDemoSession()
-        trackPostHogEvent('auth_demo_fallback_triggered', {
-          reason: providerDisabled ? 'provider_disabled' : 'provider_not_configured',
-        })
         throw new Error(
           'Supabase Google sign-in is disabled or not configured. Started a local demo session instead. Enable the Google provider in Supabase Auth when you are ready for real logins.'
         )
@@ -351,26 +303,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       if (providerDisabled && ALLOW_DEMO_FALLBACK) {
         startDemoSession()
-        trackPostHogEvent('auth_demo_fallback_triggered', {
-          reason: 'provider_disabled_during_oauth',
-        })
         throw new Error(
           'Supabase Google sign-in is not enabled. Started a local demo session instead. Enable the Google provider in Supabase Auth to use real logins.'
         )
       }
 
-      trackPostHogEvent('auth_sign_in_failed', {
-        reason: 'oauth_start_failed',
-      })
       throw new Error(message)
     }
   }
 
   const signOutHandler = async () => {
-    trackPostHogEvent('auth_sign_out', {
-      auth_mode: resolvedDemoMode ? 'demo' : 'supabase',
-    })
-
     if (resolvedDemoMode) {
       if (typeof window !== 'undefined') {
         window.localStorage.removeItem(DEMO_STORAGE_KEY)
@@ -378,8 +320,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
       setUser(null)
       setSession(null)
-      resetPostHogUser()
-      identifiedUserIdRef.current = null
       if (AUTH_MODE !== 'demo') {
         setDemoMode(false)
       }
@@ -399,6 +339,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
+
 
 
 

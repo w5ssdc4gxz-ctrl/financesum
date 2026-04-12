@@ -341,26 +341,6 @@ _FILLER_SENTENCES = [
     "leadership sequences investments",
 ]
 
-_VAGUE_ENDING_PHRASES = [
-    "if that execution slips",
-    "if that changes",
-    "remains to be seen",
-    "time will tell",
-    "only time will tell",
-    "the jury is still out",
-    "that remains the question",
-    "we will have to wait and see",
-    "the market will decide",
-    "if things change",
-    "should that shift",
-    "if the environment shifts",
-    "if conditions deteriorate",
-    "that is the real question",
-    "how that plays out",
-    "what happens next matters",
-    "what happens if that slips",
-]
-
 # Patterns that detect garbled / incomplete sentences produced by LLM padding
 _GARBLED_SENTENCE_RE = re.compile(
     r"(?:"
@@ -390,8 +370,6 @@ _SELF_REF_RE = re.compile(
     r"|[Tt]he Key Metrics (?:below |above |section )?show"
     r"|[Tt]hese [\w\s]* (?:are|is) tracked in"
     r"|[Aa]s the [\w\s]+ section (?:shows|details|explores|covers)"
-    r"|(?:the )?more useful read[- ]through belongs in the [\w\s]+"
-    r"|belongs in the (?:Executive Summary|Financial Performance|Management Discussion|MD&A|Risk Factors|Closing Takeaway)"
     r"|which is the key issue for the [\w\s]+"
     r"|the key (?:issue|question|point) for the (?:Executive Summary|Financial Performance|MD&A|Risk Factors|Closing Takeaway|Financial Health Rating)"
     r")",
@@ -428,17 +406,6 @@ def detect_filler_phrases(text: str) -> List[str]:
     # Check for garbled / incomplete sentences (LLM padding artifacts)
     found.extend(find_garbled_sentences(text))
 
-    # Check for vague ending phrases in section-final sentences
-    for _section_name, body in _split_sections(text):
-        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", str(body or "").strip()) if s.strip()]
-        if not sentences:
-            continue
-        last_sent_lower = sentences[-1].lower()
-        for vague in _VAGUE_ENDING_PHRASES:
-            if vague in last_sent_lower:
-                found.append(f"Vague ending: {sentences[-1][:80]}")
-                break
-
     return found
 
 
@@ -459,56 +426,6 @@ def find_garbled_sentences(text: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Concept-level repetition detection — synonym-normalized phrase patterns
-# ---------------------------------------------------------------------------
-
-_FUND_WORDS = ("funding", "fueling", "supporting", "enabling", "powering")
-_BUILD_WORDS = ("buildout", "build-out", "investment", "reinvestment", "expansion", "spending")
-_CASHGEN_WORDS = ("cash generation", "cash flow", "free cash flow", "cash conversion")
-_MARGIN_WORDS = ("margin strength", "operating leverage", "margin quality", "margin expansion")
-
-
-def detect_concept_repetitions(text: str, threshold: int = 3) -> List[str]:
-    """Detect repeated conceptual phrases (synonym-normalized patterns).
-
-    Returns a list of concept pattern descriptions that appear *threshold*+ times.
-    """
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-    concept_counts: Dict[str, int] = {}
-    concept_examples: Dict[str, str] = {}
-
-    for sent in sentences:
-        lower = sent.lower()
-        # Check for concept pairs: [funding-type word] + [building-type word]
-        for fund_word in _FUND_WORDS:
-            for build_word in _BUILD_WORDS:
-                if fund_word in lower and build_word in lower:
-                    key = "fund+build"
-                    concept_counts[key] = concept_counts.get(key, 0) + 1
-                    concept_examples.setdefault(key, sent.strip()[:80])
-        # Check for [cashgen-type word] + [building-type word]
-        for cash_word in _CASHGEN_WORDS:
-            for build_word in _BUILD_WORDS:
-                if cash_word in lower and build_word in lower:
-                    key = "cashgen+build"
-                    concept_counts[key] = concept_counts.get(key, 0) + 1
-                    concept_examples.setdefault(key, sent.strip()[:80])
-        # Check for [margin-type word] + [funding-type word]
-        for margin_word in _MARGIN_WORDS:
-            for fund_word in _FUND_WORDS:
-                if margin_word in lower and fund_word in lower:
-                    key = "margin+fund"
-                    concept_counts[key] = concept_counts.get(key, 0) + 1
-                    concept_examples.setdefault(key, sent.strip()[:80])
-
-    return [
-        f"Repeated concept '{key}' ({count}x, e.g., '{concept_examples[key]}')"
-        for key, count in concept_counts.items()
-        if count >= threshold
-    ]
-
-
-# ---------------------------------------------------------------------------
 # Analyst fog detection — jargon that sounds sophisticated but says nothing
 # ---------------------------------------------------------------------------
 
@@ -526,17 +443,12 @@ _ANALYST_FOG_PHRASES = [
     "the cleanest read",
     "visibility inflection",
     "monetization runway",
-    "the next proof point is",
-    "the question now is",
     "the underwriting call",
     "cash conversion optionality",
     "margin absorption",
     "operating leverage thesis",
-    "that is the lens",
-    "the thesis breaks if",
     "the underwriting still works",
     "the underwriting case",
-    "the underwriting case holds if",
     "growth visibility",
     "earnings power translation",
     "capital deployment thesis",
@@ -583,12 +495,6 @@ _BOILERPLATE_QUOTE_PATTERNS = [
     ),
     re.compile(
         r"(?:fair\s+value|carrying\s+(?:value|amount))\s+(?:of|is\s+determined)",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"(?:federal\s+foreign\s+tax\s+credits?|foreign\s+tax\s+credits?|"
-        r"excess\s+tax\s+benefits?|effective\s+tax\s+rate|deferred\s+tax|"
-        r"valuation\s+allowance)",
         re.IGNORECASE,
     ),
 ]
@@ -745,7 +651,6 @@ def check_repetition(text: str) -> RepetitionReport:
     # Scan n-grams from 5-word (cross-section phrases) up to 12-word
     for n in range(5, 13):
         repeated_ngrams.extend(detect_repeated_ngrams(text, n=n))
-    repeated_ngrams.extend(detect_concept_repetitions(text, threshold=3))
     repeated_ngrams = list(dict.fromkeys(repeated_ngrams))
     repeated_trailing = detect_repeated_trailing_phrases(text)
     placeholder_number_artifacts = detect_placeholder_number_artifacts(text)

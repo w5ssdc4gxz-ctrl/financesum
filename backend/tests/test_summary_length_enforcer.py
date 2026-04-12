@@ -127,57 +127,6 @@ def test_cleanup_sentence_artifacts_removes_stray_quotes_and_fragments() -> None
     assert "held." in cleaned
 
 
-def test_truncate_text_to_word_limit_avoids_shipping_cut_off_tail_fragments() -> None:
-    text = (
-        "The industrial buildout is getting more expensive, but demand is still visible in backlog. "
-        "The question now is whether Ferrari can keep margins high while this investment cycle stays elevated. "
-        "Investors should watch backlog conversion and any change in the customer mix."
-    )
-
-    truncated = filings_api._truncate_text_to_word_limit(text, 24)
-
-    lowered = truncated.lower()
-    assert "is getting." not in lowered
-    assert "cycle stays." not in lowered
-    assert "change in the." not in lowered
-    assert truncated.endswith((".", "!", "?"))
-
-
-def test_truncate_text_to_word_limit_never_seals_auxiliary_or_preposition_fragments() -> None:
-    text = (
-        "The product cadence can absorb more launches if execution stays disciplined. "
-        "That only works without letting channel inventory drift higher while pricing resets. "
-        "Investors should watch launches, sell-through, and any change in the installed-base mix."
-    )
-
-    truncated = filings_api._truncate_text_to_word_limit(text, 19)
-    lowered = truncated.lower()
-
-    assert "product cadence can." not in lowered
-    assert "without letting." not in lowered
-    assert "change in the." not in lowered
-    assert truncated.endswith((".", "!", "?"))
-
-
-def test_summary_has_incomplete_tail_detects_punctuated_fragment() -> None:
-    summary = (
-        "## Executive Summary\n"
-        "The setup is improving.\n\n"
-        "## Financial Performance\n"
-        "Revenue and margin both improved.\n\n"
-        "## Management Discussion & Analysis\n"
-        "Management is scaling spend carefully.\n\n"
-        "## Risk Factors\n"
-        "Capacity Ramp Risk: If utilization slips, returns can flatten.\n\n"
-        "## Key Metrics\n"
-        "DATA_GRID_START\nRevenue | $1.0B\nOperating Margin | 20.0%\nFree Cash Flow | $0.2B\nCurrent Ratio | 2.0x\nNet Debt | $0.1B\nDATA_GRID_END\n\n"
-        "## Closing Takeaway\n"
-        "Investors should watch any change in the."
-    )
-
-    assert filings_api._summary_has_incomplete_tail(summary) is True
-
-
 def test_enforce_summary_target_length_caps_to_global_max_when_no_target() -> None:
     base = _make_words(TARGET_LENGTH_MAX_WORDS + 25, "word")
     enforced = enforce_summary_target_length(base, None, tolerance=0)

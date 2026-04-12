@@ -19,10 +19,10 @@ export function TypewriterText({
 }: TypewriterTextProps) {
   const [displayText, setDisplayText] = useState('')
   const [isComplete, setIsComplete] = useState(false)
+  const indexRef = useRef(0)
   const animationRef = useRef<number>()
   const onCompleteRef = useRef(onComplete)
   const textRef = useRef(text)
-  const renderedIndexRef = useRef(0)
   
   useEffect(() => {
     onCompleteRef.current = onComplete
@@ -30,39 +30,27 @@ export function TypewriterText({
 
   useEffect(() => {
     textRef.current = text
-    renderedIndexRef.current = 0
+    indexRef.current = 0
     setDisplayText('')
     setIsComplete(false)
+    
+    const charsPerFrame = Math.max(1, Math.floor(speed / 60))
+    const interval = 1000 / 60
 
-    if (!text) {
-      setIsComplete(true)
-      onCompleteRef.current?.()
-      return
-    }
-
-    let startTime: number | null = null
+    let lastTime = 0
 
     const animate = (currentTime: number) => {
-      if (startTime == null) {
-        startTime = currentTime
+      if (currentTime - lastTime >= interval) {
+        if (indexRef.current < textRef.current.length) {
+          indexRef.current = Math.min(indexRef.current + charsPerFrame, textRef.current.length)
+          setDisplayText(textRef.current.slice(0, indexRef.current))
+          lastTime = currentTime
+        } else {
+          setIsComplete(true)
+          onCompleteRef.current?.()
+          return
+        }
       }
-
-      const nextIndex = Math.min(
-        textRef.current.length,
-        Math.max(1, Math.floor(((currentTime - startTime) * Math.max(speed, 1)) / 1000)),
-      )
-
-      if (nextIndex !== renderedIndexRef.current) {
-        renderedIndexRef.current = nextIndex
-        setDisplayText(textRef.current.slice(0, nextIndex))
-      }
-
-      if (nextIndex >= textRef.current.length) {
-        setIsComplete(true)
-        onCompleteRef.current?.()
-        return
-      }
-
       animationRef.current = requestAnimationFrame(animate)
     }
 

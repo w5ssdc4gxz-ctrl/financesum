@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useEffect, useId } from 'react'
+import React, { useState, useEffect } from 'react'
 import { motion, useSpring, useTransform } from 'framer-motion'
 import { useGSAP } from '@gsap/react'
 import gsap from 'gsap'
@@ -34,7 +34,6 @@ export function RadialGaugeChart({
   currentLabel,
   priorLabel,
 }: RadialGaugeChartProps) {
-  const svgId = useId().replace(/:/g, '')
   const [mounted, setMounted] = useState(false)
   const [isHovered, setIsHovered] = useState(false)
   
@@ -103,8 +102,8 @@ export function RadialGaugeChart({
   }
   
   const colors = getColors()
-  const gradientId = `radialGaugeGradient-${svgId}`
-  const glowId = `radialGaugeGlow-${svgId}`
+  const gradientId = `radialGaugeGradient-${Math.random().toString(36).slice(2)}`
+  const glowId = `radialGaugeGlow-${Math.random().toString(36).slice(2)}`
 
   return (
     <motion.div

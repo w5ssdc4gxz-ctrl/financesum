@@ -6183,59 +6183,6 @@ def _validate_complete_sentences(text: str) -> str:
     return "\n".join(validated_lines)
 
 
-def _strip_trailing_fragment_clause(text: str) -> str:
-    """Remove obvious cut-off tail fragments before we seal punctuation."""
-    working = " ".join(str(text or "").split()).strip()
-    if not working:
-        return ""
-
-    had_terminal_punct = bool(re.search(r'[.!?](?:["\')\]]+)?\s*$', working))
-    working = re.sub(r'[.!?](?:["\')\]]+)?\s*$', "", working).rstrip()
-
-    fragment_clause_re = re.compile(
-        r"(?:,\s*)?(?:and|but|or|while|without)\s+[^.?!,:;]{0,80}$",
-        re.IGNORECASE,
-    )
-    dangling_token_re = re.compile(
-        r"\b(?:of|at|to|for|with|without|in|on|by|from|about|the|a|an|and|but|or|"
-        r"while|although|however|which|that|than|as|can|could|should|would|will|"
-        r"may|might|must)\b$",
-        re.IGNORECASE,
-    )
-
-    guard = 0
-    while working and guard < 6:
-        updated = fragment_clause_re.sub("", working).rstrip(" ,;:")
-        updated = dangling_token_re.sub("", updated).rstrip(" ,;:")
-        if updated == working:
-            break
-        working = updated
-        guard += 1
-
-    if had_terminal_punct and working and not working.endswith((".", "!", "?")):
-        working += "."
-    return working
-
-
-def _tail_looks_incomplete_fragment(tail: str) -> bool:
-    normalized = " ".join(str(tail or "").split()).strip()
-    if not normalized:
-        return False
-
-    core = re.sub(r'[.!?](?:["\')\]]+)?\s*$', "", normalized).strip()
-    if not core:
-        return False
-
-    fragment_patterns = (
-        r"\b(?:of|at|to|for|with|without|in|on|by|from|about|the|a|an|and|but|or|"
-        r"while|although|however|which|that|than|as|can|could|should|would|will|"
-        r"may|might|must)$",
-        r"(?:,\s*)?(?:and|but|or|while|without)\s+[^.?!,:;]{0,80}$",
-        r"\b(?:is|are|was|were)\s+(?:getting|keeping|letting|making|becoming|staying)$",
-    )
-    return any(re.search(pattern, core, re.IGNORECASE) for pattern in fragment_patterns)
-
-
 def _summary_has_incomplete_tail(text: str) -> bool:
     """Detect summaries that still end mid-thought after cleanup passes."""
     if not text:
@@ -6255,8 +6202,6 @@ def _summary_has_incomplete_tail(text: str) -> bool:
     if tail.startswith("→"):
         return False
     if not tail.endswith((".", "!", "?")):
-        return True
-    if _tail_looks_incomplete_fragment(tail):
         return True
 
     incomplete_patterns = (
@@ -6307,10 +6252,7 @@ def _truncate_text_to_word_limit(text: str, max_words: int) -> str:
     truncated = text[:cutoff_index].rstrip()
 
     def _sealed_fragment(value: str) -> str:
-        value = _strip_trailing_fragment_clause((value or "").rstrip())
-        value = _validate_complete_sentences(value).strip()
-        if _tail_looks_incomplete_fragment(value):
-            value = _strip_trailing_fragment_clause(value).strip()
+        value = (value or "").rstrip()
         if value and not value.endswith((".", "!", "?")):
             value += "."
         return value
@@ -11345,69 +11287,6 @@ def _canonicalize_key_metrics_section(
     )
 
 
-def _canonicalize_key_metrics_section_compat(
-    summary_text: str,
-    metrics_lines: str,
-    *,
-    max_words: Optional[int] = None,
-    what_matters_lines: Optional[List[str]] = None,
-) -> str:
-    """Backward-compatible wrapper for older smoke and test helpers."""
-    text = _canonicalize_key_metrics_section(
-        summary_text,
-        metrics_lines,
-        what_matters_lines=what_matters_lines,
-    )
-    if not text or not max_words or int(max_words) <= 0:
-        return text
-    original_body = _extract_markdown_section_body(text, "Key Metrics") or ""
-    if not original_body or _count_words(original_body) <= int(max_words):
-        return text
-    key_metrics_body = original_body
-
-    def _compact_grid_rows(body: str) -> str:
-        lines = str(body or "").splitlines()
-        compacted: List[str] = []
-        in_grid = False
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            if stripped.upper() == "DATA_GRID_START":
-                in_grid = True
-                compacted.append("DATA_GRID_START")
-                continue
-            if stripped.upper() == "DATA_GRID_END":
-                in_grid = False
-                compacted.append("DATA_GRID_END")
-                continue
-            if not in_grid or "|" not in stripped:
-                continue
-            label, value = stripped.split("|", 1)
-            compact_value = value.strip().split()[0] if value.strip() else ""
-            compacted.append(f"{label.strip()}| {compact_value}".rstrip())
-        return "\n".join(compacted).strip()
-
-    intro_lines, remainder = _split_key_metrics_intro_and_remainder(key_metrics_body)
-    if intro_lines and remainder:
-        key_metrics_body = remainder.strip()
-    trimmed_body = _trim_appendix_preserving_rows(key_metrics_body, int(max_words))
-    if (
-        trimmed_body
-        and _count_words(trimmed_body) > int(max_words)
-        and remainder
-        and remainder.strip() != trimmed_body.strip()
-    ):
-        trimmed_body = _trim_appendix_preserving_rows(remainder.strip(), int(max_words))
-    if trimmed_body and _count_words(trimmed_body) > int(max_words):
-        compact_grid = _compact_grid_rows(trimmed_body)
-        if compact_grid and _count_words(compact_grid) <= int(max_words):
-            trimmed_body = compact_grid
-    if not trimmed_body or trimmed_body == original_body:
-        return text
-    return _replace_markdown_section_body(text, "Key Metrics", trimmed_body)
-
-
 def _ensure_health_to_exec_bridge(
     summary_text: str, *, target_length: Optional[int] = None
 ) -> str:
@@ -11992,33 +11871,6 @@ def _apply_contract_structural_repairs(
                     body,
                     budget_words=closing_budget,
                 )
-            current_closing_words = _count_words(body)
-            room_to_upper = max(
-                0,
-                int(closing_budget + closing_tol) - int(current_closing_words),
-            )
-            if (
-                int(current_closing_words) < int(closing_lower_bound)
-                and room_to_upper > 0
-            ):
-                addition = ""
-                for attempt_idx in range(8):
-                    candidate = _section_balance_top_up_sentence(
-                        "Closing Takeaway",
-                        attempt=attempt_idx,
-                        existing_body=body,
-                    )
-                    if (
-                        candidate
-                        and _count_words(candidate) <= int(room_to_upper)
-                        and not _section_body_contains_equivalent_sentence(
-                            body, candidate
-                        )
-                    ):
-                        addition = candidate
-                        break
-                if addition:
-                    body = _append_sentence(body, addition)
             body = _ensure_terminal_sentence(body)
 
         text = _replace_markdown_section_body(text, section_title, body)
@@ -14704,44 +14556,6 @@ def _apply_short_form_structural_seal(
             calculated_metrics=calculated_metrics,
             persona_requested=bool(persona_requested or persona_name),
         )
-        risk_body = _extract_markdown_section_body(text, "Risk Factors") or ""
-        if risk_body.strip() and target_length:
-            risk_budget_words = int(
-                _calculate_section_word_budgets(
-                    int(target_length),
-                    include_health_rating=include_health_rating,
-                ).get("Risk Factors", 0)
-                or 0
-            )
-            if risk_budget_words > 0:
-                normalized_risk_body, risk_info = _normalize_risk_factors_section_body(
-                    risk_body,
-                    risk_budget_words=risk_budget_words,
-                    risk_factors_excerpt=risk_factors_excerpt or "",
-                    calculated_metrics=calculated_metrics,
-                    health_score_data=health_score_data,
-                    rewrite_risk_name_fn=lambda name: _rewrite_generic_risk_name_for_repair(
-                        name,
-                        risk_factors_excerpt=risk_factors_excerpt or "",
-                    ),
-                    synthesize_risk_factors_addendum_fn=(
-                        _synthesize_risk_factors_addendum
-                        if "_synthesize_risk_factors_addendum" in globals()
-                        else None
-                    ),
-                )
-                if (
-                    normalized_risk_body
-                    and (
-                        risk_info.get("applied")
-                        or normalized_risk_body.strip() != risk_body.strip()
-                    )
-                ):
-                    text = _replace_markdown_section_body(
-                        text,
-                        "Risk Factors",
-                        normalized_risk_body,
-                    )
     text = _merge_duplicate_canonical_sections(
         text, include_health_rating=include_health_rating
     )
@@ -16480,71 +16294,33 @@ def _select_non_degradable_contract_requirements(
     items = [
         str(item) for item in (missing_requirements or []) if str(item or "").strip()
     ]
-    # Run structural detection to find missing/duplicate/extra sections.
-    structural = _select_short_form_structural_failure_requirements(
+    fatal = _select_short_form_structural_failure_requirements(
         summary_text=summary_text,
         missing_requirements=items,
         include_health_rating=include_health_rating,
         enforce_section_balance=False,
     )
-    # Only keep truly non-degradable structural issues (missing/duplicate/extra
-    # sections, missing Buy/Hold/Sell).  Minor editorial issues like "ends
-    # mid-thought", "too brief", word-band violations, and key-metrics format
-    # warnings remain degradable so the user always gets a summary.
-    degradable_snippets = (
-        "ends mid-thought",
-        "word-count band violation",
-        "word target",
-        "section is too brief",
-        "key metrics must",
-        "extra section heading detected: '## financial health rating'",
-        "missing the heading '## closing takeaway'",
-    )
-    fatal: List[str] = []
-    seen: Set[str] = set()
-    for item in structural:
-        normalized = " ".join(str(item or "").split()).strip().lower()
-        if not normalized or normalized in seen:
-            continue
-        if any(snippet in normalized for snippet in degradable_snippets):
-            continue
-        seen.add(normalized)
-        fatal.append(item)
-
+    seen = {
+        " ".join(str(item or "").split()).strip().lower()
+        for item in fatal
+        if str(item or "").strip()
+    }
     risk_schema_snippets = (
         "risk factors are not in the required format",
         "risk factors lack filing grounding",
-    )
-    hard_fail_snippets = (
-        "instruction leak detected",
-        "forbidden phrase detected",
-        "prompt residue",
     )
 
     for item in items:
         normalized = " ".join(str(item or "").split()).strip().lower()
         if not normalized:
             continue
-        if (
-            _is_risk_specificity_requirement(normalized)
-            or any(snippet in normalized for snippet in risk_schema_snippets)
-            or any(snippet in normalized for snippet in hard_fail_snippets)
+        if _is_risk_specificity_requirement(normalized) or any(
+            snippet in normalized for snippet in risk_schema_snippets
         ):
             if normalized not in seen:
                 seen.add(normalized)
                 fatal.append(item)
     return fatal
-
-
-def _is_recoverable_timeout_global_failure(message: Any) -> bool:
-    normalized = " ".join(str(message or "").split()).strip().lower()
-    if not normalized:
-        return False
-    return (
-        "under word target" in normalized
-        or "duplicate sentences detected" in normalized
-        or "near-duplicate paragraphs detected" in normalized
-    )
 
 
 def _summary_payload_is_fast_cache_eligible(
@@ -16563,30 +16339,6 @@ def _summary_payload_is_fast_cache_eligible(
     missing_requirements = list(summary_meta.get("contract_missing_requirements") or [])
     if not missing_requirements:
         missing_requirements = list(payload.get("contract_warnings") or [])
-    fast_mode_payload = bool(
-        str(payload.get("quality_mode") or "").strip().lower() == "fast"
-        or bool(summary_meta.get("fast_summary_mode"))
-    )
-    if fast_mode_payload:
-        if "## " not in summary_text:
-            return False
-        if _make_instruction_leak_validator()(summary_text):
-            return False
-        for item in missing_requirements:
-            normalized = " ".join(str(item or "").split()).strip().lower()
-            if not normalized:
-                continue
-            if (
-                _is_risk_specificity_requirement(normalized)
-                or "risk factors lack filing grounding" in normalized
-                or "instruction leak detected" in normalized
-                or "forbidden phrase detected" in normalized
-                or "prompt residue" in normalized
-            ):
-                return False
-        if include_health_rating and _validated_health_score_value(payload.get("health_score")) is None:
-            return False
-        return True
     if _select_non_degradable_contract_requirements(
         summary_text=summary_text,
         missing_requirements=missing_requirements,
@@ -18162,13 +17914,9 @@ def _repair_brief_sections_deterministically(
                 attempts += 1
                 continue
 
-            addition_budget = max(
-                int(remaining_words),
-                18 if section_title in {"Risk Factors", "Closing Takeaway"} else 14,
-            )
             addition = _section_balance_micro_top_up_sentence(
                 section_title,
-                max_words=int(addition_budget),
+                max_words=int(remaining_words),
                 existing_body=body,
             )
             if not addition:
@@ -18489,33 +18237,7 @@ def _looks_like_placeholder_balance_text(text: str) -> bool:
 
 
 def _low_signal_section_balance_sentences(section_title: str) -> List[str]:
-    fallbacks: Dict[str, List[str]] = {
-        "Financial Health Rating": [
-            "Liquidity still has to absorb the current investment cycle without shrinking the margin for error.",
-            "The balance-sheet read only holds if cash discipline remains intact through the next operating turn.",
-        ],
-        "Executive Summary": [
-            "The setup still needs the next quarter to turn the narrative into operating proof.",
-            "What matters now is whether the operating evidence catches up with the story.",
-        ],
-        "Financial Performance": [
-            "The quarter only reads well if margin quality and cash conversion keep moving together.",
-            "Reported strength matters less than whether the cash outcome is reinforcing it.",
-        ],
-        "Management Discussion & Analysis": [
-            "Management still has to turn the current plan into cleaner operating proof over the next few quarters.",
-            "The strategy only gets more credible if execution starts showing up in the operating details.",
-        ],
-        "Risk Factors": [
-            "The downside usually becomes real before the headline results fully show it, so the earliest operating signal matters most.",
-            "The risk case gets more credible when the first supporting indicator starts weakening ahead of reported results.",
-        ],
-        "Closing Takeaway": [
-            "The current stance only works if the next operating check still supports it.",
-            "The view changes fastest when the supporting proof point starts to weaken.",
-        ],
-    }
-    return list(fallbacks.get(section_title, []))
+    return []
 
 
 def _company_anchor_sentences_for_balance(
@@ -18609,8 +18331,6 @@ def _section_balance_top_up_sentence(
         existing_body="",
         context_text=anchor_context,
     )
-    if not candidates:
-        candidates = _low_signal_section_balance_sentences(section_title)
     if not candidates:
         return ""
     attempt_idx = max(0, int(attempt or 0))
@@ -18762,8 +18482,6 @@ def _section_balance_micro_top_up_sentence(
         section_title,
         existing_body=str(existing_body or ""),
     )
-    if not candidates:
-        candidates = _low_signal_section_balance_sentences(section_title)
     for candidate in candidates:
         if _fits(candidate):
             return " ".join(candidate.split()).strip()
@@ -18832,12 +18550,7 @@ def _split_sentences(blob: str) -> List[str]:
     blob = (blob or "").strip()
     if not blob:
         return []
-    matches = re.findall(
-        r"\S.*?(?:[.!?](?:[\"')\]]+)?(?=\s+|$)|$)",
-        blob,
-        flags=re.DOTALL,
-    )
-    return [" ".join(match.split()).strip() for match in matches if match.strip()]
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", blob) if s.strip()]
 
 
 def _normalize_section_balance_sentence(sentence: str) -> str:
@@ -18863,46 +18576,27 @@ def _extract_risk_entries_for_repair(body: str) -> List[Tuple[str, str]]:
     if not cleaned_body:
         return entries
 
-    header_pattern = re.compile(
-        r"(?:(?<=\A)|(?<=\n)|(?<=[.!?]\s))(?:[-*]\s*)?"
-        r"(?:(?:\*\*(?P<bold_name>[^*\n]{2,160}?)\*\*\s*(?::|[-–—]|\.)\s*)"
-        r"|(?:\*\*(?P<bold_colon_name>[^*\n]{2,160}?):\*\*\s*)"
-        r"|(?:(?P<plain_name>[A-Z][A-Za-z0-9/&()'., -]{2,120}?)\s*:\s*))"
+    pattern = re.compile(
+        r"\*\*(.+?)\*\*\s*(?::|[-–—]|\.)\s*([\s\S]*?)(?=(?:\n\s*)?\*\*.+?\*\*\s*(?::|[-–—]|\.)|\Z)"
     )
+    for match in pattern.finditer(cleaned_body):
+        name = match.group(1).strip()
+        desc = " ".join((match.group(2) or "").split())
+        if name and desc:
+            entries.append((name, desc))
 
-    def _clean_name(raw_name: str) -> str:
-        name = " ".join(str(raw_name or "").split()).strip(" -–—:.;")
-        if not name:
-            return ""
-        if len(name.split()) > 10:
-            return ""
-        if re.match(
-            r"^(?:as the filing notes|the filing warns|the filing discloses|"
-            r"investors should watch|early[- ]warning signal|if|watch for)\b",
-            name,
-            re.IGNORECASE,
-        ):
-            return ""
-        return name
+    if entries:
+        return entries
 
-    valid_matches: List[Tuple[re.Match[str], str]] = []
-    for match in header_pattern.finditer(cleaned_body):
-        name = _clean_name(
-            match.group("bold_name")
-            or match.group("bold_colon_name")
-            or match.group("plain_name")
-            or ""
-        )
-        if name:
-            valid_matches.append((match, name))
-    for idx, (match, name) in enumerate(valid_matches):
-        start = int(match.end())
-        end = (
-            int(valid_matches[idx + 1][0].start())
-            if idx + 1 < len(valid_matches)
-            else len(cleaned_body)
-        )
-        desc = " ".join((cleaned_body[start:end] or "").split()).strip(" -–—:.;")
+    for line in cleaned_body.splitlines():
+        line = re.sub(r"^[\-\*]\s*", "", line.strip())
+        if not line:
+            continue
+        match = re.match(r"\*\*(.+?)\*\*\s*(?::|[-–—]|\.)\s*(.+)", line)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        desc = match.group(2).strip()
         if name and desc:
             entries.append((name, desc))
     return entries
@@ -20381,35 +20075,17 @@ def _normalize_risk_factors_section_body(
         desc: str,
     ) -> Optional[RiskEvidenceCandidate]:
         source_quote = _quoted_source(desc)
-        anchor_candidates: List[str] = []
-        seen_anchor_candidates: Set[str] = set()
-        for raw_anchor in list(
-            _risk_named_anchor_phrases_from_excerpt(source_quote or "", limit=6)
-        ) + list(
-            _risk_named_anchor_phrases_from_excerpt(name or "", limit=4)
-        ) + list(
-            extract_anchor_terms(
-                " ".join(part for part in (source_quote, name) if part),
-                company_terms=company_terms,
-                limit=6,
-            )
-        ):
-            cleaned_anchor = " ".join(str(raw_anchor or "").split()).strip()
-            anchor_key = _normalize_risk_name_for_repair(cleaned_anchor)
-            if (
-                not cleaned_anchor
-                or not anchor_key
-                or anchor_key in seen_anchor_candidates
-                or not _is_viable_risk_anchor_phrase(cleaned_anchor)
-            ):
-                continue
-            seen_anchor_candidates.add(anchor_key)
-            anchor_candidates.append(cleaned_anchor)
         base_candidate = RiskEvidenceCandidate(
             risk_name=str(name or "").strip(),
             source_section="Risk Factors",
             source_quote=source_quote,
-            source_anchor_terms=tuple(anchor_candidates[:6]),
+            source_anchor_terms=tuple(
+                extract_anchor_terms(
+                    " ".join(part for part in (source_quote, name) if part),
+                    company_terms=company_terms,
+                    limit=6,
+                )
+            ),
             mechanism_seed=str(desc or "").strip(),
             early_warning_seed=str(desc or "").strip(),
         )
@@ -20531,31 +20207,12 @@ def _normalize_risk_factors_section_body(
             if len(cleaned_entries) >= expected_risk_count:
                 break
 
-    anchor_fallback_candidates: List[str] = []
-    seen_anchor_fallbacks: Set[str] = set()
-    for raw_anchor in list(
+    anchor_fallback_candidates = list(
         _risk_named_anchor_phrases_from_excerpt(
             risk_factors_excerpt or "",
             limit=max(expected_risk_count * 3, 6),
         )
-    ) + list(
-        extract_anchor_terms(
-            risk_factors_excerpt or "",
-            company_terms=company_terms,
-            limit=max(expected_risk_count * 4, 8),
-        )
-    ):
-        cleaned_anchor = " ".join(str(raw_anchor or "").split()).strip()
-        anchor_key = _normalize_risk_name_for_repair(cleaned_anchor)
-        if (
-            not cleaned_anchor
-            or not anchor_key
-            or anchor_key in seen_anchor_fallbacks
-            or not _is_viable_risk_anchor_phrase(cleaned_anchor)
-        ):
-            continue
-        seen_anchor_fallbacks.add(anchor_key)
-        anchor_fallback_candidates.append(cleaned_anchor)
+    )
     synthesized_entries_added = False
     if (
         not cleaned_entries
@@ -20597,7 +20254,7 @@ def _normalize_risk_factors_section_body(
             if len(cleaned_entries) >= expected_risk_count:
                 break
 
-    if len(cleaned_entries) < expected_risk_count:
+    if not cleaned_entries and not strict_entries_added:
         for anchor in anchor_fallback_candidates:
             fixed_name = _filing_specific_risk_name_from_anchor(
                 anchor,
@@ -22627,9 +22284,7 @@ def _bounded_timeout_contract_repair(
             for failure in list(report.section_failures or [])
             if str(failure.code or "") in soft_section_codes
         ]
-        gap_bucket = min(9, int(total_gap) // 25)
         return (
-            int(gap_bucket),
             len(list(report.global_failures or [])) + len(fatal_section_failures),
             int(total_gap),
             float(
@@ -22715,7 +22370,7 @@ def _bounded_timeout_contract_repair(
                 current_text
                 and _has_recoverable_key_metrics_underflow(current_text)
                 and all(
-                    _is_recoverable_timeout_global_failure(message)
+                    "under word target" in str(message or "").lower()
                     for message in global_failures
                 )
             ):
@@ -23154,7 +22809,7 @@ def _bounded_timeout_contract_repair(
             and _has_recoverable_key_metrics_underflow(text)
             and list(validation.global_failures or [])
             and all(
-                _is_recoverable_timeout_global_failure(message)
+                "under word target" in str(message or "").lower()
                 for message in list(validation.global_failures or [])
             )
         ):
@@ -23182,9 +22837,6 @@ def _bounded_timeout_contract_repair(
                 ):
                     text = fast_key_metrics_text
                     validation = fast_key_metrics_validation
-                    if _validation_rank(validation) < _validation_rank(best_validation):
-                        best_text = text
-                        best_validation = validation
                     if validation.passed and not _has_key_metrics_contract_underflow(
                         text
                     ):
@@ -31558,45 +31210,16 @@ def generate_filing_summary(
         if not draft_summary:
             return None
 
-        def _has_timeout_summary_structure(text: str) -> bool:
-            body = str(text or "").strip()
-            if not body or "## " not in body:
-                return False
-            required_sections = (
-                "Executive Summary",
-                "Financial Performance",
-                "Management Discussion & Analysis",
-                "Risk Factors",
-                "Closing Takeaway",
-            )
-            return all(
-                _extract_markdown_section_body(body, section_name) is not None
-                for section_name in required_sections
-            )
-
-        response_summary = (
-            str(response_data.get("summary") or "").strip()
-            if isinstance(response_data, dict)
-            else ""
-        )
-        draft_is_structured = _has_timeout_summary_structure(draft_summary)
-        response_is_structured = _has_timeout_summary_structure(response_summary)
         payload: Dict[str, Any]
         if (
             isinstance(response_data, dict)
-            and response_summary
-            and response_is_structured
-            and (
-                not draft_is_structured
-                or _count_words(response_summary) >= _count_words(draft_summary)
-            )
+            and str(response_data.get("summary") or "").strip()
         ):
             payload = dict(response_data)
         else:
             final_word_count = int(
                 summary_meta.get("final_word_count") or _count_words(draft_summary)
             )
-            final_split_word_count = int(len((draft_summary or "").split()))
             current_section_counts = _collect_section_body_word_counts(
                 draft_summary,
                 include_health_rating=include_health_rating,
@@ -31623,7 +31246,6 @@ def generate_filing_summary(
                     ),
                     "target_length": int(target_length) if target_length else None,
                     "final_word_count": final_word_count,
-                    "final_split_word_count": final_split_word_count,
                     "final_word_delta": (
                         final_word_count - int(target_length) if target_length else 0
                     ),
@@ -31770,11 +31392,6 @@ def generate_filing_summary(
                     persona_name=selected_persona_name,
                     generation_stats=generation_stats,
                 )
-            timeout_global_failures = list(timeout_validation.global_failures or [])
-            timeout_has_only_recoverable_globals = bool(timeout_global_failures) and all(
-                _is_recoverable_timeout_global_failure(message)
-                for message in timeout_global_failures
-            )
             if (
                 not timeout_validation.passed
                 and not _is_soft_short_mid_validation(
@@ -31782,10 +31399,7 @@ def generate_filing_summary(
                     section_budgets=section_budgets,
                     target_length=target_length,
                 )
-                and (
-                    not timeout_global_failures
-                    or timeout_has_only_recoverable_globals
-                )
+                and not list(timeout_validation.global_failures or [])
             ):
                 timeout_flags = _issue_flags_from_validation_report(timeout_validation)
                 if (
@@ -31844,11 +31458,9 @@ def generate_filing_summary(
                     include_health_rating=include_health_rating,
                 )
                 timeout_final_wc = int(_count_words(repaired_summary))
-                timeout_final_split_wc = int(len((repaired_summary or "").split()))
                 timeout_meta = dict(payload.get("summary_meta") or {})
                 timeout_meta["target_length"] = int(target_length)
                 timeout_meta["final_word_count"] = int(timeout_final_wc)
-                timeout_meta["final_split_word_count"] = int(timeout_final_split_wc)
                 timeout_meta["final_word_delta"] = int(
                     timeout_final_wc - int(target_length)
                 )
@@ -31909,32 +31521,7 @@ def generate_filing_summary(
             generation_stats["timeout_fallback_contract_missing_requirements"] = list(
                 timeout_fallback_validation_failures
             )
-            best_timeout_summary = str(payload.get("summary") or "").strip()
-            non_degradable_timeout_requirements = (
-                _select_non_degradable_contract_requirements(
-                    summary_text=best_timeout_summary,
-                    missing_requirements=timeout_fallback_validation_failures,
-                    include_health_rating=include_health_rating,
-                )
-                if best_timeout_summary
-                else list(timeout_fallback_validation_failures)
-            )
-            if not non_degradable_timeout_requirements and best_timeout_summary:
-                timeout_meta = dict(payload.get("summary_meta") or {})
-                timeout_meta["contract_missing_requirements"] = list(
-                    timeout_fallback_validation_failures
-                )
-                timeout_meta["timeout_fallback_contract_verified"] = False
-                timeout_meta["timeout_fallback_contract_soft_miss"] = True
-                payload["summary_meta"] = timeout_meta
-                payload["contract_warnings"] = list(
-                    dict.fromkeys(
-                        list(payload.get("contract_warnings") or [])
-                        + list(timeout_fallback_validation_failures)
-                    )
-                )
-            else:
-                return None
+            return None
 
         payload["degraded"] = True
         payload["degraded_reason"] = str(reason or "timeout")
@@ -31946,32 +31533,23 @@ def generate_filing_summary(
         payload["contract_warnings"] = list(
             dict.fromkeys(payload.get("contract_warnings") or [])
         )
-        timeout_soft_miss = bool(
-            isinstance(payload.get("summary_meta"), dict)
-            and payload.get("summary_meta", {}).get(
-                "timeout_fallback_contract_soft_miss"
+        _raise_if_explicit_target_response_out_of_band(
+            filing_id=filing_id,
+            payload=payload,
+            target_length=target_length,
+            explicit_target_requested=explicit_target_requested,
+            summary_request_id=str(locals().get("summary_request_id") or "").strip()
+            or None,
+            missing_requirements=list(
+                payload.get("summary_meta", {}).get("contract_missing_requirements")
+                or []
             )
+            if isinstance(payload.get("summary_meta"), dict)
+            else list(missing_requirements or []),
+            detail_message=(
+                "Unable to satisfy explicit target word-count contract before timeout."
+            ),
         )
-        if not timeout_soft_miss:
-            _raise_if_explicit_target_response_out_of_band(
-                filing_id=filing_id,
-                payload=payload,
-                target_length=target_length,
-                explicit_target_requested=explicit_target_requested,
-                summary_request_id=str(locals().get("summary_request_id") or "").strip()
-                or None,
-                missing_requirements=list(
-                    payload.get("summary_meta", {}).get(
-                        "contract_missing_requirements"
-                    )
-                    or []
-                )
-                if isinstance(payload.get("summary_meta"), dict)
-                else list(missing_requirements or []),
-                detail_message=(
-                    "Unable to satisfy explicit target word-count contract before timeout."
-                ),
-            )
         return JSONResponse(content=payload)
 
     health_score_data: Optional[Dict[str, Any]] = None
@@ -31980,151 +31558,20 @@ def generate_filing_summary(
         exc_detail: Any,
     ) -> Optional[JSONResponse]:
         """Convert a 422 contract failure into a degraded 200 with the best summary."""
-        def _structured_timeout_candidate(text: str) -> bool:
-            body = str(text or "").strip()
-            if not body or "## " not in body:
-                return False
-            required_sections = (
-                "Executive Summary",
-                "Financial Performance",
-                "Management Discussion & Analysis",
-                "Risk Factors",
-                "Closing Takeaway",
-            )
-            return all(
-                _extract_markdown_section_body(body, section_name) is not None
-                for section_name in required_sections
-            )
-
-        def _structured_timeout_section_count(text: str) -> int:
-            body = str(text or "").strip()
-            if not body or "## " not in body:
-                return 0
-            required_sections = (
-                "Executive Summary",
-                "Financial Performance",
-                "Management Discussion & Analysis",
-                "Risk Factors",
-                "Closing Takeaway",
-            )
-            return sum(
-                1
-                for section_name in required_sections
-                if _extract_markdown_section_body(body, section_name) is not None
-            )
-
-        candidate_texts = [
-            str(summary_text or "").strip(),
-            (
-                str(response_data.get("summary") or "").strip()
-                if isinstance(response_data, dict)
-                else ""
-            ),
-        ]
-        best_text = ""
-        for candidate in candidate_texts:
-            if _structured_timeout_candidate(candidate):
-                best_text = candidate
-                break
-        if not best_text:
-            for candidate in candidate_texts:
-                if candidate:
-                    best_text = candidate
-                    break
-        if "## " in best_text:
-            repaired_best_text = best_text
-            try:
-                repaired_best_text = _fix_inline_section_headers(repaired_best_text)
-                repaired_best_text = _normalize_section_headings(
-                    repaired_best_text,
-                    include_health_rating=include_health_rating,
-                )
-                repaired_best_text = _merge_duplicate_canonical_sections(
-                    repaired_best_text,
-                    include_health_rating=include_health_rating,
-                )
-                repaired_best_text = _enforce_section_order(
-                    repaired_best_text,
-                    include_health_rating=include_health_rating,
-                )
-                repaired_best_text = _ensure_required_sections(
-                    repaired_best_text,
-                    include_health_rating=include_health_rating,
-                    metrics_lines=metrics_lines,
-                    calculated_metrics=calculated_metrics,
-                    health_score_data=pre_calculated_health,
-                    company_name=company_name,
-                    risk_factors_excerpt=risk_factors_excerpt,
-                    health_rating_config=health_config,
-                    persona_name=selected_persona_name,
-                    persona_requested=persona_requested,
-                    target_length=target_length,
-                )
-            except Exception as degraded_repair_exc:  # noqa: BLE001
-                logger.debug(
-                    "Degraded 422 structural repair failed for %s: %s",
-                    filing_id,
-                    degraded_repair_exc,
-                )
-            if (
-                _structured_timeout_candidate(repaired_best_text)
-                or _structured_timeout_section_count(repaired_best_text)
-                > _structured_timeout_section_count(best_text)
-            ):
-                best_text = repaired_best_text
-        detail = exc_detail if isinstance(exc_detail, dict) else {}
-        detail_failure_code = str(detail.get("failure_code") or "").strip()
-        if (
-            best_text
-            and detail_failure_code == "SUMMARY_CONTRACT_TIMEOUT"
-            and target_length
-            and _is_short_mid_precision_target(target_length)
-        ):
-            try:
-                rebanded_best_text = _ensure_final_strict_word_band(
-                    best_text,
-                    int(target_length),
-                    include_health_rating=include_health_rating,
-                    tolerance=_effective_word_band_tolerance(target_length),
-                    generation_stats=generation_stats,
-                    allow_padding=False,
-                )
-                rebanded_best_text = _enforce_whitespace_word_band(
-                    rebanded_best_text,
-                    int(target_length),
-                    tolerance=_effective_word_band_tolerance(target_length),
-                    allow_padding=False,
-                    dedupe=True,
-                )
-                if str(rebanded_best_text or "").strip():
-                    best_text = str(rebanded_best_text).strip()
-            except Exception as degraded_reband_exc:  # noqa: BLE001
-                logger.debug(
-                    "Degraded 422 timeout reband failed for %s: %s",
-                    filing_id,
-                    degraded_reband_exc,
-                )
+        best_text = str(summary_text or "").strip()
         if not best_text:
             return None
         # Only suppress 422 when the summary has real structure (at least one section heading).
         # A nonsense draft (e.g. "timing timing timing...") should still 422.
         if "## " not in best_text:
             return None
+        detail = exc_detail if isinstance(exc_detail, dict) else {}
         exc_missing = list(detail.get("missing_requirements") or [])
         exc_diagnostic = list(detail.get("diagnostic_missing_requirements") or [])
         exc_detail_str = str(detail.get("detail") or "").strip()
         exc_guidance = str(detail.get("guidance") or "").strip()
-        existing_meta = (
-            dict(response_data.get("summary_meta") or {})
-            if isinstance(response_data, dict)
-            and isinstance(response_data.get("summary_meta"), dict)
-            else dict(summary_meta or {})
-            if isinstance(summary_meta, dict)
-            else {}
-        )
-        existing_meta_missing = list(existing_meta.get("contract_missing_requirements") or [])
         all_warnings: list[str] = []
-        for item in exc_missing + exc_diagnostic + existing_meta_missing:
+        for item in exc_missing + exc_diagnostic:
             s = str(item).strip()
             if s and s not in all_warnings:
                 all_warnings.append(s)
@@ -32166,95 +31613,6 @@ def generate_filing_summary(
             "contract_warnings": all_warnings,
             "company_country": company.get("country") if company else None,
         }
-        degraded_meta = dict(existing_meta or {})
-        degraded_meta.setdefault(
-            "pipeline_mode",
-            str(generation_stats.get("pipeline_mode"))
-            if generation_stats.get("pipeline_mode")
-            else (
-                two_agent_result.pipeline_mode
-                if two_agent_result
-                else "two_agent"
-            ),
-        )
-        degraded_meta.setdefault(
-            "model_used",
-            _summary_locked_model_name(target_length=target_length),
-        )
-        degraded_meta.setdefault(
-            "generation_policy",
-            _summary_generation_policy_name(
-                target_length=target_length,
-                one_shot_deterministic_policy=one_shot_deterministic_policy,
-                generation_stats=generation_stats,
-            ),
-        )
-        if target_length:
-            degraded_meta.setdefault("target_length", int(target_length))
-        continuous_v2_meta = (
-            generation_stats.get("summary_continuous_v2_metadata", {})
-            if isinstance(generation_stats, dict)
-            else {}
-        )
-        if not isinstance(continuous_v2_meta, dict):
-            continuous_v2_meta = {}
-        degraded_meta.setdefault(
-            "section_validation_passed",
-            bool(continuous_v2_meta.get("section_validation_passed", True)),
-        )
-        degraded_meta.setdefault(
-            "section_validation_failures",
-            list(continuous_v2_meta.get("section_validation_failures", []) or []),
-        )
-        degraded_meta.setdefault(
-            "repair_attempts",
-            int(continuous_v2_meta.get("repair_attempts", 0) or 0),
-        )
-        degraded_meta.setdefault(
-            "structured_section_generation_used",
-            bool(generation_stats.get("structured_section_generation_used") or False),
-        )
-        degraded_meta.setdefault("section_word_budgets", dict(section_budgets or {}))
-        degraded_meta.setdefault(
-            "section_word_counts",
-            _collect_section_body_word_counts(
-                best_text,
-                include_health_rating=include_health_rating,
-            ),
-        )
-        degraded_meta.setdefault(
-            "section_word_ranges",
-            {
-                section_name: {
-                    "lower": max(
-                        1,
-                        int(words)
-                        - int(
-                            canonical_section_budget_tolerance_words(
-                                section_name, int(words)
-                            )
-                        ),
-                    ),
-                    "upper": int(words)
-                    + int(
-                        canonical_section_budget_tolerance_words(
-                            section_name, int(words)
-                        )
-                    ),
-                }
-                for section_name, words in dict(section_budgets or {}).items()
-                if int(words or 0) > 0
-            },
-        )
-        degraded_meta["final_word_count"] = int(
-            degraded_meta.get("final_word_count") or _count_words(best_text)
-        )
-        degraded_meta["final_split_word_count"] = int(
-            degraded_meta.get("final_split_word_count")
-            or len((best_text or "").split())
-        )
-        degraded_meta["contract_missing_requirements"] = list(all_warnings)
-        payload["summary_meta"] = degraded_meta
         if health_score_data:
             payload["health_score"] = health_score_data.get("overall_score")
             payload["health_band"] = health_score_data.get("score_band")
@@ -32270,16 +31628,6 @@ def generate_filing_summary(
             payload["health_component_metrics"] = health_score_data.get(
                 "component_metrics"
             )
-        if (
-            fast_summary_mode
-            and fast_cache_key
-            and str(payload.get("summary") or "").strip()
-            and _summary_payload_is_fast_cache_eligible(
-                payload,
-                include_health_rating=include_health_rating,
-            )
-        ):
-            _set_fast_summary_cached_response(fast_cache_key, payload)
         return JSONResponse(content=payload)
 
     # Generate summary with GPT-5.2

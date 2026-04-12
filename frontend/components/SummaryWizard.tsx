@@ -1,14 +1,10 @@
-/* eslint-disable @next/next/no-img-element -- Persona picker images are dynamic UI assets. */
-
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 
 import Stepper, { Step } from '@/components/ui/stepper';
 import { BrutalButton } from '@/components/ui/BrutalButton';
 import { Modal } from '@/components/ui/modal';
 import { BrutalSlider } from '@/components/ui/brutal-slider';
 import { cn } from '@/lib/utils';
-import { computeSectionBudgetPreview, detailLevelToRange, suggestTargetLength } from '@/lib/summary-mappings';
-import type { SummaryDetailLevel as MappingDetailLevel } from '@/lib/summary-mappings';
 
 // ... (Types and Constants remain the same)
 
@@ -48,7 +44,7 @@ export type HealthRatingFormState = {
 
 export type SummaryPreferenceFormState = {
     mode: SummaryMode;
-    sectionInstructions: Record<string, string>;
+    investorFocus: string;
     focusAreas: string[];
     tone: SummaryTone;
     detailLevel: SummaryDetailLevel;
@@ -58,45 +54,6 @@ export type SummaryPreferenceFormState = {
     healthRating: HealthRatingFormState;
     includeHealthScore: boolean;
     selectedPersona: string | null;
-};
-
-// --- Section instruction picker ---
-const INSTRUCTION_SECTIONS = [
-    { key: 'Financial Health Rating', label: 'Financial Health', number: '01', color: 'amber', placeholder: 'E.g., Weight profitability over growth metrics...' },
-    { key: 'Executive Summary', label: 'Executive Summary', number: '02', color: 'blue', placeholder: 'E.g., Lead with the biggest surprise from this filing...' },
-    { key: 'Financial Performance', label: 'Financial Performance', number: '03', color: 'emerald', placeholder: 'E.g., Compare margins against the last 4 quarters...' },
-    { key: 'Management Discussion & Analysis', label: 'MD&A', number: '04', color: 'purple', placeholder: 'E.g., Focus on management credibility and guidance accuracy...' },
-    { key: 'Risk Factors', label: 'Risk Factors', number: '05', color: 'rose', placeholder: 'E.g., Only include risks that could impact the stock within 12 months...' },
-    { key: 'Closing Takeaway', label: 'Closing Takeaway', number: '06', color: 'sky', placeholder: 'E.g., Focus on performance and future outlook...' },
-] as const;
-
-const SECTION_DOT_COLORS: Record<string, string> = {
-    amber: 'bg-amber-500',
-    blue: 'bg-blue-500',
-    emerald: 'bg-emerald-500',
-    gray: 'bg-gray-500',
-    purple: 'bg-purple-500',
-    rose: 'bg-rose-500',
-    sky: 'bg-sky-500',
-};
-
-const SECTION_RING_COLORS: Record<string, string> = {
-    amber: 'ring-amber-500/30',
-    blue: 'ring-blue-500/30',
-    emerald: 'ring-emerald-500/30',
-    gray: 'ring-gray-500/30',
-    purple: 'ring-purple-500/30',
-    rose: 'ring-rose-500/30',
-    sky: 'ring-sky-500/30',
-};
-
-const SECTION_BG_ACTIVE: Record<string, string> = {
-    amber: 'bg-amber-50 dark:bg-amber-950/20',
-    blue: 'bg-blue-50 dark:bg-blue-950/20',
-    emerald: 'bg-emerald-50 dark:bg-emerald-950/20',
-    purple: 'bg-purple-50 dark:bg-purple-950/20',
-    rose: 'bg-rose-50 dark:bg-rose-950/20',
-    sky: 'bg-sky-50 dark:bg-sky-950/20',
 };
 
 // --- Constants ---
@@ -109,16 +66,10 @@ const focusAreaOptions = [
     'Guidance & outlook',
 ];
 
-const TARGET_LENGTH_MIN_WORDS = 300;
+const TARGET_LENGTH_MIN_WORDS = 1;
 const TARGET_LENGTH_MAX_WORDS = 3000;
-const TARGET_LENGTH_STEP_WORDS = 25;
-const TARGET_LENGTH_DEFAULT_WORDS = 1000;
-
-const clampTargetLength = (value: number | null | undefined) => {
-    const numericValue =
-        typeof value === 'number' && Number.isFinite(value) ? value : TARGET_LENGTH_DEFAULT_WORDS;
-    return Math.max(TARGET_LENGTH_MIN_WORDS, Math.min(TARGET_LENGTH_MAX_WORDS, Math.round(numericValue)));
-};
+const TARGET_LENGTH_STEP_WORDS = 1;
+const TARGET_LENGTH_DEFAULT_WORDS = 650;
 
 const toneOptions = [
     { value: 'objective', label: 'Objective' },
@@ -328,23 +279,19 @@ export default function SummaryWizard({
     isGenerating,
 }: SummaryWizardProps) {
     const [isModalOpen, setIsModalOpen] = useState(false);
-    const [editingSection, setEditingSection] = useState<string | null>(null);
+    const clampTargetLength = (value: number | null | undefined) => {
+        const numericValue =
+            typeof value === 'number' && Number.isFinite(value) ? value : TARGET_LENGTH_DEFAULT_WORDS;
+        return Math.max(TARGET_LENGTH_MIN_WORDS, Math.min(TARGET_LENGTH_MAX_WORDS, Math.round(numericValue)));
+    };
     const normalizedTargetLength = clampTargetLength(preferences.targetLength);
     const [targetLengthInput, setTargetLengthInput] = useState(() => String(normalizedTargetLength));
-    const sectionBudgetPreview = useMemo(
-        () => computeSectionBudgetPreview(
-            normalizedTargetLength,
-            preferences.focusAreas,
-            Boolean(preferences.includeHealthScore),
-        ),
-        [normalizedTargetLength, preferences.focusAreas, preferences.includeHealthScore],
-    );
 
-    const updatePref = useCallback((updates: Partial<SummaryPreferenceFormState>) => {
+    const updatePref = (updates: Partial<SummaryPreferenceFormState>) => {
         const next = { ...preferences, ...updates };
         next.targetLength = clampTargetLength(next.targetLength);
         onPreferencesChange(next);
-    }, [onPreferencesChange, preferences]);
+    };
 
     const updateHealth = (updates: Partial<HealthRatingFormState>) => {
         onPreferencesChange({
@@ -365,17 +312,11 @@ export default function SummaryWizard({
         if (preferences.targetLength !== normalizedTargetLength) {
             updatePref({ targetLength: normalizedTargetLength });
         }
-    }, [normalizedTargetLength, preferences.targetLength, updatePref]);
+    }, [normalizedTargetLength, preferences.targetLength]);
 
     useEffect(() => {
         setTargetLengthInput(String(normalizedTargetLength));
     }, [normalizedTargetLength]);
-
-    useEffect(() => {
-        if (!isModalOpen) {
-            setEditingSection(null);
-        }
-    }, [isModalOpen]);
 
     const handleCustomizeClick = () => {
         updatePref({ mode: 'custom' });
@@ -480,14 +421,7 @@ export default function SummaryWizard({
                                     <label className="block text-xs font-bold uppercase">Detail Level</label>
                                     <select
                                         value={preferences.detailLevel}
-                                        onChange={(e) => {
-                                            const newLevel = e.target.value as SummaryDetailLevel;
-                                            const suggested = suggestTargetLength(
-                                                newLevel as MappingDetailLevel,
-                                                preferences.targetLength,
-                                            );
-                                            updatePref({ detailLevel: newLevel, targetLength: suggested });
-                                        }}
+                                        onChange={(e) => updatePref({ detailLevel: e.target.value as any })}
                                         className="w-full p-2 bg-white dark:bg-black border-2 border-black dark:border-white text-xs font-mono"
                                     >
                                         {detailOptions.map(opt => (
@@ -556,36 +490,7 @@ export default function SummaryWizard({
                                     step={TARGET_LENGTH_STEP_WORDS}
                                     onChange={(val) => updatePref({ targetLength: val })}
                                 />
-                                {/* Detail level range hint */}
-                                {(() => {
-                                    const range = detailLevelToRange(preferences.detailLevel as MappingDetailLevel);
-                                    const inRange = normalizedTargetLength >= range.min && normalizedTargetLength <= range.max;
-                                    return (
-                                        <p className={cn(
-                                            "text-[10px] font-mono mt-1",
-                                            inRange ? "text-gray-400" : "text-amber-500 dark:text-amber-400"
-                                        )}>
-                                            Suggested for {preferences.detailLevel}: {range.min}–{range.max} words
-                                            {!inRange && ' (current value outside range)'}
-                                        </p>
-                                    );
-                                })()}
-                                <div className="mt-3 border border-black dark:border-white bg-gray-50 dark:bg-zinc-900 p-3">
-                                    <div className="flex items-center justify-between mb-2">
-                                        <span className="text-[10px] font-bold uppercase">Section Allocation Preview</span>
-                                        <span className="text-[10px] font-mono text-gray-500">Body words</span>
-                                    </div>
-                                    <div className="grid grid-cols-2 gap-x-3 gap-y-1">
-                                        {Object.entries(sectionBudgetPreview).map(([section, words]) => (
-                                            <div key={section} className="flex items-center justify-between text-[10px] font-mono">
-                                                <span className="truncate pr-2">{section}</span>
-                                                <span className="font-bold">{words}</span>
-                                            </div>
-                                        ))}
-                                    </div>
-                                </div>
                             </div>
-
                         </div>
                     </Step>
 
@@ -723,135 +628,19 @@ export default function SummaryWizard({
                         </div>
                     </Step>
 
-                    {/* Step 5: Per-Section Instructions */}
+                    {/* Step 5: Additional Instructions */}
                     <Step>
-                        <div className="space-y-5">
-                            <div>
-                                <h2 className="text-xl font-black uppercase">5. Section Instructions</h2>
-                                <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
-                                    Customize AI instructions per section (optional)
-                                </p>
-                            </div>
-
-                            {editingSection === null ? (
-                                /* ── Section Picker Grid ── */
-                                <div className="grid grid-cols-2 gap-3">
-                                    {INSTRUCTION_SECTIONS.map((section) => {
-                                        const hasInstruction = Boolean(
-                                            preferences.sectionInstructions[section.key]?.trim()
-                                        );
-                                        return (
-                                            <button
-                                                key={section.key}
-                                                type="button"
-                                                onClick={() => setEditingSection(section.key)}
-                                                className={cn(
-                                                    "relative text-left p-4 border-2 border-black dark:border-white",
-                                                    "transition-all duration-150 group",
-                                                    "hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] dark:hover:shadow-[3px_3px_0px_0px_rgba(255,255,255,0.3)]",
-                                                    hasInstruction
-                                                        ? SECTION_BG_ACTIVE[section.color]
-                                                        : "bg-white dark:bg-black"
-                                                )}
-                                            >
-                                                {/* Checkmark badge */}
-                                                {hasInstruction && (
-                                                    <span className="absolute top-2 right-2 w-5 h-5 rounded-full bg-green-500 flex items-center justify-center">
-                                                        <svg className="w-3 h-3 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
-                                                        </svg>
-                                                    </span>
-                                                )}
-
-                                                <div className="flex items-center gap-3">
-                                                    {/* Color dot with ring */}
-                                                    <span className={cn(
-                                                        "w-3 h-3 rounded-full shrink-0 ring-4",
-                                                        SECTION_DOT_COLORS[section.color],
-                                                        SECTION_RING_COLORS[section.color]
-                                                    )} />
-
-                                                    <div className="min-w-0">
-                                                        <span className="font-mono text-[10px] text-gray-400 dark:text-gray-500 block">
-                                                            {section.number}
-                                                        </span>
-                                                        <span className="font-bold uppercase text-xs block truncate">
-                                                            {section.label}
-                                                        </span>
-                                                    </div>
-                                                </div>
-
-                                                {hasInstruction && (
-                                                    <p className="font-mono text-[10px] text-gray-500 dark:text-gray-400 mt-2 line-clamp-1">
-                                                        {preferences.sectionInstructions[section.key]}
-                                                    </p>
-                                                )}
-                                            </button>
-                                        );
-                                    })}
-                                </div>
-                            ) : (
-                                /* ── Section Edit View ── */
-                                (() => {
-                                    const activeMeta = INSTRUCTION_SECTIONS.find(
-                                        (s) => s.key === editingSection
-                                    );
-                                    const currentText =
-                                        preferences.sectionInstructions[editingSection] ?? '';
-                                    return (
-                                        <div className="space-y-4">
-                                            <button
-                                                type="button"
-                                                onClick={() => setEditingSection(null)}
-                                                className="flex items-center gap-2 font-bold uppercase text-xs border-2 border-black dark:border-white px-3 py-1.5 hover:shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] transition-shadow"
-                                            >
-                                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M15 19l-7-7 7-7" />
-                                                </svg>
-                                                Back to sections
-                                            </button>
-
-                                            <div className="flex items-center gap-3">
-                                                <span
-                                                    className={cn(
-                                                        'w-3 h-3 rounded-full ring-4',
-                                                        SECTION_DOT_COLORS[activeMeta?.color ?? 'gray'],
-                                                        SECTION_RING_COLORS[activeMeta?.color ?? 'gray']
-                                                    )}
-                                                />
-                                                <div>
-                                                    <span className="font-mono text-[10px] text-gray-400">
-                                                        {activeMeta?.number}
-                                                    </span>
-                                                    <h3 className="font-bold uppercase text-sm">
-                                                        {activeMeta?.label}
-                                                    </h3>
-                                                </div>
-                                            </div>
-
-                                            <textarea
-                                                value={currentText}
-                                                onChange={(e) => {
-                                                    const val = e.target.value.slice(0, 1000);
-                                                    updatePref({
-                                                        sectionInstructions: {
-                                                            ...preferences.sectionInstructions,
-                                                            [editingSection]: val,
-                                                        },
-                                                    });
-                                                }}
-                                                placeholder={activeMeta?.placeholder}
-                                                className="w-full h-32 p-4 bg-white dark:bg-black border-2 border-black dark:border-white font-mono text-sm focus:outline-none focus:shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] transition-shadow resize-none"
-                                            />
-
-                                            <div className="flex justify-between text-[10px] font-mono text-gray-400">
-                                                <span>Specific instructions for this section</span>
-                                                <span>{currentText.length}/1000</span>
-                                            </div>
-                                        </div>
-                                    );
-                                })()
-                            )}
+                        <div className="space-y-6">
+                            <h2 className="text-xl font-black uppercase">5. Additional Instructions</h2>
+                            <p className="text-sm text-gray-600 dark:text-gray-400">
+                                Any specific requests or context for the AI?
+                            </p>
+                            <textarea
+                                value={preferences.investorFocus}
+                                onChange={(e) => updatePref({ investorFocus: e.target.value })}
+                                placeholder="E.g., Focus on the impact of recent regulatory changes..."
+                                className="w-full h-32 p-4 bg-white dark:bg-black border-2 border-black dark:border-white font-mono text-sm focus:outline-none focus:shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] transition-shadow resize-none"
+                            />
                         </div>
                     </Step>
 
@@ -883,28 +672,12 @@ export default function SummaryWizard({
                                         {preferences.selectedPersona ? INVESTOR_PERSONAS.find(p => p.id === preferences.selectedPersona)?.name : 'None'}
                                     </span>
                                 </div>
-                                {Object.entries(preferences.sectionInstructions).filter(([, v]) => v.trim()).length > 0 && (
-                                    <div className="flex flex-col gap-2 border-b border-gray-200 dark:border-gray-800 pb-2">
-                                        <span className="font-bold uppercase text-sm">Section Instructions</span>
-                                        {Object.entries(preferences.sectionInstructions)
-                                            .filter(([, v]) => v.trim())
-                                            .map(([section, text]) => {
-                                                const meta = INSTRUCTION_SECTIONS.find(s => s.key === section);
-                                                return (
-                                                    <div key={section} className="flex items-start gap-2">
-                                                        <span className={cn(
-                                                            'w-2 h-2 rounded-full mt-1 shrink-0',
-                                                            SECTION_DOT_COLORS[meta?.color ?? 'gray']
-                                                        )} />
-                                                        <div className="min-w-0">
-                                                            <span className="text-[10px] font-bold uppercase block">{meta?.label ?? section}</span>
-                                                            <span className="font-mono text-[10px] text-gray-500 dark:text-gray-400 line-clamp-1 block">
-                                                                {text.trim()}
-                                                            </span>
-                                                        </div>
-                                                    </div>
-                                                );
-                                            })}
+                                {preferences.investorFocus && (
+                                    <div className="flex flex-col gap-1 border-b border-gray-200 dark:border-gray-800 pb-2">
+                                        <span className="font-bold uppercase text-sm">Instructions</span>
+                                        <span className="font-mono text-xs text-gray-600 dark:text-gray-400 line-clamp-2">
+                                            {preferences.investorFocus}
+                                        </span>
                                     </div>
                                 )}
                                 <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
@@ -912,17 +685,10 @@ export default function SummaryWizard({
                                     <span className="font-mono text-sm">{normalizedTargetLength} words</span>
                                 </div>
                                 <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
-                                    <span className="font-bold uppercase text-sm">Detail Level</span>
-                                    <span className="font-mono text-sm capitalize">{preferences.detailLevel}</span>
-                                </div>
-                                <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
-                                    <span className="font-bold uppercase text-sm">Output Style</span>
-                                    <span className="font-mono text-sm capitalize">{preferences.outputStyle}</span>
-                                </div>
-                                <div className="flex justify-between items-center border-b border-gray-200 dark:border-gray-800 pb-2">
                                     <span className="font-bold uppercase text-sm">Complexity</span>
                                     <span className="font-mono text-sm capitalize">{preferences.complexity}</span>
                                 </div>
+
                                 <div className="pt-2">
                                     <p className="text-xs text-gray-500">
                                         Click &quot;Complete&quot; to start the AI analysis. This process typically takes 10-20 seconds.

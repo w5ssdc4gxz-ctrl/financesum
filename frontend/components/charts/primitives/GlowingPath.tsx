@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useRef, useEffect, useState, useId } from 'react'
+import React, { useRef, useEffect, useState } from 'react'
 import { motion } from 'framer-motion'
 import { cn } from '@/lib/utils'
 
@@ -36,7 +36,6 @@ export function GlowingPath({
   duration = 1.5,
   delay = 0,
 }: GlowingPathProps) {
-  const svgId = useId().replace(/:/g, '')
   const pathRef = useRef<SVGPathElement>(null)
   const [pathLength, setPathLength] = useState(0)
   
@@ -47,7 +46,7 @@ export function GlowingPath({
   }, [d])
   
   const effectiveGlowColor = glowColor || color
-  const filterId = `glowFilter-${svgId}`
+  const filterId = `glowFilter-${Math.random().toString(36).slice(2)}`
   
   return (
     <g className={className}>

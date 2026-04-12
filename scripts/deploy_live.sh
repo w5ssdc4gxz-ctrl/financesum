@@ -29,40 +29,6 @@ need_auth() {
   fi
 }
 
-FRONTEND_SERVICE_JSON=""
-
-load_frontend_service_json() {
-  if [[ -n "$FRONTEND_SERVICE_JSON" ]]; then
-    return 0
-  fi
-
-  FRONTEND_SERVICE_JSON="$(
-    gcloud run services describe "$FRONTEND_SERVICE" \
-      --region "$REGION" \
-      --format=json 2>/dev/null || true
-  )"
-}
-
-frontend_public_env_value() {
-  local key="$1"
-  local explicit="${!key:-}"
-  if [[ -n "$explicit" ]]; then
-    printf '%s' "$explicit"
-    return 0
-  fi
-
-  load_frontend_service_json
-  if [[ -z "$FRONTEND_SERVICE_JSON" ]]; then
-    return 0
-  fi
-
-  printf '%s' "$FRONTEND_SERVICE_JSON" | jq -r --arg key "$key" '
-    (.spec.template.spec.containers[0].env // [])
-    | map(select(.name == $key))
-    | .[0].value // ""
-  '
-}
-
 run_backend() {
   echo "==> Backend tests"
   (cd "$REPO_ROOT/backend" && pytest)
@@ -79,41 +45,11 @@ run_backend() {
 }
 
 run_frontend() {
-  local supabase_url supabase_anon site_url posthog_key posthog_host posthog_debug auth_mode
-  local substitutions
-
   echo "==> Frontend build"
   (cd "$REPO_ROOT/frontend" && npm run build)
 
-  supabase_url="$(frontend_public_env_value NEXT_PUBLIC_SUPABASE_URL)"
-  supabase_anon="$(frontend_public_env_value NEXT_PUBLIC_SUPABASE_ANON_KEY)"
-  site_url="$(frontend_public_env_value NEXT_PUBLIC_SITE_URL)"
-  posthog_key="$(frontend_public_env_value NEXT_PUBLIC_POSTHOG_KEY)"
-  posthog_host="$(frontend_public_env_value NEXT_PUBLIC_POSTHOG_HOST)"
-  posthog_debug="$(frontend_public_env_value NEXT_PUBLIC_POSTHOG_DEBUG)"
-  auth_mode="${NEXT_PUBLIC_AUTH_MODE:-supabase}"
-
-  if [[ -z "$supabase_url" || -z "$supabase_anon" ]]; then
-    echo "Missing frontend public Supabase build args."
-    echo "Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY"
-    echo "or ensure they already exist on the $FRONTEND_SERVICE Cloud Run service."
-    exit 1
-  fi
-
-  substitutions=(
-    "_NEXT_PUBLIC_SUPABASE_URL=$supabase_url"
-    "_NEXT_PUBLIC_SUPABASE_ANON_KEY=$supabase_anon"
-    "_NEXT_PUBLIC_AUTH_MODE=$auth_mode"
-    "_NEXT_PUBLIC_SITE_URL=$site_url"
-    "_NEXT_PUBLIC_POSTHOG_KEY=$posthog_key"
-    "_NEXT_PUBLIC_POSTHOG_HOST=$posthog_host"
-    "_NEXT_PUBLIC_POSTHOG_DEBUG=$posthog_debug"
-  )
-
   echo "==> Cloud Build (frontend)"
-  gcloud builds submit "$REPO_ROOT/frontend" \
-    --config "$REPO_ROOT/frontend/cloudbuild.yaml" \
-    --substitutions "$(IFS=,; echo "${substitutions[*]}")"
+  gcloud builds submit --tag "$FRONTEND_IMAGE" "$REPO_ROOT/frontend"
 
   echo "==> Cloud Run deploy (frontend)"
   gcloud run deploy "$FRONTEND_SERVICE" \
@@ -121,11 +57,6 @@ run_frontend() {
     --platform managed \
     --region "$REGION" \
     --allow-unauthenticated
-
-  echo "==> Shift frontend traffic to latest ready revision"
-  gcloud run services update-traffic "$FRONTEND_SERVICE" \
-    --region "$REGION" \
-    --to-latest
 }
 
 verify_live() {
@@ -140,11 +71,6 @@ verify_live() {
   BACKEND_URL="$(gcloud run services describe "$BACKEND_SERVICE" --region "$REGION" --format='value(status.url)')"
   curl -sSf "$BACKEND_URL/health" >/dev/null
   echo "OK: $BACKEND_URL/health"
-
-  echo "==> Frontend root"
-  FRONTEND_URL="$(gcloud run services describe "$FRONTEND_SERVICE" --region "$REGION" --format='value(status.url)')"
-  curl -I -sSf "$FRONTEND_URL/" >/dev/null
-  echo "OK: $FRONTEND_URL/"
 }
 
 case "$TARGET" in

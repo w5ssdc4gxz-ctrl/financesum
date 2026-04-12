@@ -1,6 +1,6 @@
 "use client";
 import { cn } from "@/lib/utils";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { createNoise3D } from "simplex-noise";
 
 export const WavyBackground = ({
@@ -26,80 +26,91 @@ export const WavyBackground = ({
   waveOpacity?: number;
   [key: string]: any;
 }) => {
-  const noise = useMemo(() => createNoise3D(), []);
+  const noise = createNoise3D();
+  let w: number,
+    h: number,
+    nt: number,
+    i: number,
+    x: number,
+    ctx: any,
+    canvas: any;
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const speedValue = speed === "fast" ? 0.002 : 0.001;
-  const waveColors = useMemo(
-    () =>
-      colors ?? [
-        "#38bdf8",
-        "#818cf8",
-        "#c084fc",
-        "#e879f9",
-        "#22d3ee",
-      ],
-    [colors]
-  );
+  const getSpeed = () => {
+    switch (speed) {
+      case "slow":
+        return 0.001;
+      case "fast":
+        return 0.002;
+      default:
+        return 0.001;
+    }
+  };
 
-  useEffect(() => {
-    const canvas = canvasRef.current;
+  const init = () => {
+    canvas = canvasRef.current;
     if (!canvas) return;
-
-    const ctx = canvas.getContext("2d");
+    ctx = canvas.getContext("2d");
     if (!ctx) return;
-
-    let width = window.innerWidth;
-    let height = window.innerHeight;
-    let noiseTime = 0;
-    let animationId: number;
-
-    const resize = () => {
-      width = ctx.canvas.width = window.innerWidth;
-      height = ctx.canvas.height = window.innerHeight;
+    w = ctx.canvas.width = window.innerWidth;
+    h = ctx.canvas.height = window.innerHeight;
+    ctx.filter = `blur(${blur}px)`;
+    nt = 0;
+    window.onresize = function () {
+      if (!ctx) return;
+      w = ctx.canvas.width = window.innerWidth;
+      h = ctx.canvas.height = window.innerHeight;
       ctx.filter = `blur(${blur}px)`;
     };
-
-    const drawWave = (count: number) => {
-      noiseTime += speedValue;
-      for (let i = 0; i < count; i += 1) {
-        ctx.beginPath();
-        ctx.lineWidth = waveWidth || 50;
-        ctx.lineCap = "round";
-        ctx.lineJoin = "round";
-        ctx.strokeStyle = waveColors[i % waveColors.length];
-        const initialY = noise(0, 0.3 * i, noiseTime) * 100;
-        ctx.moveTo(0, initialY + height * 0.5);
-        for (let x = 0; x <= width; x += 5) {
-          const y = noise(x / 800, 0.3 * i, noiseTime) * 100;
-          ctx.lineTo(x, y + height * 0.5);
-        }
-        ctx.stroke();
-        ctx.closePath();
-      }
-    };
-
-    const render = () => {
-      ctx.globalCompositeOperation = "source-over";
-      ctx.clearRect(0, 0, width, height);
-      ctx.globalAlpha = 1;
-      ctx.fillStyle = backgroundFill || "rgba(4, 0, 12, 0.55)";
-      ctx.fillRect(0, 0, width, height);
-      ctx.globalCompositeOperation = "lighter";
-      ctx.globalAlpha = waveOpacity || 0.7;
-      drawWave(5);
-      ctx.globalCompositeOperation = "source-over";
-      animationId = requestAnimationFrame(render);
-    };
-
-    resize();
-    window.addEventListener("resize", resize);
     render();
+  };
 
+  const waveColors = colors ?? [
+    "#38bdf8",
+    "#818cf8",
+    "#c084fc",
+    "#e879f9",
+    "#22d3ee",
+  ];
+  const drawWave = (n: number) => {
+    nt += getSpeed();
+    for (i = 0; i < n; i++) {
+      ctx.beginPath();
+      ctx.lineWidth = waveWidth || 50;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.strokeStyle = waveColors[i % waveColors.length];
+      const initialY = noise(0, 0.3 * i, nt) * 100;
+      ctx.moveTo(0, initialY + h * 0.5);
+      for (x = 0; x <= w; x += 5) {
+        const y = noise(x / 800, 0.3 * i, nt) * 100;
+        ctx.lineTo(x, y + h * 0.5); // adjust for height, currently at 50% of the container
+      }
+      ctx.stroke();
+      ctx.closePath();
+    }
+  };
+
+  let animationId: number;
+  const render = () => {
+    if (!ctx) return;
+    ctx.globalCompositeOperation = "source-over";
+    ctx.clearRect(0, 0, w, h);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = backgroundFill || "rgba(4, 0, 12, 0.55)";
+    ctx.fillRect(0, 0, w, h);
+    ctx.globalCompositeOperation = "lighter";
+    ctx.globalAlpha = waveOpacity || 0.7;
+    drawWave(5);
+    ctx.globalCompositeOperation = "source-over";
+    animationId = requestAnimationFrame(render);
+  };
+
+  useEffect(() => {
+    init();
     return () => {
       cancelAnimationFrame(animationId);
-      window.removeEventListener("resize", resize);
     };
-  }, [backgroundFill, blur, noise, speedValue, waveColors, waveOpacity, waveWidth]);
+  }, []);
 
   const [isSafari, setIsSafari] = useState(false);
   useEffect(() => {

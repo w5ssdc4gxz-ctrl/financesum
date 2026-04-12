@@ -9,7 +9,7 @@ Make sure you have:
 - ✅ Python 3.11+ installed  
 - ✅ Docker and Docker Compose installed
 - ✅ A Supabase account (free tier is fine)
-- ✅ An OpenAI API key
+- ✅ A Google Gemini API key (free tier available)
 - ✅ An EODHD API key ([Get it here](https://eodhd.com/) - free tier available with demo key)
 
 ## Step 1: Clone and Setup Environment
@@ -26,7 +26,7 @@ cp frontend/.env.local.example frontend/.env.local
 
 Edit `.env` and add:
 - Your Supabase URL and keys (from Supabase dashboard)
-- Your OpenAI API key
+- Your Gemini API key (from Google AI Studio)
 - Your EODHD API key (from https://eodhd.com/ - you can use "demo" for testing AAPL, TSLA, etc.)
 - Your email for SEC EDGAR User-Agent (optional, used for fallback)
 
@@ -122,3 +122,4 @@ Go to http://localhost:3000
 ## Need Help?
 
 Common issues and solutions are in `SETUP.md` under "Troubleshooting"
+

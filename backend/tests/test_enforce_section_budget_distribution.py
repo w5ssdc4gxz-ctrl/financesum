@@ -572,7 +572,13 @@ def test_ensure_required_sections_normalizes_risk_schema_for_short_targets() -> 
     )
 
     risk_body = _get_section_body(ensured, "Risk Factors")
-    entries = filings_api._extract_risk_entries_for_repair(risk_body)
+    entries = list(
+        re.finditer(
+            r"\*\*(?P<name>[^*:\n]{2,120}?):?\*\*\s*:?\s*(?P<body>.+?)(?=(?:(?:\n\s*|(?<=[.!?])\s+)\*\*[^*]+?\*\*\s*:?)|\Z)",
+            risk_body,
+            flags=re.DOTALL,
+        )
+    )
     budgets = filings_api._calculate_section_word_budgets(
         target_length, include_health_rating=True
     )
@@ -584,7 +590,7 @@ def test_ensure_required_sections_normalizes_risk_schema_for_short_targets() -> 
         re.IGNORECASE,
     )
     for entry in entries:
-        name = str(entry[0] or "").strip()
+        name = (entry.group("name") or "").strip()
         assert not generic_name_re.search(name)
 
     validation = filings_api.validate_summary(
@@ -766,8 +772,8 @@ def test_rebalance_normalizes_risk_factors_before_donor_inference_for_850_target
     )
     assert any(
         failure.section_name == "Risk Factors"
-        and failure.code
-        in {"risk_schema", "risk_specificity", "insufficient_filing_grounding"}
+        and failure.code == "risk_specificity"
+        and "Liquidity / Funding Risk" in failure.message
         for failure in validation.section_failures
     )
 
@@ -794,11 +800,8 @@ def test_rebalance_normalizes_risk_factors_before_donor_inference_for_850_target
         risk_factors_excerpt=risk_excerpt,
     )
 
-    assert len(filings_api._extract_risk_entries_for_repair(repaired_risk_body)) >= 2
-    assert (
-        "investors should watch" in repaired_risk_body.lower()
-        or "early-warning signal:" in repaired_risk_body.lower()
-    )
+    assert repaired_risk_body.count("**") >= 4
+    assert "investors should watch" in repaired_risk_body.lower()
     # The expanded generic-risk-name regex now correctly flags "Liquidity / Funding Risk"
     # as too generic.  Verify no OTHER risk_schema failures remain after repair.
     non_generic_risk_failures = [

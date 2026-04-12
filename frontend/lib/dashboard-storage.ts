@@ -8,11 +8,9 @@
 const ANALYSIS_HISTORY_KEY = "financesum.analysisHistory"
 const RECENT_COMPANIES_KEY = "financesum.recentCompanies"
 const SUMMARY_PREFERENCES_KEY = "financesum.summaryPreferences"
-const SUMMARY_EVENTS_KEY = "financesum.summaryEvents"
 
 const MAX_ANALYSIS_HISTORY = 12
 const MAX_RECENT_COMPANIES = 12
-const MAX_SUMMARY_EVENTS = 2000
 
 const isBrowser = () => typeof window !== "undefined"
 
@@ -53,24 +51,6 @@ export type StoredPersonaSignal = {
   stance: string
 }
 
-export type StoredChartDataPeriod = {
-  revenue?: number | null
-  operating_income?: number | null
-  net_income?: number | null
-  free_cash_flow?: number | null
-  operating_margin?: number | null
-  net_margin?: number | null
-  gross_margin?: number | null
-}
-
-export type StoredChartData = {
-  current_period: StoredChartDataPeriod
-  prior_period?: StoredChartDataPeriod | null
-  period_type?: 'quarterly' | 'annual'
-  current_label?: string
-  prior_label?: string
-}
-
 export type StoredAnalysisSnapshot = StoredCompany & {
   analysisId: string
   generatedAt: string
@@ -84,9 +64,6 @@ export type StoredAnalysisSnapshot = StoredCompany & {
   filingId?: string | null
   filingType?: string | null
   filingDate?: string | null
-  selectedPersona?: string | null
-  chartData?: StoredChartData | null
-  ratios?: Record<string, number | null> | null
   source?: 'analysis' | 'summary'
 }
 
@@ -101,7 +78,7 @@ export type StoredHealthRatingPreferences = {
 
 export type StoredSummaryPreferences = {
   mode: "default" | "custom"
-  sectionInstructions?: Record<string, string>
+  investorFocus: string
   focusAreas: string[]
   tone: string
   detailLevel: string
@@ -110,24 +87,11 @@ export type StoredSummaryPreferences = {
   healthRating?: StoredHealthRatingPreferences
 }
 
-export type StoredSummaryEvent = {
-  eventId: string
-  generatedAt: string
-  kind: "analysis" | "summary"
-  analysisId?: string | null
-  filingId?: string | null
-  companyId?: string | null
-}
-
 const SNAPSHOT_ANALYSIS = "analysis"
 const SNAPSHOT_SUMMARY = "summary"
 
-const resolveSnapshotSource = (snapshot?: Partial<StoredAnalysisSnapshot>) => {
-  if (snapshot?.source) return snapshot.source
-  const analysisId = typeof snapshot?.analysisId === "string" ? snapshot.analysisId : ""
-  if (analysisId.startsWith("summary-")) return SNAPSHOT_SUMMARY
-  return SNAPSHOT_ANALYSIS
-}
+const resolveSnapshotSource = (snapshot?: Partial<StoredAnalysisSnapshot>) =>
+  snapshot?.source ?? SNAPSHOT_ANALYSIS
 
 const getSnapshotTimestamp = (value?: string | null) => {
   if (!value) return 0
@@ -165,70 +129,6 @@ const dedupeSnapshots = (snapshots: StoredAnalysisSnapshot[]) => {
     }
     seen.add(key)
     cleaned.push(snapshot)
-  }
-  return cleaned
-}
-
-const getEventTimestamp = (value?: string | null) => {
-  if (!value) return 0
-  const parsed = new Date(value)
-  const time = parsed.getTime()
-  return Number.isNaN(time) ? 0 : time
-}
-
-const normalizeEventDate = (value: unknown): string | null => {
-  if (!value) return null
-  const parsed = new Date(value as any)
-  if (Number.isNaN(parsed.getTime())) return null
-  return parsed.toISOString()
-}
-
-const normalizeSummaryEvent = (
-  input?: Partial<StoredSummaryEvent> | null,
-): StoredSummaryEvent | null => {
-  if (!input || typeof input !== "object") return null
-
-  const kind = input.kind === SNAPSHOT_ANALYSIS ? SNAPSHOT_ANALYSIS : SNAPSHOT_SUMMARY
-  const analysisId = input.analysisId ? String(input.analysisId) : null
-  const filingId = input.filingId ? String(input.filingId) : null
-  const companyId = input.companyId ? String(input.companyId) : null
-  const generatedAt = normalizeEventDate(input.generatedAt) ?? new Date().toISOString()
-  const providedEventId =
-    typeof input.eventId === "string" ? input.eventId.trim() : ""
-
-  const inferredEventId =
-    providedEventId ||
-    (kind === SNAPSHOT_ANALYSIS && analysisId
-      ? `analysis:${analysisId}`
-      : kind === SNAPSHOT_SUMMARY && filingId
-        ? `summary:${filingId}:${generatedAt}`
-        : `${kind}:${analysisId ?? filingId ?? generatedAt}`)
-
-  if (!inferredEventId) return null
-
-  return {
-    eventId: inferredEventId,
-    generatedAt,
-    kind,
-    analysisId,
-    filingId,
-    companyId,
-  }
-}
-
-const sortSummaryEvents = (events: StoredSummaryEvent[]) =>
-  [...events].sort(
-    (a, b) => getEventTimestamp(b.generatedAt) - getEventTimestamp(a.generatedAt)
-  )
-
-const dedupeSummaryEvents = (events: StoredSummaryEvent[]) => {
-  if (!events.length) return events
-  const seen = new Set<string>()
-  const cleaned: StoredSummaryEvent[] = []
-  for (const event of sortSummaryEvents(events)) {
-    if (!event?.eventId || seen.has(event.eventId)) continue
-    seen.add(event.eventId)
-    cleaned.push(event)
   }
   return cleaned
 }
@@ -285,36 +185,6 @@ export const DashboardStorage = {
       (item) => item.analysisId !== analysisId
     )
     writeStorage(storageKey, filtered)
-  },
-
-  loadSummaryEvents(userId?: string | null): StoredSummaryEvent[] {
-    if (!isBrowser()) return []
-    const storageKey = buildStorageKey(SUMMARY_EVENTS_KEY, userId)
-    const parsed = safeParse<StoredSummaryEvent[]>(
-      window.localStorage.getItem(storageKey),
-      [],
-    )
-    const normalized = parsed
-      .map((entry) => normalizeSummaryEvent(entry))
-      .filter((entry): entry is StoredSummaryEvent => Boolean(entry))
-    const cleaned = dedupeSummaryEvents(normalized).slice(0, MAX_SUMMARY_EVENTS)
-    if (cleaned.length !== parsed.length) {
-      writeStorage(storageKey, cleaned)
-    }
-    return cleaned
-  },
-
-  appendSummaryEvent(event: Partial<StoredSummaryEvent>, userId?: string | null) {
-    if (!isBrowser()) return
-    const storageKey = buildStorageKey(SUMMARY_EVENTS_KEY, userId)
-    const normalized = normalizeSummaryEvent(event)
-    if (!normalized) return
-    const existing = DashboardStorage.loadSummaryEvents(userId)
-    const updated = dedupeSummaryEvents([normalized, ...existing]).slice(
-      0,
-      MAX_SUMMARY_EVENTS
-    )
-    writeStorage(storageKey, updated)
   },
 
   loadRecentCompanies(userId?: string | null): StoredCompany[] {
