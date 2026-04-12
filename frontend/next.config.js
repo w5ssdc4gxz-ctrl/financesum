@@ -5,6 +5,14 @@ const baseConfig = {
   reactStrictMode: true,
 }
 
+const securityHeaders = [
+  { key: 'Strict-Transport-Security', value: 'max-age=31536000; includeSubDomains' },
+  { key: 'X-Content-Type-Options', value: 'nosniff' },
+  { key: 'X-Frame-Options', value: 'DENY' },
+  { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
+  { key: 'Permissions-Policy', value: 'camera=(), microphone=(), geolocation=(), payment=()' },
+]
+
 module.exports = (phase) => {
   const isDev = phase === PHASE_DEVELOPMENT_SERVER
 
@@ -21,6 +29,10 @@ module.exports = (phase) => {
       // CDN caching of HTML. Otherwise, users can get "stuck" on old JS bundles (e.g.,
       // slider max = 3000) even after we deploy a fix.
       return [
+        {
+          source: '/:path*',
+          headers: securityHeaders,
+        },
         {
           source: '/',
           headers: [{ key: 'Cache-Control', value: 'no-store' }],
@@ -57,7 +69,6 @@ module.exports = (phase) => {
     },
   }
 }
-
 
 
 

@@ -3,6 +3,7 @@ node_modules/
 __pycache__/
 *.py[cod]
 *$py.class
+*.tsbuildinfo
 *.so
 .Python
 env/
@@ -31,6 +32,8 @@ wheels/
 **/.env.*
 *.env
 *.env.*
+config.yaml
+config.local.yaml
 *.backup
 debug_*.txt
 *.pid

@@ -3,7 +3,7 @@ model_list:
     litellm_params:
       model: anthropic/claude-opus-4.5
       api_base: https://go.fastrouter.ai/api/v1
-      api_key: sk-v1-887a5c52982a7d2ab36565e8675b278c0e0b9a1d0b579294561389ca669b5a22
+      api_key: ${FASTROUTER_API_KEY}
       custom_llm_provider: openai
 
 litellm_settings:
