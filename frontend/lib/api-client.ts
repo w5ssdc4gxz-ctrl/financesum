@@ -1,5 +1,5 @@
 import axios, { AxiosHeaders } from 'axios'
-import { supabase } from '@/lib/supabase'
+import { isSupabaseConfigured, supabase } from '@/lib/supabase'
 
 const normalizeApiBase = (value?: string | null) => {
   const trimmed = String(value || '').trim()
@@ -36,7 +36,7 @@ export const apiClient = axios.create({
 
 let supabaseAccessToken: string | null = null
 
-if (typeof window !== 'undefined') {
+if (typeof window !== 'undefined' && isSupabaseConfigured) {
   supabase.auth
     .getSession()
     .then(({ data }) => {
@@ -83,7 +83,7 @@ apiClient.interceptors.response.use(
     const status = error?.response?.status
     const originalConfig = error?.config
 
-    if (status !== 401 || !originalConfig) {
+    if (status !== 401 || !originalConfig || !isSupabaseConfigured) {
       return Promise.reject(error)
     }
 

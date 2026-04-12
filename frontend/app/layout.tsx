@@ -1,6 +1,5 @@
 import type { Metadata } from 'next'
 import localFont from 'next/font/local'
-import { Playfair_Display } from 'next/font/google'
 import './globals.css'
 import { AuthProvider } from '@/contexts/AuthContext'
 import { QueryProvider } from '@/components/QueryProvider'
@@ -46,12 +45,6 @@ const flaviotte = localFont({
   display: 'swap',
 })
 
-const playfair = Playfair_Display({
-  subsets: ['latin'],
-  variable: '--font-playfair',
-  display: 'swap',
-})
-
 export const metadata: Metadata = {
   title: 'FinanceSum - Financial Analysis Platform',
   description: 'Comprehensive financial analysis and investor insights',
@@ -71,7 +64,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className={`${geistSans.variable} ${geistMono.variable} ${flaviotte.variable} ${playfair.variable} font-sans antialiased`}>
+      <body className={`${geistSans.variable} ${geistMono.variable} ${flaviotte.variable} font-sans antialiased`}>
         <PostHogClientProvider>
           <AuthProvider>
             <QueryProvider>

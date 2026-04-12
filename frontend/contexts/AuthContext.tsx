@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { User, Session } from '@supabase/supabase-js'
-import { supabase } from '@/lib/supabase'
+import { isSupabaseConfigured, supabase } from '@/lib/supabase'
 import {
   identifyPostHogUser,
   resetPostHogUser,
@@ -213,6 +213,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return
     }
 
+    if (!isSupabaseConfigured) {
+      setLoading(false)
+      return
+    }
+
     // Supabase auth flow
     let isMounted = true
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -399,7 +404,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
-
 
 
 

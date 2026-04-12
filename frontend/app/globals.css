@@ -33,6 +33,7 @@
   --input: 0 0% 90%;
   --ring: 235 100% 50%;
   --radius: 0.75rem;
+  --font-playfair: Georgia, 'Times New Roman', serif;
 }
 
 .dark {

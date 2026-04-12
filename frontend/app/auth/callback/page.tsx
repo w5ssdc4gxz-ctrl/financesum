@@ -2,7 +2,7 @@
 
 import { useEffect } from 'react'
 import { useRouter } from 'next/navigation'
-import { supabase } from '@/lib/supabase'
+import { isSupabaseConfigured, supabase } from '@/lib/supabase'
 import { billingApi } from '@/lib/api-client'
 
 const UPGRADE_INTENT_KEY = 'financesum.intent.checkout.plan'
@@ -13,6 +13,11 @@ export default function AuthCallback() {
 
   useEffect(() => {
     const handleCallback = async () => {
+      if (!isSupabaseConfigured) {
+        router.push('/signin')
+        return
+      }
+
       const code =
         typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('code') : null
 
@@ -83,7 +88,6 @@ export default function AuthCallback() {
     </div>
   )
 }
-
 
 
 
