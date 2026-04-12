@@ -12,16 +12,15 @@ export async function GET(request: NextRequest) {
         return new NextResponse('Ticker is required', { status: 400 })
     }
 
-    const apiKey = process.env.EODHD_API_KEY
-    if (!apiKey) {
-        console.error('EODHD_API_KEY is not set')
-        return new NextResponse('Server configuration error', { status: 500 })
-    }
-
     const cleanTicker = ticker.trim().toUpperCase()
     const cleanExchange = exchange.trim().toUpperCase()
     if (!TICKER_RE.test(cleanTicker) || !EXCHANGE_RE.test(cleanExchange)) {
         return new NextResponse('Invalid ticker or exchange', { status: 400 })
+    }
+
+    const apiKey = process.env.EODHD_API_KEY
+    if (!apiKey) {
+        return new NextResponse('Logo unavailable', { status: 404 })
     }
 
     // EODHD Logo API URL

@@ -14,17 +14,14 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ error: 'Missing symbol parameter' }, { status: 400 })
   }
 
-  const apiToken = resolveLogoToken()
-  if (!apiToken) {
-    return NextResponse.json(
-      { error: 'EODHD_API_KEY not configured on the server. Add it to your environment to enable logos.' },
-      { status: 500 },
-    )
-  }
-
   const normalizedSymbol = symbol.trim().toUpperCase()
   if (!SYMBOL_RE.test(normalizedSymbol)) {
     return NextResponse.json({ error: 'Invalid symbol parameter' }, { status: 400 })
+  }
+
+  const apiToken = resolveLogoToken()
+  if (!apiToken) {
+    return NextResponse.json({ error: 'Logo unavailable' }, { status: 404 })
   }
 
   const upstreamUrl = `https://eodhd.com/api/logo/${encodeURIComponent(normalizedSymbol)}?api_token=${encodeURIComponent(apiToken)}`
