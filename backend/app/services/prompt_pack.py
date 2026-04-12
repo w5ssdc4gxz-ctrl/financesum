@@ -324,10 +324,11 @@ THE TASK: In 2-3 paragraphs of flowing prose, accomplish these goals:
 0b. AHA RULE: State the non-obvious insight as a clear contrast between the old
    read and the new read from this filing. Make it memorable, but keep it
    company-specific and grounded in the evidence rather than in slogans.
-1. Open with management's key message or thesis about the company's direction
-   — what leadership believes matters most right now.  Ground the reader in
-   management's worldview before any numbers.  Then establish what this company
-   IS and WHY it matters (competitive position, business model, market served).
+1. Open with investment insight, not attribution. The first sentence should say
+   what this filing means for the investment case; then use management's view
+   only if it sharpens strategy, outlook, or what happens next.  Then establish
+   what this company IS and WHY it matters (competitive position, business model,
+   market served).
 2. State where the business stands in this filing period and how management
    sounds about what comes next.
 3. Identify ONE central tension (e.g., "exceptional margin quality vs. rising
@@ -339,7 +340,10 @@ THE TASK: In 2-3 paragraphs of flowing prose, accomplish these goals:
 6. End with a forward-looking sentence that naturally raises the question
    Financial Performance will answer. Name the single proof point, metric, or
    operating checkpoint that will answer it — this handoff IS the golden thread.
-7. Use one verbatim management quote ONLY if the filing snippets contain a
+7. Do NOT start with a direct quote, "Management noted/said/disclosed," or
+   legal/accounting/tax/disclosure-requirement language. If the strongest
+   quote is boilerplate, paraphrase the useful idea or skip it.
+8. Use one verbatim management quote ONLY if the filing snippets contain a
    high-signal statement about strategy, outlook, or what happens next.
    Integrate it with context: "Management [verb] that '[quote],' which
    [interpretation]." If the available quotes are legal, tax, or accounting
@@ -351,7 +355,7 @@ THE TASK: In 2-3 paragraphs of flowing prose, accomplish these goals:
 {budget_instruction}
 """,
     do_rules=[
-        "Open with management's stated thesis or priority, not metrics",
+        "Open with investment insight, not a quote or management-attribution setup",
         "Make the first 2 sentences do the main work: takeaway, aha insight, and next proof point",
         "State the aha as a concrete contrast in the business, not as a vague theme",
         "State what changed in this filing period before drifting into generic finance language",
@@ -365,6 +369,8 @@ THE TASK: In 2-3 paragraphs of flowing prose, accomplish these goals:
     dont_rules=[
         "Do NOT start with a revenue or income figure",
         "Do NOT list metrics — weave any numbers into narrative claims",
+        "Do NOT begin with a direct quote or 'Management noted/said/disclosed'",
+        "Do NOT use disclosure-requirement, legal, accounting, or tax boilerplate as the opening quote",
         "Do NOT use bullet points or numbered lists",
         "Do NOT use meta language ('this memo will…')",
         "Do NOT exceed 1 numeric anchor — this section frames the story, numbers come later",
@@ -611,6 +617,7 @@ DISCARD BOILERPLATE LEGAL RISKS:
 - "We depend on key personnel" — almost never investment-relevant
 - "Cybersecurity threats" — unless a specific incident occurred in this filing period
 - Foreign securities registry, transfer-restriction, anti-takeover, or similar holder-rights boilerplate unless the filing ties it to a live transaction, ruling, or capital-markets event
+- Swiss Financial Market, financial-market-infrastructure, foreign registry, listing, transfer-restriction, or holder-rights items unless a live deadline, ruling, enforcement action, transaction, or financing event would hit revenue, margins, cash flow, or financing
 - Anything that has been in every filing for 3+ years without materializing
 
 REJECTED RISK NAMES (dressed-up generic — will fail validation):

@@ -558,6 +558,14 @@ class TestDetectBoilerplateQuotes:
         found = detect_boilerplate_quotes(text)
         assert len(found) >= 1
 
+    def test_detects_disclosure_requirements_boilerplate(self) -> None:
+        text = (
+            'Management noted, "to expand the disclosure requirements for '
+            'reportable segments under the new accounting standard."'
+        )
+        found = detect_boilerplate_quotes(text)
+        assert len(found) >= 1
+
     def test_empty_text(self) -> None:
         assert detect_boilerplate_quotes("") == []
 

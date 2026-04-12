@@ -582,6 +582,11 @@ _BOILERPLATE_QUOTE_PATTERNS = [
         re.IGNORECASE,
     ),
     re.compile(
+        r"(?:expand|comply\s+with|meet)\s+the\s+disclosure\s+requirements?",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bdisclosure\s+requirements?\b", re.IGNORECASE),
+    re.compile(
         r"(?:fair\s+value|carrying\s+(?:value|amount))\s+(?:of|is\s+determined)",
         re.IGNORECASE,
     ),

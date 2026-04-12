@@ -712,7 +712,7 @@ def test_accepted_company_risks_prioritize_management_echoed_material_risks() ->
         "Power Availability Capacity Ramp Risk",
         "Enterprise Renewal Slippage Risk",
     ]
-    assert accepted_names[-1] == "Anti-Corruption Policy Violation Risk"
+    assert "Anti-Corruption Policy Violation Risk" not in accepted_names
 
 
 def test_accepted_company_risks_deprioritize_generic_supplier_code_risk_without_near_term_event() -> None:
@@ -774,10 +774,76 @@ def test_accepted_company_risks_deprioritize_generic_supplier_code_risk_without_
 
     accepted = summary_agents._accepted_company_risks(analysis)
 
-    assert [risk.risk_name for risk in accepted][:2] == [
-        "Power Availability Capacity Ramp Risk",
-        "Supplier Code of Conduct Risk",
-    ]
+    accepted_names = [risk.risk_name for risk in accepted]
+
+    assert accepted_names == ["Power Availability Capacity Ramp Risk"]
+    assert "Supplier Code of Conduct Risk" not in accepted_names
+
+
+def test_accepted_company_risks_rejects_swiss_financial_market_boilerplate_without_live_event() -> None:
+    analysis = summary_agents.FilingAnalysis(
+        central_tension="",
+        tension_evidence="",
+        kpi_findings=[],
+        period_specific_insights=[],
+        management_quotes=[],
+        management_strategy_summary=(
+            "Management is prioritizing power availability and backlog conversion before taking on additional ramps."
+        ),
+        company_specific_risks=[
+            summary_agents.CompanyRisk(
+                risk_name="Swiss Financial Market Infrastructure Registration Risk",
+                mechanism=(
+                    "If Swiss Financial Market Infrastructure requirements change, registry work and holder notices could increase compliance activity."
+                ),
+                early_warning="An early-warning signal is additional foreign registry guidance.",
+                evidence_from_filing=(
+                    "Risk Factors: Swiss Financial Market Infrastructure rules may affect foreign securities registry requirements."
+                ),
+                source_section="Risk Factors",
+                source_quote=(
+                    "Swiss Financial Market Infrastructure rules may affect foreign securities registry requirements."
+                ),
+            ),
+            summary_agents.CompanyRisk(
+                risk_name="Power Availability Capacity Ramp Risk",
+                mechanism=(
+                    "If power availability or data-center construction slips, capacity comes online later and backlog conversion stretches before utilization catches up."
+                ),
+                early_warning=(
+                    "An early-warning signal is slower power-availability milestones or backlog conversion."
+                ),
+                evidence_from_filing=(
+                    "Risk Factors: delays in power availability and data-center construction could defer capacity coming online and slow backlog conversion."
+                ),
+                source_section="Risk Factors",
+                source_quote=(
+                    "delays in power availability and data-center construction could defer capacity coming online and slow backlog conversion."
+                ),
+            ),
+        ],
+        evidence_map={},
+        company_terms=[
+            "Swiss Financial Market Infrastructure",
+            "foreign securities registry",
+            "power availability",
+            "data-center construction",
+            "backlog conversion",
+        ],
+        management_expectations=[
+            summary_agents.ManagementExpectation(
+                topic="backlog conversion",
+                expectation="Management expects backlog conversion to improve over the next two quarters.",
+                timeframe="next two quarters",
+                evidence="Management expects backlog conversion to improve over the next two quarters.",
+            )
+        ],
+    )
+
+    accepted_names = [risk.risk_name for risk in summary_agents._accepted_company_risks(analysis)]
+
+    assert accepted_names == ["Power Availability Capacity Ramp Risk"]
+    assert "Swiss Financial Market Infrastructure Registration Risk" not in accepted_names
 
 
 def test_build_section_prompt_risk_factors_uses_source_backed_quotes() -> None:

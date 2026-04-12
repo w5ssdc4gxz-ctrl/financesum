@@ -380,9 +380,69 @@ def test_judge_sectioned_summary_flags_soft_executive_summary_opening() -> None:
     )
 
     failure_codes = {failure.code for failure in failures}
+    assert "exec_quote_led_opening" in failure_codes
     assert "exec_opening_soft" in failure_codes
     assert "aha_not_surfaced" in failure_codes
     assert "exec_missing_proof_point" in failure_codes
+
+
+def test_judge_sectioned_summary_flags_boilerplate_quote_led_opening() -> None:
+    thread_decision = summary_agents.ThreadDecision(
+        final_thread="Ad monetization has to fund the AI and Cloud buildout.",
+        anchor="AI and Cloud buildout",
+        anchor_class="operating_kpi",
+        aha_insight="The real shift is that ad durability now has to fund a heavier AI cycle.",
+    )
+    plan = summary_agents.SectionPlan(
+        section_name="Executive Summary",
+        job="State the thread and the next proof point.",
+        question="What matters now?",
+        owned_evidence=["AI and Cloud buildout"],
+    )
+
+    failures = summary_agents._judge_sectioned_summary(
+        section_bodies={
+            "Executive Summary": (
+                'Management noted, "to expand the disclosure requirements for reportable segments." '
+                "The company is still investing behind AI and Cloud buildout."
+            )
+        },
+        include_health_rating=False,
+        thread_decision=thread_decision,
+        section_plans={"Executive Summary": plan},
+    )
+
+    failure_codes = {failure.code for failure in failures}
+    assert "exec_quote_led_opening" in failure_codes
+
+
+def test_judge_sectioned_summary_flags_template_phrase_drift() -> None:
+    thread_decision = summary_agents.ThreadDecision(
+        final_thread="Cloud backlog conversion is the underwriting hinge.",
+        anchor="Cloud backlog conversion",
+        anchor_class="operating_kpi",
+        aha_insight="Margin support depends on conversion staying durable.",
+    )
+    plan = summary_agents.SectionPlan(
+        section_name="Financial Performance",
+        job="Test the thread with only the most decision-relevant metrics.",
+        question="Do the numbers confirm the thesis?",
+        owned_evidence=["Cloud backlog conversion"],
+    )
+
+    failures = summary_agents._judge_sectioned_summary(
+        section_bodies={
+            "Financial Performance": (
+                "Cloud backlog conversion still supports the margin case this quarter. "
+                "The first checkpoint is whether renewal timing stays inside management's next-quarter plan."
+            )
+        },
+        include_health_rating=False,
+        thread_decision=thread_decision,
+        section_plans={"Financial Performance": plan},
+    )
+
+    assert "template_phrase" in {failure.code for failure in failures}
 
 
 def test_opening_surfaces_aha_requires_explicit_contrast_for_contrastive_insight() -> None:

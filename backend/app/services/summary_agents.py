@@ -67,7 +67,11 @@ from app.services.summary_budget_controller import (
     section_budget_tolerance_words,
     total_word_tolerance_words,
 )
-from app.services.repetition_guard import check_repetition, detect_similar_paragraphs
+from app.services.repetition_guard import (
+    check_repetition,
+    detect_boilerplate_quotes,
+    detect_similar_paragraphs,
+)
 from app.services.summary_post_processor import (
     PostProcessResult,
     post_process_summary,
@@ -1000,7 +1004,9 @@ _RISK_PRIORITY_LOW_SIGNAL_RE = re.compile(
     r"\b("
     r"general economic|macroeconomic|geopolitical|competition(?: from)?|competitive pressure|"
     r"cybersecurity|cyber threats?|climate change|weather events?|foreign currency|"
-    r"interest rates?|key personnel|regulatory environment|compliance with laws"
+    r"interest rates?|key personnel|regulatory environment|compliance with laws|"
+    r"foreign securities registry|foreign registry|financial market infrastructure|"
+    r"transfer[- ]restriction|anti[- ]takeover|holder[- ]rights?"
     r")\b",
     re.IGNORECASE,
 )
@@ -1047,6 +1053,11 @@ _EXEC_DECISION_OPENING_RE = re.compile(
     r"comes down to|depends on|turns on|hinges on|matters because|the filing makes clear)\b",
     re.IGNORECASE,
 )
+_LOW_SIGNAL_EXEC_OPENING_RE = re.compile(
+    r"^\s*(?:[\"“]|(?:management|leadership|the company|company|[A-Z][A-Za-z&.'\- ]{1,80})\s+"
+    r"(?:noted|said|stated|disclosed|reported|indicated|highlighted|emphasized|explained|described)\b)",
+    re.IGNORECASE,
+)
 _WATCHPOINT_RE = re.compile(
     r"\b(proof point|watch|watchpoint|checkpoint|trigger|threshold|metric|"
     r"operating checkpoint|must stay true|breaks the thesis)\b",
@@ -1071,6 +1082,11 @@ _ANALYST_FOG_RE = re.compile(
     r"balance sheet optionality|forward visibility constraints|cash drag)\b",
     re.IGNORECASE,
 )
+_TEMPLATE_PHRASE_RE = re.compile(
+    r"\b(the first checkpoint is|the real downside is|the next checkpoint is|"
+    r"the key checkpoint is|the main downside is)\b",
+    re.IGNORECASE,
+)
 _FINANCIAL_PERFORMANCE_REINVESTMENT_ECHO_RE = re.compile(
     r"\b("
     r"margin strength (?:is )?fund(?:ing|s) (?:the )?(?:investment|reinvestment|buildout)|"
@@ -1090,12 +1106,24 @@ _FINANCIAL_PERFORMANCE_METRIC_PATTERNS: Dict[str, re.Pattern[str]] = {
 }
 _RISK_PRIORITY_NEAR_TERM_EVENT_RE = re.compile(
     r"\b(inquiry|investigation|enforcement|settlement|hearing|trial|ruling|deadline|ban|"
-    r"subpoena|audit finding|regulatory remedy|consent decree|non-renewal|contract renewal)\b",
+    r"subpoena|audit finding|regulatory remedy|consent decree|non-renewal|contract renewal|"
+    r"transaction|tender offer|capital[- ]markets event|listing deadline)\b",
     re.IGNORECASE,
 )
 _RISK_PRIORITY_COMPLIANCE_RE = re.compile(
     r"\b(anti-corruption|supplier code|code of conduct|ethics policy|policy violation|"
-    r"bribery|sanctions compliance|labor standards|compliance policy)\b",
+    r"bribery|sanctions compliance|labor standards|compliance policy|"
+    r"foreign securities registry|foreign registry|financial market infrastructure|"
+    r"transfer[- ]restriction|anti[- ]takeover|holder[- ]rights?|finma)\b",
+    re.IGNORECASE,
+)
+_LOW_MATERIAL_LEGAL_RISK_RE = re.compile(
+    r"\b("
+    r"swiss financial market|financial market infrastructure|foreign securities registry|"
+    r"foreign registry|securities registry|transfer[- ]restriction|share transfer restriction|"
+    r"anti[- ]takeover|holder[- ]rights?|stock exchange listing|listing rules?|"
+    r"finma|central securities depository|clearing system"
+    r")\b",
     re.IGNORECASE,
 )
 _RISK_PRIORITY_PRICED_IN_RE = re.compile(
@@ -1108,6 +1136,8 @@ _REPEATED_LEADIN_STEMS = (
     "what matters now",
     "the key issue",
     "the next question is",
+    "the first checkpoint is",
+    "the real downside is",
 )
 _INSTRUCTION_THEME_PATTERNS: Tuple[Tuple[str, str], ...] = (
     ("must_be_forward_looking", "future outlook"),
@@ -1137,8 +1167,10 @@ _SECTIONED_EDITORIAL_FAILURE_CODES = frozenset({
     "section_overlap",
     "instruction_miss",
     "exec_opening_soft",
+    "exec_quote_led_opening",
     "aha_not_surfaced",
     "exec_missing_proof_point",
+    "template_phrase",
     "financial_performance_metric_drift",
     "financial_performance_redundancy",
     "soft_section_ending",
@@ -1620,6 +1652,24 @@ def _risk_body_for_scoring(risk: CompanyRisk) -> str:
     )
 
 
+def _risk_priority_blob(risk: CompanyRisk) -> str:
+    return " ".join(
+        part
+        for part in (
+            str(risk.risk_name or "").strip(),
+            _risk_body_for_scoring(risk),
+        )
+        if part
+    )
+
+
+def _is_low_material_legal_risk(text: str) -> bool:
+    blob = str(text or "")
+    return bool(_LOW_MATERIAL_LEGAL_RISK_RE.search(blob)) and not bool(
+        _RISK_PRIORITY_NEAR_TERM_EVENT_RE.search(blob)
+    )
+
+
 def _risk_management_signal_chunks(analysis: FilingAnalysis) -> List[Tuple[int, str]]:
     chunks: List[Tuple[int, str]] = []
     for quote in analysis.management_quotes or []:
@@ -1741,13 +1791,14 @@ def _risk_priority_profile(
         )
     )
     base_score = score_risk_evidence_candidate(candidate, company_terms=company_terms)
+    risk_priority_blob = _risk_priority_blob(risk)
     management_echo_score, management_echo = _risk_management_echo_score(
         risk,
         analysis=analysis,
         company_terms=company_terms,
     )
-    has_trigger = bool(_RISK_PRIORITY_TRIGGER_RE.search(risk_blob))
-    has_transmission = bool(_TRANSMISSION_RE.search(risk_blob))
+    has_trigger = bool(_RISK_PRIORITY_TRIGGER_RE.search(risk_priority_blob))
+    has_transmission = bool(_TRANSMISSION_RE.search(risk_priority_blob))
     filing_backed_blob = " ".join(
         part
         for part in (
@@ -1760,8 +1811,9 @@ def _risk_priority_profile(
     has_near_term_event = bool(
         _RISK_PRIORITY_NEAR_TERM_EVENT_RE.search(filing_backed_blob)
     )
-    is_generic_compliance = bool(_RISK_PRIORITY_COMPLIANCE_RE.search(risk_blob))
-    is_already_priced = bool(_RISK_PRIORITY_PRICED_IN_RE.search(risk_blob))
+    is_generic_compliance = bool(_RISK_PRIORITY_COMPLIANCE_RE.search(risk_priority_blob))
+    is_low_material_legal = _is_low_material_legal_risk(risk_priority_blob)
+    is_already_priced = bool(_RISK_PRIORITY_PRICED_IN_RE.search(risk_priority_blob))
     source_section = str(risk.source_section or "").strip() or "Risk Factors"
 
     probability_score = 0
@@ -1797,12 +1849,17 @@ def _risk_priority_profile(
         score += 2
     if _GENERIC_AGENT_RISK_NAME_RE.search(str(risk.risk_name or "")):
         score -= 6
-    if _RISK_PRIORITY_LOW_SIGNAL_RE.search(risk_blob) and anchor_count <= 1 and not management_echo:
+    if _RISK_PRIORITY_LOW_SIGNAL_RE.search(risk_priority_blob) and anchor_count <= 1 and not management_echo:
         score -= 7
     if is_generic_compliance and not has_near_term_event:
         probability_score -= 4
         asymmetry_score -= 2
         score -= 12
+    if is_low_material_legal and not has_near_term_event:
+        probability_score -= 5
+        magnitude_score -= 2
+        asymmetry_score -= 2
+        score -= 16
 
     return {
         "risk": risk,
@@ -1816,6 +1873,7 @@ def _risk_priority_profile(
         "has_transmission": bool(has_transmission),
         "has_near_term_event": bool(has_near_term_event),
         "is_generic_compliance": bool(is_generic_compliance),
+        "is_low_material_legal": bool(is_low_material_legal),
         "is_already_priced": bool(is_already_priced),
         "source_section": source_section,
     }
@@ -1831,8 +1889,15 @@ def _risk_profile_is_material(
     management_echo = bool(profile.get("management_echo"))
     has_trigger = bool(profile.get("has_trigger"))
     has_transmission = bool(profile.get("has_transmission"))
+    has_near_term_event = bool(profile.get("has_near_term_event"))
+    is_generic_compliance = bool(profile.get("is_generic_compliance"))
+    is_low_material_legal = bool(profile.get("is_low_material_legal"))
     source_section = str(profile.get("source_section") or "")
 
+    if is_low_material_legal and not has_near_term_event:
+        return False
+    if is_generic_compliance and not has_near_term_event:
+        return False
     if management_echo and anchor_count >= 1 and (has_trigger or has_transmission or score >= 18):
         return True
     if source_section in {"Risk Factors", "Risk"} and anchor_count >= 1 and (has_trigger or has_transmission):
@@ -5785,6 +5850,10 @@ def _validate_risk_local_contract(
             failures.append(
                 f"Risk '{risk_name}' contains boilerplate risk language."
             )
+        if _is_low_material_legal_risk(f"{risk_name} {body}"):
+            failures.append(
+                f"Risk '{risk_name}' reads like legal/registration boilerplate; replace it with an operating risk tied to revenue, margins, cash flow, financing, or a live regulatory catalyst."
+            )
         if not _MECHANISM_RE.search(body):
             failures.append(f"Risk '{risk_name}' needs a concrete mechanism.")
         if not _TRANSMISSION_RE.search(body):
@@ -6259,6 +6328,16 @@ def _opening_has_decision_block(body: str) -> bool:
     return has_decision_language or has_implication
 
 
+def _opening_starts_with_low_signal_quote(body: str) -> bool:
+    sentences = _section_sentences(body, limit=1)
+    opening = sentences[0] if sentences else str(body or "").strip()
+    if not opening:
+        return False
+    if _LOW_SIGNAL_EXEC_OPENING_RE.search(opening):
+        return True
+    return bool(detect_boilerplate_quotes(opening))
+
+
 def _opening_names_next_proof_point(body: str) -> bool:
     opening = " ".join(_section_sentences(body, limit=2))
     if not opening:
@@ -6417,7 +6496,25 @@ def _judge_sectioned_summary(
         body = str(section_bodies.get(section_name) or "").strip()
         if not body:
             continue
+        if _TEMPLATE_PHRASE_RE.search(body):
+            failures.append(
+                EditorialFailure(
+                    section_name=section_name,
+                    code="template_phrase",
+                    message=f"{section_name} uses templated analyst phrasing. Replace stock phrases with a company-specific sentence.",
+                    severity=2.2,
+                )
+            )
         if section_name == "Executive Summary":
+            if _opening_starts_with_low_signal_quote(body):
+                failures.append(
+                    EditorialFailure(
+                        section_name=section_name,
+                        code="exec_quote_led_opening",
+                        message="Executive Summary should start with investment insight, not a management quote or disclosure filler.",
+                        severity=2.9,
+                    )
+                )
             if not _opening_has_decision_block(body):
                 failures.append(
                     EditorialFailure(
@@ -6946,7 +7043,8 @@ def _build_section_prompt(
     if section_name == "Executive Summary":
         section_focus_instruction = (
             "SECTION FOCUS:\n"
-            "- Open with management's actual message for this filing period, then anchor what the company does, how it makes money, and why its moat matters now.\n"
+            "- Open with investment insight first: what this filing means for the stock or investment case. Then use management attribution only after the lead if it sharpens strategy, outlook, or what happens next.\n"
+            "- Do NOT open with a direct quote, 'Management noted/said/disclosed,' accounting text, tax text, or disclosure-requirement language.\n"
             "- State what changed in this filing before discussing numbers.\n"
             "- Use management tone, expectations, or guidance to frame what happens next.\n"
             "- Prefer company-specific KPIs over generic Revenue/EPS when choosing evidence.\n"
@@ -6955,6 +7053,7 @@ def _build_section_prompt(
             "- Reuse the company terms below so the section reads like it came from this filing, not a template.\n"
             "- Use no more than one anchor figure if target length is under 800 words; otherwise cap at two.\n"
             "- Never open with a templated metric sentence like 'Revenue of X produced Y'. Start with the thesis or the real surprise.\n"
+            "- Avoid templated lead-ins such as 'The first checkpoint is' or 'The real downside is.' Make the sentence specific to this company.\n"
             "- End with a subtle handoff to the operating proof the quarter must show; do not say 'the next section'.\n"
             "- QUOTE RULE: Use one verbatim management quote within the first 3 sentences only if it directly supports strategy, outlook, or what happens next; otherwise use attributed paraphrase.\n"
             "- OPENING CONTRACT: Within the first 2 sentences, state the main takeaway, the non-obvious report insight, and the single proof point investors should watch next.\n"
@@ -6965,6 +7064,7 @@ def _build_section_prompt(
             "not just what it SAYS. A paraphrase is not analysis.\n"
             "- DECISION FRAMING: Open the very first sentence with the single most important "
             "takeaway. The reader should know the verdict within 2 sentences.\n"
+            f"- GOOD OPENING SHAPE: '{company_name}'s investment case now hinges on whether [specific engine] can fund [specific buildout] without [specific margin/cash-flow break].'\n"
             "- AHA INSIGHT: The filing's non-obvious insight (from AHA INSIGHT above) "
             "must appear explicitly in the first 2 paragraphs, not buried at the end.\n\n"
         )
@@ -7046,6 +7146,7 @@ def _build_section_prompt(
             "- ASYMMETRY TEST: Prioritize risks where the downside is larger than what is "
             "currently priced in. Skip symmetric or already-known risks.\n"
             "- DE-PRIORITIZE GENERIC COMPLIANCE: Supplier-code, anti-corruption, code-of-conduct, transfer-restriction, foreign-registry, or anti-takeover risks should stay below real operating risks unless the filing ties them to a near-term investigation, ruling, deadline, transaction, or enforcement path.\n"
+            "- DISCARD LOW-MATERIAL LEGAL HOLDER RISKS: Swiss Financial Market, financial-market-infrastructure, foreign registry, listing, transfer-restriction, or holder-rights items are not material risk entries unless a live deadline, ruling, enforcement action, transaction, or financing event would hit revenue, margins, cash flow, or financing. Replace them with operating risks tied to products, customers, supply, capacity, regulation, or funding.\n"
             "- TIMELINE REQUIREMENT: Each risk must state a specific timeline or catalyst — "
             "'within the next 2 quarters,' 'if the Q3 contract renewal fails,' 'before the "
             "fiscal year-end pricing reset.' Risks without timelines are too abstract.\n"
