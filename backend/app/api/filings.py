@@ -17007,6 +17007,211 @@ def _record_summary_422_observability(
     )
 
 
+def _normalize_summary_error_detail(detail: Any) -> Dict[str, Any]:
+    if isinstance(detail, dict):
+        return dict(detail)
+    text = str(detail or "").strip()
+    return {"detail": text} if text else {}
+
+
+def _should_soft_retry_explicit_short_target(
+    *,
+    detail: Any,
+    target_length: Optional[int],
+    explicit_target_requested: bool,
+) -> bool:
+    if not explicit_target_requested or not target_length:
+        return False
+    if not _is_short_mid_precision_target(target_length):
+        return False
+    if int(target_length) < 850:
+        return False
+
+    payload = _normalize_summary_error_detail(detail)
+    failure_code = str(payload.get("failure_code") or "").strip()
+    if failure_code not in {
+        "SUMMARY_CONTRACT_FAILED",
+        "SUMMARY_ONE_SHOT_CONTRACT_FAILED",
+    }:
+        return False
+
+    missing_requirements = [
+        str(item).strip()
+        for item in list(payload.get("missing_requirements") or [])
+        if str(item).strip()
+    ]
+    diagnostic_requirements = [
+        str(item).strip()
+        for item in list(payload.get("diagnostic_missing_requirements") or [])
+        if str(item).strip()
+    ]
+    issue_flags = _parse_summary_contract_missing_requirements(
+        missing_requirements + diagnostic_requirements
+    )
+
+    # Do not silently downgrade hard evidence/grounding failures. The soft retry
+    # is reserved for bounded structural/word-band misses on explicit short targets.
+    if (
+        issue_flags.get("quote_grounding_issue")
+        or issue_flags.get("quote_evidence_gap")
+        or _has_hard_risk_issue(issue_flags)
+    ):
+        return False
+
+    return True
+
+
+def _decorate_soft_target_retry_payload(
+    *,
+    payload: Dict[str, Any],
+    requested_target_length: int,
+    original_detail: Any,
+    disabled_health_rating: bool,
+) -> Dict[str, Any]:
+    result = dict(payload or {})
+    result["degraded"] = True
+    existing_reason = str(result.get("degraded_reason") or "").strip()
+    if not existing_reason or existing_reason == "soft_target":
+        result["degraded_reason"] = "contract_miss"
+
+    warning = (
+        f"Exact {int(requested_target_length)}-word target could not be satisfied from "
+        "this filing. Returned the closest stable summary instead."
+    )
+    if disabled_health_rating:
+        warning += " Health rating was disabled on the fallback pass."
+
+    original_payload = _normalize_summary_error_detail(original_detail)
+    original_missing = [
+        str(item).strip()
+        for item in list(original_payload.get("missing_requirements") or [])
+        if str(item).strip()
+    ]
+
+    warnings = [
+        str(item).strip()
+        for item in list(result.get("warnings") or [])
+        if str(item).strip()
+    ]
+    if warning not in warnings:
+        warnings.append(warning)
+    result["warnings"] = list(dict.fromkeys(warnings))
+
+    contract_warnings = [
+        str(item).strip()
+        for item in list(result.get("contract_warnings") or [])
+        if str(item).strip()
+    ]
+    contract_warnings = list(
+        dict.fromkeys([warning] + contract_warnings + original_missing[:4])
+    )
+    result["contract_warnings"] = contract_warnings
+
+    summary_meta = (
+        dict(result.get("summary_meta") or {})
+        if isinstance(result.get("summary_meta"), dict)
+        else {}
+    )
+    summary_meta["requested_target_length"] = int(requested_target_length)
+    summary_meta["soft_target_retry_used"] = True
+    summary_meta["soft_target_retry_disabled_health_rating"] = bool(
+        disabled_health_rating
+    )
+    if original_missing and not summary_meta.get("contract_missing_requirements"):
+        summary_meta["contract_missing_requirements"] = list(original_missing[:12])
+    result["summary_meta"] = summary_meta
+    return result
+
+
+def _try_soft_retry_for_explicit_short_target(
+    *,
+    filing_id: str,
+    preferences: Optional[FilingSummaryPreferences],
+    user: CurrentUser,
+    detail: Any,
+    explicit_target_requested: bool,
+    target_length: Optional[int],
+) -> Optional[JSONResponse]:
+    if not _should_soft_retry_explicit_short_target(
+        detail=detail,
+        target_length=target_length,
+        explicit_target_requested=explicit_target_requested,
+    ):
+        return None
+
+    base_preferences = (
+        preferences.model_copy(deep=True)
+        if preferences is not None
+        else FilingSummaryPreferences()
+    )
+    base_preferences.mode = "default"
+    base_preferences.strict_contract = False
+    base_preferences.target_length = None
+
+    fallback_variants = [(base_preferences, False)]
+    if (
+        base_preferences.health_rating is not None
+        and bool(base_preferences.health_rating.enabled)
+    ):
+        health_disabled_preferences = base_preferences.model_copy(deep=True)
+        health_disabled_preferences.health_rating = (
+            health_disabled_preferences.health_rating.model_copy(
+                update={"enabled": False}
+            )
+        )
+        fallback_variants.append((health_disabled_preferences, True))
+
+    for fallback_preferences, disabled_health_rating in fallback_variants:
+        try:
+            fallback_response = generate_filing_summary(
+                filing_id=filing_id,
+                preferences=fallback_preferences,
+                user=user,
+            )
+        except HTTPException:
+            continue
+
+        summary_response_parser = globals().get("_summary_response_to_payload")
+        if callable(summary_response_parser):
+            status_code, payload = summary_response_parser(fallback_response)
+        else:
+            status_code = int(getattr(fallback_response, "status_code", 200) or 200)
+            body = getattr(fallback_response, "body", None)
+            if isinstance(body, bytes):
+                body_text = body.decode("utf-8", errors="replace")
+            else:
+                body_text = str(body or "")
+            try:
+                parsed_payload = json.loads(body_text) if body_text.strip() else {}
+            except json.JSONDecodeError:
+                parsed_payload = {"detail": body_text}
+            payload = (
+                parsed_payload
+                if isinstance(parsed_payload, dict)
+                else {"result": parsed_payload}
+            )
+        if status_code >= 400:
+            continue
+        if not str(payload.get("summary") or "").strip():
+            continue
+
+        logger.warning(
+            "Explicit short-target contract miss recovered via soft-target retry: filing_id=%s target_length=%s health_disabled=%s",
+            filing_id,
+            int(target_length or 0),
+            bool(disabled_health_rating),
+        )
+        recovered_payload = _decorate_soft_target_retry_payload(
+            payload=payload,
+            requested_target_length=int(target_length or 0),
+            original_detail=detail,
+            disabled_health_rating=disabled_health_rating,
+        )
+        return JSONResponse(content=jsonable_encoder(recovered_payload))
+
+    return None
+
+
 def _estimate_contract_quote_pool_size(
     filing_language_snippets: str, *, target_quotes: int
 ) -> int:
@@ -39480,6 +39685,16 @@ FLOW AND QUALITY RULES:
 
     except HTTPException as http_exc:
         if http_exc.status_code == 422:
+            soft_retry_response = _try_soft_retry_for_explicit_short_target(
+                filing_id=str(filing_id),
+                preferences=preferences,
+                user=user,
+                detail=http_exc.detail,
+                explicit_target_requested=explicit_target_requested,
+                target_length=target_length,
+            )
+            if soft_retry_response is not None:
+                return soft_retry_response
             degraded = _contract_422_to_degraded_response(http_exc.detail)
             if degraded is not None:
                 return degraded

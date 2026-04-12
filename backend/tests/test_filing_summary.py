@@ -1,3 +1,4 @@
+import json
 import re
 import time
 from datetime import datetime
@@ -18927,3 +18928,159 @@ def test_post_final_quality_rewrite_runs_at_most_once(monkeypatch):
         local_cache.fallback_companies.pop(company_id, None)
         local_cache.fallback_financial_statements.pop(filing_id, None)
         local_cache.fallback_filing_summaries.pop(filing_id, None)
+
+
+def test_soft_retry_helper_replays_explicit_short_target_without_target_length(
+    monkeypatch,
+) -> None:
+    attempts: list[dict[str, object]] = []
+    recovered_summary = (
+        "## Executive Summary\n"
+        "Recovered summary.\n\n"
+        "## Financial Performance\n"
+        "Recovered performance section.\n\n"
+        "## Management Discussion & Analysis\n"
+        "Recovered MD&A section.\n\n"
+        "## Risk Factors\n"
+        "Recovered risk section.\n\n"
+        "## Closing Takeaway\n"
+        "Recovered closing takeaway."
+    )
+
+    def _fake_generate_summary(*, filing_id, preferences, user):
+        attempts.append(
+            {
+                "filing_id": filing_id,
+                "target_length": preferences.target_length,
+                "mode": preferences.mode,
+                "strict_contract": preferences.strict_contract,
+                "health_enabled": bool(
+                    preferences.health_rating and preferences.health_rating.enabled
+                ),
+            }
+        )
+        if preferences.health_rating and preferences.health_rating.enabled:
+            raise filings_api.HTTPException(
+                status_code=422,
+                detail={"detail": "Health-rating variant still failed."},
+            )
+        return filings_api.JSONResponse(
+            content={"summary": recovered_summary, "summary_meta": {}}
+        )
+
+    monkeypatch.setattr(filings_api, "generate_filing_summary", _fake_generate_summary)
+
+    response = filings_api._try_soft_retry_for_explicit_short_target(
+        filing_id="soft-retry-filing",
+        preferences=filings_api.FilingSummaryPreferences(
+            mode="custom",
+            target_length=1000,
+            health_rating={"enabled": True},
+        ),
+        user=filings_api.CurrentUser(id="user-1", email="user@example.com"),
+        detail={
+            "detail": "Unable to satisfy structural requirements for short-form summary.",
+            "failure_code": "SUMMARY_CONTRACT_FAILED",
+            "target_length": 1000,
+            "missing_requirements": [
+                "Missing the heading '## Risk Factors'.",
+                "Final word-count band violation: expected 960-1040, got split=843, stripped=811.",
+            ],
+        },
+        explicit_target_requested=True,
+        target_length=1000,
+    )
+
+    assert response is not None
+    payload = json.loads(response.body)
+    assert len(attempts) == 2
+    assert attempts[0]["target_length"] is None
+    assert attempts[0]["mode"] == "default"
+    assert attempts[0]["strict_contract"] is False
+    assert attempts[0]["health_enabled"] is True
+    assert attempts[1]["target_length"] is None
+    assert attempts[1]["health_enabled"] is False
+    assert payload.get("degraded") is True
+    assert payload.get("degraded_reason") == "contract_miss"
+    assert payload.get("summary") == recovered_summary
+    assert payload.get("summary_meta", {}).get("requested_target_length") == 1000
+    assert payload.get("summary_meta", {}).get("soft_target_retry_used") is True
+    assert (
+        payload.get("summary_meta", {}).get("soft_target_retry_disabled_health_rating")
+        is True
+    )
+    contract_warnings = payload.get("contract_warnings") or []
+    assert any("closest stable summary" in str(item).lower() for item in contract_warnings)
+
+
+def test_summary_endpoint_returns_soft_retry_payload_on_explicit_short_target_422(
+    monkeypatch,
+) -> None:
+    settings = get_settings()
+    settings.openai_api_key = "test-key"
+
+    filing_id = "soft-retry-endpoint-filing"
+    company_id = "soft-retry-endpoint-company"
+    _seed_filing_bundle(filing_id, company_id)
+    _relax_non_contract_quality_validators(monkeypatch)
+    _stabilize_summary_pipeline(monkeypatch)
+
+    detail = {
+        "detail": "Unable to satisfy structural requirements for short-form summary.",
+        "failure_code": "SUMMARY_CONTRACT_FAILED",
+        "target_length": 1000,
+        "missing_requirements": [
+            "Missing the heading '## Risk Factors'.",
+            "Final word-count band violation: expected 960-1040, got split=843, stripped=811.",
+        ],
+    }
+
+    def _raise_contract_failure(*args, **kwargs):
+        raise filings_api.HTTPException(status_code=422, detail=detail)
+
+    monkeypatch.setattr(
+        filings_api,
+        "_generate_summary_with_quality_control",
+        _raise_contract_failure,
+    )
+    monkeypatch.setattr(
+        filings_api,
+        "_try_soft_retry_for_explicit_short_target",
+        lambda **_kwargs: filings_api.JSONResponse(
+            content={
+                "summary": "## Executive Summary\nRecovered.\n",
+                "degraded": True,
+                "degraded_reason": "contract_miss",
+                "contract_warnings": [
+                    "Exact 1000-word target could not be satisfied from this filing. Returned the closest stable summary instead."
+                ],
+                "summary_meta": {
+                    "requested_target_length": 1000,
+                    "soft_target_retry_used": True,
+                },
+            }
+        ),
+    )
+
+    class DummyClient:
+        def __init__(self) -> None:
+            self.model = type(
+                "Model", (), {"generate_content": lambda self, _prompt: None}
+            )()
+
+    monkeypatch.setattr(filings_api, "get_gemini_client", lambda: DummyClient())
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/filings/{filing_id}/summary",
+        json={"mode": "custom", "target_length": 1000},
+    )
+
+    try:
+        assert response.status_code == 200, response.json()
+        payload = response.json() or {}
+        assert payload.get("degraded") is True
+        assert payload.get("degraded_reason") == "contract_miss"
+        assert payload.get("summary_meta", {}).get("requested_target_length") == 1000
+    finally:
+        _clear_filing_bundle(filing_id, company_id)
