@@ -258,6 +258,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return demoUser
   }
 
+  const clearDemoSession = () => {
+    if (typeof window !== 'undefined') {
+      window.localStorage.removeItem(DEMO_ACTIVE_KEY)
+      window.localStorage.removeItem(DEMO_STORAGE_KEY)
+    }
+    setDemoMode(false)
+    setUser(null)
+    setSession(null)
+    resetPostHogUser()
+    identifiedUserIdRef.current = null
+  }
+
   useEffect(() => {
     if (loading) return
 
@@ -286,14 +298,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [loading, resolvedDemoMode, user?.email, user?.id])
 
   const signInHandler = async () => {
+    const supabaseConfigured = Boolean(
+      isSupabaseConfigured && SUPABASE_URL && SUPABASE_ANON_KEY && !SUPABASE_CONFIG_MISMATCH
+    )
+    const forcedDemoMode =
+      AUTH_MODE === 'demo' || (SUPABASE_CONFIG_MISMATCH && ALLOW_DEMO_FALLBACK)
+
     trackPostHogEvent('auth_sign_in_started', {
-      auth_mode: resolvedDemoMode ? 'demo' : 'supabase',
-      provider: resolvedDemoMode ? 'demo' : 'google',
+      auth_mode: forcedDemoMode ? 'demo' : 'supabase',
+      provider: forcedDemoMode ? 'demo' : 'google',
     })
 
-    if (resolvedDemoMode) {
+    if (forcedDemoMode) {
       startDemoSession()
       return
+    }
+
+    if (demoMode && supabaseConfigured) {
+      clearDemoSession()
     }
 
     if (SUPABASE_CONFIG_MISMATCH) {
@@ -313,7 +335,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isProviderEnabled = await fetchProviderStatus()
     }
 
-    const supabaseConfigured = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY && !SUPABASE_CONFIG_MISMATCH)
     const providerDisabled = isProviderEnabled === false
 
     if (!supabaseConfigured || providerDisabled) {
@@ -404,6 +425,5 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
-
 
 
